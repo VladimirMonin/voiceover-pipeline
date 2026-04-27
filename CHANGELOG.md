@@ -38,7 +38,7 @@
 
 - 45 pytest tests: JSON contract, exit codes, validation, output policy
 - Dev dependency: `pytest`
-- Конфигурация: `uv sync --group dev`
+- Конфигурация: `uv sync --extra dev` / `pip install -e ".[dev]"`
 
 ### Documentation
 

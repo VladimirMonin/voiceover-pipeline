@@ -247,16 +247,16 @@ out/<run-id>/
 
 ```powershell
 # 1. Проверить окружение
-uv run voiceover doctor --provider polza-chat-audio --with-timings --json
+voiceover doctor --provider polza-chat-audio --with-timings --json
 
 # 2. Проверить сценарий
-uv run voiceover validate --script "in\script.md" --json
+voiceover validate --script "script.md" --json
 
 # 3. Сгенерировать озвучку + тайминги
-uv run voiceover generate `
+voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
-  --script "in\script.md" `
+  --script "script.md" `
   --run-id "prod" `
   --with-timings `
   --word-timestamps `

@@ -2,6 +2,14 @@
 
 Как агент Remotion может использовать `voiceover-pipeline` от сценария до готовых таймингов для анимаций.
 
+## Setup для Remotion агента
+
+```powershell
+pip install "voiceover-pipeline[timing-whisper]"
+```
+
+После установки доступны консольные скрипты `voiceover` и `voiceover-pipeline`.
+
 ## Полный пайплайн
 
 ```text
@@ -29,8 +37,7 @@ voiceover generate --with-timings
 ## Команда для агента
 
 ```powershell
-cd C:\PY\voiceover-pipeline
-uv run voiceover generate `
+voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
   --script "C:\remotion-project\script.md" `
@@ -46,11 +53,14 @@ uv run voiceover generate `
 ## Что читать агенту
 
 ### 1. `manifest.json` — все пути
+
+Пример (фактические пути зависят от `--output-dir` и `--run-id`):
+
 ```json
 {
-  "full_mp3": "C:\\PY\\voiceover-pipeline\\out\\production\\production-voiceover-openai-gpt-audio-mini.mp3",
-  "timings_json": "C:\\PY\\voiceover-pipeline\\out\\production\\production.timings.json",
-  "srt": "C:\\PY\\voiceover-pipeline\\out\\production\\production.srt",
+  "full_mp3": "C:\\voiceover-output\\production\\production-voiceover-openai-gpt-audio-mini.mp3",
+  "timings_json": "C:\\voiceover-output\\production\\production.timings.json",
+  "srt": "C:\\voiceover-output\\production\\production.srt",
   ...
 }
 ```
@@ -118,6 +128,6 @@ for seg in timings["segments"]:
 
 | Провайдер | Когда | Команда |
 |---|---|---|
-| `polza-chat-audio` (GPT Audio Mini) | Быстро и дёшево (0.71 RUB/min) | `--provider polza-chat-audio --model "openai/gpt-audio-mini"` |
-| `openrouter-tts` (Gemini) | Западные голоса, качество ($0.03/min) | `--provider openrouter-tts --model "google/gemini-3.1-flash-tts-preview" --voice "Puck"` |
-| `qwen-local` | Бесплатно, нужен GPU | `--provider qwen-local` |
+| `polza-chat-audio` (GPT Audio Mini) | Быстро и дёшево (0.71 RUB/min) | `voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini"` |
+| `openrouter-tts` (Gemini) | Западные голоса, качество ($0.03/min) | `voiceover generate --provider openrouter-tts --model "google/gemini-3.1-flash-tts-preview" --voice "Puck"` |
+| `qwen-local` | Бесплатно, нужен GPU | `voiceover generate --provider qwen-local` |

@@ -23,8 +23,9 @@ Exit code: 10.
 
 **Решение:**
 ```powershell
-uv sync --group timing-whisper
+pip install voiceover-pipeline[timing-whisper]
 ```
+Для локальной разработки: `uv sync --extra timing-whisper`
 
 ## Polza ключ
 
@@ -36,6 +37,8 @@ Exit code: 20.
 
 **Решение:** заполнить `.env`: `POLZA_API_KEY=pza_...`
 
+`.env` ищется в CWD и вверх по родительским директориям.
+
 ## OpenRouter ключ
 
 ```
@@ -45,6 +48,8 @@ OPENROUTER_API_KEY is required
 Exit code: 20.
 
 **Решение:** заполнить `.env`: `OPENROUTER_API_KEY=sk-or-v1-...`
+
+`.env` ищется в CWD и вверх по родительским директориям.
 
 ## CUDA не доступна
 
@@ -94,8 +99,9 @@ Exit code: 40. MP3 уже сохранён.
 
 **Восстановление:**
 ```powershell
-uv run voiceover timings --audio "out\<run>\*-voiceover-*.mp3"
+voiceover timings --audio "out\<run>\*-voiceover-*.mp3"
 ```
+При локальной разработке: `uv run voiceover timings --audio "out\<run>\*-voiceover-*.mp3"`
 
 ## Модель Whisper не скачана
 

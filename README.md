@@ -6,32 +6,35 @@ Standalone CLI для генерации озвучки + Whisper timing из Ma
 Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
 Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
 
-## Install / Run
+## Install
 
-Run without installing (Python 3.11+, uv):
+Console scripts: `voiceover` and `voiceover-pipeline` (both work).
 
-```powershell
-uvx voiceover-pipeline doctor
-```
+| Manager | Base | + Whisper | + Qwen GPU | + All extras |
+|---|---|---|---|---|
+| **uvx** (no install) | `uvx voiceover-pipeline doctor` | `uvx --from "voiceover-pipeline[timing-whisper]" voiceover-pipeline generate --with-timings ...` | `uvx --from "voiceover-pipeline[voiceover-qwen]" voiceover-pipeline generate --provider qwen-local ...` | `uvx --from "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]" ...` |
+| **pipx** | `pipx install voiceover-pipeline` | `pipx install "voiceover-pipeline[timing-whisper]"` | `pipx install "voiceover-pipeline[voiceover-qwen]"` | `pipx install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
+| **pip** | `pip install voiceover-pipeline` | `pip install "voiceover-pipeline[timing-whisper]"` | `pip install "voiceover-pipeline[voiceover-qwen]"` | `pip install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
+| **uv pip** | `uv pip install voiceover-pipeline` | `uv pip install "voiceover-pipeline[timing-whisper]"` | `uv pip install "voiceover-pipeline[voiceover-qwen]"` | `uv pip install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
 
-With Whisper timings:
-
-```powershell
-uvx --from "voiceover-pipeline[timing-whisper]" voiceover-pipeline generate --with-timings ...
-```
-
-Local dev:
+### From source
 
 ```powershell
 git clone https://github.com/VladimirMonin/voiceover-pipeline
 cd voiceover-pipeline
-uv sync --group dev --group timing-whisper
+uv sync --extra dev --extra timing-whisper
 uv run voiceover doctor
 ```
 
+### First run
+
+- `.env` is searched in CWD and upwards through parent directories.
+- Whisper model (~486 MB) auto-downloads from HuggingFace on first `--with-timings`. Subsequent runs use cache.
+- Qwen-local requires NVIDIA GPU + CUDA drivers (~4 GB VRAM).
+
 ## API Keys
 
-Create `.env` in your working directory:
+Create `.env` in your working directory (CWD or any parent directory — searched upwards):
 
 ```env
 POLZA_API_KEY=pza_...
@@ -43,15 +46,22 @@ Never commit `.env`.
 ## Golden Command
 
 ```powershell
-uv run voiceover generate `
+voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
-  --script "in\script.md" `
+  --script "script.md" `
   --run-id "prod" `
   --with-timings `
   --word-timestamps `
   --json `
   --overwrite
+```
+
+Результат (JSON stdout):
+
+```json
+{"status": "success", "provider": "polza-chat-audio", "run_id": "prod",
+ "duration_ms": 25520, "segment_count": 8, "cost": {"total": 0.0146, "currency": "RUB"}}
 ```
 
 Результат (JSON stdout):
@@ -100,8 +110,8 @@ out/<run-id>/
 ## Тестирование
 
 ```powershell
-uv sync --group dev --group timing-whisper
-uv run --group dev pytest
+uv sync --extra dev --extra timing-whisper
+uv run --extra dev pytest
 ```
 
 45 тестов: JSON-контракт, exit codes, валидация, output policy.

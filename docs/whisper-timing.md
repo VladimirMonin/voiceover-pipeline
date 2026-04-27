@@ -17,8 +17,12 @@ Whisper CPU small (`faster-whisper`) — минимальный transcriber дл
 ## Установка
 
 ```powershell
-uv sync --group timing-whisper
+pip install voiceover-pipeline[timing-whisper]
 ```
+
+Для локальной разработки: `uv sync --extra timing-whisper`
+
+Модель (~486 MB для `small`) скачивается из HuggingFace при первом запуске и кешируется.
 
 ## Команды
 
@@ -26,13 +30,13 @@ uv sync --group timing-whisper
 
 ```powershell
 # CPU small (дефолт)
-uv run voiceover timings --audio "out\run\audio.mp3"
+voiceover timings --audio "out\run\audio.mp3"
 
 # Другая модель
-uv run voiceover timings --audio "out\run\audio.mp3" --model large-v3-turbo
+voiceover timings --audio "out\run\audio.mp3" --model large-v3-turbo
 
 # С параметрами
-uv run voiceover timings `
+voiceover timings `
   --audio "out\run\audio.mp3" `
   --model small `
   --device cpu `
@@ -45,7 +49,7 @@ uv run voiceover timings `
 ### Генерация + тайминги одним заходом
 
 ```powershell
-uv run voiceover generate `
+voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
   --script "in\script.md" `

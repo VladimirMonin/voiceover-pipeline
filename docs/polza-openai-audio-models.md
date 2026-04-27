@@ -35,13 +35,13 @@
 
 ```powershell
 # GPT Audio Mini (дешёвая)
-uv run voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini"
+voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini"
 
 # GPT Audio (качество)
-uv run voiceover generate --provider polza-chat-audio --model "openai/gpt-audio"
+voiceover generate --provider polza-chat-audio --model "openai/gpt-audio"
 
 # Свои параметры
-uv run voiceover generate `
+voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
   --voice "ballad" `
@@ -51,7 +51,7 @@ uv run voiceover generate `
 
 ## Ключ
 
-Читается из `.env` → `POLZA_API_KEY=`. Обязателен.
+Читается из `.env` → `POLZA_API_KEY=`. Обязателен. `.env` ищется в CWD и вверх по родительским директориям.
 
 ## Как работает
 

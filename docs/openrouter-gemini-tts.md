@@ -43,7 +43,7 @@ Google Gemini 3.1 Flash TTS Preview — чистый text-to-speech через O
 **Свой:**
 
 ```powershell
-uv run voiceover generate `
+voiceover generate `
   --provider openrouter-tts `
   --model "google/gemini-3.1-flash-tts-preview" `
   --style-prompt "Энергичный голос ведущего новостей: громкий, быстрый."
@@ -60,27 +60,27 @@ uv run voiceover generate `
 
 ```powershell
 # Стандартный прогон
-uv run voiceover generate `
+voiceover generate `
   --provider openrouter-tts `
   --model "google/gemini-3.1-flash-tts-preview" `
   --voice "Puck"
 
 # Другим голосом
-uv run voiceover generate `
+voiceover generate `
   --provider openrouter-tts `
   --model "google/gemini-3.1-flash-tts-preview" `
   --voice "Charon"
 
 # Со своим стилем
-uv run voiceover generate `
+voiceover generate `
   --provider openrouter-tts `
   --model "google/gemini-3.1-flash-tts-preview" `
-  --style-prompt "Тёплый голос рассказчика: медленный, доверительный, с паузами."
+  --style-prompt "Тёплый голос рассказателя: медленный, доверительный, с паузами."
 ```
 
 ## Ключ
 
-Нужен `OPENROUTER_API_KEY` в `.env`:
+Нужен `OPENROUTER_API_KEY` в `.env`. `.env` ищется в CWD и вверх по родительским директориям.
 
 ```env
 OPENROUTER_API_KEY=sk-or-v1-твой-ключ

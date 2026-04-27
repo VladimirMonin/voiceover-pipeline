@@ -20,25 +20,38 @@
 
 ## Быстрый старт
 
-```powershell
-cd C:\PY\voiceover-pipeline
+### Установленный пакет (опубликован на PyPI)
 
-# Проверить окружение (Polza cloud baseline)
-uv run voiceover doctor --json
+```powershell
+pip install voiceover-pipeline
+# или: pipx install voiceover-pipeline
+# или: uvx voiceover-pipeline doctor  (без установки)
+
+# Проверить окружение
+voiceover doctor --json
 
 # Проверить сценарий
-uv run voiceover validate --script "in\сценарий.md" --json
+voiceover validate --script "script.md" --json
 
 # Сгенерировать озвучку + тайминги
-uv run voiceover generate `
+voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
-  --script "in\сценарий.md" `
+  --script "script.md" `
   --run-id "prod" `
   --with-timings `
   --word-timestamps `
   --json `
   --overwrite
+```
+
+### Локальная разработка (клон репозитория)
+
+```powershell
+cd C:\PY\voiceover-pipeline
+uv sync --extra dev --extra timing-whisper
+uv run voiceover doctor --json
+uv run voiceover generate ... --with-timings --json --overwrite
 ```
 
 ## Образцы аудио
