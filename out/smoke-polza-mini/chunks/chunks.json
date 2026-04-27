@@ -1,0 +1,89 @@
+{
+  "artifact_type": "voiceover-chunks",
+  "provider": "polza-chat-audio",
+  "model": "openai/gpt-audio-mini",
+  "voice": "ash",
+  "format": "mp3",
+  "script": "C:\\PY\\voiceover-pipeline\\in\\smoke_test.md",
+  "chunks_dir": "C:\\PY\\voiceover-pipeline\\out\\smoke-polza-mini\\chunks",
+  "chunk_count": 2,
+  "total_duration_ms": 25520,
+  "total_duration_sec": 25.52,
+  "cost_exact_available": true,
+  "cost_total": 0.01617104,
+  "cost_total_exact": "0.01617104",
+  "cost_currency": "RUB",
+  "cost_source": "Polza GET /api/v1/history/generations/{id}",
+  "cost_per_minute": 0.03801969,
+  "pricing_snapshot": {
+    "currency": "RUB",
+    "prompt_per_million": "52.84656000",
+    "completion_per_million": "211.38624000",
+    "audio_per_million": "52.84656000",
+    "source": "https://polza.ai/api/v1/models",
+    "model": "openai/gpt-audio-mini"
+  },
+  "duration_source": "ffprobe_after_ffmpeg_final_silence_trim",
+  "ffmpeg": "C:\\Users\\User\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffmpeg.EXE",
+  "ffprobe": "C:\\Users\\User\\AppData\\Local\\Microsoft\\WinGet\\Links\\ffprobe.EXE",
+  "chunks": [
+    {
+      "number": 1,
+      "id": "chunk_01",
+      "file": "chunk_01.mp3",
+      "duration_ms": 16920,
+      "duration_sec": 16.92,
+      "start_ms": 0,
+      "end_ms": 16920,
+      "text_characters": 254,
+      "transcript": "Максимальное качество видео — это не просто высокий битрейт или навороченная цветокоррекция. Это прежде всего осмысленная последовательность ��адров, где каждый следующий логично продолжает предыдущий, а зритель ни на секунду не теряет нить повествования.",
+      "client_path": "requests",
+      "generation_id": "gen_2159937946724077569",
+      "cost_rub": 0.00808552,
+      "cost_rub_exact": "0.00808552",
+      "cost": 0.00808552,
+      "cost_exact": "0.00808552",
+      "cost_currency": "RUB",
+      "usage": {
+        "total_tokens": 150,
+        "prompt_tokens": 149,
+        "completion_tokens": 1,
+        "completion_tokens_details": {
+          "audio_tokens": 4014
+        }
+      },
+      "generation_time_ms": 30476,
+      "generated_at": "2026-04-27T07:02:17.206Z",
+      "generation_detail_source": "Polza GET /api/v1/history/generations/{id}"
+    },
+    {
+      "number": 2,
+      "id": "chunk_02",
+      "file": "chunk_02.mp3",
+      "duration_ms": 8600,
+      "duration_sec": 8.6,
+      "start_ms": 16920,
+      "end_ms": 25520,
+      "text_characters": 116,
+      "transcript": "Обработка аудио в один клик — мечта любого видеомейкера. Но реальность такова, что звук требует отдельного внимания.",
+      "client_path": "requests",
+      "generation_id": "gen_2159937965376147457",
+      "cost_rub": 0.00808552,
+      "cost_rub_exact": "0.00808552",
+      "cost": 0.00808552,
+      "cost_exact": "0.00808552",
+      "cost_currency": "RUB",
+      "usage": {
+        "total_tokens": 150,
+        "prompt_tokens": 149,
+        "completion_tokens": 1,
+        "completion_tokens_details": {
+          "audio_tokens": 4014
+        }
+      },
+      "generation_time_ms": 22274,
+      "generated_at": "2026-04-27T07:02:21.654Z",
+      "generation_detail_source": "Polza GET /api/v1/history/generations/{id}"
+    }
+  ]
+}

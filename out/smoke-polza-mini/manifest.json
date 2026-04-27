@@ -1,0 +1,10 @@
+{
+  "artifact_type": "voiceover-production-bundle",
+  "run_id": "smoke-polza-mini",
+  "full_mp3": "C:\\PY\\voiceover-pipeline\\out\\smoke-polza-mini\\smoke-polza-mini-voiceover-openai-gpt-audio-mini.mp3",
+  "run_json": "C:\\PY\\voiceover-pipeline\\out\\smoke-polza-mini\\smoke-polza-mini-voiceover-openai-gpt-audio-mini.json",
+  "chunks_json": "C:\\PY\\voiceover-pipeline\\out\\smoke-polza-mini\\chunks\\chunks.json",
+  "duration_ms": 25520,
+  "timings_json": "C:\\PY\\voiceover-pipeline\\out\\smoke-polza-mini\\smoke-polza-mini.timings.json",
+  "srt": "C:\\PY\\voiceover-pipeline\\out\\smoke-polza-mini\\smoke-polza-mini.srt"
+}
