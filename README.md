@@ -6,21 +6,39 @@ Standalone CLI для генерации озвучки + Whisper timing из Ma
 Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
 Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
 
-## Установка
+## Install / Run
+
+Run without installing (Python 3.11+, uv):
 
 ```powershell
-cd C:\PY\voiceover-pipeline
-uv sync
-uv sync --group timing-whisper          # Whisper timings
-uv sync --group voiceover-qwen          # Qwen (GPU only)
+uvx voiceover-pipeline doctor
 ```
 
-Ключи API в `.env`:
+With Whisper timings:
+
+```powershell
+uvx --from "voiceover-pipeline[timing-whisper]" voiceover-pipeline generate --with-timings ...
+```
+
+Local dev:
+
+```powershell
+git clone https://github.com/VladimirMonin/voiceover-pipeline
+cd voiceover-pipeline
+uv sync --group dev --group timing-whisper
+uv run voiceover doctor
+```
+
+## API Keys
+
+Create `.env` in your working directory:
 
 ```env
-OPENROUTER_API_KEY=sk-or-v1-...
 POLZA_API_KEY=pza_...
+OPENROUTER_API_KEY=sk-or-v1-...
 ```
+
+Never commit `.env`.
 
 ## Golden Command
 
@@ -53,7 +71,7 @@ out/<run-id>/
 ├── <run-id>.timings.json                  ← Whisper-сегменты (ms)
 ├── <run-id>.srt                           ← субтитры SRT
 └── chunks/
-    ├── chunk_01.mp3 … chunk_NN.mp3
+    ├── chunk_01.mp3 ... chunk_NN.mp3
     └── chunks.json
 ```
 
@@ -87,6 +105,18 @@ uv run --group dev pytest
 ```
 
 45 тестов: JSON-контракт, exit codes, валидация, output policy.
+
+## Legal / Provider Notes
+
+This project is an independent CLI wrapper around third-party providers.
+It is not affiliated with OpenAI, Google, OpenRouter, Polza.ai, Qwen, or CTranslate2 / faster-whisper.
+Provider names and model names are used solely for integration and documentation purposes.
+Generated audio usage is subject to the selected provider's terms of service.
+Do not upload private voice samples or generated speech without permission.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Документация
 
