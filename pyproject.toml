@@ -1,0 +1,38 @@
+[project]
+name = "voiceover-pipeline"
+version = "0.3.0"
+description = "Standalone chunked TTS voiceover + Whisper timing CLI"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=2.32.0",
+  "requests>=2.33.0",
+]
+
+[dependency-groups]
+voiceover-qwen = [
+  "torch>=2.0.0",
+  "qwen-tts>=0.1.0",
+  "soundfile>=0.12.0",
+  "numpy>=1.24.0",
+]
+timing-whisper = [
+  "faster-whisper>=1.0.0",
+  "ctranslate2>=4.6.2",
+]
+cuda = [
+  "nvidia-cudnn-cu12>=9.0.0; sys_platform == 'win32' or sys_platform == 'linux'",
+  "nvidia-cublas-cu12>=12.0.0; sys_platform == 'win32' or sys_platform == 'linux'",
+]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+voiceover = "voiceover_pipeline.cli:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
