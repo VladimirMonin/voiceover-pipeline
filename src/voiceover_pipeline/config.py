@@ -13,10 +13,69 @@ DEFAULT_LOG_FILE = Path.cwd() / "podcast_generation.log"
 
 DEFAULT_MODEL = "openai/gpt-audio-mini"
 DEFAULT_PROVIDER = "polza-chat-audio"
+PROVIDER_DEFAULT_MODELS = {
+    "polza-chat-audio": "openai/gpt-audio-mini",
+    "polza-tts": "openai/gpt-4o-mini-tts",
+    "openrouter-tts": "google/gemini-3.1-flash-tts-preview",
+    "qwen-local": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+}
 DEFAULT_VOICE = "ash"
 DEFAULT_OPENROUTER_TTS_VOICE = "Puck"
 DEFAULT_FALLBACK_VOICE = "onyx"
 DEFAULT_QWEN_VOICE = "Aiden"
+DEFAULT_POLZA_TTS_VOICE = "alloy"
+DEFAULT_OPENAI_TTS_VOICE = "alloy"
+DEFAULT_ELEVENLABS_VOICE = "Rachel"
+
+DEFAULT_POLZA_TTS_MODEL = "openai/gpt-4o-mini-tts"
+DEFAULT_POLZA_TTS_RESPONSE_FORMAT = "mp3"
+
+OPENAI_TTS_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"]
+ELEVENLABS_TTS_VOICES = ["Rachel", "Aria", "Roger", "Sarah", "Laura", "Charlie", "George", "Callum", "River", "Liam", "Charlotte", "Alice", "Matilda", "Will", "Jessica", "Eric", "Chris", "Brian", "Daniel", "Lily", "Bill"]
+
+POLZA_TTS_MODELS = [
+    "openai/gpt-4o-mini-tts",
+    "elevenlabs/text-to-speech-turbo-2-5",
+    "elevenlabs/text-to-speech-multilingual-v2",
+]
+
+OPENROUTER_TTS_MODELS = [
+    "google/gemini-3.1-flash-tts-preview",
+    "openai/gpt-4o-mini-tts-2025-12-15",
+]
+
+GEMINI_TTS_VOICES = [
+    "Puck",
+    "Charon",
+    "Fenrir",
+    "Orus",
+    "Aoede",
+    "Kore",
+    "Zephyr",
+    "Leda",
+    "Callirrhoe",
+    "Autonoe",
+    "Enceladus",
+    "Iapetus",
+    "Umbriel",
+    "Algieba",
+    "Despina",
+    "Erinome",
+    "Algenib",
+    "Rasalgethi",
+    "Laomedeia",
+    "Achernar",
+    "Alnilam",
+    "Schedar",
+    "Gacrux",
+    "Pulcherrima",
+    "Achird",
+    "Zubenelgenubi",
+    "Vindemiatrix",
+    "Sadachbia",
+    "Sadaltager",
+    "Sulafat",
+]
 
 DEFAULT_TIMING_MODEL = "small"
 DEFAULT_TIMING_DEVICE = "cpu"

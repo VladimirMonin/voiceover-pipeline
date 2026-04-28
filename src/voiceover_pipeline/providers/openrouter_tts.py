@@ -31,7 +31,14 @@ class OpenRouterTTSProvider(TTSProvider):
         self.response_format = response_format
         self.timeout_seconds = timeout_seconds
 
+    @property
+    def _is_openai_model(self) -> bool:
+        return self.model.startswith("openai/")
+
     def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+        if self._is_openai_model:
+            return self._request_audio(text=text, style_prompt=None)
+
         try:
             return self._request_audio(text=text, style_prompt=self.style_prompt)
         except RuntimeError as error:
@@ -40,7 +47,7 @@ class OpenRouterTTSProvider(TTSProvider):
             print(f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.")
             return self._request_audio(text=text, style_prompt=self.fallback_style_prompt)
 
-    def _request_audio(self, text: str, style_prompt: str) -> SynthesisResult:
+    def _request_audio(self, text: str, style_prompt: str | None) -> SynthesisResult:
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
@@ -74,5 +81,7 @@ class OpenRouterTTSProvider(TTSProvider):
             },
         )
 
-    def _build_input(self, text: str, style_prompt: str) -> str:
+    def _build_input(self, text: str, style_prompt: str | None) -> str:
+        if style_prompt is None:
+            return text
         return f"{style_prompt}\n\n{text}"

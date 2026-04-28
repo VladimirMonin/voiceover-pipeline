@@ -128,6 +128,11 @@ for seg in timings["segments"]:
 
 | Провайдер | Когда | Команда |
 |---|---|---|
-| `polza-chat-audio` (GPT Audio Mini) | Быстро и дёшево (0.71 RUB/min) | `voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini"` |
-| `openrouter-tts` (Gemini) | Западные голоса, качество ($0.03/min) | `voiceover generate --provider openrouter-tts --model "google/gemini-3.1-flash-tts-preview" --voice "Puck"` |
+| `polza-chat-audio` (GPT Audio Mini) | Быстро и дёшево (~0.004 ₽/мин, anomalous) | `voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini"` |
+| `polza-chat-audio` (GPT Audio) | Качественно (~7.00 ₽/мин) | `voiceover generate --provider polza-chat-audio --model "openai/gpt-audio"` |
+| `polza-tts` (GPT-4o Mini TTS) | Классический TTS (~1.07 ₽/мин) | `voiceover generate --provider polza-tts --model "openai/gpt-4o-mini-tts" --voice ash` |
+| `polza-tts` (ElevenLabs Turbo) | Чистый голос (~3.51 ₽/мин) | `voiceover generate --provider polza-tts --model "elevenlabs/text-to-speech-turbo-2-5" --voice Rachel` |
+| `polza-tts` (ElevenLabs Multilingual) | Лучшее качество речи (~7.57 ₽/мин) | `voiceover generate --provider polza-tts --model "elevenlabs/text-to-speech-multilingual-v2" --voice Aria` |
+| `openrouter-tts` (Gemini) | Западные голоса, качество (~$0.03/min) | `voiceover generate --provider openrouter-tts --model "google/gemini-3.1-flash-tts-preview" --voice Kore` |
+| `openrouter-tts` (OpenAI TTS) | Самый дешёвый TTS (~$0.0004/min) | `voiceover generate --provider openrouter-tts --model "openai/gpt-4o-mini-tts-2025-12-15" --voice ash` |
 | `qwen-local` | Бесплатно, нужен GPU | `voiceover generate --provider qwen-local` |

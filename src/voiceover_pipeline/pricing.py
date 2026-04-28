@@ -121,7 +121,7 @@ def cost_from_generation(provider: str, generation: dict[str, Any] | None) -> tu
     if not generation:
         return None, None, None
 
-    if provider == "polza-chat-audio":
+    if provider in ("polza-chat-audio", "polza-tts"):
         value = generation.get("clientCost") or generation.get("cost")
         return (float(value), str(value), "RUB") if value is not None else (None, None, None)
 

@@ -1,5 +1,51 @@
 # Changelog
 
+## 0.4.0
+
+### New Providers & Models
+
+- `polza-tts` — новый провайдер для классического text-to-speech через Polza AI:
+  - `openai/gpt-4o-mini-tts` через `/api/v1/audio/speech` — JSON base64, ~1.07 ₽/мин
+  - `elevenlabs/text-to-speech-turbo-2-5` через `/api/v1/media` — async task, URL download, ~3.51 ₽/мин
+  - `elevenlabs/text-to-speech-multilingual-v2` через `/api/v1/media` — async task, URL download, ~7.57 ₽/мин
+- `openrouter-tts` расширен моделью `openai/gpt-4o-mini-tts-2025-12-15` (~$0.00041/мин)
+- Полный список голосов Gemini TTS (30 голосов)
+- Полный список голосов ElevenLabs через Polza (21 имя, display-names из allowlist)
+
+### Architecture
+
+- `PolzaTTSProvider`: model-aware dispatch — `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media`
+- `OpenRouterTTSProvider`: model-aware voice defaults — `Puck` для Gemini, `alloy` для OpenAI TTS
+- Style prompt пропускается для OpenAI TTS моделей в OpenRouter
+- `/api/v1/media` для ElevenLabs: submit → poll → download, стоимость из `usage.cost_rub`
+
+### JSON Contract
+
+- `list voices` теперь возвращает `voices` как плоский массив (backward-compatible) + `voice_categories` как опциональный объект с разбивкой по семействам голосов
+
+### Docs
+
+- `docs/polza-tts-models.md` — полная документация по Polza TTS моделям
+- `docs/openrouter-tts-models.md` — Gemini + OpenAI TTS через OpenRouter, с голосовыми таблицами
+- Обновлены `docs/artifacts-and-analysis.md`, `docs/remotion-workflow.md`, `README.md`, `docs/README.md`
+- Семплы OGG для всех 7 моделей (Vorbis 24kHz mono)
+- Удалён устаревший `docs/openrouter-gemini-tts.md` (заменён)
+
+### Tests
+
+- 61 pytest tests (добавлены тесты на PolzaTTSProvider, `/api/v1/media` flow, voice defaults, contract)
+
+### Package
+
+- Версия: 0.4.0
+- `/out` убран из sdist include
+- Provider-specific model defaults (каждый провайдер знает свою модель по умолчанию)
+- Model/provider validation — невалидная комбинация падает до API call
+- Polza TTS: direct cost из `usage_direct` сохраняется в ChunkArtifact (не ждём history)
+- Skill docs в репозитории (`docs/skills/voiceover-pipeline`), 15 файлов
+- `.skill` архив (ZIP) для агентов OpenCode
+- 67 pytest tests
+
 ## 0.3.0
 
 ### Agent-Grade CLI

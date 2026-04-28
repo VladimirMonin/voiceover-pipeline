@@ -18,10 +18,13 @@ from .artifacts import (
     write_json,
 )
 from .config import (
+    DEFAULT_ELEVENLABS_VOICE,
     DEFAULT_FALLBACK_VOICE,
     DEFAULT_MODEL,
+    DEFAULT_OPENAI_TTS_VOICE,
     DEFAULT_OPENROUTER_TTS_VOICE,
     DEFAULT_OUTPUT_DIR,
+    DEFAULT_POLZA_TTS_VOICE,
     DEFAULT_PROVIDER,
     DEFAULT_QWEN_VOICE,
     DEFAULT_SCRIPT_DIR,
@@ -30,7 +33,13 @@ from .config import (
     DEFAULT_TIMING_LANGUAGE,
     DEFAULT_TIMING_MODEL,
     DEFAULT_VOICE,
+    ELEVENLABS_TTS_VOICES,
+    GEMINI_TTS_VOICES,
+    OPENAI_TTS_VOICES,
+    OPENROUTER_TTS_MODELS,
     PODCAST_NARRATION_PROMPT,
+    POLZA_TTS_MODELS,
+    PROVIDER_DEFAULT_MODELS,
     QWEN_PRESET_SPEAKERS,
     read_openrouter_key,
     read_polza_key,
@@ -44,7 +53,7 @@ from .pricing import (
     fetch_polza_generation_costs,
     fetch_polza_model_pricing,
 )
-from .providers import OpenRouterTTSProvider, PolzaChatAudioProvider, QwenLocalTTSProvider, TTSProvider
+from .providers import OpenRouterTTSProvider, PolzaChatAudioProvider, PolzaTTSProvider, QwenLocalTTSProvider, TTSProvider
 from .script_splitter import split_markdown_by_delimiter
 
 _EXIT_OK = 0
@@ -122,8 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --------------- generate ---------------
     gen = subparsers.add_parser("generate", help="Generate chunk MP3 + full MP3 + optional timings.")
-    gen.add_argument("--provider", choices=["polza-chat-audio", "openrouter-tts", "qwen-local"], default=DEFAULT_PROVIDER)
-    gen.add_argument("--model", default=DEFAULT_MODEL)
+    gen.add_argument("--provider", choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], default=DEFAULT_PROVIDER)
+    gen.add_argument("--model", default=argparse.SUPPRESS)
     gen.add_argument("--script", type=Path, default=_find_default_script())
     gen.add_argument("--delimiter", default="******")
     gen.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
@@ -172,7 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --------------- doctor ---------------
     doc = subparsers.add_parser("doctor", help="Check environment and dependencies.")
     doc.add_argument("--json", dest="json_output", action="store_true")
-    doc.add_argument("--provider", default=None, choices=["polza-chat-audio", "openrouter-tts", "qwen-local"], help="Check provider-specific requirements.")
+    doc.add_argument("--provider", default=None, choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], help="Check provider-specific requirements.")
     doc.add_argument("--with-timings", action="store_true", help="Check timing dependencies.")
     doc.add_argument("--timing-device", default="cpu", choices=["auto", "cpu", "cuda"], help="Requested timing device for dependency check.")
 
@@ -269,6 +278,8 @@ def generate(args: argparse.Namespace) -> None:
         ffmpeg_path, ffprobe_path = check_media_tools()
     except RuntimeError as e:
         fail(str(e), _EXIT_NO_FFMPEG)
+    _resolve_model(args)
+    _validate_model_for_provider(args.provider, args.model)
     chunks = split_markdown_by_delimiter(args.script, args.delimiter)
     if not chunks:
         fail("Script produced no chunks. Check delimiter and content.", _EXIT_ARGS)
@@ -331,6 +342,7 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
             start_ms=start_ms, end_ms=end_ms, text_characters=len(chunk.text),
             transcript=result.transcript, client_path=result.client_path,
             generation_id=result.generation_id,
+            **_direct_cost_kwargs(args.provider, result),
         ))
         if not args.json_output:
             print(f"Saved {output_path.name}: {duration_ms} ms")
@@ -341,7 +353,7 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
 
     chunks_manifest = build_chunks_manifest(
         provider=args.provider, model=args.model, voice=args.voice,
-        style_prompt=args.style_prompt if args.provider == "openrouter-tts" else None,
+        style_prompt=args.style_prompt if args.provider == "openrouter-tts" and not args.model.startswith("openai/") else None,
         script=args.script, chunks_dir=paths.chunks_dir, pricing_snapshot=pricing_snapshot,
         cost_exact_available=cost_total is not None, cost_total=cost_total,
         cost_total_exact=cost_total_exact, cost_currency=cost_currency, cost_source=cost_source,
@@ -484,7 +496,7 @@ def doctor_cmd(args: argparse.Namespace) -> None:
     env_file = Path.cwd() / ".env"
     results["env_file"] = {"ok": env_file.exists(), "path": str(env_file), "required": True}
 
-    need_polza = (args.provider or DEFAULT_PROVIDER) == "polza-chat-audio"
+    need_polza = (args.provider or DEFAULT_PROVIDER) in ("polza-chat-audio", "polza-tts")
     polza_ok = False
     try:
         read_polza_key()
@@ -595,18 +607,32 @@ def list_cmd(args: argparse.Namespace) -> None:
         data = {
             "providers": [
                 {"id": "polza-chat-audio", "models": ["openai/gpt-audio-mini", "openai/gpt-audio"], "currency": "RUB"},
-                {"id": "openrouter-tts", "models": ["google/gemini-3.1-flash-tts-preview"], "currency": "USD"},
+                {"id": "polza-tts", "models": POLZA_TTS_MODELS, "currency": "RUB"},
+                {"id": "openrouter-tts", "models": OPENROUTER_TTS_MODELS, "currency": "USD"},
                 {"id": "qwen-local", "modes": ["preset", "clone"], "currency": "RUB", "cost": "free"},
             ]
         }
     elif args.target == "voices":
         provider = args.provider or "polza-chat-audio"
-        voices = {
+        voices_flat = {
             "polza-chat-audio": ["ash", "ballad", "coral", "verse", "marin", "cedar", "echo", "sage", "shimmer", "onyx"],
-            "openrouter-tts": ["Puck", "Charon", "Fenrir", "Orus", "Aoede", "Kore", "Zephyr"],
+            "polza-tts": OPENAI_TTS_VOICES + ELEVENLABS_TTS_VOICES,
+            "openrouter-tts": GEMINI_TTS_VOICES + OPENAI_TTS_VOICES,
             "qwen-local": QWEN_PRESET_SPEAKERS,
         }
-        data = {"provider": provider, "voices": voices.get(provider, [])}
+        voice_categories = {
+            "polza-tts": {
+                "openai": OPENAI_TTS_VOICES,
+                "elevenlabs": ELEVENLABS_TTS_VOICES,
+            },
+            "openrouter-tts": {
+                "gemini": GEMINI_TTS_VOICES,
+                "openai": OPENAI_TTS_VOICES,
+            },
+        }
+        data = {"provider": provider, "voices": voices_flat.get(provider, [])}
+        if provider in voice_categories:
+            data["voice_categories"] = voice_categories[provider]
     elif args.target == "timing-models":
         data = {
             "timing_models": [
@@ -708,8 +734,61 @@ def _emit_error(args, message: str, code: int) -> NoReturn:
         sys.exit(code)
 
 
+_VALID_MODELS_BY_PROVIDER = {
+    "polza-chat-audio": [
+        "openai/gpt-audio-mini",
+        "openai/gpt-audio",
+    ],
+    "polza-tts": POLZA_TTS_MODELS,
+    "openrouter-tts": OPENROUTER_TTS_MODELS,
+}
+
+
+def _resolve_model(args: argparse.Namespace) -> None:
+    if not hasattr(args, "model") or args.model is None:
+        args.model = PROVIDER_DEFAULT_MODELS.get(args.provider, DEFAULT_MODEL)
+
+
+def _validate_model_for_provider(provider: str, model: str) -> None:
+    valid = _VALID_MODELS_BY_PROVIDER.get(provider, [])
+    if not valid:
+        return
+    if model not in valid:
+        fail(
+            f"Model '{model}' is not valid for provider '{provider}'. "
+            f"Valid models: {valid}",
+            _EXIT_ARGS,
+        )
+
+
+def _direct_cost_kwargs(provider: str, result) -> dict:
+    if provider != "polza-tts":
+        return {}
+    usage = (result.raw_metadata or {}).get("usage_direct")
+    if not isinstance(usage, dict):
+        return {}
+    cost_rub = usage.get("cost_rub") or usage.get("cost")
+    if cost_rub is None:
+        return {}
+    return {
+        "cost": float(cost_rub),
+        "cost_exact": str(cost_rub),
+        "cost_currency": "RUB",
+        "cost_rub": float(cost_rub),
+        "cost_rub_exact": str(cost_rub),
+        "usage": usage,
+        "generation_detail_source": "Polza API usage.cost_rub (direct)",
+    }
+
+
 def _default_voice(args: argparse.Namespace) -> str:
+    if args.provider == "polza-tts":
+        if args.model and args.model.startswith("elevenlabs/"):
+            return DEFAULT_ELEVENLABS_VOICE
+        return DEFAULT_POLZA_TTS_VOICE
     if args.provider == "openrouter-tts":
+        if args.model and args.model.startswith("openai/"):
+            return DEFAULT_OPENAI_TTS_VOICE
         return DEFAULT_OPENROUTER_TTS_VOICE
     if args.provider == "qwen-local":
         return DEFAULT_QWEN_VOICE
@@ -717,7 +796,7 @@ def _default_voice(args: argparse.Namespace) -> str:
 
 
 def read_api_key(args: argparse.Namespace) -> str:
-    if args.provider == "polza-chat-audio":
+    if args.provider in ("polza-chat-audio", "polza-tts"):
         try:
             return read_polza_key()
         except RuntimeError as e:
@@ -735,6 +814,8 @@ def read_api_key(args: argparse.Namespace) -> str:
 def build_provider(args: argparse.Namespace, api_key: str) -> TTSProvider:
     if args.provider == "polza-chat-audio":
         return PolzaChatAudioProvider(api_key=api_key, model=args.model, voice=args.voice, fallback_voice=args.fallback_voice)
+    if args.provider == "polza-tts":
+        return PolzaTTSProvider(api_key=api_key, model=args.model, voice=args.voice)
     if args.provider == "openrouter-tts":
         return OpenRouterTTSProvider(api_key=api_key, model=args.model, voice=args.voice, style_prompt=args.style_prompt)
     if args.provider == "qwen-local":
@@ -743,7 +824,7 @@ def build_provider(args: argparse.Namespace, api_key: str) -> TTSProvider:
 
 
 def fetch_pricing_snapshot(provider: str, api_key: str, model: str) -> dict | None:
-    if provider == "polza-chat-audio":
+    if provider in ("polza-chat-audio", "polza-tts"):
         return fetch_polza_model_pricing(api_key, model)
     if provider == "openrouter-tts":
         return fetch_openrouter_model_pricing(model)
@@ -756,7 +837,7 @@ def attach_costs(provider, api_key, model, run_started_at, chunks):
         for chunk in chunks:
             enriched.append(ChunkArtifact(**{**chunk.__dict__, "cost": 0.0, "cost_exact": "0.0", "cost_currency": "RUB"}))
         return enriched
-    if provider == "polza-chat-audio":
+    if provider in ("polza-chat-audio", "polza-tts"):
         generations = fetch_polza_generation_costs(api_key, model, run_started_at, len(chunks))
     else:
         generations = []
@@ -799,6 +880,7 @@ def summarize_costs(provider: str, chunks: list[ChunkArtifact]) -> tuple:
 def generation_source(provider: str) -> str:
     return {
         "polza-chat-audio": "Polza GET /api/v1/history/generations/{id}",
+        "polza-tts": "Polza API usage.cost_rub or GET /api/v1/history/generations/{id}",
         "openrouter-tts": "OpenRouter GET /api/v1/generation?id=...",
         "qwen-local": "qwen-local (free)",
     }.get(provider, "unknown")

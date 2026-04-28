@@ -2,7 +2,7 @@
 
 Standalone CLI для генерации озвучки + Whisper timing из Markdown-сценариев.
 
-Три TTS-провайдера: Polza GPT Audio, OpenRouter Gemini, Qwen3-TTS (GPU).
+Четыре TTS-провайдера: Polza GPT Audio, Polza TTS, OpenRouter TTS, Qwen3-TTS (GPU).
 Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
 Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
 
@@ -22,7 +22,7 @@ Console scripts: `voiceover` and `voiceover-pipeline` (both work).
 ```powershell
 git clone https://github.com/VladimirMonin/voiceover-pipeline
 cd voiceover-pipeline
-uv sync --extra dev --extra timing-whisper
+uv sync --group dev --extra timing-whisper
 uv run voiceover doctor
 ```
 
@@ -102,19 +102,30 @@ out/<run-id>/
 
 | Провайдер | Модель | Цена минуты |
 |---|---|---|
+| Polza | `openai/gpt-audio-mini` | ~0.004 ₽/мин (anomalous 200s smoke — model added speech, needs rerun) |
+| Polza | `openai/gpt-audio` | ~7.00 ₽/мин |
+| Polza | `openai/gpt-4o-mini-tts` | ~1.07 ₽/мин |
+| Polza | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 ₽/мин |
+| Polza | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 ₽/мин |
+| OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
+| OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041/мин |
 | Qwen3-TTS | CustomVoice (preset/clone) | Бесплатно (GPU) |
-| Polza | `openai/gpt-audio-mini` | ~0.71 ₽ |
-| Polza | `openai/gpt-audio` | ~7.63 ₽ |
-| OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.03 |
 
 ## Тестирование
 
 ```powershell
-uv sync --extra dev --extra timing-whisper
-uv run --extra dev pytest
+uv sync --group dev --extra timing-whisper
+uv run pytest
 ```
 
-45 тестов: JSON-контракт, exit codes, валидация, output policy.
+61 тест: JSON-контракт, exit codes, валидация, output policy, providers.
+
+## Agent Skill
+
+OpenCode agent skill — устанавливает pipeline, выбирает провайдера, генерирует озвучку:
+
+- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.0/docs/skills/voiceover-pipeline
+- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.0
 
 ## Legal / Provider Notes
 
@@ -136,5 +147,7 @@ MIT. See [LICENSE](LICENSE).
 - [Whisper Timing](docs/whisper-timing.md) — модель, device, compute, word timestamps
 - [Troubleshooting](docs/troubleshooting.md) — типовые ошибки и их коды
 - [Polza Models](docs/polza-openai-audio-models.md) — голоса, цены, особенности
-- [OpenRouter Gemini](docs/openrouter-gemini-tts.md) — голоса, style prompt, цены
+- [Polza TTS Models](docs/polza-tts-models.md) — OpenAI TTS, ElevenLabs через Polza AI
+- [OpenRouter TTS](docs/openrouter-tts-models.md) — Gemini, OpenAI TTS через OpenRouter
+- [OpenCode Skill](docs/skills/voiceover-pipeline/SKILL.md) — Agent skill для установки и озвучки
 - [Qwen Local](docs/qwen-local-tts.md) — preset-голоса, клонирование, GPU

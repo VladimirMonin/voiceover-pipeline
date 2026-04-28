@@ -7,13 +7,14 @@
 | | GPT Audio Mini | GPT Audio |
 |---|---|---|
 | ID | `openai/gpt-audio-mini` | `openai/gpt-audio` |
+|---|---|---|---|
 | Контекст | 128 000 токенов | 128 000 токенов |
 | Качество | Хорошее, чистое | Заметно лучше: естественнее интонации |
-| Цена | 0.71 ₽/мин | 7.63 ₽/мин |
+| Цена | ~0.004 ₽/мин (anomalous) | ~7.00 ₽/мин |
 
 Обе модели могут озвучить длинный текст за один запрос. Чанкование (разбивка по `******`) нужно только для монтажа по сценам.
 
-> **Образцы:** [polza-gpt-audio-mini-chunk-01.ogg](polza-gpt-audio-mini-chunk-01.ogg) (0.71 ₽/мин) и [polza-gpt-audio-chunk-01.ogg](polza-gpt-audio-chunk-01.ogg) (7.63 ₽/мин) — первый чанк каждой модели в OGG Vorbis 42 kbps mono.
+> **Образцы:** [polza-gpt-audio-mini-chunk-01.ogg](polza-gpt-audio-mini-chunk-01.ogg) (~0.004 ₽/мин, anomalous) и [polza-gpt-audio-chunk-01.ogg](polza-gpt-audio-chunk-01.ogg) (~7.00 ₽/мин) — первый чанк каждой модели в OGG Vorbis 24 kHz mono.
 
 ## Голоса
 
@@ -93,8 +94,8 @@ Use a calm, warm, low male voice with clear pronunciation.
 
 | Модель | Общая стоимость | Длина | Цена минуты |
 |---|---:|---:|---|
-| `openai/gpt-audio-mini` | 6.56 ₽ | 557.6 сек | 0.71 ₽/мин |
-| `openai/gpt-audio` | 90.78 ₽ | 713.5 сек | 7.63 ₽/мин |
+| `openai/gpt-audio-mini` | 0.015 ₽ | 209.3 сек | 0.004 ₽/мин (anomalous) |
+| `openai/gpt-audio` | 3.70 ₽ | 31.7 сек | 7.00 ₽/мин |
 
 Pricing snapshot от Polza (`GET /api/v1/models`):
 
