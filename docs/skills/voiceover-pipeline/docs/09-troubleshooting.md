@@ -78,6 +78,23 @@ ModuleNotFoundError: No module named 'faster_whisper'
 - ~4 GB VRAM требуется
 - Агент НЕ чинит CUDA-драйверы молча — предложи cloud fallback
 
+### torch installed as CPU-only (частый баг [cuda] extra)
+
+**Симптом:** `torch.cuda.is_available()` → False, хотя nvidia-smi показывает GPU.
+Причина: PyPI по умолчанию ставит CPU-сборку torch, даже с extras `cuda`.
+
+**Диагностика:**
+```powershell
+python -c "import torch; print('version:', torch.__version__, 'cuda:', torch.version.cuda, 'available:', torch.cuda.is_available())"
+```
+Если `torch.version.cuda is None` → torch CPU-only.
+
+**Исправление:**
+```powershell
+uv pip install --python .venv/Scripts/python.exe --index-url https://download.pytorch.org/whl/cu128 --reinstall torch
+```
+После переустановки повторить: `python -c "import torch; print(torch.cuda.is_available())"`.
+
 ### soundfile / transformers (для Qwen)
 
 - Установить: `pip install "voiceover-pipeline[voiceover-qwen]"`

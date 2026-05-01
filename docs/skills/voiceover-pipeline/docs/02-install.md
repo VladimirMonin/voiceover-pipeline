@@ -52,14 +52,21 @@
 
 ## Prerequisite Install (по ОС)
 
-### Python ≥3.10
+### Python ≥3.12
+
+**UV-first (предпочтительно).** UV сам управляет версиями Python и скачивает недостающие:
+
+- `uv python install 3.12` — установить Python 3.12 (управляемая установка)
+- `uv venv --python 3.12` — создать venv, автоматически скачает 3.12 если нет
+- После установки UV: `uv venv` может скачать последнюю версию даже при отсутствии Python в системе
+
+**Fallback на системные менеджеры (если UV недоступен):**
 
 - Windows: `winget install Python.Python.3.12`
   Если `python` не найден после установки: `py -3 --version`, открыть новый terminal.
-- macOS: `brew install python`
-  Путь: `/usr/local/bin/python3` или `/opt/homebrew/bin/python3`.
-- Linux: `apt install python3 python3-pip` (Debian/Ubuntu)
-  Альтернативы: `dnf install python3` (Fedora), `pacman -S python` (Arch).
+- macOS: `brew install python@3.12`
+- Linux: `apt install python3.12 python3-pip` (Debian/Ubuntu)
+  Альтернативы: `dnf install python3.12` (Fedora), `pacman -S python` (Arch).
 
 ### FFmpeg + FFprobe
 

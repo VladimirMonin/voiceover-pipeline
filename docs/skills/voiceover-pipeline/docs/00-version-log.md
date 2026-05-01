@@ -7,16 +7,16 @@
 
 | Поле | Значение |
 |---|---|
-| **Compatible app** | voiceover-pipeline 0.4.0 |
-| **Skill revision** | 2026-04-29 |
+| **Compatible app** | voiceover-pipeline 0.4.1 |
+| **Skill revision** | 2026-05-01 |
 | **Минимальная версия CLI** | 0.4.0 |
-| **Максимальная проверенная** | 0.4.0 |
+| **Максимальная проверенная** | 0.4.1 |
 
 ## Что актуально в этой версии навыка
 
 - 4 провайдера: `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local`
 - 7 протестированных моделей с реальными ценами из smoke-прогонов
-- Полные списки голосов: OpenAI TTS (11), ElevenLabs через Polza (21), Gemini TTS через OpenRouter (30), Qwen preset (24)
+- Полные списки голосов: OpenAI TTS (11), ElevenLabs через Polza (21), Gemini TTS через OpenRouter (30), Qwen preset (9)
 - `list voices --json` контракт: `voices` как плоский массив + `voice_categories` объект
 - ElevenLabs через Polza: async `/api/v1/media` (submit → poll → download)
 - Polza TTS OpenAI: JSON base64 через `/api/v1/audio/speech`
@@ -40,5 +40,6 @@
 
 | Дата | Изменение |
 |---|---|
+| 2026-05-01 | UV-first Python: `uv python install 3.12` вместо winget. Агент сам создаёт `.env` из `.env.example`. Remotion scene grouping: Whisper-сегменты группируются по смысловым сценам, не по чанкам. Torch CPU-only диагностика. Qwen голоса обновлены до 9 актуальных. |
 | 2026-04-29 | Добавлены `polza-tts`, ElevenLabs, OpenRouter OpenAI TTS. Обновлены все цены, голоса, workflows, evaluation. |
 | 2026-03 | Исходная версия навыка под voiceover-pipeline 0.3.x (Polza GPT Audio, OpenRouter Gemini, Qwen) |

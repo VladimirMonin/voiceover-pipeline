@@ -174,11 +174,27 @@ manifest.json
 ## Приоритет чтения для Remotion
 
 1. `manifest.json` → все пути
-2. `.timings.json` → `segments[].duration_ms` для длительности сцен
+2. `.timings.json` → Whisper-сегменты как источник истины для аудио-времени
 3. `.srt` → captions/subtitles
-4. `chunks.json` → per-chunk alignment (`start_ms`/`end_ms`)
+4. `chunks.json` → только стоимость, meta и пути к чанкам (НЕ для длительности сцен)
 5. `run-*.json` → полный отчёт по стоимости (если нужен)
 
+### Semantic scene grouping
+
+Whisper-сегменты (~50 шт) мельче, чем смысловые сцены из script.md (~8 шт).
+Одна смысловая сцена может покрывать несколько Whisper-сегментов.
+Границы чанков НЕ совпадают со смысловыми границами сцен.
+
+Алгоритм для Remotion scene plan:
+1. Прочитай `manifest.json` → `timings_json`.
+2. Возьми смысловые сцены из исходного `script.md` или Remotion scene plan.
+3. Нормализуй текст сцены и `segments[].text` (lowercase, strip punctuation).
+4. Для каждой сцены найди, какие Whisper segments к ней относятся (по тексту).
+5. Для сцены:
+   - `start_ms = first_matched_segment.start_ms`
+   - `end_ms = last_matched_segment.end_ms`
+   - `duration_ms = end_ms - start_ms`
+6. `chunks[].duration_ms` — НЕ использовать для `scene.durationInFrames`.
+
 **Правило:** если есть `.timings.json` — используй его `duration_ms`.
-НИКОГДА не оценивай длительность сцен по количеству слов (words-per-second),
-если есть Whisper-тайминги.
+НИКОГДА не оценивай длительность сцен по границам чанков или words-per-second.

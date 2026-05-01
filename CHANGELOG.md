@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.1
+
+### Skill Fixes
+
+- UV-first Python: `uv python install 3.12` вместо winget, агент сам создаёт `.env`
+- Remotion semantic scene grouping: Whisper-сегменты группируются по смысловым сценам, не по чанкам
+- Torch CPU-only диагностика в troubleshooting
+- Qwen голоса обновлены до 9 актуальных (из HuggingFace model card)
+- Регрессионный набор расширен до 9 кейсов (R5-R9 из эксплуатации)
+
 ## 0.4.0
 
 ### New Providers & Models

@@ -190,6 +190,33 @@
 - «установи Python» (без voiceover-контекста) → навык НЕ срабатывает
 - «напиши сценарий для видео» → навык НЕ срабатывает
 
+### Кейс R5: UV-first Python (не winget)
+- Агент проверяет Python через `uv python list` или probe
+- Если Python не подходит → сначала пробует `uv python install 3.12` + `uv venv --python 3.12`
+- Только если UV недоступен → переходит к winget/brew/apt
+
+### Кейс R6: Агент создаёт .env сам
+- Нет `.env` → агент создаёт `.env.example` и `.env` из шаблона
+- НЕ просит пользователя скопировать файл
+- Пользователь только вписывает ключи в `.env`
+
+### Кейс R7: Torch CPU-only обнаружение
+- `voiceover doctor --provider qwen-local --json` показывает `cuda.ok: false`
+- Агент проверяет `torch.version.cuda` через python -c
+- Если `torch.version.cuda is None` → агент предлагает переустановку torch из CUDA index
+- Не утверждает что «Python 3.14 не поддерживается» без проверки
+
+### Кейс R8: Qwen invalid voice recovery
+- Пользователь выбирает несуществующий голос (Amelia, Alina, etc.)
+- Агент получает ошибку → запускает `voiceover list voices --provider qwen-local --json`
+- Показывает актуальный список из 9 голосов
+- НЕ ссылается на устаревший список из навыка
+
+### Кейс R9: Remotion semantic scene grouping
+- Агент НЕ использует `chunks[].duration_ms` для `scene.durationInFrames`
+- Группирует Whisper-сегменты из `.timings.json` по смысловым сценам
+- `scene.durationInFrames` = интервал от первого до последнего сегмента сцены
+
 ## Критерий выпуска
 
 Навык считается готовым когда:
@@ -197,7 +224,7 @@
 - [ ] Набор фраз срабатывания: 8 should trigger / 4 should not trigger / 3 boundary
 - [ ] Все 9 smoke tests проходят без критичных сбоев
 - [ ] Каждый smoke test имеет ≥3 assertions
-- [ ] Регрессионный набор (4 кейса) не ломается после правок
+- [ ] Регрессионный набор (9 кейсов) не ломается после правок
 - [ ] Security правила не нарушаются ни в одном сценарии
 - [ ] Install decision tree покрыт: probe/detect/install/verify
 - [ ] Troubleshooting покрывает: command-not-found, dependency missing, provider errors, output/fs

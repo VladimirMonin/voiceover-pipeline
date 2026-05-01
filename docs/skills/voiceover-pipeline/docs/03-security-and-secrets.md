@@ -40,7 +40,8 @@ OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxx
 POLZA_API_KEY=pza_xxxxxxxxxxxxxxxx
 ```
 
-Сообщи пользователю: «Я создал `.env.example`. Скопируй его в `.env` и впиши свои API-ключи.»
+Создай `.env` из `.env.example`: `Copy-Item .env.example .env` (Windows) или `cp .env.example .env` (macOS/Linux).
+Сообщи пользователю: «Я создал `.env` из шаблона. Открой `.env` и впиши свои API-ключи.»
 
 ### Шаг 3: Объясни какие ключи нужны
 
