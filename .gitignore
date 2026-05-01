@@ -13,8 +13,12 @@ __pycache__/
 .pytest_cache/
 temp/
 out/
+dist/
 logs/
 *.log
+
+# Local agent instructions
+AGENTS.md
 
 # IDE / Editor
 .idea/
