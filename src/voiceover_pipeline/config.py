@@ -39,6 +39,16 @@ POLZA_TTS_MODELS = [
     "elevenlabs/text-to-speech-multilingual-v2",
 ]
 
+TTS_PROMPT_MODE_NONE = "none"
+TTS_PROMPT_MODE_PREFIX = "prefix"
+TTS_PROMPT_MODE_NATIVE = "native"
+
+PROMPTABLE_TTS_MODELS: dict[str, str] = {
+    "google/gemini-3.1-flash-tts-preview": "native",
+}
+
+POLZA_PROMPTABLE_TTS_MODELS: dict[str, str] = {}
+
 OPENROUTER_TTS_MODELS = [
     "google/gemini-3.1-flash-tts-preview",
     "openai/gpt-4o-mini-tts-2025-12-15",

@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.4.2
+
+### Gemini Native Prompt Support
+
+- `TTS_PROMPT_MODE_NONE / PREFIX / NATIVE` — три режима prompt для TTS провайдеров
+- `PROMPTABLE_TTS_MODELS` карта в `config.py`: Gemini Flash TTS по умолчанию использует `native` prompt (отдельное поле `prompt` в request body)
+- `OpenRouterTTSProvider` теперь принимает `prompt_mode` и строит тело запроса через `build_request_body()` вместо конкатенации строк
+- Новый модуль `tts_prompting.py`: `resolve_prompt_mode()`, `build_request_body()`, `build_prompted_input()`, `read_style_prompt_from_file()`
+- Старый fallback `prefix` сохранён для обратной совместимости
+
+### CLI: новые флаги для style-prompt
+
+- `--style-prompt-file path/to/prompt.txt` — читать prompt из файла (удобно для длинных WVM-промптов)
+- `--no-style-prompt` — отключить prompt полностью (для чистого TTS в тестах)
+- Приоритет: `--no-style-prompt` > `--style-prompt-file` > `--style-prompt` > дефолт из `config.py`
+
+### Расширяемость
+
+- `POLZA_PROMPTABLE_TTS_MODELS` — заготовка для будущих promptable моделей Polza
+- `resolve_prompt_mode()` по префиксу модели: `google/*` → `native`, `openai/*` → `none`
+- Неизвестные Google-модели (например `google/gemini-2.5-pro-tts`) автоматически используют `native` prompt
+
+### Manifest
+
+- `chunks.json` теперь содержит поле `prompt_mode` в метаданных манифеста
+
+### Tests
+
+- 98 pytest tests (добавлены тесты на native/prefix/none режимы, `build_request_body`, CLI-флаги, unknown-модели)
+
 ## 0.4.1
 
 ### Skill Fixes

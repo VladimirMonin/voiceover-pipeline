@@ -147,3 +147,18 @@ usage: ...: error: the following arguments are required: command
 Exit code: 2.
 
 Нужно указать subcommand: `generate`, `split`, `timings`, `doctor`, `validate`, `list`.
+
+## Gemini prompt body ошибка
+
+```
+Style prompt failed for chunk_01; retrying with shorter podcast style prompt.
+```
+
+Gemini может отклонить слишком длинный style prompt. Пайплайн автоматически ретраит с укороченным fallback-промптом. Если и это не помогает — попробуйте `--no-style-prompt`.
+
+## Unsupported prompt mode
+
+Если модель не поддерживает выбранный `prompt_mode`, пайплайн молча использует безопасный fallback:
+- `openai/*` → `none` (prompt игнорируется)
+- `google/*` → `native` (раздельный prompt + input)
+- остальные → `none`

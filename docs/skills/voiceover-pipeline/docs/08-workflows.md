@@ -115,6 +115,34 @@ voiceover generate `
   --overwrite
 ```
 
+С длинным prompt из файла (WVM-ассеты, expressive, stutter):
+
+```powershell
+voiceover generate `
+  --provider openrouter-tts `
+  --model "google/gemini-3.1-flash-tts-preview" `
+  --voice "Zephyr" `
+  --style-prompt-file "prompts/expressive-narrator.txt" `
+  --script "script.md" `
+  --run-id "wvm-expressive" `
+  --json `
+  --overwrite
+```
+
+Без prompt (чистый Gemini TTS):
+
+```powershell
+voiceover generate `
+  --provider openrouter-tts `
+  --model "google/gemini-3.1-flash-tts-preview" `
+  --voice "Puck" `
+  --no-style-prompt `
+  --script "script.md" `
+  --run-id "gemini-clean" `
+  --json `
+  --overwrite
+```
+
 ## Qwen Local Workflow (бесплатно, GPU)
 
 Требуется NVIDIA GPU + CUDA + extras `voiceover-qwen`:

@@ -79,3 +79,52 @@ def test_valid_output_dir_ok(tmp_path):
         "--json",
     )
     assert code in (0, 30), f"expected 0 or 30, got {code}: {data}"
+
+
+class TestStylePromptFlags:
+    def test_no_style_prompt_flag(self):
+        import argparse
+        from voiceover_pipeline.cli import _resolve_style_prompt
+
+        ns = argparse.Namespace(style_prompt=None, style_prompt_file=None, no_style_prompt=True)
+        assert _resolve_style_prompt(ns) is None
+
+    def test_style_prompt_file(self, tmp_path):
+        import argparse
+        from voiceover_pipeline.cli import _resolve_style_prompt
+
+        pf = tmp_path / "prompt.txt"
+        pf.write_text("File-based narration style", encoding="utf-8")
+        ns = argparse.Namespace(style_prompt=None, style_prompt_file=pf, no_style_prompt=False)
+        assert _resolve_style_prompt(ns) == "File-based narration style"
+
+    def test_style_prompt_file_missing(self, tmp_path):
+        import argparse
+        from voiceover_pipeline.cli import _resolve_style_prompt
+
+        ns = argparse.Namespace(style_prompt=None, style_prompt_file=tmp_path / "missing.txt", no_style_prompt=False)
+        with pytest.raises(FileNotFoundError):
+            _resolve_style_prompt(ns)
+
+    def test_no_style_prompt_has_priority_over_file(self, tmp_path):
+        import argparse
+        from voiceover_pipeline.cli import _resolve_style_prompt
+
+        pf = tmp_path / "prompt.txt"
+        pf.write_text("Should not be read", encoding="utf-8")
+        ns = argparse.Namespace(style_prompt=None, style_prompt_file=pf, no_style_prompt=True)
+        assert _resolve_style_prompt(ns) is None
+
+    def test_no_style_prompt_has_priority_over_cli(self):
+        import argparse
+        from voiceover_pipeline.cli import _resolve_style_prompt
+
+        ns = argparse.Namespace(style_prompt="cli style", style_prompt_file=None, no_style_prompt=True)
+        assert _resolve_style_prompt(ns) is None
+
+    def test_default_prompt_when_no_flags(self):
+        import argparse
+        from voiceover_pipeline.cli import _resolve_style_prompt, PODCAST_NARRATION_PROMPT
+
+        ns = argparse.Namespace(style_prompt=None, style_prompt_file=None, no_style_prompt=False)
+        assert _resolve_style_prompt(ns) == PODCAST_NARRATION_PROMPT

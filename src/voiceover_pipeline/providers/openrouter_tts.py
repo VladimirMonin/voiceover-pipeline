@@ -7,6 +7,10 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
+from voiceover_pipeline.tts_prompting import (
+    build_request_body,
+    resolve_prompt_mode,
+)
 
 
 class OpenRouterTTSProvider(TTSProvider):
@@ -17,7 +21,8 @@ class OpenRouterTTSProvider(TTSProvider):
         api_key: str,
         model: str,
         voice: str,
-        style_prompt: str = PODCAST_NARRATION_PROMPT,
+        style_prompt: str | None = PODCAST_NARRATION_PROMPT,
+        prompt_mode: str = "auto",
         base_url: str = OPENROUTER_BASE_URL,
         response_format: str = "pcm",
         timeout_seconds: int = 240,
@@ -27,6 +32,8 @@ class OpenRouterTTSProvider(TTSProvider):
         self.voice = voice
         self.style_prompt = style_prompt
         self.fallback_style_prompt = PODCAST_NARRATION_FALLBACK_PROMPT
+        self._raw_prompt_mode = prompt_mode
+        self.prompt_mode = resolve_prompt_mode(self.provider_id, model, prompt_mode)
         self.base_url = base_url.rstrip("/")
         self.response_format = response_format
         self.timeout_seconds = timeout_seconds
@@ -48,18 +55,21 @@ class OpenRouterTTSProvider(TTSProvider):
             return self._request_audio(text=text, style_prompt=self.fallback_style_prompt)
 
     def _request_audio(self, text: str, style_prompt: str | None) -> SynthesisResult:
+        body = build_request_body(
+            model=self.model,
+            text=text,
+            voice=self.voice,
+            response_format=self.response_format,
+            style_prompt=style_prompt,
+            prompt_mode=self.prompt_mode,
+        )
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "input": self._build_input(text, style_prompt=style_prompt),
-                "voice": self.voice,
-                "response_format": self.response_format,
-            },
+            json=body,
             timeout=self.timeout_seconds,
         )
         if response.status_code >= 400:
@@ -78,10 +88,6 @@ class OpenRouterTTSProvider(TTSProvider):
                 "voice": self.voice,
                 "provider": self.provider_id,
                 "style_prompt": style_prompt,
+                "prompt_mode": self.prompt_mode,
             },
         )
-
-    def _build_input(self, text: str, style_prompt: str | None) -> str:
-        if style_prompt is None:
-            return text
-        return f"{style_prompt}\n\n{text}"

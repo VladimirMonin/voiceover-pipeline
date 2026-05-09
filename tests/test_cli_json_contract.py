@@ -205,3 +205,23 @@ def test_direct_cost_kwargs_none_for_other_providers():
     )
     assert _direct_cost_kwargs("openrouter-tts", result) == {}
     assert _direct_cost_kwargs("polza-chat-audio", result) == {}
+
+
+def test_gemini_prompt_mode_in_manifest_is_native():
+    from voiceover_pipeline.tts_prompting import resolve_prompt_mode
+    mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
+    assert mode == "native"
+
+
+def test_style_prompt_flags_accepted_by_parser():
+    import argparse
+    from pathlib import Path
+    from voiceover_pipeline.cli import build_parser
+
+    parser = build_parser()
+    parsed = parser.parse_args(
+        "generate --style-prompt test_prompt --no-style-prompt --style-prompt-file prompt.txt".split()
+    )
+    assert parsed.style_prompt == "test_prompt"
+    assert parsed.no_style_prompt is True
+    assert parsed.style_prompt_file == Path("prompt.txt")

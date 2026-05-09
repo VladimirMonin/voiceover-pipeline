@@ -68,7 +68,9 @@
 | `--run-id` | str | авто | Имя прогона (только `[a-zA-Z0-9._-]`) |
 | `--voice` | str | зависит от провайдера | Голос |
 | `--fallback-voice` | str | `onyx` | Запасной голос для Polza Chat Audio |
-| `--style-prompt` | str | дефолтный | Стиль подачи для OpenRouter Gemini |
+| `--style-prompt` | str | дефолтный | Стиль подачи для TTS (OpenRouter Gemini) |
+| `--style-prompt-file` | path | — | Читать prompt из файла |
+| `--no-style-prompt` | flag | false | Отключить prompt полностью |
 | `--no-trim` | flag | false | Не обрезать финальную тишину |
 | `--json` | flag | false | JSON-вывод в stdout |
 | `--overwrite` | flag | false | Удалить существующую папку прогона |

@@ -4,6 +4,18 @@ from unittest.mock import patch, MagicMock
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
 from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+from voiceover_pipeline.config import (
+    PODCAST_NARRATION_PROMPT,
+    TTS_PROMPT_MODE_NATIVE,
+    TTS_PROMPT_MODE_PREFIX,
+    TTS_PROMPT_MODE_NONE,
+)
+from voiceover_pipeline.tts_prompting import (
+    resolve_prompt_mode,
+    build_request_body,
+    build_prompted_input,
+    read_style_prompt_from_file,
+)
 
 
 class TestPolzaTTSProvider:
@@ -161,9 +173,10 @@ class TestOpenRouterTTSProviderOpenAI:
         assert json_body["input"] == "Hello openai"
         assert json_body["voice"] == "alloy"
         assert result.audio_bytes == b"fake-audio"
-        assert "style_prompt" not in json_body["input"].lower()
+        assert "prompt" not in json_body
+        assert "style_prompt" not in json_body.get("input", "").lower()
 
-    def test_gemini_model_uses_style_prompt(self):
+    def test_gemini_model_uses_native_prompt(self):
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.content = b"fake-audio-gemini"
@@ -179,5 +192,242 @@ class TestOpenRouterTTSProviderOpenAI:
             result = p.synthesize_chunk("Hello gemini", "chunk_01")
 
         json_body = mock_post.call_args[1]["json"]
-        assert "podcast narration style" in json_body["input"]
-        assert "Hello gemini" in json_body["input"]
+        assert json_body["input"] == "Hello gemini"
+        assert json_body["prompt"] == "podcast narration style"
+        assert json_body["voice"] == "Puck"
+        assert result.audio_bytes == b"fake-audio-gemini"
+
+    def test_gemini_no_style_prompt_sends_none_prompt(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio-gemini"
+        mock_response.headers = {"X-Generation-Id": "gen-gemini-2"}
+
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+            p = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Puck",
+                style_prompt=None,
+            )
+            result = p.synthesize_chunk("Hello gemini", "chunk_01")
+
+        json_body = mock_post.call_args[1]["json"]
+        assert json_body["input"] == "Hello gemini"
+        assert "prompt" not in json_body
+        assert result.audio_bytes == b"fake-audio-gemini"
+
+
+class TestGeminiExplicitPromptModes:
+    def test_prefix_mode_falls_back_to_old_concatenation(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio"
+        mock_response.headers = {"X-Generation-Id": "gen-1"}
+
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+            p = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Puck",
+                style_prompt="podcast style",
+                prompt_mode="prefix",
+            )
+            p.synthesize_chunk("Hello", "chunk_01")
+
+        json_body = mock_post.call_args[1]["json"]
+        assert json_body["input"] == "podcast style\n\nHello"
+        assert "prompt" not in json_body
+
+    def test_native_explicit_mode_sends_separate_prompt(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio"
+        mock_response.headers = {"X-Generation-Id": "gen-2"}
+
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+            p = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Puck",
+                style_prompt="podcast style",
+                prompt_mode="native",
+            )
+            p.synthesize_chunk("Hello", "chunk_01")
+
+        json_body = mock_post.call_args[1]["json"]
+        assert json_body["input"] == "Hello"
+        assert json_body["prompt"] == "podcast style"
+
+    def test_none_mode_sends_no_prompt_field(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio"
+        mock_response.headers = {"X-Generation-Id": "gen-3"}
+
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+            p = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Puck",
+                style_prompt="should be ignored",
+                prompt_mode="none",
+            )
+            p.synthesize_chunk("Hello", "chunk_01")
+
+        json_body = mock_post.call_args[1]["json"]
+        assert json_body["input"] == "Hello"
+        assert "prompt" not in json_body
+
+
+class TestUnknownGoogleModelFallback:
+    def test_unknown_google_model_uses_native(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio"
+        mock_response.headers = {"X-Generation-Id": "gen-future-1"}
+
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+            p = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-2.5-pro-tts",
+                voice="Puck",
+                style_prompt="expressive style",
+            )
+            p.synthesize_chunk("Future model", "chunk_01")
+
+        json_body = mock_post.call_args[1]["json"]
+        assert json_body["input"] == "Future model"
+        assert json_body["prompt"] == "expressive style"
+
+
+class TestPromptModeResolution:
+    def test_gemini_flash_tts_resolves_to_native(self):
+        mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
+        assert mode == TTS_PROMPT_MODE_NATIVE
+
+    def test_unknown_google_resolves_to_native(self):
+        mode = resolve_prompt_mode("openrouter-tts", "google/gemini-2.5-pro-tts")
+        assert mode == TTS_PROMPT_MODE_NATIVE
+
+    def test_openai_resolves_to_none(self):
+        mode = resolve_prompt_mode("openrouter-tts", "openai/gpt-4o-mini-tts-2025-12-15")
+        assert mode == TTS_PROMPT_MODE_NONE
+
+    def test_explicit_none_overrides(self):
+        mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview", TTS_PROMPT_MODE_NONE)
+        assert mode == TTS_PROMPT_MODE_NONE
+
+    def test_explicit_prefix_overrides(self):
+        mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview", TTS_PROMPT_MODE_PREFIX)
+        assert mode == TTS_PROMPT_MODE_PREFIX
+
+    def test_unknown_provider_model_resolves_to_none(self):
+        mode = resolve_prompt_mode("polza-tts", "elevenlabs/some-model")
+        assert mode == TTS_PROMPT_MODE_NONE
+
+
+class TestBuildRequestBody:
+    def test_native_mode_body(self):
+        body = build_request_body(
+            model="google/gemini-3.1-flash-tts-preview",
+            text="Hello world",
+            voice="Puck",
+            response_format="pcm",
+            style_prompt="Be expressive",
+            prompt_mode=TTS_PROMPT_MODE_NATIVE,
+        )
+        assert body["input"] == "Hello world"
+        assert body["prompt"] == "Be expressive"
+        assert body["model"] == "google/gemini-3.1-flash-tts-preview"
+        assert body["voice"] == "Puck"
+
+    def test_native_mode_no_prompt_when_none(self):
+        body = build_request_body(
+            model="google/gemini-3.1-flash-tts-preview",
+            text="Hello world",
+            voice="Puck",
+            response_format="pcm",
+            style_prompt=None,
+            prompt_mode=TTS_PROMPT_MODE_NATIVE,
+        )
+        assert body["input"] == "Hello world"
+        assert "prompt" not in body
+
+    def test_prefix_mode_body(self):
+        body = build_request_body(
+            model="google/gemini-3.1-flash-tts-preview",
+            text="Hello world",
+            voice="Puck",
+            response_format="pcm",
+            style_prompt="Be expressive",
+            prompt_mode=TTS_PROMPT_MODE_PREFIX,
+        )
+        assert body["input"] == "Be expressive\n\nHello world"
+        assert "prompt" not in body
+
+    def test_prefix_mode_no_prompt(self):
+        body = build_request_body(
+            model="google/gemini-3.1-flash-tts-preview",
+            text="Hello world",
+            voice="Puck",
+            response_format="pcm",
+            style_prompt=None,
+            prompt_mode=TTS_PROMPT_MODE_PREFIX,
+        )
+        assert body["input"] == "Hello world"
+        assert "prompt" not in body
+
+    def test_none_mode_body(self):
+        body = build_request_body(
+            model="google/gemini-3.1-flash-tts-preview",
+            text="Hello world",
+            voice="Puck",
+            response_format="pcm",
+            style_prompt="should be ignored",
+            prompt_mode=TTS_PROMPT_MODE_NONE,
+        )
+        assert body["input"] == "Hello world"
+        assert "prompt" not in body
+
+
+class TestBuildPromptedInput:
+    def test_none_mode_returns_text(self):
+        result = build_prompted_input("Hello", "style", TTS_PROMPT_MODE_NONE)
+        assert result == "Hello"
+
+    def test_prefix_mode_concatenates(self):
+        result = build_prompted_input("Hello", "style", TTS_PROMPT_MODE_PREFIX)
+        assert result == "style\n\nHello"
+
+    def test_prefix_mode_returns_text_when_prompt_none(self):
+        result = build_prompted_input("Hello", None, TTS_PROMPT_MODE_PREFIX)
+        assert result == "Hello"
+
+    def test_native_mode_returns_text_only(self):
+        result = build_prompted_input("Hello", "style", TTS_PROMPT_MODE_NATIVE)
+        assert result == "Hello"
+
+
+class TestReadStylePromptFromFile:
+    def test_reads_file_content(self, tmp_path):
+        pf = tmp_path / "prompt.txt"
+        pf.write_text("Custom podcast narration", encoding="utf-8")
+        content = read_style_prompt_from_file(pf)
+        assert content == "Custom podcast narration"
+
+    def test_strips_whitespace(self, tmp_path):
+        pf = tmp_path / "prompt.txt"
+        pf.write_text("  Padded prompt  \n", encoding="utf-8")
+        content = read_style_prompt_from_file(pf)
+        assert content == "Padded prompt"
+
+    def test_raises_on_missing_file(self):
+        with pytest.raises(FileNotFoundError):
+            read_style_prompt_from_file("nonexistent.txt")
+
+    def test_raises_on_empty_file(self, tmp_path):
+        pf = tmp_path / "empty.txt"
+        pf.write_text("   ", encoding="utf-8")
+        with pytest.raises(ValueError, match="empty"):
+            read_style_prompt_from_file(pf)

@@ -55,6 +55,7 @@ from .pricing import (
 )
 from .providers import OpenRouterTTSProvider, PolzaChatAudioProvider, PolzaTTSProvider, QwenLocalTTSProvider, TTSProvider
 from .script_splitter import split_markdown_by_delimiter
+from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
 
 _EXIT_OK = 0
 _EXIT_ARGS = 2
@@ -139,7 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--run-id", default="")
     gen.add_argument("--voice", default=None)
     gen.add_argument("--fallback-voice", default=DEFAULT_FALLBACK_VOICE)
-    gen.add_argument("--style-prompt", default=PODCAST_NARRATION_PROMPT)
+    gen.add_argument("--style-prompt", default=None)
+    gen.add_argument("--style-prompt-file", type=Path, default=None)
+    gen.add_argument("--no-style-prompt", action="store_true")
     gen.add_argument("--no-trim", action="store_true")
     gen.add_argument("--json", dest="json_output", action="store_true", help="Output JSON to stdout.")
     gen.add_argument("--overwrite", action="store_true", help="Overwrite existing run folder.")
@@ -273,6 +276,16 @@ def _validate_output_dir(output_dir: Path) -> Path:
     return output_dir
 
 
+def _resolve_style_prompt(args: argparse.Namespace) -> str | None:
+    if getattr(args, "no_style_prompt", False):
+        return None
+    if getattr(args, "style_prompt_file", None):
+        return read_style_prompt_from_file(args.style_prompt_file)
+    if getattr(args, "style_prompt", None) is not None:
+        return args.style_prompt
+    return PODCAST_NARRATION_PROMPT
+
+
 def generate(args: argparse.Namespace) -> None:
     try:
         ffmpeg_path, ffprobe_path = check_media_tools()
@@ -304,13 +317,15 @@ def generate(args: argparse.Namespace) -> None:
 
     api_key = read_api_key(args)
     args.voice = args.voice or _default_voice(args)
-    provider = build_provider(args, api_key)
+    style_prompt = _resolve_style_prompt(args)
+    prompt_mode = resolve_prompt_mode(args.provider, args.model)
+    provider = build_provider(args, api_key, style_prompt, prompt_mode)
     pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
 
-    _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths)
+    _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths, style_prompt, prompt_mode)
 
 
-def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths) -> None:
+def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths, style_prompt, prompt_mode) -> None:
     run_started_at = datetime.now(timezone.utc) - timedelta(seconds=30)
     chunk_artifacts: list[ChunkArtifact] = []
     total_duration_ms = 0
@@ -353,11 +368,12 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
 
     chunks_manifest = build_chunks_manifest(
         provider=args.provider, model=args.model, voice=args.voice,
-        style_prompt=args.style_prompt if args.provider == "openrouter-tts" and not args.model.startswith("openai/") else None,
+        style_prompt=style_prompt,
         script=args.script, chunks_dir=paths.chunks_dir, pricing_snapshot=pricing_snapshot,
         cost_exact_available=cost_total is not None, cost_total=cost_total,
         cost_total_exact=cost_total_exact, cost_currency=cost_currency, cost_source=cost_source,
         chunk_artifacts=chunk_artifacts, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+        prompt_mode=prompt_mode,
     )
     try:
         write_json(paths.chunks_json, chunks_manifest)
@@ -811,13 +827,13 @@ def read_api_key(args: argparse.Namespace) -> str:
     raise RuntimeError(f"Unsupported provider: {args.provider}")
 
 
-def build_provider(args: argparse.Namespace, api_key: str) -> TTSProvider:
+def build_provider(args: argparse.Namespace, api_key: str, style_prompt: str | None, prompt_mode: str) -> TTSProvider:
     if args.provider == "polza-chat-audio":
         return PolzaChatAudioProvider(api_key=api_key, model=args.model, voice=args.voice, fallback_voice=args.fallback_voice)
     if args.provider == "polza-tts":
         return PolzaTTSProvider(api_key=api_key, model=args.model, voice=args.voice)
     if args.provider == "openrouter-tts":
-        return OpenRouterTTSProvider(api_key=api_key, model=args.model, voice=args.voice, style_prompt=args.style_prompt)
+        return OpenRouterTTSProvider(api_key=api_key, model=args.model, voice=args.voice, style_prompt=style_prompt, prompt_mode=prompt_mode)
     if args.provider == "qwen-local":
         return QwenLocalTTSProvider(mode=args.mode, voice=args.voice, sample_path=args.sample, sample_text=args.sample_text)
     raise RuntimeError(f"Unsupported provider: {args.provider}")

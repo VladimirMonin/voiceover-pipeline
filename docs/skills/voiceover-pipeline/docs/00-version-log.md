@@ -7,10 +7,10 @@
 
 | Поле | Значение |
 |---|---|
-| **Compatible app** | voiceover-pipeline 0.4.1 |
-| **Skill revision** | 2026-05-01 |
+| **Compatible app** | voiceover-pipeline 0.4.2 |
+| **Skill revision** | 2026-05-09 |
 | **Минимальная версия CLI** | 0.4.0 |
-| **Максимальная проверенная** | 0.4.1 |
+| **Максимальная проверенная** | 0.4.2 |
 
 ## Что актуально в этой версии навыка
 
@@ -40,6 +40,7 @@
 
 | Дата | Изменение |
 |---|---|
+| 2026-05-09 | Gemini native prompt: отдельное поле `prompt` в request body вместо конкатенации в `input`. Флаги `--style-prompt-file`, `--no-style-prompt`. `prompt_mode` в manifest. Расширяемость под будущие Google/Polza модели. |
 | 2026-05-01 | UV-first Python: `uv python install 3.12` вместо winget. Агент сам создаёт `.env` из `.env.example`. Remotion scene grouping: Whisper-сегменты группируются по смысловым сценам, не по чанкам. Torch CPU-only диагностика. Qwen голоса обновлены до 9 актуальных. |
 | 2026-04-29 | Добавлены `polza-tts`, ElevenLabs, OpenRouter OpenAI TTS. Обновлены все цены, голоса, workflows, evaluation. |
 | 2026-03 | Исходная версия навыка под voiceover-pipeline 0.3.x (Polza GPT Audio, OpenRouter Gemini, Qwen) |

@@ -55,6 +55,7 @@ def build_chunks_manifest(
     chunk_artifacts: list[ChunkArtifact],
     ffmpeg_path: str,
     ffprobe_path: str,
+    prompt_mode: str = "auto",
 ) -> dict[str, Any]:
     total_duration_ms = chunk_artifacts[-1].end_ms if chunk_artifacts else 0
     return drop_none(
@@ -64,6 +65,7 @@ def build_chunks_manifest(
             "model": model,
             "voice": voice,
             "style_prompt": style_prompt,
+            "prompt_mode": prompt_mode,
             "format": "mp3",
             "script": str(script.resolve()),
             "chunks_dir": str(chunks_dir),

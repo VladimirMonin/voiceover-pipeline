@@ -64,13 +64,6 @@ voiceover generate `
  "duration_ms": 25520, "segment_count": 8, "cost": {"total": 0.0146, "currency": "RUB"}}
 ```
 
-Результат (JSON stdout):
-
-```json
-{"status": "success", "provider": "polza-chat-audio", "run_id": "prod",
- "duration_ms": 25520, "segment_count": 8, "cost": {"total": 0.0146, "currency": "RUB"}}
-```
-
 ## Что на выходе
 
 ```
@@ -118,14 +111,14 @@ uv sync --group dev --extra timing-whisper
 uv run pytest
 ```
 
-61 тест: JSON-контракт, exit codes, валидация, output policy, providers.
+98 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes.
 
 ## Agent Skill
 
 OpenCode agent skill — устанавливает pipeline, выбирает провайдера, генерирует озвучку:
 
-- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.0/docs/skills/voiceover-pipeline
-- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.0
+- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.2/docs/skills/voiceover-pipeline
+- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.2
 
 ## Legal / Provider Notes
 

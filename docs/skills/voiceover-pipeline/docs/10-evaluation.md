@@ -161,6 +161,20 @@
 2. Установил отсутствующие зависимости сам (если можно)
 3. Пользователю дана команда только при невозможности установки
 
+### Кейс 10: Gemini with native prompt
+
+**Контекст:** пользователь хочет Gemini TTS с expressive prompt.
+
+**Ожидание:**
+- Gemini использует native prompt mode: `prompt` отдельно от `input`
+- `--style-prompt-file` читает prompt из файла
+- `--no-style-prompt` не отправляет `prompt` в request body
+
+**Assertions:**
+1. В request body есть поле `prompt` (не `input` содержит prompt)
+2. `--style-prompt-file` корректно читает файл
+3. `--no-style-prompt` убирает `prompt` из тела запроса
+
 ## Заметки качественного обзора
 
 При проверке навыка смотри на:
@@ -222,7 +236,7 @@
 Навык считается готовым когда:
 
 - [ ] Набор фраз срабатывания: 8 should trigger / 4 should not trigger / 3 boundary
-- [ ] Все 9 smoke tests проходят без критичных сбоев
+- [ ] Все 10 smoke tests проходят без критичных сбоев
 - [ ] Каждый smoke test имеет ≥3 assertions
 - [ ] Регрессионный набор (9 кейсов) не ломается после правок
 - [ ] Security правила не нарушаются ни в одном сценарии

@@ -38,6 +38,7 @@ out\<run-id>\
 | `model` | ID модели |
 | `voice` | Голос |
 | `style_prompt` | Стилевой промпт (только Gemini) |
+| `prompt_mode` | Режим отправки prompt: `native`, `prefix`, `none` |
 | `chunk_count` | Сколько чанков |
 | `total_duration_ms` | Суммарная длина |
 | `cost_total` | Общая стоимость |

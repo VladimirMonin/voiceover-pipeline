@@ -129,13 +129,25 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 ### Style prompt (Gemini)
 
-Управление подачей через `--style-prompt`:
+Управление подачей через `--style-prompt`. Gemini использует **native prompt** — поле `prompt` передаётся отдельно от `input` в request body:
 
 ```powershell
 voiceover generate `
   --provider openrouter-tts `
   --model "google/gemini-3.1-flash-tts-preview" `
   --style-prompt "Энергичный голос ведущего: громкий, быстрый, чёткий."
+
+# Prompt из файла (удобно для длинных промптов)
+voiceover generate `
+  --provider openrouter-tts `
+  --model "google/gemini-3.1-flash-tts-preview" `
+  --style-prompt-file "prompts/expressive.txt"
+
+# Без prompt (чистый TTS)
+voiceover generate `
+  --provider openrouter-tts `
+  --model "google/gemini-3.1-flash-tts-preview" `
+  --no-style-prompt
 ```
 
 Дефолт: «Голос технического подкаста: спокойный, вдумчивый, живой и уверенный.»

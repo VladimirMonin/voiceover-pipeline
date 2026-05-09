@@ -80,7 +80,7 @@
 
 ## Style prompt (Gemini)
 
-Gemini поддерживает стилевой prompt — текст вставляется перед озвучиваемым контентом:
+Gemini поддерживает стилевой prompt — передаётся отдельным полем `prompt` в request body (native mode):
 
 ```powershell
 voiceover generate `
@@ -89,6 +89,20 @@ voiceover generate `
   --voice "Kore" `
   --style-prompt "Энергичный голос ведущего новостей: громкий, быстрый."
 ```
+
+### Флаги для style-prompt
+
+| Флаг | Поведение |
+|---|---|
+| `--style-prompt "..."` | Строка из CLI |
+| `--style-prompt-file path.txt` | Читать prompt из файла |
+| `--no-style-prompt` | Отключить prompt (чистый TTS) |
+| (ничего) | Дефолтный prompt из config.py |
+
+### Native prompt vs prefix fallback
+
+- **Native** (Gemini по умолчанию): `prompt` и `input` передаются раздельно в request body
+- **Prefix** (старый fallback): prompt конкатенируется с текстом в поле `input`
 
 Gemini 3.1 Flash TTS поддерживает inline audio tags: `[whispers]`, `[laughs]`, `[excited]` и другие.
 
@@ -133,17 +147,20 @@ OPENROUTER_API_KEY=sk-or-v1-...
 
 ## Как работает
 
-### Gemini TTS
+### Gemini TTS (native prompt)
 
 ```
 POST https://openrouter.ai/api/v1/audio/speech
 {
   "model": "google/gemini-3.1-flash-tts-preview",
-  "input": "<style prompt>\n\n<текст чанка>",
+  "input": "<текст чанка>",
+  "prompt": "<style prompt>",
   "voice": "Puck",
   "response_format": "pcm"
 }
 ```
+
+Поле `prompt` передаётся отдельно от `input`. Если `--no-style-prompt` — поле `prompt` не отправляется.
 
 Gemini через OpenRouter принимает только `response_format="pcm"`. Пайплайн конвертирует PCM в MP3 через FFmpeg.
 

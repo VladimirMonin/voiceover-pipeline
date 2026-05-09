@@ -116,7 +116,17 @@ voiceover doctor --with-timings --timing-device cpu --json  # нужен faster-
 
 При `issues` агент предлагает пользователю исправить сценарий.
 
-## `generate --json`
+## `generate` — Style Prompt Flags
+
+| Флаг | Тип | Default | Поведение |
+|---|---|---|---|
+| `--style-prompt` | str | дефолтный | Prompt строкой из CLI |
+| `--style-prompt-file` | path | — | Читать prompt из файла |
+| `--no-style-prompt` | flag | false | Отключить prompt полностью |
+
+Приоритет: `--no-style-prompt` > `--style-prompt-file` > `--style-prompt` > дефолт из config.py.
+
+## `generate --json` (output)
 
 ```json
 {
