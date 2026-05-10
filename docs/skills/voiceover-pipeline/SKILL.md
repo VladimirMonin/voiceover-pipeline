@@ -14,7 +14,8 @@ description: >
   никогда не читает .env. Триггеры: озвучь, voiceover, TTS, тайминги,
   whisper timing, аудио для видео, подкаст, generate audio, timings for
   Remotion, voiceover-pipeline, выбери провайдера, сравни модели TTS,
-  голос для озвучки, format: voiceover, gemini-dialogue.
+  голос для озвучки, format: voiceover, gemini-dialogue, --resume,
+  status run, concat partial audio.
 ---
 # Voiceover Pipeline — навык агента
 
@@ -97,9 +98,10 @@ description: >
    Убедись что `workflow_ok: true`.
 5. **Валидация сценария.** `voiceover validate --script "script.md" --json`.
    Если есть issues — покажи пользователю, не запускай генерацию.
-6. **Генерация.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --with-timings --json --overwrite`.
-   Прочитай `out/<run-id>/manifest.json` как entry-point.
-7. **Отдай артефакты.** `manifest.json` → `.timings.json` (durations) + `.srt` (captions) + `full_mp3` (аудио).
+6. **Генерация аудио.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --json --resume`.
+   Не используй `--overwrite` для платной генерации; если run оборвался — продолжай через `--resume`.
+7. **Тайминги отдельно.** `voiceover timings --audio "out/prod/<full>.mp3" --run-id "prod" --json --overwrite`.
+8. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
 
 ## Security-first правила
 
@@ -126,7 +128,7 @@ description: >
 | Создаёт .env.example, .gitignore, script.md, out/ — все болванки проекта | Читает .env или значения ключей |
 | Проверяет окружение через doctor | Конфигурирует системный PATH |
 | Валидирует Markdown-сценарий | Пишет сценарий за пользователя |
-| Генерирует озвучку + тайминги через любой из 4 провайдеров | Рендерит Remotion-видео |
+| Генерирует озвучку через любой из 4 провайдеров с retry/resume/state/log | Рендерит Remotion-видео |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
 | Объясняет провайдеров, модели, голоса, цены (7 моделей) | Гарантирует будущие цены провайдеров |
 | Диагностирует ошибки по exit codes | Правит исходники voiceover-pipeline |

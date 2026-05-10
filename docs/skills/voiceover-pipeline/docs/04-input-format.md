@@ -93,6 +93,16 @@ JSON-ответ:
 
 Полезно чтобы понять, как сценарий разобьётся, не тратя деньги на генерацию.
 
+Для production безопаснее разделять стадии:
+
+```powershell
+voiceover generate --script "script.md" --run-id "prod" --json --resume
+voiceover timings --audio "out/prod/prod-voiceover-model.mp3" --run-id "prod" --json --overwrite
+```
+
+Если всё же используется `generate --with-timings`, зависимость `faster-whisper`
+проверяется до первого платного TTS-запроса.
+
 ## Gemini Dialogue format
 
 Для Gemini 3.1 Flash TTS через OpenRouter есть отдельный формат для подкастов
@@ -162,9 +172,8 @@ voiceover generate `
   --format gemini-dialogue `
   --script "script.md" `
   --run-id "podcast-prod" `
-  --with-timings `
   --json `
-  --overwrite
+  --resume
 ```
 
 ## Voiceover metadata format
@@ -207,7 +216,7 @@ voiceover validate --script "script.md" --format voiceover --agent --json
 Генерация может использовать metadata без повторения provider/model/voice:
 
 ```powershell
-voiceover generate --script "script.md" --run-id "prod" --json --overwrite
+voiceover generate --script "script.md" --run-id "prod" --json --resume
 ```
 
 CLI-флаги переопределяют frontmatter, например:

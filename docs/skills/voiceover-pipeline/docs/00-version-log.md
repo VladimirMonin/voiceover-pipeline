@@ -23,6 +23,7 @@
 - OpenRouter OpenAI TTS: `/audio/speech` без style_prompt
 - Voiceover metadata: `format: voiceover` frontmatter для provider/model/voice/fallback/style_prompt, auto-detect in validate/generate
 - OpenRouter Gemini dialogue: `--format gemini-dialogue`, frontmatter speaker map, inline audio tags, strict UTF-8 byte validation
+- Stability layer: `run_state.json`, `generation.log`, universal retries, `--resume`, paid-audio overwrite guard, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`, `--json-events`
 - Endpoint dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media`
 
 ## Цены (smoke 2026-04-29, не гарантия провайдера)
@@ -44,6 +45,7 @@
 |---|---|
 | 2026-05-10 | Добавлен generic `format: voiceover` для single-speaker режимов: provider/model/voice в frontmatter, CLI overrides, full-error validator, backward compatibility с plain Markdown. |
 | 2026-05-10 | Добавлен Gemini dialogue workflow: two speakers через OpenRouter `multi_speaker_voice_config` + обязательный top-level `voice`, full-error validator, `--speaker-voice`, `--agent`, chunk byte safety gates. |
+| 2026-05-10 | Добавлен стабильный generation supervisor: state/log after each chunk, universal retry для всех провайдеров, безопасный `--resume`, защита paid chunks от overwrite, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`. |
 | 2026-05-09 | Gemini native prompt: отдельное поле `prompt` в request body вместо конкатенации в `input`. Флаги `--style-prompt-file`, `--no-style-prompt`. `prompt_mode` в manifest. Расширяемость под будущие Google/Polza модели. |
 | 2026-05-01 | UV-first Python: `uv python install 3.12` вместо winget. Агент сам создаёт `.env` из `.env.example`. Remotion scene grouping: Whisper-сегменты группируются по смысловым сценам, не по чанкам. Torch CPU-only диагностика. Qwen голоса обновлены до 9 актуальных. |
 | 2026-04-29 | Добавлены `polza-tts`, ElevenLabs, OpenRouter OpenAI TTS. Обновлены все цены, голоса, workflows, evaluation. |

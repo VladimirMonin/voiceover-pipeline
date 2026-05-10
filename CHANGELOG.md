@@ -17,7 +17,18 @@
 
 ### Tests
 
-- 109 pytest tests covering metadata validation, Gemini dialogue validation, backward compatibility for plain Markdown, and provider payload regressions.
+- 117 pytest tests covering metadata validation, Gemini dialogue validation, backward compatibility for plain Markdown, provider payload regressions, retry/resume safety, state persistence, logging, status, dry-run limits, and partial concat.
+
+### Generation Stability
+
+- Added `run_state.json` with atomic writes after every successfully saved chunk, including chunk number, file, duration, generation id, model, voice, text, and text hash.
+- Added `generation.log` in every run folder; it is written even when `--json` is enabled.
+- Added universal per-chunk retry wrapper for all providers with `--retries`, `--retry-delay`, `--retry-max-delay`, and `--no-retry`.
+- Added `--resume` to continue interrupted runs without regenerating completed chunks; resume rejects changed scripts when `run_state.json` exists.
+- Added paid-audio overwrite protection: `--overwrite` refuses to delete existing chunks unless `--confirm-delete-paid-audio` is also set.
+- Added `voiceover status --run-id ...` and `voiceover concat --run-id ... --format ogg` for partial run inspection and safe partial audio assembly.
+- Added `--dry-run-cost`, `--limit-chunks`, and `--json-events` for safer agent workflows and long-running generation visibility.
+- Fixed Whisper install guidance from `uv sync --group timing-whisper` to `uv sync --extra timing-whisper`.
 
 ## 0.4.2
 

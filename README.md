@@ -52,11 +52,13 @@ voiceover generate `
   --model "openai/gpt-audio-mini" `
   --script "script.md" `
   --run-id "prod" `
-  --with-timings `
-  --word-timestamps `
   --json `
-  --overwrite
+  --resume
 ```
+
+Recommended production flow: generate paid audio first, then run `voiceover timings`
+as a separate step. If you still use `--with-timings`, Whisper dependencies are
+checked before the first paid TTS request.
 
 ### Metadata script
 
@@ -91,6 +93,8 @@ max_chunk_chars: 2000
 ```
 out/<run-id>/
 ├── manifest.json                          ← entry-point для агентов
+├── run_state.json                         ← resumable state after each chunk
+├── generation.log                         ← human-readable generation log
 ├── <run-id>-voiceover-<model>.mp3         ← полный MP3
 ├── <run-id>-voiceover-<model>.json        ← run-манифест
 ├── <run-id>.timings.json                  ← Whisper-сегменты (ms)
@@ -108,10 +112,12 @@ out/<run-id>/
 | `validate --script X` | Проверить сценарий |
 | `list providers/voices/timing-models` | Доступные модели |
 | `split --script X` | Чанки сценария |
-| `generate` | Полная генерация + тайминги |
+| `generate` | Генерация аудио с resume/retry/state/log |
 | `timings --audio X` | Тайминги из готового MP3 |
+| `status --run-id X` | Статус partial/resumable run |
+| `concat --run-id X --format ogg` | Склеить существующие chunks в partial/full файл |
 
-Все команды поддерживают `--json`.
+Все команды поддерживают `--json`; `generate` также поддерживает `--json-events`.
 
 ## Модели и цены
 
@@ -133,7 +139,7 @@ uv sync --group dev --extra timing-whisper
 uv run pytest
 ```
 
-109 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes, script metadata.
+117 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes, script metadata, resume/retry/state/log/status/concat safety.
 
 ## Agent Skill
 

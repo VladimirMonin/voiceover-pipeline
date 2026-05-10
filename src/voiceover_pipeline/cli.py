@@ -44,8 +44,8 @@ from .config import (
     read_openrouter_key,
     read_polza_key,
 )
-from .media import check_media_tools, concat_mp3_chunks, mp3_duration_ms, trim_final_silence, write_audio_as_mp3
-from .models import ChunkArtifact
+from .media import check_media_tools, concat_audio_files, concat_mp3_chunks, mp3_duration_ms, trim_final_silence, write_audio_as_mp3
+from .models import ChunkArtifact, ScriptChunk
 from .gemini_dialogue import (
     GEMINI_DIALOGUE_FORMAT,
     chunks_from_validation as gemini_chunks_from_validation,
@@ -65,6 +65,20 @@ from .pricing import (
     fetch_polza_model_pricing,
 )
 from .providers import OpenRouterTTSProvider, PolzaChatAudioProvider, PolzaTTSProvider, QwenLocalTTSProvider, TTSProvider
+from .retry import RetryPolicy, run_with_retry
+from .run_state import (
+    LOG_FILE,
+    STATE_FILE,
+    GenerationLogger,
+    append_error,
+    atomic_write_json,
+    completed_numbers,
+    initial_state,
+    load_state,
+    script_hash,
+    state_chunks_as_artifacts,
+    upsert_completed_chunk,
+)
 from .script_splitter import split_markdown_by_delimiter
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
 
@@ -118,6 +132,10 @@ def main() -> None:
             split_cmd(args)
         elif args.command == "timings":
             run_timings(args)
+        elif args.command == "status":
+            status_cmd(args)
+        elif args.command == "concat":
+            concat_cmd(args)
         elif args.command == "doctor":
             doctor_cmd(args)
         elif args.command == "validate":
@@ -159,8 +177,17 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--no-style-prompt", action="store_true")
     gen.add_argument("--no-trim", action="store_true")
     gen.add_argument("--json", dest="json_output", action="store_true", help="Output JSON to stdout.")
+    gen.add_argument("--json-events", action="store_true", help="Emit progress events as NDJSON.")
     gen.add_argument("--overwrite", action="store_true", help="Overwrite existing run folder.")
+    gen.add_argument("--confirm-delete-paid-audio", action="store_true", help="Allow --overwrite to delete existing chunk audio.")
     gen.add_argument("--skip-existing", action="store_true", help="Skip if run folder exists.")
+    gen.add_argument("--resume", action="store_true", help="Resume an interrupted run without regenerating completed chunks.")
+    gen.add_argument("--retries", type=int, default=3, help="Attempts per chunk for retryable provider errors.")
+    gen.add_argument("--retry-delay", type=float, default=2.0, help="Initial retry delay in seconds.")
+    gen.add_argument("--retry-max-delay", type=float, default=30.0, help="Maximum retry delay in seconds.")
+    gen.add_argument("--no-retry", action="store_true", help="Disable retry attempts.")
+    gen.add_argument("--limit-chunks", type=int, default=None, help="Generate only the first N chunks for a test run.")
+    gen.add_argument("--dry-run-cost", action="store_true", help="Validate and estimate generation scope without TTS calls.")
 
     qwen = gen.add_argument_group("qwen-local options")
     qwen.add_argument("--mode", choices=["preset", "clone"], default="preset")
@@ -194,6 +221,19 @@ def build_parser() -> argparse.ArgumentParser:
     timp.add_argument("--word-timestamps", action="store_true")
     timp.add_argument("--overwrite", action="store_true")
     timp.add_argument("--skip-existing", action="store_true", help="Skip if output dir exists.")
+
+    # --------------- status ---------------
+    stat = subparsers.add_parser("status", help="Show resumable generation status for a run.")
+    stat.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    stat.add_argument("--run-id", required=True)
+    stat.add_argument("--json", dest="json_output", action="store_true")
+
+    # --------------- concat ---------------
+    con = subparsers.add_parser("concat", help="Concatenate existing chunks, including partial runs.")
+    con.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    con.add_argument("--run-id", required=True)
+    con.add_argument("--format", choices=["mp3", "ogg"], default="ogg")
+    con.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- doctor ---------------
     doc = subparsers.add_parser("doctor", help="Check environment and dependencies.")
@@ -373,22 +413,53 @@ def generate(args: argparse.Namespace) -> None:
     _validate_model_for_provider(args.provider, args.model)
     if not chunks:
         fail("Script produced no chunks. Check delimiter and content.", _EXIT_ARGS)
+    original_chunk_count = len(chunks)
+    if args.limit_chunks is not None:
+        if args.limit_chunks <= 0:
+            fail("--limit-chunks must be greater than zero", _EXIT_ARGS)
+        chunks = chunks[:args.limit_chunks]
     if args.run_id:
         _validate_run_id(args.run_id)
     _validate_output_dir(args.output_dir)
     paths = build_run_paths(args.output_dir, args.model, args.run_id or None)
+
+    if getattr(args, "dry_run_cost", False):
+        _json_ok({
+            "status": "success",
+            "dry_run": True,
+            "provider": args.provider,
+            "model": args.model,
+            "voice": args.voice or _default_voice(args),
+            "script_format": script_format,
+            "chunks": len(chunks),
+            "original_chunks": original_chunk_count,
+            "total_characters": sum(len(chunk.text) for chunk in chunks),
+            "estimated_cost": None,
+            "estimate_note": "Exact pre-generation cost is unavailable for this provider/model without usage data.",
+        })
+
+    if getattr(args, "with_timings", False):
+        _preflight_timing_dependency()
 
     if paths.output_root.exists():
         if args.skip_existing:
             files = _list_artifact_files(paths)
             _json_ok({"status": "skipped", "reason": "run folder exists", "run_id": paths.prefix, "files": files})
             return
-        if not args.overwrite:
+        if args.resume:
+            pass
+        elif not args.overwrite:
             fail(
-                f"Run folder already exists: {paths.output_root}. Use --overwrite to replace or --skip-existing.",
+                f"Run folder already exists: {paths.output_root}. Use --resume to continue, --skip-existing, or --overwrite.",
                 _EXIT_PROVIDER,
             )
-        _safe_remove_run_dir(paths.output_root, args.output_dir)
+        elif _has_paid_chunk_audio(paths) and not args.confirm_delete_paid_audio:
+            fail(
+                "Refusing to delete existing paid chunk audio. Use --resume, or add --confirm-delete-paid-audio with --overwrite.",
+                _EXIT_PROVIDER,
+            )
+        if args.overwrite:
+            _safe_remove_run_dir(paths.output_root, args.output_dir)
 
     _ensure_run_dirs(paths)
 
@@ -412,23 +483,92 @@ def generate(args: argparse.Namespace) -> None:
 
 def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths, style_prompt, prompt_mode) -> None:
     run_started_at = datetime.now(timezone.utc) - timedelta(seconds=30)
-    chunk_artifacts: list[ChunkArtifact] = []
-    total_duration_ms = 0
+    logger = GenerationLogger(paths.output_root / LOG_FILE)
+    state_path = paths.output_root / STATE_FILE
+    logger.event("info", "run_started", run_id=paths.prefix, provider=args.provider, model=args.model, chunks=len(chunks))
+    _emit_json_event(args, "run_started", run_id=paths.prefix, chunks=len(chunks))
+
+    current_hash = script_hash(chunks)
+    state = load_state(state_path)
+    if state and args.resume:
+        if state.get("script_hash") != current_hash:
+            logger.event("error", "resume_rejected", reason="script_hash_mismatch")
+            fail("Cannot resume: script chunks do not match the previous run_state.json.", _EXIT_PROVIDER)
+        logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
+    elif state and not args.resume:
+        logger.event("info", "state_replaced", reason="fresh_run")
+        state = initial_state(
+            provider=args.provider, model=args.model, voice=args.voice, script_path=args.script,
+            chunks=chunks, script_format=getattr(args, "format", "markdown"), run_id=paths.prefix,
+            limited_to_chunks=getattr(args, "limit_chunks", None),
+        )
+    elif args.resume:
+        state = initial_state(
+            provider=args.provider, model=args.model, voice=args.voice, script_path=args.script,
+            chunks=chunks, script_format=getattr(args, "format", "markdown"), run_id=paths.prefix,
+            limited_to_chunks=getattr(args, "limit_chunks", None),
+        )
+        _recover_existing_chunks(state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice)
+        logger.event("info", "resume_recovered", completed=state.get("completed_count", 0))
+    else:
+        state = initial_state(
+            provider=args.provider, model=args.model, voice=args.voice, script_path=args.script,
+            chunks=chunks, script_format=getattr(args, "format", "markdown"), run_id=paths.prefix,
+            limited_to_chunks=getattr(args, "limit_chunks", None),
+        )
+    atomic_write_json(state_path, state)
+
+    chunk_artifacts: list[ChunkArtifact] = state_chunks_as_artifacts(state, paths.chunks_dir) if args.resume else []
+    chunk_artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
+    completed = completed_numbers(state)
+    total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
+    retry_policy = RetryPolicy(
+        attempts=args.retries,
+        delay_seconds=args.retry_delay,
+        max_delay_seconds=args.retry_max_delay,
+        enabled=not args.no_retry,
+    )
 
     for chunk in chunks:
         output_path = paths.chunks_dir / f"{chunk.id}.mp3"
+        if chunk.number in completed and output_path.exists():
+            logger.event("info", "chunk_skipped_resume", chunk=chunk.number, id=chunk.id, file=output_path.name)
+            _emit_json_event(args, "chunk_skipped", chunk=chunk.number, id=chunk.id, reason="resume")
+            continue
         if not args.json_output:
             print(f"Generating {chunk.id}/{len(chunks):02d}: {output_path.name}")
+        logger.event("info", "chunk_started", chunk=chunk.number, id=chunk.id, file=output_path.name)
+        _emit_json_event(args, "chunk_started", chunk=chunk.number, id=chunk.id)
 
-        result = provider.synthesize_chunk(chunk.text, chunk.id)
+        try:
+            result = run_with_retry(
+                lambda: provider.synthesize_chunk(chunk.text, chunk.id),
+                policy=retry_policy,
+                on_retry=lambda attempt, error, delay: _log_retry(logger, args, chunk, attempt, error, delay),
+            )
+        except Exception as e:
+            append_error(state, chunk_id=chunk.id, message=str(e))
+            atomic_write_json(state_path, state)
+            logger.event("error", "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
+            _emit_json_event(args, "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
+            fail(f"Failed to synthesize {chunk.id}: {e}", _EXIT_PROVIDER)
+        logger.event("info", "chunk_provider_response", chunk=chunk.number, id=chunk.id, generation_id=result.generation_id)
         try:
             write_audio_as_mp3(ffmpeg_path, result.audio_bytes, result.audio_format, output_path)
         except Exception as e:
+            append_error(state, chunk_id=chunk.id, message=str(e))
+            atomic_write_json(state_path, state)
+            logger.event("error", "chunk_write_failed", chunk=chunk.number, id=chunk.id, error=str(e))
             fail(f"Failed to write chunk audio {output_path}: {e}", _EXIT_OUTPUT)
+        logger.event("info", "chunk_file_saved", chunk=chunk.number, id=chunk.id, file=output_path.name)
         if not args.no_trim:
             try:
                 trim_final_silence(ffmpeg_path, ffprobe_path, output_path)
+                logger.event("info", "chunk_trimmed", chunk=chunk.number, id=chunk.id)
             except Exception as e:
+                append_error(state, chunk_id=chunk.id, message=str(e))
+                atomic_write_json(state_path, state)
+                logger.event("error", "chunk_trim_failed", chunk=chunk.number, id=chunk.id, error=str(e))
                 fail(f"Failed to trim chunk audio {output_path}: {e}", _EXIT_OUTPUT)
 
         duration_ms = mp3_duration_ms(ffprobe_path, output_path)
@@ -436,16 +576,23 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         end_ms = start_ms + duration_ms
         total_duration_ms = end_ms
 
-        chunk_artifacts.append(ChunkArtifact(
+        artifact = ChunkArtifact(
             number=chunk.number, id=chunk.id, file=output_path.name,
             duration_ms=duration_ms, duration_sec=round(duration_ms / 1000, 3),
             start_ms=start_ms, end_ms=end_ms, text_characters=len(chunk.text),
             transcript=result.transcript, client_path=result.client_path,
             generation_id=result.generation_id,
             **_direct_cost_kwargs(args.provider, result),
-        ))
+        )
+        chunk_artifacts_by_number[chunk.number] = artifact
+        upsert_completed_chunk(state, artifact=artifact, model=args.model, voice=args.voice, text=chunk.text)
+        atomic_write_json(state_path, state)
+        logger.event("info", "chunk_state_saved", chunk=chunk.number, id=chunk.id, state=state_path.name)
+        _emit_json_event(args, "chunk_saved", chunk=chunk.number, id=chunk.id, file=output_path.name, duration_ms=duration_ms)
         if not args.json_output:
             print(f"Saved {output_path.name}: {duration_ms} ms")
+
+    chunk_artifacts = [chunk_artifacts_by_number[number] for number in sorted(chunk_artifacts_by_number)]
 
     time.sleep(2)
     chunk_artifacts = attach_costs(args.provider, api_key, args.model, run_started_at, chunk_artifacts)
@@ -468,10 +615,15 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         fail(f"Failed to write {paths.chunks_json}: {e}", _EXIT_OUTPUT)
 
     try:
+        logger.event("info", "concat_started", output=paths.full_mp3.name)
         concat_mp3_chunks(ffmpeg_path, paths.chunks_dir, paths.full_mp3)
     except Exception as e:
+        append_error(state, chunk_id=None, message=str(e))
+        atomic_write_json(state_path, state)
+        logger.event("error", "concat_failed", error=str(e))
         fail(f"Failed to concat MP3 chunks: {e}", _EXIT_OUTPUT)
     main_duration_ms = mp3_duration_ms(ffprobe_path, paths.full_mp3)
+    logger.event("info", "concat_complete", output=paths.full_mp3.name, duration_ms=main_duration_ms)
     run_manifest = build_run_manifest(chunks_manifest, paths, main_duration_ms)
     try:
         write_json(paths.run_json, run_manifest)
@@ -481,6 +633,7 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
     timing_info = None
     if getattr(args, "with_timings", False):
         try:
+            logger.event("info", "timings_started", audio=paths.full_mp3.name)
             timing_info = _extract_timings(
                 audio_path=paths.full_mp3, output_dir=paths.output_root, prefix=paths.prefix,
                 model=args.timing_model, device=args.timing_device,
@@ -488,8 +641,10 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
                 word_timestamps=args.word_timestamps, quiet=args.json_output,
             )
         except ModuleNotFoundError as exc:
-            fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --group timing-whisper", _EXIT_MISSING_DEP)
+            logger.event("error", "timings_failed", error=str(exc))
+            fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
         except Exception as exc:
+            logger.event("error", "timings_failed", error=str(exc))
             fail(
                 f"Voiceover generated but timing extraction failed: {exc}",
                 _EXIT_WHISPER,
@@ -502,6 +657,12 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         fail(f"Failed to write manifest.json: {e}", _EXIT_OUTPUT)
 
     files = _list_artifact_files(paths)
+    state["status"] = "completed"
+    state["full_mp3"] = str(paths.full_mp3)
+    state["main_duration_ms"] = main_duration_ms
+    atomic_write_json(state_path, state)
+    logger.event("info", "run_complete", run_id=paths.prefix, duration_ms=main_duration_ms)
+    _emit_json_event(args, "run_complete", run_id=paths.prefix, duration_ms=main_duration_ms)
     if args.json_output:
         _json_ok({
             "status": "success", "provider": args.provider, "model": args.model,
@@ -572,7 +733,7 @@ def run_timings(args: argparse.Namespace) -> None:
             quiet=args.json_output,
         )
     except ModuleNotFoundError as exc:
-        fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --group timing-whisper", _EXIT_MISSING_DEP)
+        fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
     except Exception as exc:
         fail(f"Whisper timing failed: {exc}", _EXIT_WHISPER)
 
@@ -584,6 +745,82 @@ def run_timings(args: argparse.Namespace) -> None:
         print(f"Timings JSON: {files['timings_json']}")
         print(f"SRT: {files['srt']}")
         print(f"Segments: {timing['segment_count']}")
+
+
+def status_cmd(args: argparse.Namespace) -> None:
+    if args.run_id:
+        _validate_run_id(args.run_id)
+    run_dir = (Path(args.output_dir) / args.run_id).resolve()
+    state = load_state(run_dir / STATE_FILE)
+    chunks_dir = run_dir / "chunks"
+    chunk_files = _continuous_chunk_files(chunks_dir)
+    total = int(state.get("chunk_count", len(chunk_files)) if state else len(chunk_files))
+    ready = int(state.get("completed_count", len(chunk_files)) if state else len(chunk_files))
+    if state:
+        ready = len(completed_numbers(state))
+    next_chunk = ready + 1 if total == 0 or ready < total else None
+    full_audio = _find_full_audio(run_dir)
+    timings_json = list(run_dir.glob("*.timings.json"))
+    errors = state.get("errors", []) if state else []
+    can_resume = run_dir.exists() and ready < total and bool(state or chunk_files)
+    data = {
+        "status": "success",
+        "run_id": args.run_id,
+        "run_dir": str(run_dir),
+        "exists": run_dir.exists(),
+        "total_chunks": total,
+        "completed_chunks": ready,
+        "next_chunk": next_chunk,
+        "full_audio_exists": bool(full_audio),
+        "full_audio": str(full_audio) if full_audio else None,
+        "timings_exists": bool(timings_json),
+        "errors": errors,
+        "can_resume": can_resume,
+    }
+    if args.json_output:
+        _json_ok(data)
+    print(f"Run: {args.run_id}")
+    print(f"Chunks: {ready} of {total}")
+    print(f"Next chunk: {next_chunk if next_chunk is not None else 'none'}")
+    print(f"Full audio: {'yes' if full_audio else 'no'}")
+    print(f"Timings: {'yes' if timings_json else 'no'}")
+    print(f"Errors: {len(errors)}")
+    print(f"Can resume: {'yes' if can_resume else 'no'}")
+
+
+def concat_cmd(args: argparse.Namespace) -> None:
+    try:
+        ffmpeg_path, _ffprobe_path = check_media_tools()
+    except RuntimeError as e:
+        fail(str(e), _EXIT_NO_FFMPEG)
+    _validate_run_id(args.run_id)
+    run_dir = (Path(args.output_dir) / args.run_id).resolve()
+    state = load_state(run_dir / STATE_FILE)
+    chunks_dir = run_dir / "chunks"
+    chunk_files = _continuous_chunk_files(chunks_dir)
+    if not chunk_files:
+        fail(f"No contiguous chunk_*.mp3 files found in {chunks_dir}", _EXIT_ARGS)
+    total = int(state.get("chunk_count", len(chunk_files)) if state else len(chunk_files))
+    ready = len(chunk_files)
+    kind = "full" if ready >= total else "partial"
+    output_path = run_dir / f"{kind}-{ready}-of-{total}.{args.format}"
+    try:
+        concat_audio_files(ffmpeg_path, chunk_files, output_path)
+    except Exception as e:
+        fail(f"Failed to concat existing chunks: {e}", _EXIT_OUTPUT)
+    data = {
+        "status": "success",
+        "run_id": args.run_id,
+        "partial": ready < total,
+        "completed_chunks": ready,
+        "total_chunks": total,
+        "file": str(output_path),
+    }
+    if args.json_output:
+        _json_ok(data)
+    print(f"Wrote {output_path}")
+    if ready < total:
+        print(f"Partial file: {ready} of {total} chunks")
 
 
 def doctor_cmd(args: argparse.Namespace) -> None:
@@ -645,7 +882,7 @@ def doctor_cmd(args: argparse.Namespace) -> None:
     if not cuda_available and need_cuda:
         warnings.append("CUDA is unavailable but required for the selected provider or timing device.")
     if not whisper_ok and need_whisper:
-        warnings.append("faster-whisper is not installed. Install with: uv sync --group timing-whisper")
+        warnings.append("faster-whisper is not installed. Install with: uv sync --extra timing-whisper")
     if not polza_ok and need_polza:
         warnings.append("POLZA_API_KEY is missing. Set it in .env: POLZA_API_KEY=...")
     if not or_ok and need_or:
@@ -808,6 +1045,87 @@ def list_cmd(args: argparse.Namespace) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def _preflight_timing_dependency() -> None:
+    try:
+        import faster_whisper  # noqa: F401
+    except ModuleNotFoundError as exc:
+        fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
+
+
+def _has_paid_chunk_audio(paths) -> bool:
+    return paths.chunks_dir.exists() and any(paths.chunks_dir.glob("chunk_*.mp3"))
+
+
+def _emit_json_event(args, event: str, **fields) -> None:
+    if not getattr(args, "json_events", False):
+        return
+    print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
+
+
+def _log_retry(logger: GenerationLogger, args, chunk: ScriptChunk, attempt: int, error: BaseException, delay: float) -> None:
+    logger.event(
+        "warn",
+        "chunk_retry",
+        chunk=chunk.number,
+        id=chunk.id,
+        attempt=attempt,
+        delay_sec=round(delay, 2),
+        error=str(error),
+    )
+    _emit_json_event(args, "chunk_retry", chunk=chunk.number, id=chunk.id, attempt=attempt, error=str(error))
+
+
+def _recover_existing_chunks(
+    state: dict,
+    chunks: list[ScriptChunk],
+    chunks_dir: Path,
+    ffprobe_path: str,
+    model: str,
+    voice: str,
+) -> None:
+    total_duration_ms = 0
+    for chunk in chunks:
+        path = chunks_dir / f"{chunk.id}.mp3"
+        if not path.exists():
+            break
+        duration_ms = mp3_duration_ms(ffprobe_path, path)
+        start_ms = total_duration_ms
+        end_ms = start_ms + duration_ms
+        total_duration_ms = end_ms
+        artifact = ChunkArtifact(
+            number=chunk.number,
+            id=chunk.id,
+            file=path.name,
+            duration_ms=duration_ms,
+            duration_sec=round(duration_ms / 1000, 3),
+            start_ms=start_ms,
+            end_ms=end_ms,
+            text_characters=len(chunk.text),
+            transcript=None,
+            client_path="recovered-from-existing-file",
+            generation_id=None,
+        )
+        upsert_completed_chunk(state, artifact=artifact, model=model, voice=voice, text=chunk.text)
+
+
+def _continuous_chunk_files(chunks_dir: Path) -> list[Path]:
+    files = []
+    number = 1
+    while True:
+        path = chunks_dir / f"chunk_{number:02d}.mp3"
+        if not path.exists():
+            break
+        files.append(path)
+        number += 1
+    return files
+
+
+def _find_full_audio(run_dir: Path) -> Path | None:
+    for path in sorted(run_dir.glob("*-voiceover-*.mp3")):
+        if path.is_file():
+            return path
+    return None
 
 def _resolve_audio(raw: str) -> Path:
     if "*" in raw or "?" in raw:

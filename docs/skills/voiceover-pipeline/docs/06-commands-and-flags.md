@@ -1,7 +1,7 @@
 # Команды и флаги: полный CLI-справочник
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
-> Здесь: все 8 команд, флаги, exit codes, JSON-контракт, правила безопасности.
+> Здесь: команды, флаги, exit codes, JSON-контракт, правила безопасности.
 
 ## Команды
 
@@ -15,6 +15,8 @@
 | `split --script` | Разбить сценарий на чанки (без генерации) | Да |
 | `generate` | Полная генерация: TTS + MP3 + опционально тайминги | Да |
 | `timings --audio` | Извлечь Whisper-тайминги из готового MP3 | Да |
+| `status --run-id` | Проверить partial/resumable run | Да |
+| `concat --run-id` | Склеить существующие chunks в partial/full файл | Да |
 
 Все команды поддерживают `--json` для машинно-читаемого вывода.
 
@@ -76,8 +78,17 @@
 | `--no-style-prompt` | flag | false | Отключить prompt полностью |
 | `--no-trim` | flag | false | Не обрезать финальную тишину |
 | `--json` | flag | false | JSON-вывод в stdout |
+| `--json-events` | flag | false | NDJSON progress events: `chunk_started`, `chunk_saved`, `chunk_failed`, `run_complete` |
 | `--overwrite` | flag | false | Удалить существующую папку прогона |
+| `--confirm-delete-paid-audio` | flag | false | Разрешить `--overwrite` удалить существующие `chunk_*.mp3` |
 | `--skip-existing` | flag | false | Пропустить если прогон уже есть |
+| `--resume` | flag | false | Продолжить interrupted run без повторной генерации готовых chunks |
+| `--retries` | int | `3` | Количество попыток на retryable provider error |
+| `--retry-delay` | float | `2.0` | Начальная задержка retry в секундах |
+| `--retry-max-delay` | float | `30.0` | Максимальная задержка retry |
+| `--no-retry` | flag | false | Отключить retry |
+| `--limit-chunks` | int | — | Сгенерировать только первые N chunks для теста |
+| `--dry-run-cost` | flag | false | Посчитать chunks/chars без TTS-запросов |
 
 ### Qwen-local опции
 
@@ -91,7 +102,7 @@
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
-| `--with-timings` | flag | false | Запустить Whisper после TTS |
+| `--with-timings` | flag | false | Запустить Whisper после TTS; dependency preflight выполняется до TTS |
 | `--timing-model` | choice | `small` | `base`, `small`, `medium`, `large-v3-turbo`, `large-v3` |
 | `--timing-device` | choice | `cpu` | `auto`, `cpu`, `cuda` |
 | `--timing-compute` | choice | `int8` | `auto`, `int8`, `int8_float16`, `float16`, `float32` |
@@ -113,6 +124,9 @@
 Генерация с metadata-форматом блокируется, если `valid: false`.
 
 ## Команда `timings` — флаги
+
+Рекомендуемый production flow: сначала `generate` для платного аудио, затем
+отдельно `timings`. Это отделяет TTS от распознавания и упрощает recovery.
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
@@ -179,8 +193,10 @@ voiceover list voices --provider polza-tts --json
 | Ситуация | Поведение |
 |---|---|
 | Папка не существует | Создать |
-| Папка существует + `--overwrite` | Удалить папку полностью, создать заново |
+| Папка существует + `--overwrite` без chunks | Удалить папку полностью, создать заново |
+| Папка существует + `--overwrite` + chunks | Ошибка без `--confirm-delete-paid-audio` |
 | Папка существует + `--skip-existing` | Вернуть `status: skipped`, не менять файлы |
+| Папка существует + `--resume` | Продолжить с первого несохранённого chunk |
 | Папка существует без флагов | Ошибка exit code 30 |
 
 ## Safe defaults

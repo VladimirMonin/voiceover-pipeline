@@ -31,10 +31,9 @@ voiceover generate `
   --model "openai/gpt-audio-mini" `
   --script "script.md" `
   --run-id "prod" `
-  --with-timings `
-  --word-timestamps `
   --json `
-  --overwrite
+  --resume
+voiceover timings --audio "out/prod/prod-voiceover-openai-gpt-audio-mini.mp3" --run-id "prod" --json --overwrite
 ```
 
 ## Golden Cloud Workflow — Polza TTS (рубли, классический TTS)
@@ -50,10 +49,8 @@ voiceover generate `
   --voice "ash" `
   --script "script.md" `
   --run-id "prod" `
-  --with-timings `
-  --word-timestamps `
   --json `
-  --overwrite
+  --resume
 ```
 
 ElevenLabs через Polza — async `/media`, чистое качество:
@@ -65,9 +62,8 @@ voiceover generate `
   --voice "Rachel" `
   --script "script.md" `
   --run-id "elevenlabs" `
-  --with-timings `
   --json `
-  --overwrite
+  --resume
 ```
 
 ## Golden Cloud Workflow — OpenRouter (доллары)
@@ -81,10 +77,8 @@ voiceover generate `
   --voice "Puck" `
   --script "script.md" `
   --run-id "gemini-prod" `
-  --with-timings `
-  --word-timestamps `
   --json `
-  --overwrite
+  --resume
 ```
 
 OpenAI TTS через OpenRouter — самый дешёвый TTS в долларах:
@@ -96,9 +90,8 @@ voiceover generate `
   --voice "alloy" `
   --script "script.md" `
   --run-id "openai-or" `
-  --with-timings `
   --json `
-  --overwrite
+  --resume
 ```
 
 С style prompt (Gemini):
@@ -112,7 +105,7 @@ voiceover generate `
   --script "script.md" `
   --run-id "podcast-ep1" `
   --json `
-  --overwrite
+  --resume
 ```
 
 С длинным prompt из файла (WVM-ассеты, expressive, stutter):
@@ -126,7 +119,7 @@ voiceover generate `
   --script "script.md" `
   --run-id "wvm-expressive" `
   --json `
-  --overwrite
+  --resume
 ```
 
 Без prompt (чистый Gemini TTS):
@@ -140,7 +133,7 @@ voiceover generate `
   --script "script.md" `
   --run-id "gemini-clean" `
   --json `
-  --overwrite
+  --resume
 ```
 
 ## Qwen Local Workflow (бесплатно, GPU)
@@ -156,7 +149,7 @@ voiceover generate `
   --script "script.md" `
   --run-id "qwen-prod" `
   --json `
-  --overwrite
+  --resume
 ```
 
 Clone-голос (нужен референс-аудиофайл):
@@ -170,7 +163,7 @@ voiceover generate `
   --script "script.md" `
   --run-id "my-voice" `
   --json `
-  --overwrite
+  --resume
 ```
 
 ## Timings из готового MP3
@@ -194,9 +187,10 @@ voiceover timings `
 ## Безопасный повторный запуск
 
 ```powershell
-voiceover generate ... --overwrite         # перезаписать
+voiceover generate ... --resume            # продолжить безопасно
 voiceover generate ... --skip-existing     # пропустить если есть
 voiceover generate ... --run-id "prod-02"  # новый run-id
+voiceover generate ... --overwrite --confirm-delete-paid-audio  # удалить paid chunks явно
 ```
 
 ## Интеграция с Remotion (полный поток)
@@ -208,14 +202,17 @@ voiceover generate ... --run-id "prod-02"  # новый run-id
 2. Проверка:
    voiceover doctor --provider polza-chat-audio --with-timings --json
 
-3. Генерация:
-   voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini" --script "script.md" --run-id "production" --with-timings --word-timestamps --json --overwrite
+3. Генерация аудио:
+   voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini" --script "script.md" --run-id "production" --json --resume
 
-4. Чтение артефактов:
+4. Тайминги:
+   voiceover timings --audio "out/production/production-voiceover-openai-gpt-audio-mini.mp3" --run-id "production" --word-timestamps --json --overwrite
+
+5. Чтение артефактов:
    manifest = json.load(open("out/production/manifest.json"))
    timings = json.load(open(manifest["timings_json"]))
 
-5. Использование в Remotion:
+6. Использование в Remotion:
    for seg in timings["segments"]:
        scene = {
            "start_ms": seg["start_ms"],

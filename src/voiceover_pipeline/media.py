@@ -188,9 +188,12 @@ def trim_final_silence(ffmpeg_path: str, ffprobe_path: str, input_path: Path) ->
 
 
 def concat_mp3_chunks(ffmpeg_path: str, chunks_dir: Path, output_path: Path) -> None:
-    chunk_paths = sorted(chunks_dir.glob("chunk_*.mp3"))
+    concat_audio_files(ffmpeg_path, sorted(chunks_dir.glob("chunk_*.mp3")), output_path)
+
+
+def concat_audio_files(ffmpeg_path: str, chunk_paths: list[Path], output_path: Path) -> None:
     if not chunk_paths:
-        raise RuntimeError(f"No chunk_*.mp3 files found in {chunks_dir}")
+        raise RuntimeError("No audio chunk files provided for concat")
 
     concat_list = output_path.with_suffix(".concat.txt")
     concat_list.write_text(
@@ -210,9 +213,8 @@ def concat_mp3_chunks(ffmpeg_path: str, chunks_dir: Path, output_path: Path) -> 
                 "-i",
                 str(concat_list),
                 "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                MP3_BITRATE,
+                _concat_codec(output_path),
+                *(_concat_bitrate_args(output_path)),
                 str(output_path),
             ],
             stdout=subprocess.PIPE,
@@ -223,3 +225,15 @@ def concat_mp3_chunks(ffmpeg_path: str, chunks_dir: Path, output_path: Path) -> 
             raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
     finally:
         concat_list.unlink(missing_ok=True)
+
+
+def _concat_codec(output_path: Path) -> str:
+    if output_path.suffix.lower() == ".ogg":
+        return "libopus"
+    return "libmp3lame"
+
+
+def _concat_bitrate_args(output_path: Path) -> list[str]:
+    if output_path.suffix.lower() == ".ogg":
+        return ["-b:a", "96k"]
+    return ["-b:a", MP3_BITRATE]
