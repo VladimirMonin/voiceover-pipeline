@@ -23,6 +23,14 @@ from .models import ScriptChunk
 
 
 VOICEOVER_FORMAT = "voiceover"
+PROMPT_SKELETON_MARKERS = [
+    "Synthesize speech",
+    "AUDIO PROFILE",
+    "SCENE",
+    "PERFORMANCE",
+    "CONTEXT",
+    "#### TRANSCRIPT",
+]
 SUPPORTED_PROVIDERS = ["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"]
 POLZA_CHAT_AUDIO_MODELS = ["openai/gpt-audio-mini", "openai/gpt-audio"]
 POLZA_CHAT_AUDIO_VOICES = ["ash", "ballad", "coral", "verse", "marin", "cedar", "echo", "sage", "shimmer", "onyx"]
@@ -218,6 +226,14 @@ def validate_plain_chunk(chunk: dict[str, Any], max_chunk_chars: int, agent: boo
         ))
     if any(ch.isdigit() for ch in text):
         warnings.append(warning("CONTAINS_DIGITS", "Chunk contains digits; TTS pronunciation may be unexpected.", chunk=chunk["chunk"]))
+    leaked_markers = [marker for marker in PROMPT_SKELETON_MARKERS if marker in text]
+    if leaked_markers:
+        warnings.append(warning(
+            "PROMPT_SKELETON_IN_BODY",
+            "Prompt direction markers found in the spoken body. Move direction into frontmatter style_prompt/prompt and keep body as transcript only.",
+            chunk=chunk["chunk"],
+            actual=leaked_markers,
+        ))
     return {
         "chunk": chunk["chunk"],
         "line_start": chunk["line_start"],

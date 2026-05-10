@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.5
+
+### Gemini Prompting Guide
+
+- Added a practical Gemini 3.1 Flash TTS prompting guide for voice direction, scene/profile/performance structure, English audio tags, emotion recipes, voice selection, chunk sizing, and production anti-patterns.
+- Added README guidance for Gemini prompting: treat Gemini TTS as a directed voice performer, keep service directions separate from transcript, use `PERFORMANCE` for global emotion and inline tags for local delivery changes.
+- Expanded default Gemini dialogue safe tags with practical production tags such as `[thoughtfully]`, `[medium pause]`, `[long pause]`, `[gasp]`, `[cough]`, `[uhm]`, `[panicked]`, `[trembling]`, and `[shouting]`.
+- Updated bundled and installed OpenCode skills to point agents at the new Gemini prompting guide.
+
+### Tests
+
+- 120 pytest tests, including coverage for the expanded Gemini dialogue safe tag set.
+
 ## 0.4.4
 
 ### Generation Stability

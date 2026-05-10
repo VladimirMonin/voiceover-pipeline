@@ -15,14 +15,14 @@ description: >
   whisper timing, аудио для видео, подкаст, generate audio, timings for
   Remotion, voiceover-pipeline, выбери провайдера, сравни модели TTS,
   голос для озвучки, format: voiceover, gemini-dialogue, --resume,
-  status run, concat partial audio.
+  status run, concat partial audio, Gemini prompting, audio tags.
 ---
 # Voiceover Pipeline — навык агента
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-> **Совместимость:** voiceover-pipeline 0.4.4, skill revision 2026-05-10.
+> **Совместимость:** voiceover-pipeline 0.4.5, skill revision 2026-05-10.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение
@@ -81,6 +81,8 @@ description: >
 | По ситуации | [docs/08-workflows.md](docs/08-workflows.md) | Нужен готовый end-to-end сценарий |
 | По ситуации | [docs/09-troubleshooting.md](docs/09-troubleshooting.md) | Что-то пошло не так |
 | По ситуации | [docs/10-evaluation.md](docs/10-evaluation.md) | Проверить качество навыка |
+| По ситуации | [docs/11-gemini-prompting.md](docs/11-gemini-prompting.md) | Нужна режиссура Gemini TTS, audio tags, эмоции, chunk limits |
+| По ситуации | [docs/12-gemini-prompting-templates.md](docs/12-gemini-prompting-templates.md) | Нужны project-native Gemini examples, prompt templates, QA checklist |
 | Примеры | [examples/](examples/) | Нужен образец сценария, .env.example, Remotion-поток |
 
 ## Обязательный быстрый алгоритм

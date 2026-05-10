@@ -12,19 +12,42 @@ DEFAULT_MAX_CHUNK_BYTES = 3500
 HARD_MAX_CHUNK_BYTES = 4000
 DEFAULT_ALLOWED_TAGS = {
     "amazed",
+    "calmly",
+    "confidently",
+    "cough",
     "crying",
     "curious",
     "excited",
     "excitedly",
+    "gasp",
     "gently",
+    "giggles",
     "laughs",
+    "long pause",
+    "medium pause",
+    "mischievously",
+    "panicked",
     "sadly",
+    "sarcastic",
     "serious",
+    "shouting",
     "short pause",
     "sighs",
+    "thoughtfully",
+    "tired",
+    "trembling",
+    "uhm",
     "warmly",
     "whispers",
 }
+PROMPT_SKELETON_MARKERS = [
+    "Synthesize speech",
+    "AUDIO PROFILE",
+    "SCENE",
+    "PERFORMANCE",
+    "CONTEXT",
+    "#### TRANSCRIPT",
+]
 
 _SPEAKER_RE = re.compile(r"^([A-Za-z0-9]+):\s*(.*)$")
 _TAG_RE = re.compile(r"\[([^\[\]\n]+)\]")
@@ -364,6 +387,16 @@ def validate_chunk(
             continue
         match = _SPEAKER_RE.match(line)
         if not match:
+            if any(marker in line for marker in PROMPT_SKELETON_MARKERS):
+                errors.append(error(
+                    "PROMPT_SKELETON_IN_DIALOGUE_BODY",
+                    "Do not paste the full Gemini prompt skeleton into the dialogue body. Put direction in frontmatter (vibe/profile) and keep body as SpeakerAlias: spoken text only.",
+                    chunk=chunk["chunk"],
+                    line=line_no,
+                    snippet=line if agent else None,
+                    suggested_fix="Move AUDIO PROFILE/SCENE/PERFORMANCE/CONTEXT into frontmatter fields, then keep only Speaker1: and Speaker2: lines in the body.",
+                ))
+                continue
             errors.append(error(
                 "LINE_WITHOUT_SPEAKER",
                 "Every non-empty dialogue line must start with SpeakerAlias: text.",

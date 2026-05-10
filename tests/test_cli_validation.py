@@ -149,9 +149,15 @@ def write_gemini_dialogue(tmp_path, body, extra_meta=""):
             "    profile: energetic co-host",
             "allowed_tags:",
             "  - warmly",
+            "  - calmly",
             "  - laughs",
+            "  - cough",
             "  - crying",
             "  - curious",
+            "  - gasp",
+            "  - medium pause",
+            "  - thoughtfully",
+            "  - uhm",
             "max_chunk_bytes: 3500",
             extra_meta.rstrip(),
             "---",
@@ -204,6 +210,26 @@ class TestGeminiDialogueValidation:
         chunk_errors = [item for item in data["errors"] if item["code"] == "CHUNK_TOO_LARGE"]
         assert chunk_errors
         assert chunk_errors[0]["chunk"] == 2
+
+    def test_gemini_dialogue_default_safe_tags_from_prompting_guide(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [thoughtfully] Сначала спокойно. [medium pause] Потом пауза.\n"
+            "Speaker2: [gasp] Ого. [cough] Простите. [uhm] Продолжим.",
+        )
+        code, data = cli_json("validate", "--script", str(script), "--format", "gemini-dialogue", "--json")
+        assert code == 0
+        assert data["valid"] is True
+
+    def test_gemini_dialogue_detects_prompt_skeleton_in_body(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "#### TRANSCRIPT\nSpeaker1: Это уже реплика.",
+        )
+        code, data = cli_json("validate", "--script", str(script), "--format", "gemini-dialogue", "--agent", "--json")
+        assert code == 0
+        assert data["valid"] is False
+        assert any(item["code"] == "PROMPT_SKELETON_IN_DIALOGUE_BODY" for item in data["errors"])
 
 
 def write_voiceover_script(tmp_path, meta_lines, body="Первый чанк.\n******\nВторой чанк."):
@@ -282,3 +308,15 @@ class TestVoiceoverMetadataValidation:
         assert data["effective_config"]["provider"] == "openrouter-tts"
         assert data["effective_config"]["model"] == "openai/gpt-4o-mini-tts-2025-12-15"
         assert data["effective_config"]["voice"] == "alloy"
+
+    def test_voiceover_metadata_warns_about_prompt_skeleton_in_body(self, tmp_path):
+        script = write_voiceover_script(tmp_path, [
+            "format: voiceover",
+            "provider: openrouter-tts",
+            "model: google/gemini-3.1-flash-tts-preview",
+            "voice: Puck",
+        ], body="#### TRANSCRIPT\n[thoughtfully] Это тело, но маркер prompt skeleton здесь лишний.")
+        code, data = cli_json("validate", "--script", str(script), "--format", "voiceover", "--json")
+        assert code == 0
+        assert data["valid"] is True
+        assert any(item["code"] == "PROMPT_SKELETON_IN_BODY" for item in data["warnings"])

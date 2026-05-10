@@ -81,6 +81,39 @@ max_chunk_chars: 2000
 Для Gemini 3.1 Flash TTS podcasts доступен `format: gemini-dialogue` с двумя
 спикерами, voice map и inline tags вроде `[laughs]`, `[serious]`, `[short pause]`.
 
+### Gemini prompting quick guide
+
+Gemini TTS works best as a directed voice performer, not as plain text-to-speech.
+Keep instructions separate from spoken transcript: `AUDIO PROFILE`, `SCENE`,
+`PERFORMANCE`, `CONTEXT`, then `#### TRANSCRIPT`.
+
+```text
+Synthesize speech for the performance defined below.
+The profile, scene, performance notes, and context are direction only.
+Do NOT speak them.
+Speak ONLY the lines under #### TRANSCRIPT.
+
+### PERFORMANCE
+Style: Warm, thoughtful, conversational, emotionally alive.
+Pace: Natural podcast pace with small pauses after important ideas.
+Accent: Natural Russian speech.
+
+#### TRANSCRIPT
+[thoughtfully] Сегодня разберём Gemini TTS, [short pause] и почему хороший голос начинается с режиссуры.
+```
+
+Use English service directions and English audio tags; keep the transcript in the
+target language. Use `PERFORMANCE` for global emotion and inline tags such as
+`[thoughtfully]`, `[sighs]`, `[laughs]`, `[gasp]`, `[medium pause]` for local
+delivery changes. For long podcasts, prefer semantic chunks of roughly 250-450
+Russian words, or 180-350 words for emotional material.
+
+Do not paste the whole prompt skeleton into the script body. In this project,
+put direction into `style_prompt`, `vibe`, and speaker `profile`; keep body text
+as spoken transcript only. See the full guides:
+`docs/skills/voiceover-pipeline/docs/11-gemini-prompting.md` and
+`docs/skills/voiceover-pipeline/docs/12-gemini-prompting-templates.md`.
+
 Результат (JSON stdout):
 
 ```json
@@ -139,14 +172,14 @@ uv sync --group dev --extra timing-whisper
 uv run pytest
 ```
 
-117 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes, script metadata, resume/retry/state/log/status/concat safety.
+120 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes, script metadata, resume/retry/state/log/status/concat safety, Gemini safe tags.
 
 ## Agent Skill
 
 OpenCode agent skill — устанавливает pipeline, выбирает провайдера, генерирует озвучку:
 
-- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.4/docs/skills/voiceover-pipeline
-- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.4
+- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.5/docs/skills/voiceover-pipeline
+- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.5
 
 ## Legal / Provider Notes
 
@@ -171,4 +204,6 @@ MIT. See [LICENSE](LICENSE).
 - [Polza TTS Models](docs/polza-tts-models.md) — OpenAI TTS, ElevenLabs через Polza AI
 - [OpenRouter TTS](docs/openrouter-tts-models.md) — Gemini, OpenAI TTS через OpenRouter
 - [OpenCode Skill](docs/skills/voiceover-pipeline/SKILL.md) — Agent skill для установки и озвучки
+- [Gemini Prompting Skill Guide](docs/skills/voiceover-pipeline/docs/11-gemini-prompting.md) — режиссура Gemini TTS, эмоции, теги, chunk limits
+- [Gemini Prompting Templates](docs/skills/voiceover-pipeline/docs/12-gemini-prompting-templates.md) — project-native examples, шаблоны, QA checklist
 - [Qwen Local](docs/qwen-local-tts.md) — preset-голоса, клонирование, GPU
