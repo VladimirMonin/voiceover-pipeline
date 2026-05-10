@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.3
+
+### Unified Script Metadata
+
+- Added `format: voiceover` frontmatter for single-speaker providers: provider/service, model, voice, fallback voice, style prompt, and chunk limits can now live in the Markdown script.
+- Added auto-detection for metadata scripts in `validate` and `generate`; plain delimiter-based Markdown remains backward compatible.
+- Added full-error validation for metadata scripts so agents receive all provider/model/voice/chunk defects in one JSON report.
+- Added CLI overrides for metadata scripts: `--provider`, `--model`, and `--voice` override frontmatter.
+
+### Gemini Dialogue
+
+- Added `format: gemini-dialogue` for OpenRouter Gemini 3.1 Flash TTS with two speakers, per-speaker Gemini voices, shared style prompt, and inline emotion tags.
+- Added OpenRouter Gemini multi-speaker payload support with `multi_speaker_voice_config` while preserving OpenRouter's required top-level `voice` field.
+- Added strict UTF-8 byte validation for Gemini dialogue chunks to catch oversized final chunks before paid generation.
+
+### Tests
+
+- 109 pytest tests covering metadata validation, Gemini dialogue validation, backward compatibility for plain Markdown, and provider payload regressions.
+
 ## 0.4.2
 
 ### Gemini Native Prompt Support

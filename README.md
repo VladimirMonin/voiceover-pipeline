@@ -5,6 +5,7 @@ Standalone CLI для генерации озвучки + Whisper timing из Ma
 Четыре TTS-провайдера: Polza GPT Audio, Polza TTS, OpenRouter TTS, Qwen3-TTS (GPU).
 Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
 Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
+Сценарии могут быть plain Markdown или Markdown с frontmatter metadata для provider/model/voice.
 
 ## Install
 
@@ -56,6 +57,27 @@ voiceover generate `
   --json `
   --overwrite
 ```
+
+### Metadata script
+
+```markdown
+---
+format: voiceover
+provider: polza-tts
+model: openai/gpt-4o-mini-tts
+voice: ash
+max_chunk_chars: 2000
+---
+
+Первый фрагмент озвучки.
+
+******
+
+Второй фрагмент озвучки.
+```
+
+Для Gemini 3.1 Flash TTS podcasts доступен `format: gemini-dialogue` с двумя
+спикерами, voice map и inline tags вроде `[laughs]`, `[serious]`, `[short pause]`.
 
 Результат (JSON stdout):
 
@@ -111,14 +133,14 @@ uv sync --group dev --extra timing-whisper
 uv run pytest
 ```
 
-98 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes.
+109 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes, script metadata.
 
 ## Agent Skill
 
 OpenCode agent skill — устанавливает pipeline, выбирает провайдера, генерирует озвучку:
 
-- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.2/docs/skills/voiceover-pipeline
-- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.2
+- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.3/docs/skills/voiceover-pipeline
+- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.3
 
 ## Legal / Provider Notes
 

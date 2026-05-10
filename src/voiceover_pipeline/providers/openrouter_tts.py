@@ -23,6 +23,7 @@ class OpenRouterTTSProvider(TTSProvider):
         voice: str,
         style_prompt: str | None = PODCAST_NARRATION_PROMPT,
         prompt_mode: str = "auto",
+        speaker_voice_map: dict[str, str] | None = None,
         base_url: str = OPENROUTER_BASE_URL,
         response_format: str = "pcm",
         timeout_seconds: int = 240,
@@ -31,6 +32,7 @@ class OpenRouterTTSProvider(TTSProvider):
         self.model = model
         self.voice = voice
         self.style_prompt = style_prompt
+        self.speaker_voice_map = speaker_voice_map or {}
         self.fallback_style_prompt = PODCAST_NARRATION_FALLBACK_PROMPT
         self._raw_prompt_mode = prompt_mode
         self.prompt_mode = resolve_prompt_mode(self.provider_id, model, prompt_mode)
@@ -63,6 +65,18 @@ class OpenRouterTTSProvider(TTSProvider):
             style_prompt=style_prompt,
             prompt_mode=self.prompt_mode,
         )
+        if self.speaker_voice_map:
+            body["multi_speaker_voice_config"] = {
+                "speaker_voice_configs": [
+                    {
+                        "speaker": speaker,
+                        "voice_config": {
+                            "prebuilt_voice_config": {"voice_name": voice}
+                        },
+                    }
+                    for speaker, voice in self.speaker_voice_map.items()
+                ]
+            }
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
@@ -89,5 +103,6 @@ class OpenRouterTTSProvider(TTSProvider):
                 "provider": self.provider_id,
                 "style_prompt": style_prompt,
                 "prompt_mode": self.prompt_mode,
+                "speaker_voice_map": self.speaker_voice_map,
             },
         )

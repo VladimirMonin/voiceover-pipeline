@@ -67,6 +67,9 @@
 | `--output-dir` | path | `out` | Корень выходной директории |
 | `--run-id` | str | авто | Имя прогона (только `[a-zA-Z0-9._-]`) |
 | `--voice` | str | зависит от провайдера | Голос |
+| `--format` | choice | `markdown` | `markdown`, `voiceover` или `gemini-dialogue` |
+| `--max-chunk-chars` | int | `2000` | Validation limit для `voiceover` metadata scripts |
+| `--speaker-voice` | repeat | — | Override для Gemini dialogue: `Speaker1=Puck` |
 | `--fallback-voice` | str | `onyx` | Запасной голос для Polza Chat Audio |
 | `--style-prompt` | str | дефолтный | Стиль подачи для TTS (OpenRouter Gemini) |
 | `--style-prompt-file` | path | — | Читать prompt из файла |
@@ -94,6 +97,20 @@
 | `--timing-compute` | choice | `int8` | `auto`, `int8`, `int8_float16`, `float16`, `float32` |
 | `--timing-language` | str | `ru` | Код языка для Whisper |
 | `--word-timestamps` | flag | false | Добавить word-level тайминги |
+
+### `validate` Gemini dialogue options
+
+| Флаг | Тип | Default | Назначение |
+|---|---|---|---|
+| `--format` | choice | `markdown` | Включить `voiceover` или `gemini-dialogue` валидатор |
+| `--provider` | choice | frontmatter | Override provider для `voiceover` metadata |
+| `--model` | str | frontmatter | Override/check model for metadata format |
+| `--voice` | str | frontmatter | Override voice для `voiceover` metadata |
+| `--speaker-voice` | repeat | — | Override voice map: `Speaker2=Kore` |
+| `--agent` | flag | false | Добавить snippets и suggested fixes в JSON |
+
+`voiceover` и `gemini-dialogue` валидаторы возвращают все ошибки за один прогон.
+Генерация с metadata-форматом блокируется, если `valid: false`.
 
 ## Команда `timings` — флаги
 

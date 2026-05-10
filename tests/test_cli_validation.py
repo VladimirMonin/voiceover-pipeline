@@ -128,3 +128,157 @@ class TestStylePromptFlags:
 
         ns = argparse.Namespace(style_prompt=None, style_prompt_file=None, no_style_prompt=False)
         assert _resolve_style_prompt(ns) == PODCAST_NARRATION_PROMPT
+
+
+def write_gemini_dialogue(tmp_path, body, extra_meta=""):
+    script = tmp_path / "dialogue.md"
+    script.write_text(
+        "\n".join([
+            "---",
+            "format: gemini-dialogue",
+            "language: ru",
+            "model: google/gemini-3.1-flash-tts-preview",
+            "speakers:",
+            "  Speaker1:",
+            "    display_name: Первый диктор",
+            "    voice: Puck",
+            "    profile: calm host",
+            "  Speaker2:",
+            "    display_name: Второй диктор",
+            "    voice: Kore",
+            "    profile: energetic co-host",
+            "allowed_tags:",
+            "  - warmly",
+            "  - laughs",
+            "  - crying",
+            "  - curious",
+            "max_chunk_bytes: 3500",
+            extra_meta.rstrip(),
+            "---",
+            body,
+        ]),
+        encoding="utf-8",
+    )
+    return script
+
+
+class TestGeminiDialogueValidation:
+    def test_valid_gemini_dialogue_script(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
+        )
+        code, data = cli_json("validate", "--script", str(script), "--format", "gemini-dialogue", "--json")
+        assert code == 0
+        assert data["valid"] is True
+        assert data["speaker_voice_map"] == {"Speaker1": "Puck", "Speaker2": "Kore"}
+        assert data["chunk_reports"][0]["turn_count"] == 2
+
+    def test_gemini_dialogue_reports_all_errors(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker3: [angry] Неизвестный спикер.\n"
+            "Это строка без спикера.\n"
+            "Speaker1:",
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--agent", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        codes = {item["code"] for item in data["errors"]}
+        assert "UNKNOWN_SPEAKER" in codes
+        assert "INVALID_AUDIO_TAG" in codes
+        assert "LINE_WITHOUT_SPEAKER" in codes
+        assert "EMPTY_REPLICA" in codes
+
+    def test_gemini_dialogue_checks_last_chunk_size(self, tmp_path):
+        long_text = "очень длинный текст " * 240
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: Короткий первый чанк.\n******\nSpeaker2: " + long_text,
+        )
+        code, data = cli_json("validate", "--script", str(script), "--format", "gemini-dialogue", "--json")
+        assert code == 0
+        assert data["valid"] is False
+        chunk_errors = [item for item in data["errors"] if item["code"] == "CHUNK_TOO_LARGE"]
+        assert chunk_errors
+        assert chunk_errors[0]["chunk"] == 2
+
+
+def write_voiceover_script(tmp_path, meta_lines, body="Первый чанк.\n******\nВторой чанк."):
+    script = tmp_path / "voiceover.md"
+    script.write_text(
+        "\n".join(["---", *meta_lines, "---", body]),
+        encoding="utf-8",
+    )
+    return script
+
+
+class TestVoiceoverMetadataValidation:
+    def test_valid_polza_tts_voiceover_metadata(self, tmp_path):
+        script = write_voiceover_script(tmp_path, [
+            "format: voiceover",
+            "provider: polza-tts",
+            "model: openai/gpt-4o-mini-tts",
+            "voice: ash",
+            "max_chunk_chars: 2000",
+        ])
+        code, data = cli_json("validate", "--script", str(script), "--json")
+        assert code == 0
+        assert data["valid"] is True
+        assert data["format"] == "voiceover"
+        assert data["effective_config"]["provider"] == "polza-tts"
+        assert data["effective_config"]["model"] == "openai/gpt-4o-mini-tts"
+        assert data["effective_config"]["voice"] == "ash"
+
+    def test_valid_openrouter_gemini_voiceover_metadata_with_style(self, tmp_path):
+        script = write_voiceover_script(tmp_path, [
+            "format: voiceover",
+            "provider: openrouter-tts",
+            "model: google/gemini-3.1-flash-tts-preview",
+            "voice: Puck",
+            "style_prompt: >",
+            "  Speak as a calm technical podcast narrator.",
+        ])
+        code, data = cli_json("validate", "--script", str(script), "--json")
+        assert code == 0
+        assert data["valid"] is True
+        assert data["warnings"] == []
+        assert data["effective_config"]["style_prompt"] == "Speak as a calm technical podcast narrator."
+
+    def test_voiceover_metadata_reports_all_errors(self, tmp_path):
+        script = write_voiceover_script(tmp_path, [
+            "format: voiceover",
+            "provider: polza-tts",
+            "model: elevenlabs/text-to-speech-turbo-2-5",
+            "voice: ash",
+        ], body="длинно " * 500)
+        code, data = cli_json("validate", "--script", str(script), "--format", "voiceover", "--agent", "--json")
+        assert code == 0
+        assert data["valid"] is False
+        codes = {item["code"] for item in data["errors"]}
+        assert "INVALID_VOICE" in codes
+        assert "CHUNK_TOO_LARGE" in codes
+
+    def test_voiceover_metadata_cli_overrides_provider_model_voice(self, tmp_path):
+        script = write_voiceover_script(tmp_path, [
+            "format: voiceover",
+            "provider: polza-tts",
+            "model: openai/gpt-4o-mini-tts",
+            "voice: ash",
+        ])
+        code, data = cli_json(
+            "validate",
+            "--script", str(script),
+            "--format", "voiceover",
+            "--provider", "openrouter-tts",
+            "--model", "openai/gpt-4o-mini-tts-2025-12-15",
+            "--voice", "alloy",
+            "--json",
+        )
+        assert code == 0
+        assert data["valid"] is True
+        assert data["effective_config"]["provider"] == "openrouter-tts"
+        assert data["effective_config"]["model"] == "openai/gpt-4o-mini-tts-2025-12-15"
+        assert data["effective_config"]["voice"] == "alloy"

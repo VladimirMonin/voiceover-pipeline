@@ -197,6 +197,31 @@ class TestOpenRouterTTSProviderOpenAI:
         assert json_body["voice"] == "Puck"
         assert result.audio_bytes == b"fake-audio-gemini"
 
+    def test_gemini_model_can_send_multispeaker_config(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio-gemini"
+        mock_response.headers = {"X-Generation-Id": "gen-gemini-multi"}
+
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+            p = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Puck",
+                style_prompt="podcast style",
+                speaker_voice_map={"Speaker1": "Puck", "Speaker2": "Kore"},
+            )
+            result = p.synthesize_chunk("Speaker1: Hello\nSpeaker2: Hi", "chunk_01")
+
+        json_body = mock_post.call_args[1]["json"]
+        assert json_body["voice"] == "Puck"
+        configs = json_body["multi_speaker_voice_config"]["speaker_voice_configs"]
+        assert configs[0]["speaker"] == "Speaker1"
+        assert configs[0]["voice_config"]["prebuilt_voice_config"]["voice_name"] == "Puck"
+        assert configs[1]["speaker"] == "Speaker2"
+        assert configs[1]["voice_config"]["prebuilt_voice_config"]["voice_name"] == "Kore"
+        assert result.audio_bytes == b"fake-audio-gemini"
+
     def test_gemini_no_style_prompt_sends_none_prompt(self):
         mock_response = MagicMock()
         mock_response.status_code = 200

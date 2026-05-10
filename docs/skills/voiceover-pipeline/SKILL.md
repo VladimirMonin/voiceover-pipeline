@@ -2,7 +2,8 @@
 name: voiceover-pipeline
 description: >
   Установка и использование voiceover-pipeline CLI для генерации озвучки
-  из Markdown-сценариев, TTS-аудио, Whisper-таймингов, SRT, manifest.json
+  из Markdown-сценариев, включая frontmatter metadata для provider/model/voice
+  и Gemini dialogue scripts, TTS-аудио, Whisper-таймингов, SRT, manifest.json
   и Remotion-ready артефактов. Используй ВСЕГДА, когда пользователь просит
   озвучить текст, создать voiceover, TTS, аудио для видео, подкаста или
   Remotion, получить тайминги, scene durations, subtitles, timestamps,
@@ -13,14 +14,14 @@ description: >
   никогда не читает .env. Триггеры: озвучь, voiceover, TTS, тайминги,
   whisper timing, аудио для видео, подкаст, generate audio, timings for
   Remotion, voiceover-pipeline, выбери провайдера, сравни модели TTS,
-  голос для озвучки.
+  голос для озвучки, format: voiceover, gemini-dialogue.
 ---
 # Voiceover Pipeline — навык агента
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-> **Совместимость:** voiceover-pipeline 0.4.2, skill revision 2026-05-09.
+> **Совместимость:** voiceover-pipeline 0.4.3, skill revision 2026-05-10.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение

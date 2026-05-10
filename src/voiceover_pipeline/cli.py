@@ -46,6 +46,17 @@ from .config import (
 )
 from .media import check_media_tools, concat_mp3_chunks, mp3_duration_ms, trim_final_silence, write_audio_as_mp3
 from .models import ChunkArtifact
+from .gemini_dialogue import (
+    GEMINI_DIALOGUE_FORMAT,
+    chunks_from_validation as gemini_chunks_from_validation,
+    validate_gemini_dialogue_file,
+)
+from .voiceover_script import (
+    VOICEOVER_FORMAT,
+    chunks_from_voiceover_report,
+    detect_frontmatter_format,
+    validate_voiceover_file,
+)
 from .pricing import (
     cost_from_generation,
     fetch_openrouter_generation_detail,
@@ -132,13 +143,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --------------- generate ---------------
     gen = subparsers.add_parser("generate", help="Generate chunk MP3 + full MP3 + optional timings.")
-    gen.add_argument("--provider", choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], default=DEFAULT_PROVIDER)
+    gen.add_argument("--provider", choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], default=None)
     gen.add_argument("--model", default=argparse.SUPPRESS)
     gen.add_argument("--script", type=Path, default=_find_default_script())
     gen.add_argument("--delimiter", default="******")
     gen.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     gen.add_argument("--run-id", default="")
     gen.add_argument("--voice", default=None)
+    gen.add_argument("--format", choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT], default="markdown")
+    gen.add_argument("--max-chunk-chars", type=int, default=2000, help="Validation limit for voiceover metadata scripts.")
+    gen.add_argument("--speaker-voice", action="append", default=[], help="Gemini dialogue voice mapping, e.g. Speaker1=Puck. Can repeat.")
     gen.add_argument("--fallback-voice", default=DEFAULT_FALLBACK_VOICE)
     gen.add_argument("--style-prompt", default=None)
     gen.add_argument("--style-prompt-file", type=Path, default=None)
@@ -192,6 +206,12 @@ def build_parser() -> argparse.ArgumentParser:
     val = subparsers.add_parser("validate", help="Validate script for generation.")
     val.add_argument("--script", type=Path, required=True)
     val.add_argument("--delimiter", default="******")
+    val.add_argument("--format", choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT], default="markdown")
+    val.add_argument("--provider", choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], default=None)
+    val.add_argument("--model", default=None)
+    val.add_argument("--voice", default=None)
+    val.add_argument("--speaker-voice", action="append", default=[], help="Gemini dialogue voice mapping, e.g. Speaker1=Puck. Can repeat.")
+    val.add_argument("--agent", action="store_true", help="Include agent-oriented snippets and suggested fixes.")
     val.add_argument("--max-chunk-chars", type=int, default=2000)
     val.add_argument("--json", dest="json_output", action="store_true")
 
@@ -291,9 +311,66 @@ def generate(args: argparse.Namespace) -> None:
         ffmpeg_path, ffprobe_path = check_media_tools()
     except RuntimeError as e:
         fail(str(e), _EXIT_NO_FFMPEG)
-    _resolve_model(args)
+    detected_format = detect_frontmatter_format(args.script)
+    script_format = args.format
+    if script_format == "markdown" and detected_format in (VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT):
+        script_format = detected_format
+    args.format = script_format
+
+    gemini_report = None
+    voiceover_report = None
+    if script_format == GEMINI_DIALOGUE_FORMAT:
+        args.provider = args.provider or "openrouter-tts"
+        _resolve_model(args)
+        if args.provider != "openrouter-tts":
+            fail("gemini-dialogue format currently requires provider openrouter-tts.", _EXIT_ARGS)
+        gemini_report = validate_gemini_dialogue_file(
+            args.script,
+            delimiter=args.delimiter,
+            model=args.model,
+            speaker_voice_overrides=args.speaker_voice,
+            agent=True,
+        )
+        if not gemini_report["valid"]:
+            if args.json_output:
+                print(json.dumps(gemini_report, ensure_ascii=False))
+                sys.exit(_EXIT_ARGS)
+            for item in gemini_report["errors"]:
+                print(f"ERROR {item['code']}: {item['message']}", file=sys.stderr)
+            sys.exit(_EXIT_ARGS)
+        chunks = gemini_chunks_from_validation(gemini_report)
+    elif script_format == VOICEOVER_FORMAT:
+        voiceover_report = validate_voiceover_file(
+            args.script,
+            delimiter=args.delimiter,
+            provider_override=args.provider,
+            model_override=getattr(args, "model", None),
+            voice_override=args.voice,
+            max_chunk_chars=args.max_chunk_chars if hasattr(args, "max_chunk_chars") else 2000,
+            agent=True,
+        )
+        if not voiceover_report["valid"]:
+            if args.json_output:
+                print(json.dumps(voiceover_report, ensure_ascii=False))
+                sys.exit(_EXIT_ARGS)
+            for item in voiceover_report["errors"]:
+                print(f"ERROR {item['code']}: {item['message']}", file=sys.stderr)
+            sys.exit(_EXIT_ARGS)
+        effective = voiceover_report["effective_config"]
+        args.provider = effective["provider"]
+        args.model = effective["model"]
+        args.voice = effective["voice"]
+        if effective.get("fallback_voice"):
+            args.fallback_voice = effective["fallback_voice"]
+        if effective.get("style_prompt") and args.style_prompt is None and args.style_prompt_file is None and not args.no_style_prompt:
+            args.style_prompt = effective["style_prompt"]
+        chunks = chunks_from_voiceover_report(voiceover_report)
+    else:
+        args.provider = args.provider or DEFAULT_PROVIDER
+        _resolve_model(args)
+        chunks = split_markdown_by_delimiter(args.script, args.delimiter)
+
     _validate_model_for_provider(args.provider, args.model)
-    chunks = split_markdown_by_delimiter(args.script, args.delimiter)
     if not chunks:
         fail("Script produced no chunks. Check delimiter and content.", _EXIT_ARGS)
     if args.run_id:
@@ -316,8 +393,16 @@ def generate(args: argparse.Namespace) -> None:
     _ensure_run_dirs(paths)
 
     api_key = read_api_key(args)
-    args.voice = args.voice or _default_voice(args)
+    requested_voice = args.voice
+    if gemini_report:
+        args.speaker_voice_map = gemini_report["speaker_voice_map"]
+        args.voice = requested_voice or next(iter(args.speaker_voice_map.values()))
+    else:
+        args.speaker_voice_map = {}
+        args.voice = requested_voice or _default_voice(args)
     style_prompt = _resolve_style_prompt(args)
+    if gemini_report and not args.no_style_prompt and args.style_prompt is None and args.style_prompt_file is None:
+        style_prompt = gemini_report["style_prompt"]
     prompt_mode = resolve_prompt_mode(args.provider, args.model)
     provider = build_provider(args, api_key, style_prompt, prompt_mode)
     pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
@@ -374,6 +459,8 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         cost_total_exact=cost_total_exact, cost_currency=cost_currency, cost_source=cost_source,
         chunk_artifacts=chunk_artifacts, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
         prompt_mode=prompt_mode,
+        script_format=getattr(args, "format", "markdown"),
+        speaker_voice_map=getattr(args, "speaker_voice_map", None) or None,
     )
     try:
         write_json(paths.chunks_json, chunks_manifest)
@@ -586,6 +673,57 @@ def validate_cmd(args: argparse.Namespace) -> None:
     script = Path(args.script)
     if not script.exists():
         fail("Script file not found", _EXIT_ARGS)
+
+    detected_format = detect_frontmatter_format(script)
+    script_format = args.format
+    if script_format == "markdown" and detected_format in (VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT):
+        script_format = detected_format
+
+    if script_format == GEMINI_DIALOGUE_FORMAT:
+        report = validate_gemini_dialogue_file(
+            script,
+            delimiter=args.delimiter,
+            model=args.model,
+            speaker_voice_overrides=args.speaker_voice,
+            agent=args.agent,
+        )
+        if args.json_output:
+            print(json.dumps(report, ensure_ascii=False))
+            sys.exit(_EXIT_OK)
+        print(f"Script: {script}")
+        print(f"Format: {GEMINI_DIALOGUE_FORMAT}")
+        print(f"Chunks: {report['chunks']}, Valid: {report['valid']}")
+        for item in report["errors"]:
+            loc = f" line {item.get('line') or item.get('line_start', '')}".rstrip()
+            print(f"  ERROR {item['code']}{loc}: {item['message']}")
+        for item in report["warnings"]:
+            loc = f" line {item.get('line') or item.get('line_start', '')}".rstrip()
+            print(f"  WARNING {item['code']}{loc}: {item['message']}")
+        return
+
+    if script_format == VOICEOVER_FORMAT:
+        report = validate_voiceover_file(
+            script,
+            delimiter=args.delimiter,
+            provider_override=args.provider,
+            model_override=args.model,
+            voice_override=args.voice,
+            max_chunk_chars=args.max_chunk_chars,
+            agent=args.agent,
+        )
+        if args.json_output:
+            print(json.dumps(report, ensure_ascii=False))
+            sys.exit(_EXIT_OK)
+        print(f"Script: {script}")
+        print(f"Format: {VOICEOVER_FORMAT}")
+        print(f"Chunks: {report['chunks']}, Valid: {report['valid']}")
+        for item in report["errors"]:
+            loc = f" line {item.get('line') or item.get('line_start', '')}".rstrip()
+            print(f"  ERROR {item['code']}{loc}: {item['message']}")
+        for item in report["warnings"]:
+            loc = f" line {item.get('line') or item.get('line_start', '')}".rstrip()
+            print(f"  WARNING {item['code']}{loc}: {item['message']}")
+        return
 
     text = script.read_text(encoding="utf-8-sig")
     parts = [p.strip() for p in text.split(args.delimiter)]
@@ -833,7 +971,14 @@ def build_provider(args: argparse.Namespace, api_key: str, style_prompt: str | N
     if args.provider == "polza-tts":
         return PolzaTTSProvider(api_key=api_key, model=args.model, voice=args.voice)
     if args.provider == "openrouter-tts":
-        return OpenRouterTTSProvider(api_key=api_key, model=args.model, voice=args.voice, style_prompt=style_prompt, prompt_mode=prompt_mode)
+        return OpenRouterTTSProvider(
+            api_key=api_key,
+            model=args.model,
+            voice=args.voice,
+            style_prompt=style_prompt,
+            prompt_mode=prompt_mode,
+            speaker_voice_map=getattr(args, "speaker_voice_map", None),
+        )
     if args.provider == "qwen-local":
         return QwenLocalTTSProvider(mode=args.mode, voice=args.voice, sample_path=args.sample, sample_text=args.sample_text)
     raise RuntimeError(f"Unsupported provider: {args.provider}")
