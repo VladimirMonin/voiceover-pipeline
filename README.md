@@ -145,8 +145,8 @@ uv run pytest
 
 OpenCode agent skill — устанавливает pipeline, выбирает провайдера, генерирует озвучку:
 
-- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.3/docs/skills/voiceover-pipeline
-- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.3
+- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.4/docs/skills/voiceover-pipeline
+- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.4
 
 ## Legal / Provider Notes
 
