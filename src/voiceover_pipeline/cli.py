@@ -1139,11 +1139,13 @@ def _resolve_audio(raw: str) -> Path:
 
 
 def _extract_timings(audio_path, output_dir, prefix, model, device, compute_type, language, word_timestamps=False, quiet=False):
-    from .whisper_timing import transcribe_audio
+    from .providers.faster_whisper import FasterWhisperProvider
 
-    timing = transcribe_audio(
-        audio_path=audio_path, model_size=model, device=device,
-        compute_type=compute_type, language=language,
+    provider = FasterWhisperProvider(
+        model_size=model, device=device, compute_type=compute_type,
+    )
+    timing = provider.transcribe(
+        audio_path=audio_path, language=language,
         word_timestamps=word_timestamps, quiet=quiet,
     )
 

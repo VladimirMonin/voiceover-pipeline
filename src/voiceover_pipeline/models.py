@@ -71,7 +71,8 @@ class TimingResult:
     segments: list[TimingSegment]
     model: str
     backend: str
-    device: str
-    compute_type: str
-    language: str
-    source_audio: str
+    provider: str | None = None
+    device: str = ""
+    compute_type: str = ""
+    language: str = ""
+    source_audio: str = ""

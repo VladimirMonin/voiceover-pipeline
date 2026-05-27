@@ -1,4 +1,5 @@
-from .base import TTSProvider
+from .base import TTSProvider, TranscriptionProvider
+from .faster_whisper import FasterWhisperProvider
 from .openrouter_tts import OpenRouterTTSProvider
 from .polza_chat_audio import PolzaChatAudioProvider
 from .polza_tts import PolzaTTSProvider
@@ -8,6 +9,13 @@ try:
 except ModuleNotFoundError:
     QwenLocalTTSProvider = None  # type: ignore[assignment]
 
-__all__ = ["TTSProvider", "PolzaChatAudioProvider", "OpenRouterTTSProvider", "PolzaTTSProvider"]
+__all__ = [
+    "TTSProvider",
+    "TranscriptionProvider",
+    "FasterWhisperProvider",
+    "PolzaChatAudioProvider",
+    "OpenRouterTTSProvider",
+    "PolzaTTSProvider",
+]
 if QwenLocalTTSProvider is not None:
     __all__.append("QwenLocalTTSProvider")

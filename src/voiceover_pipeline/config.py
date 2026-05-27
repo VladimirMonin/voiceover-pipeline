@@ -92,6 +92,14 @@ DEFAULT_TIMING_DEVICE = "cpu"
 DEFAULT_TIMING_COMPUTE = "int8"
 DEFAULT_TIMING_LANGUAGE = "ru"
 
+WHISPER_HF_REPOS: dict[str, str] = {
+    "base": "Systran/faster-whisper-base",
+    "small": "Systran/faster-whisper-small",
+    "medium": "Systran/faster-whisper-medium",
+    "large-v3-turbo": "mobiuslabsgmbh/faster-whisper-large-v3-turbo",
+    "large-v3": "Systran/faster-whisper-large-v3",
+}
+
 SAMPLE_RATE = 24000
 CHANNELS = 1
 BYTES_PER_SAMPLE = 2
