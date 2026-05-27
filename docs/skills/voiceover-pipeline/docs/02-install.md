@@ -121,10 +121,12 @@ Console scripts: `voiceover` и `voiceover-pipeline` (работают оба).
 # Базовая
 voiceover doctor --json
 
-# С таймингами
+# С таймингами (все timing-провайдеры)
 voiceover doctor --with-timings --json
+voiceover doctor --with-timings --timing-provider groq-whisper --json
+voiceover doctor --with-timings --timing-provider xai-stt --json
 
-# Для конкретного провайдера
+# Для конкретного TTS-провайдера
 voiceover doctor --provider polza-chat-audio --with-timings --json
 voiceover doctor --provider polza-tts --with-timings --json
 voiceover doctor --provider openrouter-tts --with-timings --json

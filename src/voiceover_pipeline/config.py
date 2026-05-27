@@ -4,6 +4,8 @@ from pathlib import Path
 
 POLZA_BASE_URL = "https://polza.ai/api/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+XAI_BASE_URL = "https://api.x.ai/v1"
 
 DEFAULT_ENV_FILE = Path.cwd() / ".env"
 DEFAULT_SCRIPT_DIR = Path.cwd() / "in"
@@ -58,6 +60,11 @@ OPENROUTER_WHISPER_MODELS = [
     "openai/whisper-large-v3-turbo",
     "openai/whisper-large-v3",
     "openai/whisper-1",
+]
+
+GROQ_WHISPER_MODELS = [
+    "whisper-large-v3-turbo",
+    "whisper-large-v3",
 ]
 DEFAULT_TIMING_PROVIDER = "faster-whisper"
 
@@ -214,5 +221,25 @@ def read_openrouter_key() -> str:
         raise RuntimeError(
             "OPENROUTER_API_KEY is required for provider=openrouter-tts. "
             f"Put it into {DEFAULT_ENV_FILE}: OPENROUTER_API_KEY=sk-or-..."
+        )
+    return env_key.removeprefix("Bearer ").strip()
+
+
+def read_groq_key() -> str:
+    env_key = get_secret("GROQ_API_KEY")
+    if not env_key:
+        raise RuntimeError(
+            "GROQ_API_KEY is required for timing-provider=groq-whisper. "
+            f"Put it into {DEFAULT_ENV_FILE}: GROQ_API_KEY=gsk_..."
+        )
+    return env_key.removeprefix("Bearer ").strip()
+
+
+def read_xai_key() -> str:
+    env_key = get_secret("X_AI_API_KEY")
+    if not env_key:
+        raise RuntimeError(
+            "X_AI_API_KEY is required for timing-provider=xai-stt. "
+            f"Put it into {DEFAULT_ENV_FILE}: X_AI_API_KEY=xai-..."
         )
     return env_key.removeprefix("Bearer ").strip()

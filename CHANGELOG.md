@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.1
+
+### Documentation & Skill Update
+
+- Updated skill documentation: 4 timing providers (faster-whisper, openrouter-whisper, groq-whisper, xai-stt) in providers-and-models, commands-and-flags, security-and-secrets, install, version-log.
+- Updated `list timing-providers` JSON contract with 4 providers and `timestamps` field.
+- Added `--timing-provider` choices for `groq-whisper` and `xai-stt` in all CLI reference tables.
+- Documented openrouter-whisper blocking (exit code 40) — no timestamps returned by API.
+- Created `.env.example` with `GROQ_API_KEY` and `X_AI_API_KEY` placeholders.
+- Updated AGENTS.md / OpenCode skill in project and Obsidian vault.
+
+### New Providers
+
+- **groq-whisper**: Direct Groq API with segment + word timestamps, `whisper-large-v3-turbo` at $0.04/hr.
+- **xai-stt**: xAI STT API with word-level timestamps + confidence, 12 audio formats.
+
+## 0.5.0
+
+### Cloud Transcription Providers
+
+- Added `--timing-provider openrouter-whisper` for cloud transcription via OpenRouter Whisper Large V3 Turbo.
+- Added `list timing-providers` command with local + cloud provider display.
+- Implemented `TranscriptionProvider` ABC architecture for provider extensibility.
+- OpenRouter Whisper: JSON body with base64-encoded audio.
+
 ## 0.4.5
 
 ### Gemini Prompting Guide

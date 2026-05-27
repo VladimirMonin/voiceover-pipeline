@@ -12,6 +12,10 @@ from voiceover_pipeline.tts_prompting import (
     resolve_prompt_mode,
 )
 
+# ── OpenRouter app attribution headers ──────────────────────────────────────
+_APP_TITLE = "Voiceover Pipeline"
+_APP_REFERER = "https://github.com/visper-io/voiceover-pipeline"
+
 
 class OpenRouterTTSProvider(TTSProvider):
     provider_id = "openrouter-tts"
@@ -82,6 +86,8 @@ class OpenRouterTTSProvider(TTSProvider):
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
+                "X-Title": _APP_TITLE,
+                "HTTP-Referer": _APP_REFERER,
             },
             json=body,
             timeout=self.timeout_seconds,

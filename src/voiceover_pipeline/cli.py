@@ -44,6 +44,8 @@ from .config import (
     PROVIDER_DEFAULT_MODELS,
     QWEN_PRESET_SPEAKERS,
     read_openrouter_key,
+    read_groq_key,
+    read_xai_key,
     read_polza_key,
 )
 from .media import check_media_tools, concat_audio_files, concat_mp3_chunks, mp3_duration_ms, trim_final_silence, write_audio_as_mp3
@@ -198,13 +200,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     tim = gen.add_argument_group("Whisper timing (optional)")
     tim.add_argument("--with-timings", action="store_true")
-    tim.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper"],
+    tim.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
                      help="Transcription provider (default: faster-whisper)")
     tim.add_argument("--timing-model", default=None, help="Provider-specific model for transcription")
     tim.add_argument("--timing-device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"])
     tim.add_argument("--timing-compute", default=DEFAULT_TIMING_COMPUTE, choices=["auto", "int8", "int8_float16", "float16", "float32"])
     tim.add_argument("--timing-language", default=DEFAULT_TIMING_LANGUAGE)
-    tim.add_argument("--word-timestamps", action="store_true", help="Include word-level timestamps.")
+    tim.add_argument("--word-timestamps", action="store_true", help="Include word-level timestamps (faster-whisper + groq-whisper; openrouter-whisper ignores with a warning).")
 
     # --------------- split ---------------
     spl = subparsers.add_parser("split", help="Print chunk ids and character counts.")
@@ -217,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     timp.add_argument("--audio", type=str, required=True)
     timp.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     timp.add_argument("--run-id", default="")
-    timp.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper"],
+    timp.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
                       help="Transcription provider (default: faster-whisper)")
     timp.add_argument("--model", default=None, help="Provider-specific model (e.g. openai/whisper-large-v3-turbo)")
     timp.add_argument("--device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"])
@@ -246,7 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--json", dest="json_output", action="store_true")
     doc.add_argument("--provider", default=None, choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], help="Check provider-specific requirements.")
     doc.add_argument("--with-timings", action="store_true", help="Check timing dependencies.")
-    doc.add_argument("--timing-provider", default="faster-whisper", choices=["faster-whisper", "openrouter-whisper"],
+    doc.add_argument("--timing-provider", default="faster-whisper", choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
                     help="Timing provider to check (default: faster-whisper)")
     doc.add_argument("--timing-device", default="cpu", choices=["auto", "cpu", "cuda"], help="Requested timing device for dependency check.")
 
@@ -877,6 +879,22 @@ def doctor_cmd(args: argparse.Namespace) -> None:
         except Exception:
             pass
         results["openrouter_whisper_key"] = {"ok": whisper_ok, "required": need_whisper}
+    elif timing_provider == "groq-whisper":
+        whisper_ok = False
+        try:
+            read_groq_key()
+            whisper_ok = True
+        except Exception:
+            pass
+        results["groq_whisper_key"] = {"ok": whisper_ok, "required": need_whisper}
+    elif timing_provider == "xai-stt":
+        whisper_ok = False
+        try:
+            read_xai_key()
+            whisper_ok = True
+        except Exception:
+            pass
+        results["xai_stt_key"] = {"ok": whisper_ok, "required": need_whisper}
     else:
         whisper_ok = False
         try:
@@ -905,7 +923,14 @@ def doctor_cmd(args: argparse.Namespace) -> None:
     if not cuda_available and need_cuda:
         warnings.append("CUDA is unavailable but required for the selected provider or timing device.")
     if not whisper_ok and need_whisper:
-        warnings.append("faster-whisper is not installed. Install with: uv sync --extra timing-whisper")
+        if timing_provider == "openrouter-whisper":
+            warnings.append("OPENROUTER_API_KEY is missing. Set it in .env: OPENROUTER_API_KEY=sk-or-v1-...")
+        elif timing_provider == "groq-whisper":
+            warnings.append("GROQ_API_KEY is missing. Set it in .env: GROQ_API_KEY=gsk_...")
+        elif timing_provider == "xai-stt":
+            warnings.append("X_AI_API_KEY is missing. Set it in .env: X_AI_API_KEY=xai-...")
+        else:
+            warnings.append("faster-whisper is not installed. Install with: uv sync --extra timing-whisper")
     if not polza_ok and need_polza:
         warnings.append("POLZA_API_KEY is missing. Set it in .env: POLZA_API_KEY=...")
     if not or_ok and need_or:
@@ -1081,6 +1106,25 @@ def list_cmd(args: argparse.Namespace) -> None:
                         {"id": "openai/whisper-1", "description": "Whisper v1 — legacy, cheapest"},
                     ],
                 },
+                {
+                    "id": "groq-whisper",
+                    "type": "cloud",
+                    "currency": "USD",
+                    "timestamps": ["segment", "word"],
+                    "models": [
+                        {"id": "whisper-large-v3-turbo", "description": "Optimized Whisper Large V3 Turbo — fast, 99+ languages", "default": True},
+                        {"id": "whisper-large-v3", "description": "Whisper Large V3 — highest accuracy"},
+                    ],
+                },
+                {
+                    "id": "xai-stt",
+                    "type": "cloud",
+                    "currency": "USD",
+                    "timestamps": ["word"],
+                    "models": [
+                        {"id": "grok-stt", "description": "Grok STT — word-level timestamps, 12 formats, multichannel, diarization", "default": True},
+                    ],
+                },
             ]
         }
     else:
@@ -1099,6 +1143,16 @@ def _preflight_timing_dependency(timing_provider: str = "faster-whisper") -> Non
     if timing_provider == "openrouter-whisper":
         try:
             read_openrouter_key()
+        except RuntimeError as exc:
+            fail(str(exc), _EXIT_NO_KEY)
+    elif timing_provider == "groq-whisper":
+        try:
+            read_groq_key()
+        except RuntimeError as exc:
+            fail(str(exc), _EXIT_NO_KEY)
+    elif timing_provider == "xai-stt":
+        try:
+            read_xai_key()
         except RuntimeError as exc:
             fail(str(exc), _EXIT_NO_KEY)
     else:
@@ -1195,9 +1249,25 @@ def _resolve_audio(raw: str) -> Path:
 
 def _extract_timings(audio_path, output_dir, prefix, timing_provider, model, device, compute_type, language, word_timestamps=False, quiet=False):
     if timing_provider == "openrouter-whisper":
-        from .providers.openrouter_whisper import OpenRouterWhisperProvider
-        effective_model = model or "openai/whisper-large-v3-turbo"
-        provider = OpenRouterWhisperProvider(model=effective_model)
+        fail(
+            "openrouter-whisper does NOT return segment or word-level timestamps. "
+            "The API only returns full text — one segment covering the entire audio. "
+            "This would produce useless timings (one entry for the whole file) and waste your money.\n\n"
+            "Use a provider that supports real timestamps:\n"
+            "  • faster-whisper (local) — free, segments + words\n"
+            "  • groq-whisper (cloud) — GROQ_API_KEY, segments + words\n"
+            "  • xai-stt (cloud) — X_AI_API_KEY, words + confidence\n\n"
+            "For plain transcription (text only, no timings), use OpenRouter directly.",
+            _EXIT_PROVIDER,
+        )
+    elif timing_provider == "groq-whisper":
+        from .providers.groq_whisper import GroqWhisperProvider
+        effective_model = model or "whisper-large-v3-turbo"
+        provider = GroqWhisperProvider(model=effective_model)
+    elif timing_provider == "xai-stt":
+        from .providers.xai_stt import XAISttProvider
+        effective_model = model or "grok-stt"
+        provider = XAISttProvider(model=effective_model)
     else:
         from .providers.faster_whisper import FasterWhisperProvider
         effective_model = model or DEFAULT_TIMING_MODEL

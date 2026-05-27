@@ -11,7 +11,9 @@ description: >
   timing-провайдера или проверить voiceover project. Провайдеры TTS: Polza
   GPT Audio, Polza TTS (OpenAI + ElevenLabs), OpenRouter TTS (Gemini +
   OpenAI), Qwen3-TTS (локальный GPU). Провайдеры распознавания:
-  faster-whisper (локальный), openrouter-whisper (облачный). Агент создаёт project skeleton
+  faster-whisper (локальный), openrouter-whisper (облачный, без таймкодов),
+  groq-whisper (облачный, сегменты + слова), xai-stt (облачный, слова +
+  confidence). Агент создаёт project skeleton
   (.env.example, .gitignore, script.md, out/), просит ключи однократно,
   никогда не читает .env. Триггеры: озвучь, voiceover, TTS, тайминги,
   whisper timing, аудио для видео, подкаст, generate audio, timings for
@@ -24,7 +26,7 @@ description: >
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-> **Совместимость:** voiceover-pipeline 0.5.0, skill revision 2026-05-27.
+| **Совместимость:** voiceover-pipeline 0.5.1, skill revision 2026-05-27.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение
@@ -103,13 +105,13 @@ description: >
    `polza-tts` с `openai/gpt-4o-mini-tts` (классический TTS, ~1.07 ₽/мин).
 4. **Проверка окружения.** `voiceover doctor --provider <X> --with-timings [--timing-provider <Y>] --json`.
    Убедись что `workflow_ok: true`.
-   Если нужны тайминги через облако: `--timing-provider openrouter-whisper`.
+   Если нужны таймкоды через облако: `--timing-provider groq-whisper` или `--timing-provider xai-stt`.
 5. **Валидация сценария.** `voiceover validate --script "script.md" --json`.
    Если есть issues — покажи пользователю, не запускай генерацию.
 6. **Генерация аудио.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --json --resume`.
    Не используй `--overwrite` для платной генерации; если run оборвался — продолжай через `--resume`.
 7. **Тайминги отдельно.** `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --run-id "prod" --json --overwrite`.
-   Для облачной транскрипции: `--timing-provider openrouter-whisper --model openai/whisper-large-v3-turbo`.
+   Для облачной транскрипции: `--timing-provider groq-whisper --model whisper-large-v3-turbo` (таймкоды) или `--timing-provider xai-stt --model grok-stt` (слова + confidence).
 8. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
 
 ## Security-first правила
@@ -138,9 +140,9 @@ description: >
 | Проверяет окружение через doctor | Конфигурирует системный PATH |
 | Валидирует Markdown-сценарий | Пишет сценарий за пользователя |
 | Генерирует озвучку через любой из 4 провайдеров с retry, safe rerun и manifest/log | Рендерит Remotion-видео |
-| Извлекает тайминги через локальный faster-whisper ИЛИ облачный OpenRouter Whisper | Правит исходники voiceover-pipeline |
+| Извлекает тайминги через локальный faster-whisper ИЛИ облачные OpenRouter/Groq/xAI Whisper | Правит исходники voiceover-pipeline |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
-| Объясняет провайдеров, модели, голоса, цены (7 TTS + 3 STT моделей) | Гарантирует будущие цены провайдеров |
+| Объясняет провайдеров, модели, голоса, цены (7 TTS + 6 STT моделей) | Гарантирует будущие цены провайдеров |
 | Диагностирует ошибки по exit codes | Правит исходники voiceover-pipeline |
 
 ## Чеклист готового навыка

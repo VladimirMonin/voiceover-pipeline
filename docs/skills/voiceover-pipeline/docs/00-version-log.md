@@ -7,10 +7,10 @@
 
 | Поле | Значение |
 |---|---|
-| **Compatible app** | voiceover-pipeline 0.5.0 |
+| **Compatible app** | voiceover-pipeline 0.5.1 |
 | **Skill revision** | 2026-05-27 |
 | **Минимальная версия CLI** | 0.4.0 |
-| **Максимальная проверенная** | 0.5.0 |
+| **Максимальная проверенная** | 0.5.1 |
 
 ## Что актуально в этой версии навыка
 
@@ -25,7 +25,9 @@
 - OpenRouter Gemini dialogue: `--format gemini-dialogue`, frontmatter speaker map, inline audio tags, strict UTF-8 byte validation
 - Gemini prompting guide: voice direction skeleton, safe audio tags, emotion recipes, voice selection, chunking limits
 - Stability layer: `run_state.json`, `generation.log`, universal retries, `--resume`, paid-audio overwrite guard, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`, `--json-events`
-- Cloud transcription: `--timing-provider openrouter-whisper` (OpenRouter Whisper Large V3 Turbo), `list timing-providers`, архитектура провайдеров распознавания (TranscriptionProvider ABC)
+- Cloud transcription: 4 провайдера распознавания — `faster-whisper` (локальный), `openrouter-whisper` (текст без таймкодов), `groq-whisper` (сегменты + слова), `xai-stt` (слова + confidence)
+- `list timing-providers` показывает 4 провайдера с `timestamps` полем
+- OpenRouter Whisper: CLI блокирует `timings`/`--with-timings` с exit code 40 (API не возвращает таймкоды)
 - Endpoint dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media`
 
 ## Цены (smoke 2026-04-29, не гарантия провайдера)
@@ -45,7 +47,7 @@
 
 | Дата | Изменение |
 |---|---|
-| 2026-05-27 | **v0.5.0:** Cloud transcription providers. `--timing-provider` (faster-whisper | openrouter-whisper), `list timing-providers`, архитектура `TranscriptionProvider` ABC для расширяемости. OpenRouter Whisper Large V3 Turbo через JSON body с base64. |
+| 2026-05-27 | **v0.5.0:** Cloud transcription providers. `--timing-provider` (faster-whisper | openrouter-whisper | groq-whisper | xai-stt), `list timing-providers` с 4 провайдерами, архитектура `TranscriptionProvider` ABC. Groq Whisper — сегментные и пословные таймкоды через прямой API ($0.04/час). xAI STT — пословные таймкоды с confidence через xAI API. OpenRouter Whisper — блокировка `timings`/`--with-timings` (exit code 40) из-за отсутствия таймкодов. |
 | 2026-05-10 | Добавлен Gemini prompting guide: `AUDIO PROFILE`/`SCENE`/`PERFORMANCE`/`CONTEXT`/`TRANSCRIPT`, safe audio tags, emotion recipes, voice selection, chunking guidance. |
 | 2026-05-10 | Добавлен generic `format: voiceover` для single-speaker режимов: provider/model/voice в frontmatter, CLI overrides, full-error validator, backward compatibility с plain Markdown. |
 | 2026-05-10 | Добавлен Gemini dialogue workflow: two speakers через OpenRouter `multi_speaker_voice_config` + обязательный top-level `voice`, full-error validator, `--speaker-voice`, `--agent`, chunk byte safety gates. |

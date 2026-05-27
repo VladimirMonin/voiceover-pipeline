@@ -31,7 +31,7 @@
 | 11 | no ffmpeg/ffprobe | FFmpeg не найден в PATH |
 | 20 | no key | Нет POLZA_API_KEY или OPENROUTER_API_KEY в .env |
 | 30 | provider/run error | API error, папка существует без --overwrite |
-| 40 | whisper error | Whisper timing не удался (но MP3 сохранён!) |
+| 40 | timing blocked / whisper error | openrouter-whisper отклонён (нет таймкодов) или whisper timing упал (но MP3 сохранён!) |
 | 50 | output error | Ошибка записи/удаления файлов |
 
 ## Stdout/Stderr контракт
@@ -104,7 +104,7 @@
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
 | `--with-timings` | flag | false | Запустить Whisper после TTS; dependency preflight выполняется до TTS |
-| `--timing-provider` | choice | `faster-whisper` | `faster-whisper` (локально) или `openrouter-whisper` (облачно) |
+| `--timing-provider` | choice | `faster-whisper` | `faster-whisper` (локально), `openrouter-whisper` (облачно, без таймкодов), `groq-whisper` (облачно, сегменты+слова), `xai-stt` (облачно, слова+confidence) |
 | `--timing-model` | str | `small` / `openai/whisper-large-v3-turbo` | ID модели (зависит от провайдера) |
 | `--timing-device` | choice | `cpu` | `auto`, `cpu`, `cuda` (только для faster-whisper) |
 | `--timing-compute` | choice | `int8` | `auto`, `int8`, `int8_float16`, `float16`, `float32` (только faster-whisper) |
@@ -135,7 +135,7 @@
 | `--audio` | str | **обязательный** | Путь к аудио-файлу (MP3, Opus, WAV, FLAC, ...) |
 | `--output-dir` | path | `out` | Корень выходной директории |
 | `--run-id` | str | stem аудиофайла | Имя прогона |
-| `--timing-provider` | choice | `faster-whisper` | `faster-whisper` (локально) или `openrouter-whisper` (облачно) |
+| `--timing-provider` | choice | `faster-whisper` | `faster-whisper` (локально), `openrouter-whisper` (облачно, без таймкодов), `groq-whisper` (облачно, сегменты+слова), `xai-stt` (облачно, слова+confidence) |
 | `--model` | str | зависит от провайдера | ID модели (см. `list timing-providers`) |
 | `--device` | choice | `cpu` | `auto`, `cpu`, `cuda` (только faster-whisper) |
 | `--compute` | choice | `int8` | Тип вычислений (только faster-whisper) |
@@ -185,19 +185,34 @@ voiceover list timing-providers --json
     {
       "id": "faster-whisper",
       "type": "local",
-      "models": [{...}]
+      "models": [{"id": "small", "parameters_m": 244, ...}]
     },
     {
       "id": "openrouter-whisper",
       "type": "cloud",
       "currency": "USD",
       "models": [{...}]
+    },
+    {
+      "id": "groq-whisper",
+      "type": "cloud",
+      "currency": "USD",
+      "timestamps": ["segment", "word"],
+      "models": [{...}]
+    },
+    {
+      "id": "xai-stt",
+      "type": "cloud",
+      "currency": "USD",
+      "timestamps": ["word"],
+      "models": [{...}]
     }
   ]
 }
 ```
 
-- `type`: `"local"` (faster-whisper) или `"cloud"` (openrouter-whisper)
+- `type`: `"local"` (faster-whisper) или `"cloud"` (openrouter-whisper, groq-whisper, xai-stt)
+- `timestamps`: какие таймкоды поддерживает провайдер — `segment`, `word` или поле отсутствует (openrouter-whisper — только текст)
 - `models`: у local — `parameters_m`/`disk_mb`/`speed`, у cloud — `id`/`description`
 
 ## `--run-id` правила

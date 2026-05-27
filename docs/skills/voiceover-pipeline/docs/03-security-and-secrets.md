@@ -36,8 +36,10 @@
 # .env is searched in CWD and upwards through parent directories.
 # Never commit .env.
 
-OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxx
+OPENROUTER_API_KEY=sk-or-...xxxx
 POLZA_API_KEY=pza_xxxxxxxxxxxxxxxx
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxx
+X_AI_API_KEY=xai-xxxxxxxxxxxxxxxx
 ```
 
 Создай `.env` из `.env.example`: `Copy-Item .env.example .env` (Windows) или `cp .env.example .env` (macOS/Linux).
@@ -49,6 +51,8 @@ POLZA_API_KEY=pza_xxxxxxxxxxxxxxxx
 
 - **Polza (chat-audio + tts):** `POLZA_API_KEY` — начинается с `pza_`. Один ключ для обоих polza-провайдеров.
 - **OpenRouter:** `OPENROUTER_API_KEY` — начинается с `sk-or-v1-`
+- **Groq Whisper (timing):** `GROQ_API_KEY` — начинается с `gsk_`. https://console.groq.com/keys
+- **xAI STT (timing):** `X_AI_API_KEY` — начинается с `xai-`. https://docs.x.ai
 - **Qwen-local:** ключи НЕ нужны (работает локально на GPU)
 
 ### Шаг 4: Попроси один раз

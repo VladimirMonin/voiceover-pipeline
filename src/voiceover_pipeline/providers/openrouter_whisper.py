@@ -14,6 +14,29 @@ from voiceover_pipeline.config import (
 from voiceover_pipeline.models import TimingResult, TimingSegment
 from voiceover_pipeline.providers.base import TranscriptionProvider
 
+# ── OpenRouter app attribution headers ──────────────────────────────────────
+# See: https://openrouter.ai/docs/app-attribution
+_APP_TITLE = "Voiceover Pipeline"
+_APP_REFERER = "https://github.com/visper-io/voiceover-pipeline"
+
+
+def _or_headers(api_key: str) -> dict[str, str]:
+    """Build OpenRouter request headers with app attribution."""
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": _APP_TITLE,
+        "HTTP-Referer": _APP_REFERER,
+    }
+
+
+_NO_TIMESTAMPS_WARNING = (
+    "WARNING: openrouter-whisper does NOT return per-segment or word-level timestamps. "
+    "The API returns a single 'text' field — one segment covering the entire audio. "
+    "word_timestamps=True is ignored. For real timestamps use faster-whisper (local) "
+    "or groq-whisper (cloud with GROQ_API_KEY)."
+)
+
 
 def _detect_audio_duration_ms(audio_path: Path) -> int:
     """Get audio duration in ms using ffprobe."""
@@ -82,6 +105,9 @@ class OpenRouterWhisperProvider(TranscriptionProvider):
         word_timestamps: bool = False,
         quiet: bool = False,
     ) -> TimingResult:
+        if word_timestamps and not quiet:
+            print(_NO_TIMESTAMPS_WARNING, file=sys.stderr)
+
         audio_path = Path(audio_path)
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
@@ -111,10 +137,7 @@ class OpenRouterWhisperProvider(TranscriptionProvider):
         if language:
             body["language"] = language
 
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = _or_headers(self.api_key)
 
         if not quiet:
             print(

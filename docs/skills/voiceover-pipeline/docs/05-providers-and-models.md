@@ -7,7 +7,7 @@
 ## Обзор
 
 voiceover-pipeline поддерживает четыре TTS-провайдера с единым интерфейсом
-и два провайдера распознавания речи (timing):
+и четыре провайдера распознавания речи (timing):
 
 | Провайдер | Тип | API | Валюта | Ключ | Provider ID |
 |---|---|---|---|---|---|
@@ -189,12 +189,14 @@ Open-source модель синтеза речи. Работает локаль�
 
 ## Провайдеры распознавания речи (timing)
 
-Два провайдера для извлечения таймингов и субтитров из аудио.
+Четыре провайдера для извлечения таймингов и субтитров из аудио.
 
-| Провайдер | Тип | Provider ID | Ключ | По умолчанию |
+| Провайдер | Тип | Provider ID | Ключ | Таймкоды |
 |---|---|---|---|---|
-| Faster-Whisper | Локальный | `faster-whisper` | Не нужен | Да |
-| OpenRouter Whisper | Облачный | `openrouter-whisper` | `OPENROUTER_API_KEY` | Нет |
+| Faster-Whisper | Локальный | `faster-whisper` | Не нужен | Сегменты + слова |
+| OpenRouter Whisper | Облачный | `openrouter-whisper` | `OPENROUTER_API_KEY` | ❌ Только текст |
+| Groq Whisper | Облачный | `groq-whisper` | `GROQ_API_KEY` | Сегменты + слова |
+| xAI STT | Облачный | `xai-stt` | `X_AI_API_KEY` | Слова + confidence |
 
 ### Faster-Whisper (локальный)
 
@@ -242,14 +244,61 @@ voiceover timings --audio podcast.mp3 --timing-provider faster-whisper --model s
 voiceover timings --audio podcast.opus --timing-provider openrouter-whisper --model openai/whisper-large-v3-turbo --language ru --json
 ```
 
+> ⚠️ **openrouter-whisper НЕ возвращает таймкоды.** API отдаёт только полный текст — один сегмент на весь файл.
+> CLI блокирует `timings` и `--with-timings` с `openrouter-whisper` (exit code 40).
+> Используйте его только для транскрипции текста, не для SRT/глав.
+
+### Groq Whisper (облачный)
+
+Прямой доступ к Groq API с полными таймкодами. Быстрее и дешевле OpenRouter для STT.
+
+**Модели:**
+
+| Модель | ID | Скорость | Цена |
+|---|---|---|---|
+| Large V3 Turbo ⭐ | `whisper-large-v3-turbo` | 216x real-time | $0.04/час |
+| Large V3 | `whisper-large-v3` | 189x real-time | $0.111/час |
+
+**Особенности:**
+- ✅ Полные посегментные и пословные таймкоды (`timestamp_granularities=["segment","word"]`)
+- Требуется `GROQ_API_KEY` (начинается с `gsk_`) — https://console.groq.com/keys
+- Не путать с xAI (Grok): Groq = groq.com, xAI = x.ai
+- Форматы: mp3, wav, ogg, opus, flac, m4a, webm
+
+```bash
+voiceover timings --audio podcast.opus --timing-provider groq-whisper --model whisper-large-v3-turbo --language ru --json
+```
+
+### xAI STT (облачный)
+
+Batch-транскрипция через xAI API с пословными таймкодами и confidence.
+
+**Модели:**
+
+| Модель | ID | Описание |
+|---|---|---|
+| Grok STT ⭐ | `grok-stt` | Word-level timestamps, 12 форматов, multichannel, diarization |
+
+**Особенности:**
+- ✅ Пословные таймкоды с confidence (0.0–1.0)
+- Авто-сегментация: слова группируются в сегменты по паузам >0.5с
+- 12 аудиоформатов: mp3, wav, ogg, opus, flac, m4a, webm, aac, mp4, mpeg, mpga
+- API поддерживает multichannel и diarization
+- Требуется `X_AI_API_KEY` (начинается с `xai-`) — https://docs.x.ai
+
+```bash
+voiceover timings --audio podcast.opus --timing-provider xai-stt --model grok-stt --language ru --json
+```
+
 ### Выбор провайдера таймингов
 
 | Задача | Провайдер | Модель |
 |---|---|---|
 | Локально, нужны сегменты | `faster-whisper` | `small` |
-| Быстро, облачно, без GPU | `openrouter-whisper` | `openai/whisper-large-v3-turbo` |
+| Быстро, облачно, с таймкодами | `groq-whisper` | `whisper-large-v3-turbo` |
+| Облачно, слова + confidence | `xai-stt` | `grok-stt` |
 | Максимальная точность (локально) | `faster-whisper` | `large-v3` |
-| Дешёво, облачно | `openrouter-whisper` | `openai/whisper-1` |
+| Только текст, дёшево | `openrouter-whisper` | `openai/whisper-1` |
 
 ---
 
@@ -266,8 +315,9 @@ voiceover timings --audio podcast.opus --timing-provider openrouter-whisper --mo
 | Западные голоса, качество | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
 | Бесплатно, есть GPU | Qwen-local | CustomVoice (preset) | Бесплатно |
 | Локальные тайминги, сегменты | faster-whisper | `small` | Бесплатно (CPU) |
-| Быстрые тайминги, облачно | openrouter-whisper | `openai/whisper-large-v3-turbo` | ~$0.006/мин |
-| Дешёвые тайминги, облачно | openrouter-whisper | `openai/whisper-1` | ~$0.002/мин |
+| Облачные тайминги + сегменты | groq-whisper | `whisper-large-v3-turbo` | $0.04/час |
+| Облачные тайминги, слова + conf | xai-stt | `grok-stt` | xAI pricing |
+| Только текст, облачно | openrouter-whisper | `openai/whisper-1` | ~$0.002/мин |
 
 Цены — реальные smoke-прогоны 2026-04-29 (TTS) / 2026-05-27 (STT), не гарантия провайдера.
 Актуальный список всегда в `docs/00-version-log.md`.
