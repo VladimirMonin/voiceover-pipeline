@@ -32,11 +32,13 @@ from .config import (
     DEFAULT_TIMING_DEVICE,
     DEFAULT_TIMING_LANGUAGE,
     DEFAULT_TIMING_MODEL,
+    DEFAULT_TIMING_PROVIDER,
     DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
     GEMINI_TTS_VOICES,
     OPENAI_TTS_VOICES,
     OPENROUTER_TTS_MODELS,
+    OPENROUTER_WHISPER_MODELS,
     PODCAST_NARRATION_PROMPT,
     POLZA_TTS_MODELS,
     PROVIDER_DEFAULT_MODELS,
@@ -196,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     tim = gen.add_argument_group("Whisper timing (optional)")
     tim.add_argument("--with-timings", action="store_true")
-    tim.add_argument("--timing-model", default=DEFAULT_TIMING_MODEL, choices=["base", "small", "medium", "large-v3-turbo", "large-v3"])
+    tim.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper"],
+                     help="Transcription provider (default: faster-whisper)")
+    tim.add_argument("--timing-model", default=None, help="Provider-specific model for transcription")
     tim.add_argument("--timing-device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"])
     tim.add_argument("--timing-compute", default=DEFAULT_TIMING_COMPUTE, choices=["auto", "int8", "int8_float16", "float16", "float32"])
     tim.add_argument("--timing-language", default=DEFAULT_TIMING_LANGUAGE)
@@ -213,7 +217,9 @@ def build_parser() -> argparse.ArgumentParser:
     timp.add_argument("--audio", type=str, required=True)
     timp.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     timp.add_argument("--run-id", default="")
-    timp.add_argument("--model", default=DEFAULT_TIMING_MODEL, choices=["base", "small", "medium", "large-v3-turbo", "large-v3"])
+    timp.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper"],
+                      help="Transcription provider (default: faster-whisper)")
+    timp.add_argument("--model", default=None, help="Provider-specific model (e.g. openai/whisper-large-v3-turbo)")
     timp.add_argument("--device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"])
     timp.add_argument("--compute", default=DEFAULT_TIMING_COMPUTE, choices=["auto", "int8", "int8_float16", "float16", "float32"])
     timp.add_argument("--language", default=DEFAULT_TIMING_LANGUAGE)
@@ -240,6 +246,8 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--json", dest="json_output", action="store_true")
     doc.add_argument("--provider", default=None, choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], help="Check provider-specific requirements.")
     doc.add_argument("--with-timings", action="store_true", help="Check timing dependencies.")
+    doc.add_argument("--timing-provider", default="faster-whisper", choices=["faster-whisper", "openrouter-whisper"],
+                    help="Timing provider to check (default: faster-whisper)")
     doc.add_argument("--timing-device", default="cpu", choices=["auto", "cpu", "cuda"], help="Requested timing device for dependency check.")
 
     # --------------- validate ---------------
@@ -257,7 +265,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --------------- list ---------------
     lst = subparsers.add_parser("list", help="List available providers, voices, or timing models.")
-    lst.add_argument("target", choices=["providers", "voices", "timing-models"])
+    lst.add_argument("target", choices=["providers", "voices", "timing-models", "timing-providers"])
     lst.add_argument("--provider", default=None, help="Filter voices by provider.")
     lst.add_argument("--json", dest="json_output", action="store_true")
 
@@ -439,7 +447,9 @@ def generate(args: argparse.Namespace) -> None:
         })
 
     if getattr(args, "with_timings", False):
-        _preflight_timing_dependency()
+        _preflight_timing_dependency(
+            getattr(args, "timing_provider", "faster-whisper"),
+        )
 
     if paths.output_root.exists():
         if args.skip_existing:
@@ -636,6 +646,7 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
             logger.event("info", "timings_started", audio=paths.full_mp3.name)
             timing_info = _extract_timings(
                 audio_path=paths.full_mp3, output_dir=paths.output_root, prefix=paths.prefix,
+                timing_provider=getattr(args, "timing_provider", "faster-whisper"),
                 model=args.timing_model, device=args.timing_device,
                 compute_type=args.timing_compute, language=args.timing_language,
                 word_timestamps=args.word_timestamps, quiet=args.json_output,
@@ -728,7 +739,8 @@ def run_timings(args: argparse.Namespace) -> None:
     try:
         timing = _extract_timings(
             audio_path=audio_path, output_dir=output_dir, prefix=run_id,
-            model=args.model, device=args.device, compute_type=args.compute,
+            timing_provider=args.timing_provider, model=args.model,
+            device=args.device, compute_type=args.compute,
             language=args.language, word_timestamps=args.word_timestamps,
             quiet=args.json_output,
         )
@@ -855,13 +867,24 @@ def doctor_cmd(args: argparse.Namespace) -> None:
     results["openrouter_key"] = {"ok": or_ok, "required": need_or}
 
     need_whisper = bool(args.with_timings)
-    whisper_ok = False
-    try:
-        import faster_whisper
-        whisper_ok = True
-    except ImportError:
-        pass
-    results["faster_whisper"] = {"ok": whisper_ok, "required": need_whisper}
+    timing_provider = getattr(args, "timing_provider", "faster-whisper")
+
+    if timing_provider == "openrouter-whisper":
+        whisper_ok = False
+        try:
+            read_openrouter_key()
+            whisper_ok = True
+        except Exception:
+            pass
+        results["openrouter_whisper_key"] = {"ok": whisper_ok, "required": need_whisper}
+    else:
+        whisper_ok = False
+        try:
+            import faster_whisper
+            whisper_ok = True
+        except ImportError:
+            pass
+        results["faster_whisper"] = {"ok": whisper_ok, "required": need_whisper}
 
     need_cuda = (args.provider == "qwen-local") or (args.timing_device == "cuda")
     cuda_available = False
@@ -1034,6 +1057,32 @@ def list_cmd(args: argparse.Namespace) -> None:
                 {"id": "large-v3", "parameters_m": 1550, "disk_mb": 3090, "speed": "slowest"},
             ]
         }
+    elif args.target == "timing-providers":
+        data = {
+            "timing_providers": [
+                {
+                    "id": "faster-whisper",
+                    "type": "local",
+                    "models": [
+                        {"id": "base", "parameters_m": 74, "disk_mb": 148, "speed": "fastest"},
+                        {"id": "small", "parameters_m": 244, "disk_mb": 486, "speed": "fast", "default": True},
+                        {"id": "medium", "parameters_m": 769, "disk_mb": 1536, "speed": "balanced"},
+                        {"id": "large-v3-turbo", "parameters_m": 809, "disk_mb": 1620, "speed": "slow"},
+                        {"id": "large-v3", "parameters_m": 1550, "disk_mb": 3090, "speed": "slowest"},
+                    ],
+                },
+                {
+                    "id": "openrouter-whisper",
+                    "type": "cloud",
+                    "currency": "USD",
+                    "models": [
+                        {"id": "openai/whisper-large-v3-turbo", "description": "Optimized Whisper Large V3 — fast, 99+ languages"},
+                        {"id": "openai/whisper-large-v3", "description": "Whisper Large V3 — highest accuracy"},
+                        {"id": "openai/whisper-1", "description": "Whisper v1 — legacy, cheapest"},
+                    ],
+                },
+            ]
+        }
     else:
         data = {}
     if args.json_output:
@@ -1046,11 +1095,17 @@ def list_cmd(args: argparse.Namespace) -> None:
 # helpers
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _preflight_timing_dependency() -> None:
-    try:
-        import faster_whisper  # noqa: F401
-    except ModuleNotFoundError as exc:
-        fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
+def _preflight_timing_dependency(timing_provider: str = "faster-whisper") -> None:
+    if timing_provider == "openrouter-whisper":
+        try:
+            read_openrouter_key()
+        except RuntimeError as exc:
+            fail(str(exc), _EXIT_NO_KEY)
+    else:
+        try:
+            import faster_whisper  # noqa: F401
+        except ModuleNotFoundError as exc:
+            fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
 
 
 def _has_paid_chunk_audio(paths) -> bool:
@@ -1138,12 +1193,18 @@ def _resolve_audio(raw: str) -> Path:
     return Path(raw)
 
 
-def _extract_timings(audio_path, output_dir, prefix, model, device, compute_type, language, word_timestamps=False, quiet=False):
-    from .providers.faster_whisper import FasterWhisperProvider
+def _extract_timings(audio_path, output_dir, prefix, timing_provider, model, device, compute_type, language, word_timestamps=False, quiet=False):
+    if timing_provider == "openrouter-whisper":
+        from .providers.openrouter_whisper import OpenRouterWhisperProvider
+        effective_model = model or "openai/whisper-large-v3-turbo"
+        provider = OpenRouterWhisperProvider(model=effective_model)
+    else:
+        from .providers.faster_whisper import FasterWhisperProvider
+        effective_model = model or DEFAULT_TIMING_MODEL
+        provider = FasterWhisperProvider(
+            model_size=effective_model, device=device, compute_type=compute_type,
+        )
 
-    provider = FasterWhisperProvider(
-        model_size=model, device=device, compute_type=compute_type,
-    )
     timing = provider.transcribe(
         audio_path=audio_path, language=language,
         word_timestamps=word_timestamps, quiet=quiet,
