@@ -265,6 +265,9 @@ voiceover timings --audio podcast.opus --timing-provider openrouter-whisper --mo
 | Самый дешёвый TTS, доллары | OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041/мин |
 | Западные голоса, качество | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
 | Бесплатно, есть GPU | Qwen-local | CustomVoice (preset) | Бесплатно |
+| Локальные тайминги, сегменты | faster-whisper | `small` | Бесплатно (CPU) |
+| Быстрые тайминги, облачно | openrouter-whisper | `openai/whisper-large-v3-turbo` | ~$0.006/мин |
+| Дешёвые тайминги, облачно | openrouter-whisper | `openai/whisper-1` | ~$0.002/мин |
 
-Цены — реальные smoke-прогоны 2026-04-29, не гарантия провайдера.
+Цены — реальные smoke-прогоны 2026-04-29 (TTS) / 2026-05-27 (STT), не гарантия провайдера.
 Актуальный список всегда в `docs/00-version-log.md`.

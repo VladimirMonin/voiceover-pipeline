@@ -11,8 +11,8 @@
 | `validate --script` | Проверить Markdown-сценарий | Да |
 | `list providers` | Показать доступных TTS-провайдеров | Да |
 | `list voices --provider` | Показать голоса провайдера | Да |
-|| `list timing-models` | Показать локальные Whisper-модели | Да |
-|| `list timing-providers` | Показать всех провайдеров распознавания (local + cloud) | Да |
+| `list timing-models` | Показать локальные Whisper-модели | Да |
+| `list timing-providers` | Показать всех провайдеров распознавания (local + cloud) | Да |
 | `split --script` | Разбить сценарий на чанки (без генерации) | Да |
 | `generate` | Полная генерация: TTS + MP3 + опционально тайминги | Да |
 | `timings --audio` | Извлечь Whisper-тайминги из готового MP3 | Да |
@@ -169,6 +169,36 @@ voiceover list voices --provider polza-tts --json
 - `voice_categories` — объект с разбивкой по семействам (опционально, есть у `polza-tts` и `openrouter-tts`)
 
 Для `openrouter-tts` категории: `"gemini"` и `"openai"`.
+
+## `list timing-providers` — JSON контракт
+
+```bash
+voiceover list timing-providers --json
+```
+
+Ответ:
+
+```json
+{
+  "status": "success",
+  "timing_providers": [
+    {
+      "id": "faster-whisper",
+      "type": "local",
+      "models": [{...}]
+    },
+    {
+      "id": "openrouter-whisper",
+      "type": "cloud",
+      "currency": "USD",
+      "models": [{...}]
+    }
+  ]
+}
+```
+
+- `type`: `"local"` (faster-whisper) или `"cloud"` (openrouter-whisper)
+- `models`: у local — `parameters_m`/`disk_mb`/`speed`, у cloud — `id`/`description`
 
 ## `--run-id` правила
 
