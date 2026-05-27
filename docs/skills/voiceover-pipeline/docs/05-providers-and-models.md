@@ -6,7 +6,8 @@
 
 ## Обзор
 
-voiceover-pipeline поддерживает четыре TTS-провайдера с единым интерфейсом:
+voiceover-pipeline поддерживает четыре TTS-провайдера с единым интерфейсом
+и два провайдера распознавания речи (timing):
 
 | Провайдер | Тип | API | Валюта | Ключ | Provider ID |
 |---|---|---|---|---|---|
@@ -183,6 +184,72 @@ Open-source модель синтеза речи. Работает локаль�
 - NVIDIA GPU + CUDA (~4 GB VRAM)
 - Модель ~3.4 GB, скачивается один раз
 - Extras: `voiceover-pipeline[voiceover-qwen]`
+
+---
+
+## Провайдеры распознавания речи (timing)
+
+Два провайдера для извлечения таймингов и субтитров из аудио.
+
+| Провайдер | Тип | Provider ID | Ключ | По умолчанию |
+|---|---|---|---|---|
+| Faster-Whisper | Локальный | `faster-whisper` | Не нужен | Да |
+| OpenRouter Whisper | Облачный | `openrouter-whisper` | `OPENROUTER_API_KEY` | Нет |
+
+### Faster-Whisper (локальный)
+
+Локальное распознавание через библиотеку `faster-whisper`. Модели скачиваются с HuggingFace.
+
+**Модели:**
+
+| Модель | ID | Параметры | Размер | Скорость |
+|---|---|---|---|---|
+| Base | `base` | 74M | 148 MB | Самая быстрая |
+| Small ⭐ | `small` | 244M | 486 MB | Быстрая (дефолт) |
+| Medium | `medium` | 769M | 1.5 GB | Сбалансированная |
+| Large V3 Turbo | `large-v3-turbo` | 809M | 1.6 GB | Медленная |
+| Large V3 | `large-v3` | 1.55B | 3.0 GB | Самая точная |
+
+**Особенности:**
+- Полные посегментные тайминги (Word-level: `--word-timestamps`)
+- Требуется `faster-whisper` (`uv sync --extra timing-whisper`)
+- Работает на CPU/GPU
+- Дефолтная модель: `small` (486 MB, оптимум для русского)
+
+```bash
+voiceover timings --audio podcast.mp3 --timing-provider faster-whisper --model small --language ru --json
+```
+
+### OpenRouter Whisper (облачный)
+
+Облачное распознавание через OpenRouter API. Быстро, не требует локального GPU/CPU.
+
+**Модели:**
+
+| Модель | ID | Описание | Скорость |
+|---|---|---|---|
+| Large V3 Turbo ⭐ | `openai/whisper-large-v3-turbo` | Оптимизированная, 99+ языков | Быстрая (дефолт) |
+| Large V3 | `openai/whisper-large-v3` | Максимальная точность, дороже | Средняя |
+| Whisper v1 | `openai/whisper-1` | Legacy, самая дешёвая | Быстрая |
+
+**Особенности:**
+- Использует существующий `OPENROUTER_API_KEY` из `.env`
+- Ответ: `{text, usage}` — один сегмент на весь файл (без посегментных таймкодов)
+- Поддерживает форматы: mp3, wav, ogg, opus, flac, m4a, webm
+- Цена: ~$0.006/мин для turbo (оценка, зависит от провайдера)
+
+```bash
+voiceover timings --audio podcast.opus --timing-provider openrouter-whisper --model openai/whisper-large-v3-turbo --language ru --json
+```
+
+### Выбор провайдера таймингов
+
+| Задача | Провайдер | Модель |
+|---|---|---|
+| Локально, нужны сегменты | `faster-whisper` | `small` |
+| Быстро, облачно, без GPU | `openrouter-whisper` | `openai/whisper-large-v3-turbo` |
+| Максимальная точность (локально) | `faster-whisper` | `large-v3` |
+| Дешёво, облачно | `openrouter-whisper` | `openai/whisper-1` |
 
 ---
 

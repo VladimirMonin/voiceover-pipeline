@@ -11,7 +11,8 @@
 | `validate --script` | Проверить Markdown-сценарий | Да |
 | `list providers` | Показать доступных TTS-провайдеров | Да |
 | `list voices --provider` | Показать голоса провайдера | Да |
-| `list timing-models` | Показать Whisper-модели | Да |
+|| `list timing-models` | Показать локальные Whisper-модели | Да |
+|| `list timing-providers` | Показать всех провайдеров распознавания (local + cloud) | Да |
 | `split --script` | Разбить сценарий на чанки (без генерации) | Да |
 | `generate` | Полная генерация: TTS + MP3 + опционально тайминги | Да |
 | `timings --audio` | Извлечь Whisper-тайминги из готового MP3 | Да |
@@ -103,11 +104,12 @@
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
 | `--with-timings` | flag | false | Запустить Whisper после TTS; dependency preflight выполняется до TTS |
-| `--timing-model` | choice | `small` | `base`, `small`, `medium`, `large-v3-turbo`, `large-v3` |
-| `--timing-device` | choice | `cpu` | `auto`, `cpu`, `cuda` |
-| `--timing-compute` | choice | `int8` | `auto`, `int8`, `int8_float16`, `float16`, `float32` |
-| `--timing-language` | str | `ru` | Код языка для Whisper |
-| `--word-timestamps` | flag | false | Добавить word-level тайминги |
+| `--timing-provider` | choice | `faster-whisper` | `faster-whisper` (локально) или `openrouter-whisper` (облачно) |
+| `--timing-model` | str | `small` / `openai/whisper-large-v3-turbo` | ID модели (зависит от провайдера) |
+| `--timing-device` | choice | `cpu` | `auto`, `cpu`, `cuda` (только для faster-whisper) |
+| `--timing-compute` | choice | `int8` | `auto`, `int8`, `int8_float16`, `float16`, `float32` (только faster-whisper) |
+| `--timing-language` | str | `ru` | Код языка |
+| `--word-timestamps` | flag | false | Word-level тайминги (только faster-whisper) |
 
 ### `validate` Gemini dialogue options
 
@@ -130,15 +132,16 @@
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
-| `--audio` | str | **обязательный** | Путь к MP3-файлу |
+| `--audio` | str | **обязательный** | Путь к аудио-файлу (MP3, Opus, WAV, FLAC, ...) |
 | `--output-dir` | path | `out` | Корень выходной директории |
 | `--run-id` | str | stem аудиофайла | Имя прогона |
-| `--model` | choice | `small` | Whisper-модель |
-| `--device` | choice | `cpu` | `auto`, `cpu`, `cuda` |
-| `--compute` | choice | `int8` | Тип вычислений |
+| `--timing-provider` | choice | `faster-whisper` | `faster-whisper` (локально) или `openrouter-whisper` (облачно) |
+| `--model` | str | зависит от провайдера | ID модели (см. `list timing-providers`) |
+| `--device` | choice | `cpu` | `auto`, `cpu`, `cuda` (только faster-whisper) |
+| `--compute` | choice | `int8` | Тип вычислений (только faster-whisper) |
 | `--language` | str | `ru` | Код языка |
 | `--json` | flag | false | JSON-вывод |
-| `--word-timestamps` | flag | false | Word-level тайминги |
+| `--word-timestamps` | flag | false | Word-level тайминги (только faster-whisper) |
 | `--overwrite` | flag | false | Перезаписать |
 | `--skip-existing` | flag | false | Пропустить |
 

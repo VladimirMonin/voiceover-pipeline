@@ -7,10 +7,10 @@
 
 | Поле | Значение |
 |---|---|
-| **Compatible app** | voiceover-pipeline 0.4.5 |
-| **Skill revision** | 2026-05-10 |
+| **Compatible app** | voiceover-pipeline 0.5.0 |
+| **Skill revision** | 2026-05-27 |
 | **Минимальная версия CLI** | 0.4.0 |
-| **Максимальная проверенная** | 0.4.5 |
+| **Максимальная проверенная** | 0.5.0 |
 
 ## Что актуально в этой версии навыка
 
@@ -25,6 +25,7 @@
 - OpenRouter Gemini dialogue: `--format gemini-dialogue`, frontmatter speaker map, inline audio tags, strict UTF-8 byte validation
 - Gemini prompting guide: voice direction skeleton, safe audio tags, emotion recipes, voice selection, chunking limits
 - Stability layer: `run_state.json`, `generation.log`, universal retries, `--resume`, paid-audio overwrite guard, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`, `--json-events`
+- Cloud transcription: `--timing-provider openrouter-whisper` (OpenRouter Whisper Large V3 Turbo), `list timing-providers`, архитектура провайдеров распознавания (TranscriptionProvider ABC)
 - Endpoint dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media`
 
 ## Цены (smoke 2026-04-29, не гарантия провайдера)
@@ -44,6 +45,7 @@
 
 | Дата | Изменение |
 |---|---|
+| 2026-05-27 | **v0.5.0:** Cloud transcription providers. `--timing-provider` (faster-whisper | openrouter-whisper), `list timing-providers`, архитектура `TranscriptionProvider` ABC для расширяемости. OpenRouter Whisper Large V3 Turbo через JSON body с base64. |
 | 2026-05-10 | Добавлен Gemini prompting guide: `AUDIO PROFILE`/`SCENE`/`PERFORMANCE`/`CONTEXT`/`TRANSCRIPT`, safe audio tags, emotion recipes, voice selection, chunking guidance. |
 | 2026-05-10 | Добавлен generic `format: voiceover` для single-speaker режимов: provider/model/voice в frontmatter, CLI overrides, full-error validator, backward compatibility с plain Markdown. |
 | 2026-05-10 | Добавлен Gemini dialogue workflow: two speakers через OpenRouter `multi_speaker_voice_config` + обязательный top-level `voice`, full-error validator, `--speaker-voice`, `--agent`, chunk byte safety gates. |

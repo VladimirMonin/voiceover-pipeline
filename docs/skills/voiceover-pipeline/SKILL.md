@@ -7,9 +7,11 @@ description: >
   и Remotion-ready артефактов. Используй ВСЕГДА, когда пользователь просит
   озвучить текст, создать voiceover, TTS, аудио для видео, подкаста или
   Remotion, получить тайминги, scene durations, subtitles, timestamps,
-  whisper timing или проверить voiceover project. Провайдеры: Polza GPT
-  Audio, Polza TTS (OpenAI + ElevenLabs), OpenRouter TTS (Gemini + OpenAI),
-  Qwen3-TTS (локальный GPU). Агент создаёт project skeleton
+  whisper timing, распознать речь, транскрибировать аудио, выбрать
+  timing-провайдера или проверить voiceover project. Провайдеры TTS: Polza
+  GPT Audio, Polza TTS (OpenAI + ElevenLabs), OpenRouter TTS (Gemini +
+  OpenAI), Qwen3-TTS (локальный GPU). Провайдеры распознавания:
+  faster-whisper (локальный), openrouter-whisper (облачный). Агент создаёт project skeleton
   (.env.example, .gitignore, script.md, out/), просит ключи однократно,
   никогда не читает .env. Триггеры: озвучь, voiceover, TTS, тайминги,
   whisper timing, аудио для видео, подкаст, generate audio, timings for
@@ -22,7 +24,7 @@ description: >
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-> **Совместимость:** voiceover-pipeline 0.4.5, skill revision 2026-05-10.
+> **Совместимость:** voiceover-pipeline 0.5.0, skill revision 2026-05-27.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение
@@ -42,7 +44,7 @@ description: >
 |---|---|---|
 | **A: Bootstrap** | Проекта нет, CLI не установлен, нет .env | Установка → .env.example → .gitignore → script.md → out/ |
 | **B: Generate** | Сценарий готов, ключи есть | doctor → validate → generate → manifest.json |
-| **C: Timings only** | Готовый MP3, нужны SRT/тайминги | timings --audio → .timings.json + .srt |
+| **C: Timings only** | Готовый MP3/Opus, нужны SRT/тайминги | timings --audio --timing-provider → .timings.json + .srt |
 | **D: Troubleshoot** | Что-то сломалось | doctor --json → exit code → recovery |
 
 ## Когда навык должен срабатывать
@@ -56,6 +58,9 @@ description: >
 - «сделай подкаст из сценария»
 - «voiceover generate с таймингами»
 - «какие есть провайдеры/модели/голоса для TTS»
+- «какие есть провайдеры для распознавания речи»
+- «распознай аудио через облачный whisper»
+- «транскрибируй подкаст через OpenRouter»
 - «выбери дешёвую озвучку»
 - «сравни качество TTS моделей»
 
@@ -96,13 +101,15 @@ description: >
    `docs/05-providers-and-models.md`, предложи варианты. По умолчанию:
    `polza-chat-audio` с `openai/gpt-audio-mini` (дёшево, рубли) или
    `polza-tts` с `openai/gpt-4o-mini-tts` (классический TTS, ~1.07 ₽/мин).
-4. **Проверка окружения.** `voiceover doctor --provider <X> --with-timings --json`.
+4. **Проверка окружения.** `voiceover doctor --provider <X> --with-timings [--timing-provider <Y>] --json`.
    Убедись что `workflow_ok: true`.
+   Если нужны тайминги через облако: `--timing-provider openrouter-whisper`.
 5. **Валидация сценария.** `voiceover validate --script "script.md" --json`.
    Если есть issues — покажи пользователю, не запускай генерацию.
 6. **Генерация аудио.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --json --resume`.
    Не используй `--overwrite` для платной генерации; если run оборвался — продолжай через `--resume`.
-7. **Тайминги отдельно.** `voiceover timings --audio "out/prod/<full>.mp3" --run-id "prod" --json --overwrite`.
+7. **Тайминги отдельно.** `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --run-id "prod" --json --overwrite`.
+   Для облачной транскрипции: `--timing-provider openrouter-whisper --model openai/whisper-large-v3-turbo`.
 8. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
 
 ## Security-first правила
@@ -130,9 +137,10 @@ description: >
 | Создаёт .env.example, .gitignore, script.md, out/ — все болванки проекта | Читает .env или значения ключей |
 | Проверяет окружение через doctor | Конфигурирует системный PATH |
 | Валидирует Markdown-сценарий | Пишет сценарий за пользователя |
-| Генерирует озвучку через любой из 4 провайдеров с retry/resume/state/log | Рендерит Remotion-видео |
+| Генерирует озвучку через любой из 4 провайдеров с retry, safe rerun и manifest/log | Рендерит Remotion-видео |
+| Извлекает тайминги через локальный faster-whisper ИЛИ облачный OpenRouter Whisper | Правит исходники voiceover-pipeline |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
-| Объясняет провайдеров, модели, голоса, цены (7 моделей) | Гарантирует будущие цены провайдеров |
+| Объясняет провайдеров, модели, голоса, цены (7 TTS + 3 STT моделей) | Гарантирует будущие цены провайдеров |
 | Диагностирует ошибки по exit codes | Правит исходники voiceover-pipeline |
 
 ## Чеклист готового навыка
