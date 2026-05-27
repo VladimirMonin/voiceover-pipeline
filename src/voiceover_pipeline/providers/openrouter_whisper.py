@@ -1,3 +1,6 @@
+import base64
+import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +13,35 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.models import TimingResult, TimingSegment
 from voiceover_pipeline.providers.base import TranscriptionProvider
+
+
+def _detect_audio_duration_ms(audio_path: Path) -> int:
+    """Get audio duration in ms using ffprobe."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return 0
+    try:
+        import subprocess
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return int(float(result.stdout.strip()) * 1000)
+    except Exception:
+        return 0
+
+
+_AUDIO_FORMAT_MAP = {
+    ".mp3": "mp3",
+    ".wav": "wav",
+    ".ogg": "ogg",
+    ".opus": "ogg",
+    ".flac": "flac",
+    ".m4a": "m4a",
+    ".webm": "webm",
+    ".aac": "aac",
+}
 
 
 class OpenRouterWhisperProvider(TranscriptionProvider):
@@ -54,56 +86,68 @@ class OpenRouterWhisperProvider(TranscriptionProvider):
         if not audio_path.exists():
             raise FileNotFoundError(f"Audio file not found: {audio_path}")
 
+        ext = audio_path.suffix.lower()
+        audio_format = _AUDIO_FORMAT_MAP.get(ext, "mp3")
+
+        # Read and base64-encode
         with open(audio_path, "rb") as fh:
-            files = {
-                "file": (audio_path.name, fh, self._mime_type(audio_path)),
-            }
-            data: dict[str, str] = {
-                "model": self.model,
-                "language": language,
-                "response_format": "verbose_json",
-            }
-            if word_timestamps:
-                data["timestamp_granularities[]"] = "word"
+            audio_bytes = fh.read()
 
-            headers = {"Authorization": f"Bearer {self.api_key}"}
-
-            resp = requests.post(
-                f"{self.base_url}/audio/transcriptions",
-                headers=headers,
-                files=files,
-                data=data,
-                timeout=300,
+        if not quiet:
+            print(
+                f"Encoding {len(audio_bytes) / 1024 / 1024:.1f} MB audio to base64...",
+                file=sys.stderr,
             )
-            resp.raise_for_status()
-            result = resp.json()
 
-        segments: list[TimingSegment] = []
-        for idx, seg in enumerate(result.get("segments", [])):
-            start_ms = round(seg["start"] * 1000)
-            end_ms = round(seg["end"] * 1000)
-            words_list = None
-            if word_timestamps and seg.get("words"):
-                words_list = [
-                    {
-                        "word": w["word"].strip(),
-                        "start_ms": round(w["start"] * 1000),
-                        "end_ms": round(w["end"] * 1000),
-                    }
-                    for w in seg["words"]
-                ]
-            segments.append(
-                TimingSegment(
-                    id=idx,
-                    start_sec=round(seg["start"], 3),
-                    end_sec=round(seg["end"], 3),
-                    start_ms=start_ms,
-                    end_ms=end_ms,
-                    duration_ms=end_ms - start_ms,
-                    text=seg["text"].strip(),
-                    words=words_list,
-                )
+        b64_data = base64.b64encode(audio_bytes).decode("utf-8")
+
+        body: dict[str, Any] = {
+            "model": self.model,
+            "input_audio": {
+                "data": b64_data,
+                "format": audio_format,
+            },
+        }
+        if language:
+            body["language"] = language
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        if not quiet:
+            print(
+                f"Sending {len(b64_data) / 1024 / 1024:.1f} MB base64 to OpenRouter...",
+                file=sys.stderr,
             )
+
+        resp = requests.post(
+            f"{self.base_url}/audio/transcriptions",
+            headers=headers,
+            json=body,
+            timeout=300,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+
+        text = result.get("text", "")
+        duration_ms = _detect_audio_duration_ms(audio_path)
+
+        # The basic API returns full text without segments.
+        # We create a single segment covering the entire audio.
+        segments = [
+            TimingSegment(
+                id=0,
+                start_sec=0.0,
+                end_sec=round(duration_ms / 1000, 3),
+                start_ms=0,
+                end_ms=duration_ms,
+                duration_ms=duration_ms,
+                text=text.strip(),
+                words=None,
+            )
+        ]
 
         return TimingResult(
             segments=segments,
@@ -113,16 +157,3 @@ class OpenRouterWhisperProvider(TranscriptionProvider):
             language=language,
             source_audio=str(audio_path.resolve()),
         )
-
-    @staticmethod
-    def _mime_type(path: Path) -> str:
-        ext = path.suffix.lower()
-        return {
-            ".mp3": "audio/mpeg",
-            ".wav": "audio/wav",
-            ".ogg": "audio/ogg",
-            ".opus": "audio/ogg",
-            ".flac": "audio/flac",
-            ".m4a": "audio/mp4",
-            ".webm": "audio/webm",
-        }.get(ext, "audio/mpeg")
