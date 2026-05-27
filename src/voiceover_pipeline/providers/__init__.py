@@ -1,6 +1,7 @@
 from .base import TTSProvider, TranscriptionProvider
 from .faster_whisper import FasterWhisperProvider
 from .openrouter_tts import OpenRouterTTSProvider
+from .openrouter_whisper import OpenRouterWhisperProvider
 from .polza_chat_audio import PolzaChatAudioProvider
 from .polza_tts import PolzaTTSProvider
 
@@ -13,6 +14,7 @@ __all__ = [
     "TTSProvider",
     "TranscriptionProvider",
     "FasterWhisperProvider",
+    "OpenRouterWhisperProvider",
     "PolzaChatAudioProvider",
     "OpenRouterTTSProvider",
     "PolzaTTSProvider",

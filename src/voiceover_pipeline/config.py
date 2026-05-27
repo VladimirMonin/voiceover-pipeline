@@ -54,6 +54,13 @@ OPENROUTER_TTS_MODELS = [
     "openai/gpt-4o-mini-tts-2025-12-15",
 ]
 
+OPENROUTER_WHISPER_MODELS = [
+    "openai/whisper-large-v3-turbo",
+    "openai/whisper-large-v3",
+    "openai/whisper-1",
+]
+DEFAULT_TIMING_PROVIDER = "faster-whisper"
+
 GEMINI_TTS_VOICES = [
     "Puck",
     "Charon",
