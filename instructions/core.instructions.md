@@ -6,8 +6,8 @@ applyTo: "**"
 
 # Core repository contract
 
-- Read `AGENTS.md` and every instruction whose `applyTo` matches the files being handled.
-- Inspect the relevant implementation, public docs, and tests before changing behavior; do not infer interfaces from stale prose.
+- Read `AGENTS.md` and every instruction whose `applyTo` matches the files being handled before any repository research, planning, editing, or card dispatch.
+- For code research and impact analysis, follow `code-intelligence.instructions.md`; do not substitute broad direct reads or recursive grep for Codebase, Serena, and ast-grep evidence.
 - Make the smallest coherent change. Do not reformat, regenerate, delete, or restore unrelated files.
 - Treat a dirty working tree as user-owned state. Record `git status --short` before and after work and preserve pre-existing modifications and untracked paths.
 - Never read, print, source, parse, copy, or expose `.env`, credential files, API keys, tokens, or secret-bearing command output. Check configuration only through redacted application interfaces such as `voiceover doctor --json` when the task explicitly allows execution.

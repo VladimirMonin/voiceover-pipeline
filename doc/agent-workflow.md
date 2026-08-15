@@ -4,10 +4,11 @@ This document describes how repository agents plan, execute, and verify changes.
 
 ## 1. Discover and protect state
 
-1. Read [`../AGENTS.md`](../AGENTS.md) and all matching atomic instructions.
-2. Inspect `git status --short` and treat every existing modification/untracked path as user-owned.
-3. Read the relevant public docs, source interfaces, and tests. Never inspect `.env` or reveal credentials.
-4. On the `voiceover-pipeline` Kanban board, locate the relevant card and confirm its acceptance criteria when board tooling is available.
+1. Read [`../AGENTS.md`](../AGENTS.md), [`../instructions/code-intelligence.instructions.md`](../instructions/code-intelligence.instructions.md), and all other matching atomic instructions.
+2. For repository research, index/map with Codebase, narrow exact symbols with Serena, and prove structural patterns with ast-grep before direct targeted reads.
+3. Inspect `git status --short` and treat every existing modification/untracked path as user-owned.
+4. Read only the implementation owners narrowed by code intelligence, plus relevant public docs and tests. Never inspect `.env` or reveal credentials.
+5. On the `voiceover-pipeline` Kanban board, locate the relevant card and confirm that its body explicitly requires Codebase, Serena, ast-grep, exact instruction paths, and measurable evidence before dispatch.
 
 ## 2. Define the change boundary
 
