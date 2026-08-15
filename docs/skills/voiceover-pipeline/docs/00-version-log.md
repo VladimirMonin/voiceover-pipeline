@@ -8,7 +8,7 @@
 | Поле | Значение |
 |---|---|
 | **Compatible app** | voiceover-pipeline 0.5.1 |
-| **Skill revision** | 2026-05-27 |
+| **Skill revision** | 2026-07-31 |
 | **Минимальная версия CLI** | 0.4.0 |
 | **Максимальная проверенная** | 0.5.1 |
 
@@ -47,6 +47,7 @@
 
 | Дата | Изменение |
 |---|---|
+| 2026-07-31 | Каноническая версия навыка закреплена в репозитории; справочник TTS и распознавания разделён для соблюдения лимита 300 строк; шаблон `.env.example` дополнен безопасными placeholder-ами Groq/xAI; runtime Hermes привязывается к in-repo skill. |
 | 2026-05-27 | **v0.5.0:** Cloud transcription providers. `--timing-provider` (faster-whisper | openrouter-whisper | groq-whisper | xai-stt), `list timing-providers` с 4 провайдерами, архитектура `TranscriptionProvider` ABC. Groq Whisper — сегментные и пословные таймкоды через прямой API ($0.04/час). xAI STT — пословные таймкоды с confidence через xAI API. OpenRouter Whisper — блокировка `timings`/`--with-timings` (exit code 40) из-за отсутствия таймкодов. |
 | 2026-05-10 | Добавлен Gemini prompting guide: `AUDIO PROFILE`/`SCENE`/`PERFORMANCE`/`CONTEXT`/`TRANSCRIPT`, safe audio tags, emotion recipes, voice selection, chunking guidance. |
 | 2026-05-10 | Добавлен generic `format: voiceover` для single-speaker режимов: provider/model/voice в frontmatter, CLI overrides, full-error validator, backward compatibility с plain Markdown. |

@@ -12,6 +12,7 @@
 
 | Документ | Содержание |
 |---|---|
+| [Agent Development Workflow](../doc/agent-workflow.md) | Безопасный цикл работы агента: scope, dirty tree, Kanban, проверки и отдельные approvals для Git/release |
 | [Artifacts & Analysis](artifacts-and-analysis.md) | JSON-схемы всех артефактов, обработка аудио (PCM→MP3, обрезка тишины, склейка), цены, сравнение моделей |
 | [Whisper Timing](whisper-timing.md) | Whisper CPU small: модели, установка, команды, device/compute, word timestamps, SRT |
 | [Polza Models](polza-openai-audio-models.md) | Polza AI + OpenAI GPT Audio: голоса, цены в RUB, ограничения, особенности |

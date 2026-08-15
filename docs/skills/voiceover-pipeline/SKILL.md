@@ -26,7 +26,7 @@ description: >
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-| **Совместимость:** voiceover-pipeline 0.5.1, skill revision 2026-05-27.
+| **Совместимость:** voiceover-pipeline 0.5.1, skill revision 2026-07-31.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение
@@ -82,7 +82,8 @@ description: >
 | ВСЕГДА | [docs/02-install.md](docs/02-install.md) | Нужно установить CLI, зависимости или понять какую сборку выбрать |
 | ВСЕГДА | [docs/01-concept.md](docs/01-concept.md) | Нужно понять что это и зачем |
 | По ситуации | [docs/04-input-format.md](docs/04-input-format.md) | Нужно создать или проверить сценарий |
-| По ситуации | [docs/05-providers-and-models.md](docs/05-providers-and-models.md) | Нужно выбрать провайдера/модель/голос |
+| По ситуации | [docs/05-providers-and-models.md](docs/05-providers-and-models.md) | Нужно выбрать TTS-провайдера, модель или голос |
+| По ситуации | [docs/13-speech-recognition-providers.md](docs/13-speech-recognition-providers.md) | Нужно выбрать локальное/облачное распознавание и вид таймкодов |
 | По ситуации | [docs/06-commands-and-flags.md](docs/06-commands-and-flags.md) | Нужен полный CLI-справочник |
 | По ситуации | [docs/07-artifacts.md](docs/07-artifacts.md) | Нужно понять что на выходе |
 | По ситуации | [docs/08-workflows.md](docs/08-workflows.md) | Нужен готовый end-to-end сценарий |

@@ -1,54 +1,25 @@
 # AGENTS.md — voiceover-pipeline
 
-> Авто-загружаемый контекст для AI-агентов.
+Repository instructions are split into small, scoped files. Read this router first, then load every matching file from `instructions/` before acting.
 
-## Быстрые команды
+## Required routes
 
-```bash
-uv run voiceover doctor --json                   # проверка окружения
-uv run voiceover list timing-providers --json    # 4 провайдера распознавания
-uv run pytest tests/ -x --tb=short               # тесты (>120)
-```
+- Always: [`instructions/core.instructions.md`](instructions/core.instructions.md)
+- Provider, model, prompt, timing, or CLI behavior: [`instructions/provider-cli.instructions.md`](instructions/provider-cli.instructions.md)
+- Tests or behavior changes: [`instructions/test-quality.instructions.md`](instructions/test-quality.instructions.md)
+- Documentation: [`instructions/docs-governance.instructions.md`](instructions/docs-governance.instructions.md)
+- Agent task tracking: [`instructions/agent-kanban.instructions.md`](instructions/agent-kanban.instructions.md)
+- Git, versioning, packaging, or releases: [`instructions/git-release-safety.instructions.md`](instructions/git-release-safety.instructions.md)
 
-## Публикация в PyPI
+## Source-of-truth map
 
-```bash
-# 1. Токен лежит в .env: PYPI_TOKEN=pypi-...
-# 2. Версия уже в pyproject.toml
-# 3. Собрать и опубликовать:
-uv build
-export $(grep -v '^#' .env | grep PYPI_TOKEN | xargs)
-uv publish --token "$PYPI_TOKEN"
+- Project overview and development setup: [`README.md`](README.md), [`pyproject.toml`](pyproject.toml)
+- Machine-facing CLI behavior: [`docs/agent-cli-contract.md`](docs/agent-cli-contract.md)
+- Documentation index: [`docs/README.md`](docs/README.md)
+- Agent development workflow: [`doc/agent-workflow.md`](doc/agent-workflow.md)
+- User-facing skill: [`docs/skills/voiceover-pipeline/SKILL.md`](docs/skills/voiceover-pipeline/SKILL.md)
+- Implementation: `src/voiceover_pipeline/`; tests: `tests/`
 
-# 4. Тег:
-git tag v$(grep version pyproject.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
-git push --tags
-```
+## Non-negotiable safety
 
-## Где что лежит
-
-| Что | Где |
-|-----|-----|
-| Код провайдеров TTS | `src/voiceover_pipeline/providers/` |
-| Код провайдеров STT | `src/voiceover_pipeline/providers/` (groq_whisper.py, xai_stt.py, openrouter_whisper.py) |
-| CLI | `src/voiceover_pipeline/cli.py` |
-| Конфиг | `src/voiceover_pipeline/config.py` |
-| Документация навыка | `docs/skills/voiceover-pipeline/` (SKILL.md + docs/*.md) |
-| OpenCode навык (Obsidian) | `E:\AUTO_OBSIDIAN\.opencode\skills\voiceover-pipeline\` |
-| `.env` | Корень проекта. НИКОГДА НЕ ЧИТАТЬ содержимое. Токен PYPI_TOKEN внутри. |
-
-## Провайдеры распознавания (timing)
-
-| ID | Тип | Таймкоды | Ключ |
-|----|-----|----------|------|
-| `faster-whisper` | local | segment+word | — |
-| `openrouter-whisper` | cloud | ❌ text only | `OPENROUTER_API_KEY` |
-| `groq-whisper` | cloud | segment+word | `GROQ_API_KEY` |
-| `xai-stt` | cloud | word+confidence | `X_AI_API_KEY` |
-
-`openrouter-whisper` заблокирован для `timings`/`--with-timings` (exit code 40).
-
-## CI/CD
-
-Скрипт релиза: `scripts/release.ps1` (PowerShell, Windows).
-На Linux: ручной bump + build + publish + tag (см. выше).
+Never read, print, source, parse, copy, or expose `.env` or secret values. Never commit secrets. Publishing, tagging, pushing, and any live/cloud or other network operation require explicit user approval for that operation. Preserve unrelated and pre-existing working-tree changes.

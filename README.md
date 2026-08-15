@@ -195,6 +195,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Документация
 
+- [Agent Development Workflow](doc/agent-workflow.md) — безопасная работа с dirty tree, Kanban и Git/release approvals
 - [Agent CLI Contract](docs/agent-cli-contract.md) — JSON-контракт, exit codes, stdout/stderr, safety rules
 - [Remotion Workflow](docs/remotion-workflow.md) — как агент Remotion использует pipeline
 - [Artifacts & Analysis](docs/artifacts-and-analysis.md) — JSON-схемы, обработка аудио, сравнение моделей

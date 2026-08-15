@@ -13,8 +13,10 @@
 # .env is searched in CWD and upwards through parent directories.
 # Never commit .env.
 
-OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxx
+OPENROUTER_API_KEY=sk-or-...xxxx
 POLZA_API_KEY=pza_xxxxxxxxxxxxxxxx
+GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxx
+X_AI_API_KEY=xai-xxxxxxxxxxxxxxxx
 ```
 
 ## Что сказать пользователю
@@ -24,7 +26,9 @@ POLZA_API_KEY=pza_xxxxxxxxxxxxxxxx
 
 - Для Polza нужен `POLZA_API_KEY` (начинается с `pza_`)
 - Для OpenRouter нужен `OPENROUTER_API_KEY` (начинается с `sk-or-v1-`)
-- Для Qwen-local ключи не нужны
+- Для Groq Whisper нужен `GROQ_API_KEY` (начинается с `gsk_`)
+- Для xAI STT нужен `X_AI_API_KEY` (начинается с `xai-`)
+- Для Qwen-local и Faster-Whisper ключи не нужны
 
 После этого я проверю что ключи видны через `voiceover doctor`.»
 
