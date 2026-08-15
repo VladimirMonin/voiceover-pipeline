@@ -51,9 +51,18 @@ voiceover-qwen = [
   "soundfile>=0.12.0",
   "numpy>=1.24.0",
 ]
+asr-qwen = [
+  "qwen-asr",
+]
 cuda = [
   "nvidia-cudnn-cu12>=9.0.0; sys_platform == 'win32' or sys_platform == 'linux'",
   "nvidia-cublas-cu12>=12.0.0; sys_platform == 'win32' or sys_platform == 'linux'",
+]
+asr-nemotron = [
+  "accelerate>=1.0.0",
+  "librosa>=0.10.0",
+  "torch>=2.0.0",
+  "transformers>=5.0.0",
 ]
 
 [project.urls]
@@ -72,6 +81,11 @@ dev = [
 
 [tool.uv]
 package = true
+conflicts = [
+  [{ extra = "asr-qwen" }, { extra = "voiceover-qwen" }],
+  [{ extra = "asr-qwen" }, { extra = "asr-nemotron" }],
+  [{ extra = "asr-nemotron" }, { extra = "voiceover-qwen" }],
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/voiceover_pipeline"]

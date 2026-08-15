@@ -11,9 +11,11 @@
 | `list providers` | Доступные TTS-провайдеры | да |
 | `list voices --provider X` | Голоса провайдера | да |
 | `list timing-models` | Whisper-модели | да |
+| `list asr-providers` | Зарегистрированные локальные ASR-провайдеры и capabilities | да |
 | `split --script` | Чанки сценария | да |
 | `generate` | Полная генерация + тайминги | да |
 | `timings --audio` | Тайминги из готового MP3 | да |
+| `transcribe --audio` | Распознать конечный локальный аудиофайл через ASR registry | да |
 
 Все команды можно вызвать с `--json` для машинно-читаемого вывода.
 
@@ -22,8 +24,8 @@
 | Код | Значение | Когда |
 |---|---|---|
 | `0` | success | Всё ок |
-| `2` | invalid args | Неверные аргументы, файл не найден, 0 чанков |
-| `10` | missing dependency | faster-whisper не установлен |
+| `2` | invalid args | Неверные аргументы, файл не найден, 0 чанков, неизвестный provider или неподдерживаемая capability |
+| `10` | missing dependency | Не установлен выбранный локальный ASR runtime или faster-whisper |
 | `11` | no ffmpeg/ffprobe | FFmpeg не найден в PATH |
 | `20` | no key | Нет POLZA_API_KEY или OPENROUTER_API_KEY |
 | `30` | provider/run error | API error, папка существует без --overwrite |
@@ -68,13 +70,14 @@
 
 Проверяет: Python, FFmpeg, FFprobe, `.env`, ключи, faster-whisper, CUDA.
 
-Без флагов проверяет общее окружение (Polza cloud TTS baseline; faster-whisper и CUDA становятся required только с `--with-timings` или `--provider qwen-local`).
+Без флагов проверяет общее окружение (Polza cloud TTS baseline; faster-whisper и CUDA становятся required только с `--with-timings` или `--provider qwen-local`). Локальный ASR runtime проверяется только при явных `--with-asr --asr-provider <id>`; CUDA сама по себе не является ASR healthcheck.
 
 С флагами проверяет конкретный workflow:
 
 ```powershell
 voiceover doctor --provider qwen-local --json           # нужен CUDA
 voiceover doctor --with-timings --timing-device cpu --json  # нужен faster-whisper
+voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-compute auto --json
 ```
 
 ```json
@@ -170,6 +173,130 @@ voiceover doctor --with-timings --timing-device cpu --json  # нужен faster-
   "duration_ms": 25520
 }
 ```
+
+## `transcribe --audio --json`
+
+`transcribe` — отдельная finite-audio ASR-команда. Она не вызывает `timings`,
+не создаёт SRT и не синтезирует сегменты по всей длине аудио. Первый core slice
+не реализует streaming, VAD/session lifecycle, cloud fallback или загрузку
+моделей.
+
+```powershell
+voiceover list asr-providers --json
+voiceover transcribe `
+  --audio "recording.wav" `
+  --provider local-id `
+  --model "model-id" `
+  --language ru `
+  --device cpu `
+  --compute auto `
+  --json
+```
+
+- `--provider` обязателен и всегда разрешается через ASR registry. Неизвестный
+  ID возвращает machine JSON error с exit code `2`; fallback в faster-whisper
+  или облако запрещён.
+- `--model`, `--language`, `--device` и `--compute` валидируются по capability
+  выбранного provider до его factory/runtime. `qwen-local` и `nemotron-local`
+  — text-only ASR IDs; неизвестный ID по-прежнему fail-closed.
+- Публичных флагов `--prompt`, `--context`, `--glossary` или числового phrase
+  boost нет. В API typed `ASRContextHints` различает `context_text`, glossary
+  profile/digest/selected terms, `ASRPhraseHint` с силой `mild|normal|strong` и
+  adapter-specific `initial_prompt`; они не записываются в стандартный receipt.
+- `timestamp_mode: "none"` означает text-only ASR. `segments` или `words`
+  появляются только при заявленных provider capabilities; timestamps требуют
+  `native` или `forced` origin. Text-only ответ не допускается к SRT.
+
+```json
+{
+  "status": "success",
+  "provider": "local-id",
+  "model": "model-id",
+  "transcript": "...",
+  "language": "ru",
+  "duration_s": null,
+  "source_audio": "...",
+  "timestamp_mode": "none",
+  "segments": [],
+  "words": [],
+  "execution": {
+    "runtime": "...",
+    "runtime_version": "...",
+    "model_revision": null,
+    "device": "cpu",
+    "compute": "auto",
+    "measurements": {}
+  }
+}
+```
+
+### Qwen3-ASR text-only optional runtime
+
+`qwen-local` в ASR registry — отдельное пространство имён от одноимённого TTS
+provider. Его default model — `Qwen/Qwen3-ASR-0.6B`; runtime устанавливается
+явно, без автоматической загрузки модели:
+
+```powershell
+voiceover list asr-providers --json
+voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-compute auto --json
+```
+
+- Runtime boundary намеренно deferred-import. Approved compatibility resolution
+  declares `qwen-asr` in the `asr-qwen` optional extra; install it explicitly
+  with `uv sync --extra asr-qwen`. That extra is mutually exclusive with
+  `voiceover-qwen`, because their pinned Transformers runtimes are incompatible.
+  CLI itself never downloads the runtime or a model.
+- Adapter поддерживает finite batch audio, explicit language и typed
+  `ASRContextHints.context_text`: канонические Qwen language names передаются
+  как есть, а ISO-коды `de|en|es|ru` преобразуются в `German|English|Spanish|Russian`.
+  Context остаётся soft contextual bias, передаваемым в
+  `qwen_asr.Qwen3ASRModel.transcribe(..., context=..., language=...)`. Raw
+  `--context`/`--prompt` flags и cloud fallback отсутствуют.
+- Capability допускает request `--device cpu|cuda` и `--compute
+  auto|bfloat16|float32`; `auto` выбирает `float32` для CPU и `bfloat16` для
+  opt-in CUDA. `doctor` проверяет только импорт runtime, не наличие модели и не
+  пригодность GPU.
+- Adapter выдаёт transcript, effective language и execution receipt. Он не
+  объявляет segment/word timestamps, forced alignment, confidence или streaming;
+  результат всегда text-only (`timestamp_mode: "none"`) и не создаёт SRT.
+- Отсутствующий selected runtime возвращает exit code `10` и одну remediation:
+  `qwen-asr runtime is unavailable. Install an approved qwen-asr runtime before retrying.`
+
+Установленный пакет, модельные веса, конкретный response schema и CPU/GPU
+совместимость не доказаны этим offline slice. Они требуют отдельного
+owner-approved local runtime experiment; CLI не загружает модель автоматически.
+
+### Nemotron ASR text-only optional runtime
+
+`nemotron-local` — отдельный local ASR ID к NVIDIA Nemotron 3.5 через Hugging
+Face Transformers: `AutoProcessor` готовит audio и locale, а
+`AutoModelForRNNT.generate(...)` возвращает text-only transcript. Default
+identifier — `nvidia/nemotron-3.5-asr-streaming-0.6b`; он не утверждает
+доступность артефакта, совместимость версии или пригодность оборудования.
+
+```powershell
+voiceover list asr-providers --json
+voiceover doctor --with-asr --asr-provider nemotron-local --asr-device cpu --asr-compute auto --json
+```
+
+- Runtime boundary deferred-import: registry/listing и factory не импортируют
+  `transformers`; optional extra `asr-nemotron` фиксирует совместимый runtime,
+  но CLI ничего не скачивает до explicit transcription request.
+- Adapter принимает finite batch audio, запрашивает `--device cpu|cuda` и только
+  `--compute auto`. Для известных ISO language codes он передаёт Nemotron locale;
+  `context_text`, glossary, `phrase_hints` и `initial_prompt` не передаются.
+  Official model API документирует language conditioning, но не contextual bias
+  или phrase boosting, поэтому обе capability не заявлены.
+- Streaming, segment/word timestamps, forced alignment и confidence также не
+  заявлены. Результат всегда text-only (`timestamp_mode: "none"`), не создаёт
+  SRT и не является timing bridge.
+- Missing selected runtime возвращает exit code `10` и одну remediation:
+  `Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying.`
+
+Этот contract покрыт mocked fixtures. Установленный Transformers runtime,
+модельные веса/revision, точный response schema, phrase boosting, timestamps,
+streaming, CPU/GPU compatibility и качество не проверялись; для каждого нужен
+отдельный owner-approved local experiment.
 
 ### `generate --json` (skipped)
 

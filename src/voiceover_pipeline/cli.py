@@ -18,6 +18,8 @@ from .artifacts import (
     write_json,
 )
 from .config import (
+    DEFAULT_ASR_COMPUTE,
+    DEFAULT_ASR_DEVICE,
     DEFAULT_ELEVENLABS_VOICE,
     DEFAULT_FALLBACK_VOICE,
     DEFAULT_MODEL,
@@ -50,7 +52,7 @@ from .config import (
     read_polza_key,
 )
 from .media import check_media_tools, concat_audio_files, concat_mp3_chunks, mp3_duration_ms, trim_final_silence, write_audio_as_mp3
-from .models import ChunkArtifact, ScriptChunk
+from .models import ASRRequest, ChunkArtifact, ScriptChunk
 from .gemini_dialogue import (
     GEMINI_DIALOGUE_FORMAT,
     chunks_from_validation as gemini_chunks_from_validation,
@@ -70,6 +72,11 @@ from .pricing import (
     fetch_polza_model_pricing,
 )
 from .providers import OpenRouterTTSProvider, PolzaChatAudioProvider, PolzaTTSProvider, QwenLocalTTSProvider, TTSProvider
+from .providers.asr_registry import (
+    ASRProviderNotFoundError,
+    get_asr_provider_spec,
+    list_asr_provider_specs,
+)
 from .retry import RetryPolicy, run_with_retry
 from .run_state import (
     LOG_FILE,
@@ -135,6 +142,8 @@ def main() -> None:
             generate(args)
         elif args.command == "split":
             split_cmd(args)
+        elif args.command == "transcribe":
+            transcribe_cmd(args)
         elif args.command == "timings":
             run_timings(args)
         elif args.command == "status":
@@ -216,6 +225,16 @@ def build_parser() -> argparse.ArgumentParser:
     spl.add_argument("--delimiter", default="******")
     spl.add_argument("--json", dest="json_output", action="store_true")
 
+    # --------------- transcribe ---------------
+    asr = subparsers.add_parser("transcribe", help="Transcribe finite audio with a registered local ASR provider.")
+    asr.add_argument("--audio", type=str, required=True)
+    asr.add_argument("--provider", required=True, help="Registered ASR provider ID.")
+    asr.add_argument("--model", default=None, help="Provider-specific ASR model ID.")
+    asr.add_argument("--language", default=None, help="Optional forced language.")
+    asr.add_argument("--device", default=DEFAULT_ASR_DEVICE, help="Requested device, validated against provider capabilities.")
+    asr.add_argument("--compute", default=DEFAULT_ASR_COMPUTE, help="Requested compute mode, validated against provider capabilities.")
+    asr.add_argument("--json", dest="json_output", action="store_true")
+
     # --------------- timings ---------------
     timp = subparsers.add_parser("timings", help="Extract Whisper timings from audio.")
     timp.add_argument("--audio", type=str, required=True)
@@ -253,6 +272,10 @@ def build_parser() -> argparse.ArgumentParser:
     doc.add_argument("--timing-provider", default="faster-whisper", choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
                     help="Timing provider to check (default: faster-whisper)")
     doc.add_argument("--timing-device", default="cpu", choices=["auto", "cpu", "cuda"], help="Requested timing device for dependency check.")
+    doc.add_argument("--with-asr", action="store_true", help="Check a registered local ASR provider dependency boundary.")
+    doc.add_argument("--asr-provider", default=None, help="ASR provider ID to check with --with-asr.")
+    doc.add_argument("--asr-device", default=DEFAULT_ASR_DEVICE, help="Requested ASR device for the selected provider.")
+    doc.add_argument("--asr-compute", default=DEFAULT_ASR_COMPUTE, help="Requested ASR compute mode for the selected provider.")
 
     # --------------- validate ---------------
     val = subparsers.add_parser("validate", help="Validate script for generation.")
@@ -269,7 +292,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --------------- list ---------------
     lst = subparsers.add_parser("list", help="List available providers, voices, or timing models.")
-    lst.add_argument("target", choices=["providers", "voices", "timing-models", "timing-providers"])
+    lst.add_argument("target", choices=["providers", "voices", "timing-models", "timing-providers", "asr-providers"])
     lst.add_argument("--provider", default=None, help="Filter voices by provider.")
     lst.add_argument("--json", dest="json_output", action="store_true")
 
@@ -729,6 +752,121 @@ def split_cmd(args: argparse.Namespace) -> None:
             print(f"{chunk.id}: {len(chunk.text)} chars")
 
 
+def _validate_asr_request_options(args: argparse.Namespace, spec) -> None:
+    capabilities = spec.capabilities
+    if not capabilities.batch_audio:
+        fail(
+            f"ASR provider {spec.provider_id} does not support finite batch audio",
+            _EXIT_ARGS,
+        )
+    if args.device not in capabilities.device_modes:
+        fail(
+            f"ASR provider {spec.provider_id} does not support device={args.device}",
+            _EXIT_ARGS,
+        )
+    if args.compute not in capabilities.compute_modes:
+        fail(
+            f"ASR provider {spec.provider_id} does not support compute={args.compute}",
+            _EXIT_ARGS,
+        )
+    model_ids = {model["id"] for model in spec.models if "id" in model}
+    if args.model and model_ids and args.model not in model_ids:
+        fail(
+            f"ASR provider {spec.provider_id} does not support model={args.model}",
+            _EXIT_ARGS,
+        )
+    if args.language and not capabilities.forced_language:
+        fail(
+            f"ASR provider {spec.provider_id} does not support forced language selection",
+            _EXIT_ARGS,
+        )
+
+
+def _asr_result_payload(result, source_audio: Path) -> dict:
+    return {
+        "status": "success",
+        "provider": result.provider_id,
+        "model": result.model_id,
+        "transcript": result.transcript,
+        "language": result.language,
+        "duration_s": result.duration_s,
+        "source_audio": str(source_audio.resolve()),
+        "timestamp_mode": result.alignment_origin or "none",
+        "segments": [
+            {"text": segment.text, "start_s": segment.start_s, "end_s": segment.end_s}
+            for segment in result.segments
+        ],
+        "words": [
+            {
+                "text": word.text,
+                "start_s": word.start_s,
+                "end_s": word.end_s,
+                "confidence": word.confidence,
+            }
+            for word in result.words
+        ],
+        "execution": {
+            "runtime": result.execution.runtime,
+            "runtime_version": result.execution.runtime_version,
+            "model_revision": result.execution.model_revision,
+            "device": result.execution.resolved_device,
+            "compute": result.execution.resolved_compute,
+            "measurements": dict(result.execution.measurements),
+        },
+    }
+
+
+def transcribe_cmd(args: argparse.Namespace) -> None:
+    audio_path = _resolve_audio(args.audio)
+    if not audio_path.exists():
+        fail(f"Audio file not found: {audio_path}", _EXIT_ARGS)
+    try:
+        spec = get_asr_provider_spec(args.provider)
+    except ASRProviderNotFoundError as exc:
+        fail(str(exc), _EXIT_ARGS)
+
+    _validate_asr_request_options(args, spec)
+    health = spec.dependency_probe()
+    if not health.available:
+        fail(health.remediation, _EXIT_MISSING_DEP)
+
+    model_id = args.model
+    if model_id is None:
+        model_id = next((model["id"] for model in spec.models if model.get("default")), None)
+    request = ASRRequest(
+        audio_path=audio_path,
+        model_id=model_id,
+        language=args.language,
+        device=args.device,
+        compute=args.compute,
+    )
+    try:
+        result = spec.factory().transcribe(request)
+    except ModuleNotFoundError as exc:
+        fail(f"Missing dependency for ASR provider {spec.provider_id}: {exc}", _EXIT_MISSING_DEP)
+    except Exception as exc:
+        fail(f"ASR provider {spec.provider_id} failed: {exc}", _EXIT_PROVIDER)
+
+    capabilities = spec.capabilities
+    if result.provider_id != spec.provider_id:
+        fail(
+            f"ASR provider {spec.provider_id} returned provider ID {result.provider_id}",
+            _EXIT_PROVIDER,
+        )
+    if any(segment.start_s is not None for segment in result.segments) and not capabilities.segment_timestamps:
+        fail(f"ASR provider {spec.provider_id} returned undeclared segment timestamps", _EXIT_PROVIDER)
+    if result.words and not capabilities.word_timestamps:
+        fail(f"ASR provider {spec.provider_id} returned undeclared word timestamps", _EXIT_PROVIDER)
+    if result.alignment_origin == "forced" and not capabilities.forced_alignment:
+        fail(f"ASR provider {spec.provider_id} returned undeclared forced alignment", _EXIT_PROVIDER)
+
+    data = _asr_result_payload(result, audio_path)
+    if args.json_output:
+        _json_ok(data)
+    else:
+        print(result.transcript)
+
+
 def run_timings(args: argparse.Namespace) -> None:
     try:
         check_media_tools()
@@ -894,6 +1032,32 @@ def doctor_cmd(args: argparse.Namespace) -> None:
 
     need_whisper = bool(args.with_timings)
     timing_provider = getattr(args, "timing_provider", "faster-whisper")
+    need_asr = bool(getattr(args, "with_asr", False))
+    asr_health = None
+
+    if need_asr:
+        if not args.asr_provider:
+            fail("--asr-provider is required with --with-asr", _EXIT_ARGS)
+        try:
+            asr_spec = get_asr_provider_spec(args.asr_provider)
+        except ASRProviderNotFoundError as exc:
+            fail(str(exc), _EXIT_ARGS)
+        if args.asr_device not in asr_spec.capabilities.device_modes:
+            fail(
+                f"ASR provider {asr_spec.provider_id} does not support device={args.asr_device}",
+                _EXIT_ARGS,
+            )
+        if args.asr_compute not in asr_spec.capabilities.compute_modes:
+            fail(
+                f"ASR provider {asr_spec.provider_id} does not support compute={args.asr_compute}",
+                _EXIT_ARGS,
+            )
+        asr_health = asr_spec.dependency_probe()
+        results["asr_provider"] = {
+            "ok": asr_health.available,
+            "provider": asr_spec.provider_id,
+            "required": True,
+        }
 
     if timing_provider == "openrouter-whisper":
         whisper_ok = False
@@ -955,6 +1119,8 @@ def doctor_cmd(args: argparse.Namespace) -> None:
             warnings.append("X_AI_API_KEY is missing. Set it in .env: X_AI_API_KEY=xai-...")
         else:
             warnings.append("faster-whisper is not installed. Install with: uv sync --extra timing-whisper")
+    if asr_health is not None and not asr_health.available:
+        warnings.append(asr_health.remediation)
     if not polza_ok and need_polza:
         warnings.append("POLZA_API_KEY is missing. Set it in .env: POLZA_API_KEY=...")
     if not or_ok and need_or:
@@ -1151,6 +1317,8 @@ def list_cmd(args: argparse.Namespace) -> None:
                 },
             ]
         }
+    elif args.target == "asr-providers":
+        data = {"asr_providers": [spec.listing() for spec in list_asr_provider_specs()]}
     else:
         data = {}
     if args.json_output:

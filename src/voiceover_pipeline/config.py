@@ -105,6 +105,8 @@ DEFAULT_TIMING_MODEL = "small"
 DEFAULT_TIMING_DEVICE = "cpu"
 DEFAULT_TIMING_COMPUTE = "int8"
 DEFAULT_TIMING_LANGUAGE = "ru"
+DEFAULT_ASR_DEVICE = "cpu"
+DEFAULT_ASR_COMPUTE = "auto"
 
 WHISPER_HF_REPOS: dict[str, str] = {
     "base": "Systran/faster-whisper-base",

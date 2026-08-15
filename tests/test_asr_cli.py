@@ -1,0 +1,178 @@
+import argparse
+import json
+import sys
+import types
+
+import pytest
+
+from conftest import cli_json, fixture_path
+from voiceover_pipeline.models import ASRCapabilities, ASRExecutionReceipt, ASRRequest, ASRResult
+from voiceover_pipeline.providers.base import ASRProvider
+from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth, ASRProviderSpec
+
+
+def test_list_asr_providers_reads_registry_listing(monkeypatch, capsys):
+    import voiceover_pipeline.cli as cli
+
+    spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=lambda: None,
+        models=({"id": "fixture-model"},),
+        capabilities=ASRCapabilities(batch_audio=True, device_modes=("cpu",), compute_modes=("float32",)),
+        dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
+    )
+    monkeypatch.setattr(cli, "list_asr_provider_specs", lambda: [spec])
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.list_cmd(argparse.Namespace(target="asr-providers", json_output=True))
+
+    data = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 0
+    assert data["status"] == "success"
+    assert data["asr_providers"][0]["id"] == "fixture-local"
+    assert data["asr_providers"][0]["capabilities"]["batch_audio"] is True
+
+
+def test_transcribe_unknown_provider_keeps_machine_json_and_invalid_args_exit_code():
+    code, data = cli_json(
+        "transcribe",
+        "--audio",
+        str(fixture_path("smoke_test.md")),
+        "--provider",
+        "missing",
+        "--json",
+    )
+
+    assert code == 2
+    assert data == {
+        "status": "error",
+        "error": "Unknown ASR provider: missing",
+        "code": 2,
+    }
+
+
+def test_transcribe_parser_has_finite_audio_controls_but_no_generic_prompt_flags():
+    from voiceover_pipeline.cli import build_parser
+
+    parser = build_parser()
+    parsed = parser.parse_args(
+        "transcribe --audio audio.wav --provider fixture-local --model fixture-model --language ru --device cpu --compute float32 --json".split()
+    )
+
+    assert parsed.audio == "audio.wav"
+    assert parsed.provider == "fixture-local"
+    assert parsed.language == "ru"
+    assert parsed.device == "cpu"
+    assert parsed.compute == "float32"
+    with pytest.raises(SystemExit):
+        parser.parse_args("transcribe --audio audio.wav --provider fixture-local --prompt ignored".split())
+
+
+def _fixture_spec(*, available=True):
+    return ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=FixtureASRProvider,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            forced_language=True,
+            device_modes=("cpu",),
+            compute_modes=("float32",),
+        ),
+        dependency_probe=lambda: ASRDependencyHealth(
+            available=available,
+            remediation="Install the approved optional ASR runtime.",
+        ),
+    )
+
+
+class FixtureASRProvider(ASRProvider):
+    provider_id = "fixture-local"
+
+    def transcribe(self, request: ASRRequest) -> ASRResult:
+        assert request.model_id == "fixture-model"
+        assert request.language == "ru"
+        assert request.device == "cpu"
+        assert request.compute == "float32"
+        return ASRResult(
+            transcript="fixture transcript",
+            provider_id=self.provider_id,
+            model_id="fixture-model",
+            language="ru",
+            execution=ASRExecutionReceipt(
+                runtime="fixture-runtime",
+                runtime_version="1.0",
+                resolved_device="cpu",
+                resolved_compute="float32",
+                measurements={"wall_s": 0.25},
+            ),
+        )
+
+
+def test_transcribe_normalizes_a_fixture_provider_without_timestamps(monkeypatch, capsys):
+    import voiceover_pipeline.cli as cli
+
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec())
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--model",
+            "fixture-model",
+            "--language",
+            "ru",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.transcribe_cmd(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 0
+    assert data["transcript"] == "fixture transcript"
+    assert data["timestamp_mode"] == "none"
+    assert data["segments"] == []
+    assert data["words"] == []
+    assert data["execution"]["measurements"] == {"wall_s": 0.25}
+
+
+def test_doctor_checks_only_the_selected_asr_dependency_probe(monkeypatch, capsys):
+    import voiceover_pipeline.cli as cli
+
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec(available=False))
+    monkeypatch.setattr(cli.shutil, "which", lambda _command: "/fixture/bin")
+    monkeypatch.setattr(cli, "read_polza_key", lambda: "fixture")
+    monkeypatch.setattr(cli, "read_openrouter_key", lambda: "fixture")
+    monkeypatch.setattr(cli, "read_groq_key", lambda: "fixture")
+    monkeypatch.setattr(cli, "read_xai_key", lambda: "fixture")
+
+    torch_fixture = types.ModuleType("torch")
+    setattr(torch_fixture, "cuda", types.SimpleNamespace(is_available=lambda: False))
+    monkeypatch.setitem(sys.modules, "torch", torch_fixture)
+    monkeypatch.setitem(sys.modules, "faster_whisper", types.ModuleType("faster_whisper"))
+    args = cli.build_parser().parse_args(
+        "doctor --with-asr --asr-provider fixture-local --asr-device cpu --asr-compute float32 --json".split()
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.doctor_cmd(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 0
+    assert data["checks"]["asr_provider"] == {
+        "ok": False,
+        "provider": "fixture-local",
+        "required": True,
+    }
+    assert data["workflow_ok"] is False
+    assert "Install the approved optional ASR runtime." in data["warnings"]

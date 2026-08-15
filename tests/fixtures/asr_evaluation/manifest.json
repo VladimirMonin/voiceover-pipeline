@@ -1,0 +1,167 @@
+{
+  "cases": [
+    {
+      "audio_path": "audio/clean-short.wav",
+      "case_id": "clean-short",
+      "category": "clean",
+      "duration_s": 2.469375,
+      "expected_speech_window_s": [
+        0.0,
+        2.469375
+      ],
+      "expected_text": "The quick brown fox checks one two three.",
+      "language": "en",
+      "noise": {
+        "amplitude": 0.0,
+        "category": "none",
+        "seed": null
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "provenance": {
+        "noise_transform": "deterministic xorshift32 white-noise mixer",
+        "rendering": "FFmpeg flite filter with voice=kal",
+        "source": "locally-generated synthetic speech",
+        "source_recording": false,
+        "text_authoring": "project-owned fixture text"
+      },
+      "sha256": "f6887ddaec6afc6cefa3b6ade27ccffad488fffbaf67ee7445c0001e10839385"
+    },
+    {
+      "audio_path": "audio/leading-pause.wav",
+      "case_id": "leading-pause",
+      "category": "pause",
+      "duration_s": 3.041375,
+      "expected_speech_window_s": [
+        0.75,
+        3.041375
+      ],
+      "expected_text": "A pause comes before this sentence.",
+      "language": "en",
+      "noise": {
+        "amplitude": 0.0,
+        "category": "none",
+        "seed": null
+      },
+      "pause": {
+        "leading_s": 0.75,
+        "trailing_s": 0.0
+      },
+      "provenance": {
+        "noise_transform": "deterministic xorshift32 white-noise mixer",
+        "rendering": "FFmpeg flite filter with voice=kal",
+        "source": "locally-generated synthetic speech",
+        "source_recording": false,
+        "text_authoring": "project-owned fixture text"
+      },
+      "sha256": "a7e57d774fd88bf4ae20a63852da6b3a22086e2fee1384a417e7e4dcccae68e6"
+    },
+    {
+      "audio_path": "audio/trailing-pause.wav",
+      "case_id": "trailing-pause",
+      "category": "pause",
+      "duration_s": 2.7755,
+      "expected_speech_window_s": [
+        0.0,
+        2.0255
+      ],
+      "expected_text": "This sentence ends before a pause.",
+      "language": "en",
+      "noise": {
+        "amplitude": 0.0,
+        "category": "none",
+        "seed": null
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.75
+      },
+      "provenance": {
+        "noise_transform": "deterministic xorshift32 white-noise mixer",
+        "rendering": "FFmpeg flite filter with voice=kal",
+        "source": "locally-generated synthetic speech",
+        "source_recording": false,
+        "text_authoring": "project-owned fixture text"
+      },
+      "sha256": "71b8c698074e8c20eab68f1f63770307369b7dca5bdd1488d9acbd42202220cd"
+    },
+    {
+      "audio_path": "audio/white-noise.wav",
+      "case_id": "white-noise",
+      "category": "noise",
+      "duration_s": 2.803375,
+      "expected_speech_window_s": [
+        0.0,
+        2.803375
+      ],
+      "expected_text": "White noise makes speech recognition harder.",
+      "language": "en",
+      "noise": {
+        "amplitude": 0.012,
+        "category": "white",
+        "seed": 4104
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "provenance": {
+        "noise_transform": "deterministic xorshift32 white-noise mixer",
+        "rendering": "FFmpeg flite filter with voice=kal",
+        "source": "locally-generated synthetic speech",
+        "source_recording": false,
+        "text_authoring": "project-owned fixture text"
+      },
+      "sha256": "2461b75625adc52a5cbac34c43073802b1c68baf1ea3fd7035907dbfb9913275"
+    },
+    {
+      "audio_path": "audio/pause-and-white-noise.wav",
+      "case_id": "pause-and-white-noise",
+      "category": "pause_noise",
+      "duration_s": 3.866875,
+      "expected_speech_window_s": [
+        0.5,
+        3.366875
+      ],
+      "expected_text": "A long pause and white noise test the boundary.",
+      "language": "en",
+      "noise": {
+        "amplitude": 0.015,
+        "category": "white",
+        "seed": 5105
+      },
+      "pause": {
+        "leading_s": 0.5,
+        "trailing_s": 0.5
+      },
+      "provenance": {
+        "noise_transform": "deterministic xorshift32 white-noise mixer",
+        "rendering": "FFmpeg flite filter with voice=kal",
+        "source": "locally-generated synthetic speech",
+        "source_recording": false,
+        "text_authoring": "project-owned fixture text"
+      },
+      "sha256": "25b6ec7322391ece0bf7395b18374fd9572f211cca7c2f4437c55da324453c5f"
+    }
+  ],
+  "corpus_id": "synthetic-asr-evaluation-v1",
+  "license": {
+    "audio": "NOASSERTION",
+    "metadata_and_generator": "MIT (repository license)",
+    "reason": "FFmpeg/flite voice-output redistribution has not been separately audited."
+  },
+  "privacy": {
+    "contains_personal_data": false,
+    "contains_private_recordings": false,
+    "source": "locally-generated synthetic speech only"
+  },
+  "provenance": {
+    "audio_renderer": "FFmpeg flite filter with voice=kal",
+    "generator": "tools/generate_asr_evaluation_corpus.py",
+    "noise_renderer": "in-process deterministic xorshift32 mixer",
+    "wvm_assets_used": false
+  },
+  "schema_version": 1
+}

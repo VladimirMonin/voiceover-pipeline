@@ -1,4 +1,12 @@
-from .base import TTSProvider, TranscriptionProvider
+from .asr_registry import (
+    ASRDependencyHealth,
+    ASRProviderNotFoundError,
+    ASRProviderRegistry,
+    ASRProviderSpec,
+    get_asr_provider_spec,
+    list_asr_provider_specs,
+)
+from .base import ASRProvider, TTSProvider, TranscriptionProvider
 from .faster_whisper import FasterWhisperProvider
 from .groq_whisper import GroqWhisperProvider
 from .openrouter_tts import OpenRouterTTSProvider
@@ -13,6 +21,11 @@ except ModuleNotFoundError:
     QwenLocalTTSProvider = None  # type: ignore[assignment]
 
 __all__ = [
+    "ASRDependencyHealth",
+    "ASRProvider",
+    "ASRProviderNotFoundError",
+    "ASRProviderRegistry",
+    "ASRProviderSpec",
     "TTSProvider",
     "TranscriptionProvider",
     "FasterWhisperProvider",
@@ -22,6 +35,8 @@ __all__ = [
     "OpenRouterTTSProvider",
     "PolzaTTSProvider",
     "XAISttProvider",
+    "get_asr_provider_spec",
+    "list_asr_provider_specs",
 ]
 if QwenLocalTTSProvider is not None:
     __all__.append("QwenLocalTTSProvider")

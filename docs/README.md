@@ -4,7 +4,7 @@
 
 | Документ | Содержание |
 |---|---|
-| [Agent CLI Contract](agent-cli-contract.md) | Контракт для машинного использования: команды, JSON-ответы, exit codes (0/2/10/11/20/30/40/50), stdout/stderr, safety rules |
+| [Agent CLI Contract](agent-cli-contract.md) | Контракт для машинного использования: TTS, timing и generic local ASR, включая deferred text-only Qwen3-ASR и Nemotron, JSON-ответы, exit codes (0/2/10/11/20/30/40/50), stdout/stderr, safety rules |
 | [Remotion Workflow](remotion-workflow.md) | Как агент Remotion использует pipeline: от сценария до captions, manifest.json как entry-point, запрет оценки duration по словам |
 | [Troubleshooting](troubleshooting.md) | Типовые ошибки: exit codes, recovery paths, зависимости |
 
@@ -12,6 +12,10 @@
 
 | Документ | Содержание |
 |---|---|
+| [Synthetic ASR evaluation corpus](asr-evaluation-corpus.md) | Privacy-safe локальный fixture corpus: manifest, SHA-256, pause/noise metadata, provenance и license boundary |
+| [WVM Slice 5 local-reference benchmark](wvm-slice5-local-reference-benchmark.md) | Owner-approved local-only manifest для 50 WVM Slice 5 cases: явный corpus root, SHA-256 и NOASSERTION boundary |
+| [ADR-001: Generic local ASR](adr/ADR-001-generic-local-asr.md) | Решение о capability-aware локальном ASR: registry, typed hints, dependency/device policy и граница timing/alignment |
+| [Generic local ASR implementation plan](plans/2026-08-15-generic-local-asr-implementation-plan.md) | Последовательные offline-first срезы реализации, тестовые и benchmark-гейты |
 | [Agent Development Workflow](../doc/agent-workflow.md) | Безопасный цикл работы агента: scope, dirty tree, Kanban, проверки и отдельные approvals для Git/release |
 | [Artifacts & Analysis](artifacts-and-analysis.md) | JSON-схемы всех артефактов, обработка аудио (PCM→MP3, обрезка тишины, склейка), цены, сравнение моделей |
 | [Whisper Timing](whisper-timing.md) | Whisper CPU small: модели, установка, команды, device/compute, word timestamps, SRT |

@@ -1,0 +1,1348 @@
+{
+  "cases": [
+    {
+      "audio_path": "tests/assets/whisper/slice5/silence_strict_10s.ogg",
+      "case_id": "p0_silence_strict_10s",
+      "category": "no_speech",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of maximally quiet room silence. No speech, no intentional actions, no recognizable words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/silence_strict_10s.txt",
+      "reference_sha256": "fc849997a6268e5ed2958f7c7a604745a2f6c37cb3eeea55fc9623ae9d7a93a2",
+      "required_anchors": [],
+      "sha256": "ba8202c15a6d75ce78ed254e4b5218f99535928a3a3a14a84665c159612966c5",
+      "state": "no_speech",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/room_tone_10s.ogg",
+      "case_id": "p0_room_tone_10s",
+      "category": "no_speech",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of natural room tone with street noise through an open window, amplified by 40 percent. No speech, no recognizable words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "room_tone"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/room_tone_10s.txt",
+      "reference_sha256": "81d8fd9dfbf2c05ab6bd9adb9e1dbb8c0c83cec902a92e11fbb629e23ce01ad7",
+      "required_anchors": [],
+      "sha256": "e7ba7d07622f6aba1d1c1d8f70d68fb24dc2dbe888c87b7f062fdb8f7cbb6ce0",
+      "state": "no_speech",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/near_silence_breath_keyboard_10s.ogg",
+      "case_id": "p0_near_silence_breath_keyboard_10s",
+      "category": "no_speech",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of near-silence with quiet breathing, mouse and keyboard sounds. No speech, no recognizable words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "breath_keyboard"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/near_silence_breath_keyboard_10s.txt",
+      "reference_sha256": "3c143a44d228a918329ac1980bf9814b2c5e98e3d645faa777466e21510c18a1",
+      "required_anchors": [],
+      "sha256": "16200ca89016381e4f1a38b6f8fb00004656b33af42432b4d244e2a398a07b72",
+      "state": "no_speech",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_normal_you_settings.ogg",
+      "case_id": "p0_en_normal_you_settings",
+      "category": "positive_speech",
+      "duration_s": 3.4865,
+      "expected_text": "When you open the settings, choose the smaller model.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_normal_you_settings.txt",
+      "reference_sha256": "e8d40c6149a0e0caa1703a172d1ee91f713e43435067776ef837af640968cef3",
+      "required_anchors": [
+        "settings",
+        "model"
+      ],
+      "sha256": "a6607af0de11e81ef957839c9c2b21f6980daac1bd6c1514a59c45b39a2167e5",
+      "state": "non_empty",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_repeated_you_noise_soft.ogg",
+      "case_id": "p0_en_repeated_you_noise_soft",
+      "category": "hallucination_phrase",
+      "duration_s": 10.0065,
+      "expected_text": "you... you... you...",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "light_noise"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_repeated_you_noise_soft.txt",
+      "reference_sha256": "d038db3a550780b21e2fd56022c3ac08ca105ecbf65872c642aa71a53a15fb68",
+      "required_anchors": [
+        "you"
+      ],
+      "sha256": "388b7a4be408409a7678bc5761277073dc8c432e0e72eb392e1814d6439ac207",
+      "state": "filtered_or_rejected",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_outro_thanks_watching.ogg",
+      "case_id": "p0_en_outro_thanks_watching",
+      "category": "hallucination_phrase",
+      "duration_s": 1.8065,
+      "expected_text": "Thank you for watching.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_outro_thanks_watching.txt",
+      "reference_sha256": "266b2e6055dbffac29ea470dcfd938761e4d099d26c488220fa69cfc3a3ec1ad",
+      "required_anchors": [
+        "thank",
+        "watching"
+      ],
+      "sha256": "b0281354e7553727936abdd0926ad6b4efb665f877661fc10308e0a3392eaa15",
+      "state": "filtered_or_rejected",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_subtitles_amara.ogg",
+      "case_id": "p0_en_subtitles_amara",
+      "category": "hallucination_phrase",
+      "duration_s": 3.8065,
+      "expected_text": "Subtitles by the Amara dot org community.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_subtitles_amara.txt",
+      "reference_sha256": "197fa87b7a2c0041643b7645281be6bc749ac2858a90cb0901320bece43c494f",
+      "required_anchors": [
+        "subtitles",
+        "amara"
+      ],
+      "sha256": "57e607549fbf85538e872cbcefedcaffbb2e17f27614bd3723718c51813884ee",
+      "state": "filtered_or_rejected",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/prompt_echo_silence_en.ogg",
+      "case_id": "p0_prompt_echo_silence_en",
+      "category": "prompt_echo",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of silence. No spoken words. Prompt echo sentinel words belong only in the test prompt, not in this audio.",
+      "forbidden_anchors": [
+        "ZARQUON-42",
+        "NEBULA_WIDGET",
+        "HYPERION_CACHE"
+      ],
+      "language": null,
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/prompt_echo_silence_en.txt",
+      "reference_sha256": "c22c8bc7e3a578590bb18a8e229ad5d0af0a73794392eec2310dc3fdc6a1eae6",
+      "required_anchors": [],
+      "sha256": "ba8202c15a6d75ce78ed254e4b5218f99535928a3a3a14a84665c159612966c5",
+      "state": "no_speech",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/prompt_echo_noise_en.ogg",
+      "case_id": "p0_prompt_echo_noise_en",
+      "category": "prompt_echo",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of room tone and street noise. No spoken words. Prompt echo sentinel words belong only in the test prompt, not in this audio.",
+      "forbidden_anchors": [
+        "ZARQUON-42",
+        "NEBULA_WIDGET",
+        "HYPERION_CACHE"
+      ],
+      "language": null,
+      "noise": {
+        "category": "room_tone"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/prompt_echo_noise_en.txt",
+      "reference_sha256": "c2a65a647a32eec5845009305fd18dac15022cf266322a81fd89b70fae131ba0",
+      "required_anchors": [],
+      "sha256": "e7ba7d07622f6aba1d1c1d8f70d68fb24dc2dbe888c87b7f062fdb8f7cbb6ce0",
+      "state": "no_speech",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_normal_settings_model.ogg",
+      "case_id": "p0_ru_normal_settings_model",
+      "category": "positive_speech",
+      "duration_s": 3.6065,
+      "expected_text": "Открой настройки и выбери меньшую модель.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_normal_settings_model.txt",
+      "reference_sha256": "2a4d484e4395f12d8508a5a1ad3fad43c1d6976fa10812d7aeb22624459d3a72",
+      "required_anchors": [
+        "настрой",
+        "модель"
+      ],
+      "sha256": "db0e7e8af75d0e59de2daa359c2603012ddac0658061d5deb1769097d19621d7",
+      "state": "non_empty",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_outro_spasibo.ogg",
+      "case_id": "p0_ru_outro_spasibo",
+      "category": "hallucination_phrase",
+      "duration_s": 1.8865,
+      "expected_text": "Спасибо за просмотр.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_outro_spasibo.txt",
+      "reference_sha256": "e7da0ae4aeb6dd50277d68e87d0149f034c6fb9bf63fc3f205b4f74229d868c4",
+      "required_anchors": [
+        "спасибо",
+        "просмотр"
+      ],
+      "sha256": "95c84261543f158baed87cd454160f09cc251ca7bcbb3bdbd0adcd3e209e2200",
+      "state": "filtered_or_rejected",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_subtitles_dimatorzok.ogg",
+      "case_id": "p0_ru_subtitles_dimatorzok",
+      "category": "hallucination_phrase",
+      "duration_s": 2.9265,
+      "expected_text": "Субтитры сделал DimaTorzok.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_subtitles_dimatorzok.txt",
+      "reference_sha256": "b251515089d3e437ce0a9a448c3064ceb30d79d456b307b8a5d08e977419bb29",
+      "required_anchors": [
+        "субтитр",
+        "dimatorzok"
+      ],
+      "sha256": "eecba3ee1ca80ea795c3c56775f8f46e1ca1258817a2c4eebdd3be7fbfd70a5e",
+      "state": "filtered_or_rejected",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_prompt_terms_wvm_stack.ogg",
+      "case_id": "p0_ru_prompt_terms_wvm_stack",
+      "category": "prompt_quality",
+      "duration_s": 10.0065,
+      "expected_text": "Мы используем PySide6, OpenRouter, LLM API, MLX, CTranslate2, SQLite и FTS5.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_prompt_terms_wvm_stack.txt",
+      "reference_sha256": "864fc882c56d511d8ef9fc2bf77516b634f0c05d2500cc735b117aee19cfe06a",
+      "required_anchors": [
+        "pyside6",
+        "openrouter",
+        "sqlite",
+        "fts5"
+      ],
+      "sha256": "6cd821548e5cb52433beeb9cce8edf1b4d9bc310df49ebc4afd17e74df640251",
+      "state": "non_empty",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_prompt_terms_wvm_stack.ogg",
+      "case_id": "p0_en_prompt_terms_wvm_stack",
+      "category": "prompt_quality",
+      "duration_s": 10.4465,
+      "expected_text": "The app uses PySide6, OpenRouter, LLM API, MLX, CTranslate2, SQLite, and FTS5.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_prompt_terms_wvm_stack.txt",
+      "reference_sha256": "8fb8a48f76f209b97951ffa86980af0353955ad22ab81ab05a020fb90bb578aa",
+      "required_anchors": [
+        "pyside6",
+        "openrouter",
+        "sqlite",
+        "fts5"
+      ],
+      "sha256": "d86d1af1f5014c0c2f45f9def8033dae9d15eb507a794b24c0b8546e9d72216f",
+      "state": "non_empty",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/lang_en_clean_first5.ogg",
+      "case_id": "p0_lang_en_clean_first5",
+      "category": "language_detection",
+      "duration_s": 3.8065,
+      "expected_text": "This is a clean English language detection test.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/lang_en_clean_first5.txt",
+      "reference_sha256": "00a87a60411f90f5caacab259291f541f653e86e6eef07153b7bba4da6019a77",
+      "required_anchors": [
+        "english",
+        "language",
+        "test"
+      ],
+      "sha256": "baa78312eb9e93eda12a4d13fe0dad6dcaf9b8c60aea421e2b188f1b7b11b738",
+      "state": "non_empty",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/lang_ru_clean_first5.ogg",
+      "case_id": "p0_lang_ru_clean_first5",
+      "category": "language_detection",
+      "duration_s": 3.5665,
+      "expected_text": "Это чистый тест определения русского языка.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/lang_ru_clean_first5.txt",
+      "reference_sha256": "d17e37cc3d6898f3bbaa141f41cb00182d0f9f7ca5f984d61e676d25c21e89e9",
+      "required_anchors": [
+        "русск",
+        "язык"
+      ],
+      "sha256": "69044dbd9e0c08d7584e17611392f0f3fc1552aefaac063f77f8e3b682bd4f58",
+      "state": "non_empty",
+      "tier": "P0"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/fan_noise_only_10s.ogg",
+      "case_id": "p1_fan_noise_only_10s",
+      "category": "no_speech",
+      "duration_s": 10.0065,
+      "expected_text": "﻿10 seconds of steady robot vacuum cleaner motor/fan noise. No speech, no recognizable words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "fan"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/fan_noise_only_10s.txt",
+      "reference_sha256": "76c792cb67d44aa81c9c11563fe28e4aaa7abada2d02289bcddc41ef7d65036f",
+      "required_anchors": [],
+      "sha256": "a6f5c9d094c0419dc0a0e11f41a9de44795716b41d100579f1cbf14e63d76c94",
+      "state": "no_speech",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/white_noise_low_10s.ogg",
+      "case_id": "p1_white_noise_low_10s",
+      "category": "no_speech",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of low-level generated white noise. No speech, no recognizable words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "white"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/white_noise_low_10s.txt",
+      "reference_sha256": "8ddb56f2125ca5b361bdc07092752ed950706b92663cead8644ed3046fcc81b6",
+      "required_anchors": [],
+      "sha256": "c8f63c929be915b87b870daf67cebef21a562dcf1427a0726c2d3afd5c391846",
+      "state": "no_speech",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/silence_then_noise_10s.ogg",
+      "case_id": "p1_silence_then_noise_10s",
+      "category": "no_speech",
+      "duration_s": 10.0065,
+      "expected_text": "5 seconds of silence followed by 5 seconds of low-level generated white noise. No speech, no recognizable words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "white"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/silence_then_noise_10s.txt",
+      "reference_sha256": "2024339d63da9207e33d0d2855aabd492eb5dfca5a65b1e62d7a6e17979e1867",
+      "required_anchors": [],
+      "sha256": "471cd7724e7cfc250d904ce50e9a99dd59287ed5a9b4333df6d602eb90bbf5c7",
+      "state": "no_speech",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_no_no_no_emphasis.ogg",
+      "case_id": "p1_en_no_no_no_emphasis",
+      "category": "positive_speech",
+      "duration_s": 2.9265,
+      "expected_text": "No, no, no, this is not correct.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_no_no_no_emphasis.txt",
+      "reference_sha256": "f53096193a56b361cf5c274c48ddae8751dc05798ed7145a0e98f903002a58c1",
+      "required_anchors": [
+        "no",
+        "correct"
+      ],
+      "sha256": "f14c4320580466f8fbfd205dc3559fe698f2d018d4f1df58afb66592575b6695",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_long_pause_yes.ogg",
+      "case_id": "p1_en_long_pause_yes",
+      "category": "positive_speech",
+      "duration_s": 7.3265,
+      "expected_text": "6 seconds silence, then: Yes.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 6.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_long_pause_yes.txt",
+      "reference_sha256": "f514cd6a163955ab1f5e24660a04ef1c2905dac4b627e3d3f7c07f8b1d73641e",
+      "required_anchors": [
+        "yes"
+      ],
+      "sha256": "c946c0951013da1939f46d2876d496dea80f897112670415d9ed976e0e95bf1f",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_da_da_emphasis.ogg",
+      "case_id": "p1_ru_da_da_emphasis",
+      "category": "positive_speech",
+      "duration_s": 2.2865,
+      "expected_text": "Да, да, именно так.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_da_da_emphasis.txt",
+      "reference_sha256": "8f365d57f7aa23301e56c6a2c184a527fd5d2be767031a065a5e40cdd34eaef0",
+      "required_anchors": [
+        "да",
+        "именно"
+      ],
+      "sha256": "a73de4b766703d2c83f662fe1724fd615504d2f76616305751e29cb3dd990888",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_outro_thanks_listening.ogg",
+      "case_id": "p1_en_outro_thanks_listening",
+      "category": "hallucination_phrase",
+      "duration_s": 1.7665,
+      "expected_text": "Thank you for listening.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_outro_thanks_listening.txt",
+      "reference_sha256": "0e3816fc92ef48813559b587aa534164b58775e2489c0810f3cb93a28fbfadfb",
+      "required_anchors": [
+        "thank",
+        "listening"
+      ],
+      "sha256": "8f9669e7769ac0d19cb8f0aeff74746da6e8ce21a54ff6888fb6628565e39b3c",
+      "state": "filtered_or_rejected",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_prompt_terms_runtime.ogg",
+      "case_id": "p1_ru_prompt_terms_runtime",
+      "category": "prompt_quality",
+      "duration_s": 6.4865,
+      "expected_text": "Runtime manager выдаёт lease, затем применяет deferred swap после release.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_prompt_terms_runtime.txt",
+      "reference_sha256": "845cb440e3441b7934da2b343fd9db0828def96fd27b96f9fd4dee0964bd5dc6",
+      "required_anchors": [
+        "runtime manager",
+        "lease",
+        "deferred swap",
+        "release"
+      ],
+      "sha256": "befb51ed34b39d73fa8e6e7979f679792b491edbeb153395ae5f824f1817e92d",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_prompt_terms_runtime.ogg",
+      "case_id": "p1_en_prompt_terms_runtime",
+      "category": "prompt_quality",
+      "duration_s": 5.4465,
+      "expected_text": "The runtime manager keeps a lease and applies deferred swap after release.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_prompt_terms_runtime.txt",
+      "reference_sha256": "296fb342144f3b41f01913827a1fbdaad16f36357c4d2a5b43b07dd29d254c5e",
+      "required_anchors": [
+        "runtime manager",
+        "lease",
+        "deferred swap",
+        "release"
+      ],
+      "sha256": "4b41db7af4cb5a4530500beb3aa450d15aa4406e94e08805da0c366f2716b35f",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_prompt_terms_qt.ogg",
+      "case_id": "p1_ru_prompt_terms_qt",
+      "category": "prompt_quality",
+      "duration_s": 7.7665,
+      "expected_text": "Интерфейс использует QThreadPool, QRunnable, EventBus и PySide6 signals.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_prompt_terms_qt.txt",
+      "reference_sha256": "f9f7f2712ded314fc2fe6154a34dd1879e4dc8dd92eca0d5df995dfe83d60b39",
+      "required_anchors": [
+        "qthreadpool",
+        "qrunnable",
+        "eventbus",
+        "pyside6"
+      ],
+      "sha256": "e7689d3401163097e97753487dc50c36e3194ad4ad83b024d62b41206d2c50e3",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_prompt_terms_qt.ogg",
+      "case_id": "p1_en_prompt_terms_qt",
+      "category": "prompt_quality",
+      "duration_s": 7.0465,
+      "expected_text": "The interface uses QThreadPool, QRunnable, EventBus, and PySide6 signals.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_prompt_terms_qt.txt",
+      "reference_sha256": "2587ab4e1bee90aba45824c3b77918bad4065e4a44a6de51e2eaf956ef69537b",
+      "required_anchors": [
+        "qthreadpool",
+        "qrunnable",
+        "eventbus",
+        "pyside6"
+      ],
+      "sha256": "0916ef28a14a12676ed38808c9d044feef8b98971b2dae2df23567df596b1432",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/prompt_echo_silence_ru.ogg",
+      "case_id": "p1_prompt_echo_silence_ru",
+      "category": "prompt_echo",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of silence. No spoken words. Russian-oriented prompt echo sentinel words belong only in the test prompt, not in this audio.",
+      "forbidden_anchors": [
+        "ZARQUON-42",
+        "NEBULA_WIDGET",
+        "HYPERION_CACHE"
+      ],
+      "language": null,
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/prompt_echo_silence_ru.txt",
+      "reference_sha256": "756802cfc076e13e164bebc9e19514afed8bdd575d5f8ee71dcc35efefe2cc2b",
+      "required_anchors": [],
+      "sha256": "ba8202c15a6d75ce78ed254e4b5218f99535928a3a3a14a84665c159612966c5",
+      "state": "no_speech",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/prompt_echo_then_real_speech_en.ogg",
+      "case_id": "p1_prompt_echo_then_real_speech_en",
+      "category": "prompt_echo",
+      "duration_s": 1.9665,
+      "expected_text": "Open the second tab.",
+      "forbidden_anchors": [
+        "ZARQUON-42",
+        "NEBULA_WIDGET",
+        "HYPERION_CACHE"
+      ],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/prompt_echo_then_real_speech_en.txt",
+      "reference_sha256": "78e3f5d13cbdfb6f6574d24758e94efb4252e00e16667712ce47fbe029d399b3",
+      "required_anchors": [
+        "open",
+        "second",
+        "tab"
+      ],
+      "sha256": "0cb3a8fb29564f973779dc78927f0b6174599f17996ddee6d61d8f924a722981",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/prompt_echo_then_real_speech_ru.ogg",
+      "case_id": "p1_prompt_echo_then_real_speech_ru",
+      "category": "prompt_echo",
+      "duration_s": 2.1265,
+      "expected_text": "Открой вторую вкладку.",
+      "forbidden_anchors": [
+        "ZARQUON-42",
+        "NEBULA_WIDGET",
+        "HYPERION_CACHE"
+      ],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/prompt_echo_then_real_speech_ru.txt",
+      "reference_sha256": "a450ed3050bbe47d42d372f9d4b6892359400cb2ec881b9b5e6d1f07fe745a25",
+      "required_anchors": [
+        "открой",
+        "втор",
+        "вкладк"
+      ],
+      "sha256": "59d8704a90fa0cb3b152446e2ebd12902793c7b9d00575747a0fa3ad23094e2a",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/lang_de_clean_first5.ogg",
+      "case_id": "p1_lang_de_clean_first5",
+      "category": "language_detection",
+      "duration_s": 3.1665,
+      "expected_text": "Dies ist ein deutscher Test für die Spracherkennung.",
+      "forbidden_anchors": [],
+      "language": "de",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/lang_de_clean_first5.txt",
+      "reference_sha256": "38954ff300ad613db46b7c5d635f59c498059344fe95a771d3311cd0600389ff",
+      "required_anchors": [
+        "deutscher",
+        "sprach",
+        "test"
+      ],
+      "sha256": "caff36f46bbee4eb1b5e94e542384fa5797be936a684b8e32b643ce1da09fd47",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/lang_es_clean_first5.ogg",
+      "case_id": "p1_lang_es_clean_first5",
+      "category": "language_detection",
+      "duration_s": 4.0865,
+      "expected_text": "Esta es una prueba limpia de reconocimiento de idioma.",
+      "forbidden_anchors": [],
+      "language": "es",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/lang_es_clean_first5.txt",
+      "reference_sha256": "c2ba50d94e75b0f02703c72f35a8c4e2c6c2ffb2753d7e70381324be07eef6b2",
+      "required_anchors": [
+        "prueba",
+        "idioma"
+      ],
+      "sha256": "e4f040253a565ec941d0b9deaa265cf7b5705ad8fc0f38ec9d6a04ffda454cf5",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/leading_silence_en_language.ogg",
+      "case_id": "p1_leading_silence_en_language",
+      "category": "language_detection",
+      "duration_s": 6.2465,
+      "expected_text": "3 seconds silence, then: This is an English test after silence.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 3.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/leading_silence_en_language.txt",
+      "reference_sha256": "0cb055a389d62f09038e401346d38ff523b77c4fe759872a36c52e2fc9ececad",
+      "required_anchors": [
+        "english",
+        "test",
+        "silence"
+      ],
+      "sha256": "82a149eb5485812adb992d94d809aca10245b26f667a26bb7ccd19fc87c40ded",
+      "state": "non_empty",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_two_chunk_safe_then_you.ogg",
+      "case_id": "p1_en_two_chunk_safe_then_you",
+      "category": "chunked_prompt_tail",
+      "duration_s": 39.601625,
+      "expected_text": "This is a longer English context for queue and prompt tail testing. The application receives audio, creates a transcription job, stores metadata, and prepares safe context for later processing. The user opens the history tab, reviews the result, and checks that normal useful sentences remain available for the next step. The runtime remains stable while the queue continues working. Near the end of this clip the speaker repeats a risky short token: you you you.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_two_chunk_safe_then_you.txt",
+      "reference_sha256": "3b3f6bed1a31baae196f00d75bfc972be9c86f9b61cfc916a8b0c3402f10888a",
+      "required_anchors": [
+        "you"
+      ],
+      "sha256": "8bc11d8660588569cadac103d960ec8e4a0bf1631e8d6a859c3d9daccb96b12d",
+      "state": "diagnostic",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_two_chunk_outro_then_safe.ogg",
+      "case_id": "p1_en_two_chunk_outro_then_safe",
+      "category": "chunked_prompt_tail",
+      "duration_s": 36.229438,
+      "expected_text": "Thank you for watching. After that phrase, the recording continues with normal useful speech about the desktop application. The user opens the settings dialog, selects a smaller model, verifies the queue status, and exports the result. This safe context should remain meaningful even if the earlier outro-like sentence is rejected from prompt tail admission. The final part contains ordinary English instructions without any credits or promotional text.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_two_chunk_outro_then_safe.txt",
+      "reference_sha256": "89bffbba7b68cb0ddd1909eb2a1f2707670815a055022de90e35b3738be1cc8f",
+      "required_anchors": [
+        "thank",
+        "outro"
+      ],
+      "sha256": "e13dc10e4d3eabb469782c4ec86a81aef75fd5f872ed4ad3e5fef2b5111609ac",
+      "state": "diagnostic",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_two_chunk_safe_then_outro.ogg",
+      "case_id": "p1_ru_two_chunk_safe_then_outro",
+      "category": "chunked_prompt_tail",
+      "duration_s": 35.234813,
+      "expected_text": "Это длинный русский фрагмент для проверки очереди, контекста и безопасного хвоста промпта. Пользователь открывает историю, проверяет расшифровку, выбирает меньшую модель и запускает обработку следующего файла. Runtime manager удерживает lease, затем применяет deferred swap после release. В конце записи появляется фраза, похожая на концовку видео: Спасибо за просмотр.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_two_chunk_safe_then_outro.txt",
+      "reference_sha256": "940be44e9830b56f83c2f608457298ab670c01098229dc9bc98afabcda724ab5",
+      "required_anchors": [
+        "спасибо",
+        "просмотр"
+      ],
+      "sha256": "c81083ced129ae68e011825b4d5a0b697996cad03d893d63bf018e0f7d2234e7",
+      "state": "diagnostic",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_35s_prompt_terms_safe.ogg",
+      "case_id": "p1_en_35s_prompt_terms_safe",
+      "category": "chunked_prompt_tail",
+      "duration_s": 35.4465,
+      "expected_text": "35+ seconds of English WVM technical terms, assembled from Gemini TTS technical-term segments: PySide6, OpenRouter, LLM API, MLX, CTranslate2, SQLite, FTS5, runtime manager, lease, deferred swap, QThreadPool, QRunnable, EventBus, API, JSON, GPU, VRAM.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_35s_prompt_terms_safe.txt",
+      "reference_sha256": "298f280d652cac995b8ffae1b0704608754712f98f8726357d5fc9d059d7a6d3",
+      "required_anchors": [
+        "pyside6",
+        "openrouter",
+        "sqlite",
+        "fts5"
+      ],
+      "sha256": "5803d0e3c5f96d4b70fcfacfee83851b8e4d413e39ac936a6bcf831457b4e42c",
+      "state": "diagnostic",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_35s_prompt_terms_safe.ogg",
+      "case_id": "p1_ru_35s_prompt_terms_safe",
+      "category": "chunked_prompt_tail",
+      "duration_s": 36.5665,
+      "expected_text": "Whisper Voice Machine использует PySide6, EventBus, SQLite, FTS5, OpenRouter, LM Studio, CTranslate2 и MLX. Менеджер очереди принимает файлы из дроп-зоны, watched folders, записи микрофона и MCP server. Runtime manager удерживает model lease, пока идёт транскрипция. После release он применяет deferred swap и выгружает старую модель. История хранит сегменты, метаданные, стоимость и безопасный технический контекст.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_35s_prompt_terms_safe.txt",
+      "reference_sha256": "d4f5cf8f8e83cb8aa6881d51a972e64faef256657f9249e989f7fc0bb225fdad",
+      "required_anchors": [
+        "pyside6",
+        "openrouter",
+        "sqlite",
+        "fts5"
+      ],
+      "sha256": "8be331cdd5a438cfb1bbc7ed72ee93a65fbf67c61b9333347dc140a563641efb",
+      "state": "diagnostic",
+      "tier": "P1"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/low_amp_mumble_no_words.ogg",
+      "case_id": "p2_low_amp_mumble_no_words",
+      "category": "degraded_audio",
+      "duration_s": 10.0065,
+      "expected_text": "10 seconds of quiet non-lexical mumbling sounds such as hm, uhu, mmm. No intelligible words.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/low_amp_mumble_no_words.txt",
+      "reference_sha256": "6db4ce08826494d083d7c213ea67a1e47e7c0a104d7a2fa97faa3d6d73c7c589",
+      "required_anchors": [],
+      "sha256": "c6833538e3ac1bb7468082c0e29f159d752ce0b19646910718c4291e55b864a0",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/en_whisper_you_right.ogg",
+      "case_id": "p2_en_whisper_you_right",
+      "category": "degraded_audio",
+      "duration_s": 1.7665,
+      "expected_text": "You are right.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/en_whisper_you_right.txt",
+      "reference_sha256": "711f25d5532807630306c337f942810dec933d6f2684ef5dc2cff54ac55afbb4",
+      "required_anchors": [
+        "you",
+        "right"
+      ],
+      "sha256": "a9c1292223d0b1131f89b0e7433a1f1fae513992c4576f5c86414a4e0045fca0",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_quiet_whisper_phrase.ogg",
+      "case_id": "p2_ru_quiet_whisper_phrase",
+      "category": "degraded_audio",
+      "duration_s": 2.2865,
+      "expected_text": "Это важная проверка.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_quiet_whisper_phrase.txt",
+      "reference_sha256": "e62b500760bd46236abb7736dbb5b706cfab4a417eba49184f5c23ec8c65262a",
+      "required_anchors": [
+        "важн",
+        "проверк"
+      ],
+      "sha256": "23eced2fa0ab7fe1d23d1fbeff985b1576f48781156a2f723efcde751980d68a",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_short_name_yura.ogg",
+      "case_id": "p2_ru_short_name_yura",
+      "category": "degraded_audio",
+      "duration_s": 2.6065,
+      "expected_text": "Юра выбрал второй вариант.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_short_name_yura.txt",
+      "reference_sha256": "62575be21e8e5b2065598ddbff580f38aa32324e2aa1bffd1e39cafcdff601f2",
+      "required_anchors": [
+        "юра",
+        "втор",
+        "вариант"
+      ],
+      "sha256": "1e3de215d1cd2b841205744bca15ac244df66e6c66100f338dec9bf6d9de4018",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/bilingual_en_to_ru.ogg",
+      "case_id": "p2_bilingual_en_to_ru",
+      "category": "language_detection",
+      "duration_s": 5.4065,
+      "expected_text": "This is an English sentence first. Затем идёт русское предложение.",
+      "forbidden_anchors": [],
+      "language": null,
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/bilingual_en_to_ru.txt",
+      "reference_sha256": "c8f9542e7ca20228141eb91457fb1d252f87f435fb179eb35ce05e955f963bc4",
+      "required_anchors": [],
+      "sha256": "be8fc725b970d1d08e766867ac4e3347acc8702b7b520f647d6250c096b12a94",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ambiguous_names_then_ru.ogg",
+      "case_id": "p2_ambiguous_names_then_ru",
+      "category": "language_detection",
+      "duration_s": 6.3265,
+      "expected_text": "PySide, OpenRouter, Gemini. Это русский тест.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ambiguous_names_then_ru.txt",
+      "reference_sha256": "e60dc0330f0cc4c405fa3824ee69554bf0b4d1e2a0c5d9ac88024b54d4279fe2",
+      "required_anchors": [
+        "русск",
+        "тест"
+      ],
+      "sha256": "ba6c82c4bcad84b595e9dcdcbcc7585d03cb2596e7f78a0f60881e6473ad9050",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/robot_legit_you_en.ogg",
+      "case_id": "p2_robot_legit_you_en",
+      "category": "positive_speech",
+      "duration_s": 1.8865,
+      "expected_text": "You are right.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/robot_legit_you_en.txt",
+      "reference_sha256": "711f25d5532807630306c337f942810dec933d6f2684ef5dc2cff54ac55afbb4",
+      "required_anchors": [
+        "you",
+        "right"
+      ],
+      "sha256": "9620b197254b0a0820f7e1e5806388f6cd1701ecc105b25cbdfdccba84c4cdbe",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/robot_prompt_echo_multilang.ogg",
+      "case_id": "p2_robot_prompt_echo_multilang",
+      "category": "prompt_echo",
+      "duration_s": 1.7265,
+      "expected_text": "Open the tab. Открой вкладку.",
+      "forbidden_anchors": [
+        "ZARQUON-42",
+        "NEBULA_WIDGET",
+        "HYPERION_CACHE"
+      ],
+      "language": null,
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/robot_prompt_echo_multilang.txt",
+      "reference_sha256": "2da44b3513caca4d2b14fdb6a470a5bd215567aca5ac5bffb6556b99763f3837",
+      "required_anchors": [],
+      "sha256": "ea969c43eba328a9238f9046b0ce254be381763e1f12ab8245021cba7a72525f",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/fan_noise_legit_en.ogg",
+      "case_id": "p2_fan_noise_legit_en",
+      "category": "degraded_audio",
+      "duration_s": 10.0065,
+      "expected_text": "Open the second tab.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "fan"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/fan_noise_legit_en.txt",
+      "reference_sha256": "78e3f5d13cbdfb6f6574d24758e94efb4252e00e16667712ce47fbe029d399b3",
+      "required_anchors": [
+        "open",
+        "second",
+        "tab"
+      ],
+      "sha256": "3573d54a23ed0858d79e00fb09dc1b6658f98923f0b7bcfb6868c455a3b1f881",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/low_bitrate_tts_en.ogg",
+      "case_id": "p2_low_bitrate_tts_en",
+      "category": "degraded_audio",
+      "duration_s": 4.6465,
+      "expected_text": "The queue stores a short technical phrase for low bitrate degradation.",
+      "forbidden_anchors": [],
+      "language": "en",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/low_bitrate_tts_en.txt",
+      "reference_sha256": "c30a8349948303b5f0efa25dfa4353b59fd5f2a0bbe3b03fc30db28708edd666",
+      "required_anchors": [],
+      "sha256": "4d9b2f255a510ffdc9790337c59b55ae28e4b51c6b733f9d2161f61139ad13b5",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_60s_mixed_terms.ogg",
+      "case_id": "p2_ru_60s_mixed_terms",
+      "category": "chunked_prompt_tail",
+      "duration_s": 60.8065,
+      "expected_text": "60+ seconds of Russian WVM technical terms, assembled from Gemini TTS technical-term segments: PySide6, SQLite, FTS5, OpenRouter, LM Studio, CTranslate2, MLX, runtime manager, model lease, deferred swap, release, QThreadPool, QRunnable, EventBus, signals.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "none"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_60s_mixed_terms.txt",
+      "reference_sha256": "5181693ebf982ca1031150a609af59222c7fd4a8192d72e8e7ce8daa92cbeb72",
+      "required_anchors": [
+        "2026",
+        "api",
+        "json"
+      ],
+      "sha256": "59f3e20ae7f7d95d2c01f81e531328c47257369bbfde471d3cfa07a24d36ad5b",
+      "state": "diagnostic",
+      "tier": "P2"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_fan_noise_terms.ogg",
+      "case_id": "p2_ru_fan_noise_terms",
+      "category": "degraded_audio",
+      "duration_s": 11.1265,
+      "expected_text": "Интерфейс использует QThreadPool, QRunnable, EventBus, PySide6 signals, SQLite и FTS5.",
+      "forbidden_anchors": [],
+      "language": "ru",
+      "noise": {
+        "category": "fan"
+      },
+      "pause": {
+        "leading_s": 0.0,
+        "trailing_s": 0.0
+      },
+      "prompt_sentinels": [],
+      "reference_path": "tests/assets/whisper/slice5/ru_fan_noise_terms.txt",
+      "reference_sha256": "17f3f16b9a83449d14ff16fb64baa50e2af98af8fb8180ca31e4ae2de6ac841d",
+      "required_anchors": [
+        "pyside6",
+        "sqlite"
+      ],
+      "sha256": "c7bfc002b4236bba483f0ce14eed1eb93c66c1f8fa4e8160b6c12f543cea1258",
+      "state": "diagnostic",
+      "tier": "P2"
+    }
+  ],
+  "corpus_id": "wvm-slice5-local-reference-v1",
+  "license": {
+    "audio_and_references": "NOASSERTION",
+    "reason": "Owner approval is limited to local Voiceover Pipeline evaluation; it is not a redistribution or publication license."
+  },
+  "local_reference": {
+    "asset_root": "tests/assets/whisper/slice5",
+    "root_resolution": "Pass the WVM repository root explicitly as --corpus-root (typically $WVM_ROOT); no absolute local root is recorded."
+  },
+  "privacy": {
+    "contains_personal_data": false,
+    "contains_private_recordings": false,
+    "source": "owner-approved local synthetic WVM Slice 5 evaluation assets"
+  },
+  "provenance": {
+    "inventory_path": "tests/integration/helpers/slice5_asset_cases.py",
+    "note": "Local-reference manifest only. It records paired WVM-root-relative paths and integrity data; no WVM audio binary or code is copied into Voiceover Pipeline.",
+    "source_pack": "WVM Slice 5 canonical asset inventory"
+  },
+  "schema_version": 1,
+  "selection": {
+    "category_counts": {
+      "chunked_prompt_tail": 6,
+      "degraded_audio": 7,
+      "hallucination_phrase": 6,
+      "language_detection": 7,
+      "no_speech": 6,
+      "positive_speech": 6,
+      "prompt_echo": 6,
+      "prompt_quality": 6
+    },
+    "method": "Fixed 6-or-7 case quota per canonical WVM category, retaining P0/P1/P2 coverage and canonical inventory order.",
+    "tier_counts": {
+      "P0": 16,
+      "P1": 22,
+      "P2": 12
+    }
+  }
+}
