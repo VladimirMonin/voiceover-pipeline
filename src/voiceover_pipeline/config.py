@@ -141,30 +141,15 @@ POLZA_CHAT_NARRATION_SYSTEM_PROMPT = (
 
 
 QWEN_PRESET_SPEAKERS = [
+    "Vivian",
+    "Serena",
+    "Uncle_Fu",
+    "Dylan",
+    "Eric",
+    "Ryan",
     "Aiden",
-    "Alina",
-    "Amelia",
-    "Arthur",
-    "Callum",
-    "Carter",
-    "Elijah",
-    "Ethan",
-    "Evelyn",
-    "Isabella",
-    "Jack",
-    "James",
-    "Landon",
-    "Liam",
-    "Lily",
-    "Lucas",
-    "Mason",
-    "Mia",
-    "Natalia",
-    "Olivia",
-    "Paul",
-    "Sofia",
-    "Theo",
-    "Violet",
+    "Ono_Anna",
+    "Sohee",
 ]
 
 QWEN_MODEL_CUSTOMVOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"

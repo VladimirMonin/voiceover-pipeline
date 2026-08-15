@@ -96,6 +96,7 @@
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
 | `--mode` | choice | `preset` | `preset` (готовый голос) или `clone` (клонирование) |
+| `--qwen-instruct` | str | `QWEN_INSTRUCT` | Индивидуальная инструкция по стилю для текущего `qwen-local` прогона |
 | `--sample` | str | — | Путь к референс-аудио для clone |
 | `--sample-text` | str | `""` | Текст референса для clone (точнее) |
 

@@ -42,6 +42,7 @@ from .config import (
     PODCAST_NARRATION_PROMPT,
     POLZA_TTS_MODELS,
     PROVIDER_DEFAULT_MODELS,
+    QWEN_INSTRUCT,
     QWEN_PRESET_SPEAKERS,
     read_openrouter_key,
     read_groq_key,
@@ -195,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     qwen = gen.add_argument_group("qwen-local options")
     qwen.add_argument("--mode", choices=["preset", "clone"], default="preset")
+    qwen.add_argument("--qwen-instruct", default=None, help="Per-run speaking style instruction for qwen-local preset mode.")
     qwen.add_argument("--sample", type=str, default=None)
     qwen.add_argument("--sample-text", type=str, default="")
 
@@ -333,15 +335,30 @@ def _ensure_run_dirs(paths) -> None:
         fail(f"Failed to create output directory {paths.chunks_dir}: {e}", _EXIT_OUTPUT)
 
 
+def _looks_like_windows_drive_root(path: Path) -> bool:
+    """Detect values like ``C:\\`` even when running on POSIX.
+
+    On Linux, ``Path("C:\\")`` is a relative directory named ``C:\\``, so
+    ``Path.anchor`` is empty and the normal root check does not catch it.
+    The CLI still treats Windows drive roots as unsafe because scripts and
+    tests may be authored cross-platform.
+    """
+    value = str(path).strip().replace("/", "\\")
+    return len(value) == 3 and value[1:] == ":\\" and value[0].isalpha()
+
+
 def _validate_output_dir(output_dir: Path) -> Path:
+    if _looks_like_windows_drive_root(output_dir):
+        fail(f"--output-dir cannot be a drive root: {output_dir}", _EXIT_ARGS)
+
     resolved = output_dir.resolve()
     if resolved == Path.cwd().resolve():
         fail(f"--output-dir cannot be the current working directory: {resolved}", _EXIT_ARGS)
     home = Path.home().resolve()
     if resolved == home:
         fail(f"--output-dir cannot be your home directory: {resolved}", _EXIT_ARGS)
-    root = resolved.anchor or "C:\\"
-    if str(resolved).rstrip("\\/") == root.rstrip("\\/"):
+    root = resolved.anchor or "C:\\\\"
+    if str(resolved).rstrip("\\\\/") == root.rstrip("\\\\/"):
         fail(f"--output-dir cannot be a drive root: {resolved}", _EXIT_ARGS)
     return output_dir
 
@@ -354,6 +371,13 @@ def _resolve_style_prompt(args: argparse.Namespace) -> str | None:
     if getattr(args, "style_prompt", None) is not None:
         return args.style_prompt
     return PODCAST_NARRATION_PROMPT
+
+
+def _resolve_provider_style_prompt(args: argparse.Namespace) -> str | None:
+    if getattr(args, "provider", None) == "qwen-local":
+        instruct = getattr(args, "qwen_instruct", None)
+        return QWEN_INSTRUCT if instruct is None else instruct
+    return _resolve_style_prompt(args)
 
 
 def generate(args: argparse.Namespace) -> None:
@@ -483,7 +507,7 @@ def generate(args: argparse.Namespace) -> None:
     else:
         args.speaker_voice_map = {}
         args.voice = requested_voice or _default_voice(args)
-    style_prompt = _resolve_style_prompt(args)
+    style_prompt = _resolve_provider_style_prompt(args)
     if gemini_report and not args.no_style_prompt and args.style_prompt is None and args.style_prompt_file is None:
         style_prompt = gemini_report["style_prompt"]
     prompt_mode = resolve_prompt_mode(args.provider, args.model)
@@ -1431,7 +1455,14 @@ def build_provider(args: argparse.Namespace, api_key: str, style_prompt: str | N
             speaker_voice_map=getattr(args, "speaker_voice_map", None),
         )
     if args.provider == "qwen-local":
-        return QwenLocalTTSProvider(mode=args.mode, voice=args.voice, sample_path=args.sample, sample_text=args.sample_text)
+        instruct = getattr(args, "qwen_instruct", None)
+        return QwenLocalTTSProvider(
+            mode=args.mode,
+            voice=args.voice,
+            instruct=QWEN_INSTRUCT if instruct is None else instruct,
+            sample_path=args.sample,
+            sample_text=args.sample_text,
+        )
     raise RuntimeError(f"Unsupported provider: {args.provider}")
 
 

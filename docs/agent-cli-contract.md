@@ -126,6 +126,10 @@ voiceover doctor --with-timings --timing-device cpu --json  # нужен faster-
 
 Приоритет: `--no-style-prompt` > `--style-prompt-file` > `--style-prompt` > дефолт из config.py.
 
+Для `qwen-local` используется отдельный `--qwen-instruct`. Он передаётся в
+`generate_custom_voice(..., instruct=...)` только для текущего прогона. Если
+флаг не указан, сохраняется прежний дефолт `QWEN_INSTRUCT` из `config.py`.
+
 ## `generate --json` (output)
 
 ```json

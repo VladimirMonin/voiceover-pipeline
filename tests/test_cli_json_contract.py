@@ -16,9 +16,12 @@ def test_doctor_json_parseable():
 def test_doctor_qwen_workflow():
     code, data = cli_json("doctor", "--provider", "qwen-local", "--json")
     assert code == 0
-    assert data["workflow_ok"] is False
-    assert data["checks"]["cuda"]["required"] is True
-    assert data["checks"]["cuda"]["ok"] is False
+    checks = data["checks"]
+    assert isinstance(checks, dict)
+    cuda_check = checks["cuda"]
+    assert isinstance(cuda_check, dict)
+    assert cuda_check["required"] is True
+    assert data["workflow_ok"] is cuda_check["ok"]
 
 
 def test_doctor_with_timings():
@@ -78,6 +81,22 @@ def test_list_voices():
     voices = data["voices"]
     assert isinstance(voices, list)
     assert len(voices) > 0
+
+
+def test_list_qwen_voices_match_official_custom_voice_model():
+    code, data = cli_json("list", "voices", "--provider", "qwen-local", "--json")
+    assert code == 0
+    assert data["voices"] == [
+        "Vivian",
+        "Serena",
+        "Uncle_Fu",
+        "Dylan",
+        "Eric",
+        "Ryan",
+        "Aiden",
+        "Ono_Anna",
+        "Sohee",
+    ]
 
 
 def test_list_polza_tts_providers():
@@ -211,6 +230,38 @@ def test_gemini_prompt_mode_in_manifest_is_native():
     from voiceover_pipeline.tts_prompting import resolve_prompt_mode
     mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
     assert mode == "native"
+
+
+def test_qwen_instruct_flag_reaches_local_provider():
+    from voiceover_pipeline.cli import build_parser, build_provider, _resolve_provider_style_prompt
+
+    parser = build_parser()
+    parsed = parser.parse_args(
+        "generate --provider qwen-local --voice Serena --qwen-instruct calm_confident".split()
+    )
+    provider = build_provider(parsed, api_key="", style_prompt=None, prompt_mode="none")
+
+    assert parsed.qwen_instruct == "calm_confident"
+    assert getattr(provider, "_instruct") == "calm_confident"
+    assert _resolve_provider_style_prompt(parsed) == "calm_confident"
+
+
+def test_qwen_instruct_defaults_for_backward_compatibility():
+    import argparse
+    from voiceover_pipeline.cli import build_provider, _resolve_provider_style_prompt
+    from voiceover_pipeline.config import QWEN_INSTRUCT
+
+    args = argparse.Namespace(
+        provider="qwen-local",
+        mode="preset",
+        voice="Serena",
+        sample=None,
+        sample_text="",
+    )
+    provider = build_provider(args, api_key="", style_prompt=None, prompt_mode="none")
+
+    assert getattr(provider, "_instruct") == QWEN_INSTRUCT
+    assert _resolve_provider_style_prompt(args) == QWEN_INSTRUCT
 
 
 def test_style_prompt_flags_accepted_by_parser():
