@@ -16,6 +16,7 @@
 | [WVM Slice 5 local-reference benchmark](wvm-slice5-local-reference-benchmark.md) | Owner-approved local-only manifest для 50 WVM Slice 5 cases: явный corpus root, SHA-256 и NOASSERTION boundary |
 | [ADR-001: Generic local ASR](adr/ADR-001-generic-local-asr.md) | Решение о capability-aware локальном ASR: registry, typed hints, dependency/device policy и граница timing/alignment |
 | [Generic local ASR implementation plan](plans/2026-08-15-generic-local-asr-implementation-plan.md) | Последовательные offline-first срезы реализации, тестовые и benchmark-гейты |
+| [audio.cpp hybrid migration plan](plans/2026-08-16-audio-cpp-hybrid-migration-plan.md) | Runtime-neutral план переезда Qwen ASR, Nemotron, Qwen TTS и OmniVoice на audio.cpp с будущим MLX-драйвером и Faster-Whisper рядом |
 | [audio.cpp feasibility report](research/2026-08-15-audio-cpp-feasibility.md) | Проверенная оценка полного перехода, optional backend и изолированного spike для Qwen/Nemotron без замены Faster-Whisper |
 | [audio.cpp hybrid consolidation addendum](research/2026-08-16-audio-cpp-hybrid-consolidation.md) | Уточнённая цель: общий runtime для Qwen ASR, Nemotron, Qwen TTS и OmniVoice при сохранении Faster-Whisper и cloud providers |
 | [Agent Development Workflow](../doc/agent-workflow.md) | Безопасный цикл работы агента: scope, dirty tree, Kanban, проверки и отдельные approvals для Git/release |
