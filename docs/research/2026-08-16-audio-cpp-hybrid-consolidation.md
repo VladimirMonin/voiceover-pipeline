@@ -19,7 +19,7 @@
 - **PROMOTE IF PASS:** каждое семейство отдельно, только после сравнительного runtime-gate.
 - **REJECT:** big-bang, удаление Python adapters до доказанной паритетности, удаление Faster-Whisper/cloud.
 - **DEFER:** production streaming и универсальный daemon до доказательства хотя бы одного ASR и одного TTS family.
-- Нужны не только `AudioCppASRProvider`/`AudioCppTTSProvider`, а отдельный **`AudioCppLocalRuntime` — владелец процесса, GPU lease, unload, cancellation, provenance и privacy**.
+- Нужны не только `AudioCppASRProvider`/`AudioCppTTSProvider`, а отдельный **`LocalAudioRuntime` — владелец процесса, GPU lease, unload, cancellation, provenance и privacy**.
 - Текущий feasibility report нуждается в **датированном addendum/revision**: прежний вывод был корректен для полной миграции, но его рекомендация «optional ASR only; TTS deferred» больше не отвечает уточнённой цели и не учитывает OmniVoice.
 
 ---
@@ -161,7 +161,7 @@ FasterWhisperProvider ────────────────┐
 Cloud providers ──────────────────────┤
                                      ├→ existing VOP CLI/artifacts/receipts
 AudioCppASRProvider ─┐                │
-AudioCppTTSProvider ─┴→ AudioCppLocalRuntime
+AudioCppTTSProvider ─┴→ LocalAudioRuntime
                          ├─ binary/build identity
                          ├─ global single-GPU lease
                          ├─ model/session load-unload
@@ -175,7 +175,7 @@ AudioCppTTSProvider ─┴→ AudioCppLocalRuntime
 - **Один custom binary:** предпочтителен; единый build SHA/toolchain и family registry. Но «один binary» не означает одновременно держать все weights в GPU.
 - **Per-request subprocess:** принять только для first standalone spikes и failure mapping. Для chunked TTS production — отклонить: repeated model load ухудшит latency и делает 5-run stability нерепрезентативной.
 - **Long-lived `audiocpp_server`:** наиболее практичный production candidate. Он сохраняет model/session, поддерживает lazy load и explicit unload endpoints.[6]
-- **Но VOP нужен внешний runtime owner:** upstream server сохраняет все использованные модели до unload, сериализует только внутри одного model ID и не обеспечивает global single-GPU arbitration. `AudioCppLocalRuntime` должен выдавать lease, выгружать предыдущую family, контролировать health/restart и фиксировать receipts.
+- **Но VOP нужен внешний runtime owner:** upstream server сохраняет все использованные модели до unload, сериализует только внутри одного model ID и не обеспечивает global single-GPU arbitration. `LocalAudioRuntime` должен выдавать lease, выгружать предыдущую family, контролировать health/restart и фиксировать receipts.
 - **Cancellation:** soft cancel до inference; client disconnect для stream; timeout/busy guard; для зависшего CUDA — supervised process termination/restart. Нельзя обещать in-process cancellation.
 - **Privacy:** loopback-only, `log_request_body=false`, no CORS, private temp directory, не писать transcript/reference/design prompt в общие logs, не auto-download weights.
 
@@ -188,7 +188,7 @@ AudioCppTTSProvider ─┴→ AudioCppLocalRuntime
 3. **Qwen TTS CustomVoice — ACCEPT SPIKE:** Aiden и Sohee, те же тексты/instructions/artifacts.
 4. **Qwen TTS Base clone — отдельный spike:** ref audio с transcript и без него.
 5. **OmniVoice license/provenance gate**, затем official Python baseline → standalone `omnivoice.cpp` reference → audio.cpp OmniVoice на идентичных assets.
-6. После первого ASR и первого TTS pass реализовать `AudioCppLocalRuntime`.
+6. После первого ASR и первого TTS pass реализовать `LocalAudioRuntime`.
 7. Продвигать family по одной, сохраняя Python provider как rollback.
 8. После доказанного operational window отдельно решать removal старых Python extras. Не удалять их в интеграционном PR.
 
@@ -288,7 +288,7 @@ A0 Report addendum + exact source/provenance ledger
      ├─ C3 Qwen Base clone
      └─ C4 OmniVoice Python → standalone C++ → audio.cpp parity [after A1]
 
-(B2 pass OR C2 pass) → D1 AudioCppLocalRuntime contract
+(B2 pass OR C2 pass) → D1 LocalAudioRuntime contract
 D1 + each family pass → E1/E2/E3/E4 independent optional-provider promotion
 all promoted + operational window → F1 decide Python-runtime retirement
 ```

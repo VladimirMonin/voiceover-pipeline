@@ -77,6 +77,7 @@ from .providers.asr_registry import (
     get_asr_provider_spec,
     list_asr_provider_specs,
 )
+from .providers.base import validate_asr_response
 from .retry import RetryPolicy, run_with_retry
 from .run_state import (
     LOG_FILE,
@@ -841,7 +842,7 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
         compute=args.compute,
     )
     try:
-        result = spec.factory().transcribe(request)
+        result = validate_asr_response(request, spec.factory().transcribe(request))
     except ModuleNotFoundError as exc:
         fail(f"Missing dependency for ASR provider {spec.provider_id}: {exc}", _EXIT_MISSING_DEP)
     except Exception as exc:

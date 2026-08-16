@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from math import isfinite
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -81,6 +82,7 @@ class TimingResult:
 
 ASRAlignmentOrigin = Literal["native", "forced"]
 ASRPhraseStrength = Literal["mild", "normal", "strong"]
+ASRTimestampMode = Literal["none", "word"]
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,7 @@ class ASRRequest:
     device: str = "cpu"
     compute: str = "auto"
     hints: ASRContextHints = field(default_factory=ASRContextHints)
+    timestamp_mode: ASRTimestampMode = "none"
 
     def __post_init__(self) -> None:
         if not str(self.audio_path):
@@ -136,6 +139,8 @@ class ASRRequest:
             raise ValueError("ASR device must not be blank")
         if not self.compute.strip():
             raise ValueError("ASR compute must not be blank")
+        if self.timestamp_mode not in ("none", "word"):
+            raise ValueError("ASR timestamp mode must be none or word")
 
 
 @dataclass(frozen=True)
@@ -162,8 +167,10 @@ class ASRSegment:
     def __post_init__(self) -> None:
         if (self.start_s is None) != (self.end_s is None):
             raise ValueError("ASR segment timestamps must include both start and end")
-        if self.start_s is not None and self.start_s < 0:
-            raise ValueError("ASR timestamps must be non-negative")
+        if self.start_s is not None and (not isfinite(self.start_s) or self.start_s < 0):
+            raise ValueError("ASR timestamps must be finite and non-negative")
+        if self.end_s is not None and not isfinite(self.end_s):
+            raise ValueError("ASR timestamps must be finite and non-negative")
         if self.end_s is not None and self.start_s is not None and self.end_s < self.start_s:
             raise ValueError("ASR timestamp end must not be before start")
 
@@ -176,8 +183,10 @@ class ASRWordSpan:
     confidence: float | None = None
 
     def __post_init__(self) -> None:
-        if self.start_s < 0:
-            raise ValueError("ASR timestamps must be non-negative")
+        if not isfinite(self.start_s) or self.start_s < 0:
+            raise ValueError("ASR timestamps must be finite and non-negative")
+        if not isfinite(self.end_s):
+            raise ValueError("ASR timestamps must be finite and non-negative")
         if self.end_s < self.start_s:
             raise ValueError("ASR timestamp end must not be before start")
 
@@ -208,6 +217,10 @@ def _validate_monotonic_spans(spans: tuple[ASRSegment | ASRWordSpan, ...]) -> No
         previous_start = start
 
 
+def _normalized_asr_text(text: str) -> str:
+    return "".join(character for character in text.casefold() if character.isalnum())
+
+
 @dataclass(frozen=True)
 class ASRResult:
     transcript: str
@@ -229,6 +242,24 @@ class ASRResult:
             raise ValueError("ASR duration must be non-negative")
         _validate_monotonic_spans(self.segments)
         _validate_monotonic_spans(self.words)
+        if self.words:
+            normalized_transcript = _normalized_asr_text(self.transcript)
+            if not normalized_transcript:
+                raise ValueError("ASR word spans require a non-empty speech transcript")
+            normalized_words = _normalized_asr_text("".join(word.text for word in self.words))
+            if normalized_words != normalized_transcript:
+                raise ValueError("ASR word spans must correspond to the transcript")
         has_timestamps = any(segment.start_s is not None for segment in self.segments) or bool(self.words)
         if has_timestamps and self.alignment_origin is None:
             raise ValueError("ASR timestamps require an alignment origin")
+        if self.duration_s is not None:
+            timed_spans = (*self.segments, *self.words)
+            if any(span.end_s is not None and span.end_s > self.duration_s for span in timed_spans):
+                raise ValueError("ASR timestamps must not exceed source duration")
+
+    def validate_for_request(self, request: ASRRequest) -> None:
+        """Validate result guarantees that depend on the caller's typed intent."""
+        if request.timestamp_mode == "word" and self.transcript.strip() and not self.words:
+            raise ValueError("ASR requested word timestamps but returned no word spans for speech output")
+        if request.timestamp_mode == "none" and self.words:
+            raise ValueError("ASR returned word timestamps when timestamp mode is none")

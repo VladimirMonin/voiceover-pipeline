@@ -1,4 +1,11 @@
-# Generic local ASR implementation plan
+# Generic Local ASR Implementation Plan
+
+> **Status (2026-08-16): implemented baseline and superseded for family/runtime rollout.**
+> This plan remains the record of the provider-neutral ASR seam. Qwen and
+> Nemotron adapters are no longer future work, and timestamp support must not be
+> described as a model limitation: Qwen uses Qwen3 Forced Aligner; Nemotron
+> provides native timing entries requiring normalization. Continue implementation
+> through [the hybrid audio runtime migration plan](2026-08-16-audio-cpp-hybrid-migration-plan.md).
 
 > **For Hermes:** Execute only through the downstream Kanban implementation card, one verified slice at a time. Do not commit, download models, or run live inference unless that card explicitly authorizes it.
 

@@ -13,8 +13,10 @@ from voiceover_pipeline.models import (
     ASRRequest,
     ASRResult,
     ASRSegment,
+    ASRTimestampMode,
     ASRWordSpan,
 )
+from voiceover_pipeline.providers.base import validate_asr_response
 
 
 def _receipt() -> ASRExecutionReceipt:
@@ -106,6 +108,71 @@ def test_context_glossary_and_phrase_hints_are_typed_without_generic_prompt():
     assert request.hints.glossary.profile_id == "ops-v1"
     assert request.hints.phrase_hints[0].strength == "strong"
     assert not hasattr(request, "prompt")
+
+
+def test_timestamp_mode_is_an_explicit_closed_request_intent_with_text_only_default():
+    assert ASRRequest(audio_path=Path("fixture.wav")).timestamp_mode == "none"
+    assert ASRRequest(audio_path=Path("fixture.wav"), timestamp_mode="word").timestamp_mode == "word"
+
+    with pytest.raises(ValueError, match="timestamp mode"):
+        ASRRequest(audio_path=Path("fixture.wav"), timestamp_mode=cast(ASRTimestampMode, "segment"))
+
+
+def test_requested_word_timestamps_reject_speech_without_words_and_out_of_bounds_spans():
+    request = ASRRequest(audio_path=Path("fixture.wav"), timestamp_mode="word")
+    text_only = ASRResult(
+        transcript="spoken fixture",
+        provider_id="fixture-local",
+        model_id="fixture-model",
+        execution=_receipt(),
+    )
+
+    with pytest.raises(ValueError, match="requested word timestamps"):
+        validate_asr_response(request, text_only)
+    with pytest.raises(ValueError, match="source duration"):
+        ASRResult(
+            transcript="spoken fixture",
+            provider_id="fixture-local",
+            model_id="fixture-model",
+            execution=_receipt(),
+            duration_s=1.0,
+            words=(ASRWordSpan(text="spoken fixture", start_s=0.0, end_s=1.1),),
+            alignment_origin="native",
+        )
+
+
+def test_word_spans_must_describe_non_empty_transcript_text():
+    valid = ASRResult(
+        transcript="Привет, мир!",
+        provider_id="fixture-local",
+        model_id="fixture-model",
+        execution=_receipt(),
+        words=(
+            ASRWordSpan(text="Привет", start_s=0.0, end_s=0.2),
+            ASRWordSpan(text="мир", start_s=0.3, end_s=0.5),
+        ),
+        alignment_origin="native",
+    )
+
+    assert valid.words[0].text == "Привет"
+    with pytest.raises(ValueError, match="non-empty speech transcript"):
+        ASRResult(
+            transcript="",
+            provider_id="fixture-local",
+            model_id="fixture-model",
+            execution=_receipt(),
+            words=(ASRWordSpan(text="fabricated", start_s=0.0, end_s=0.2),),
+            alignment_origin="native",
+        )
+    with pytest.raises(ValueError, match="correspond to the transcript"):
+        ASRResult(
+            transcript="expected words",
+            provider_id="fixture-local",
+            model_id="fixture-model",
+            execution=_receipt(),
+            words=(ASRWordSpan(text="unrelated", start_s=0.0, end_s=0.2),),
+            alignment_origin="native",
+        )
 
 
 def test_phrase_hint_strength_and_alignment_origin_are_closed_sets():

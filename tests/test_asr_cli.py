@@ -6,7 +6,7 @@ import types
 import pytest
 
 from conftest import cli_json, fixture_path
-from voiceover_pipeline.models import ASRCapabilities, ASRExecutionReceipt, ASRRequest, ASRResult
+from voiceover_pipeline.models import ASRCapabilities, ASRExecutionReceipt, ASRRequest, ASRResult, ASRWordSpan
 from voiceover_pipeline.providers.base import ASRProvider
 from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth, ASRProviderSpec
 
@@ -144,6 +144,66 @@ def test_transcribe_normalizes_a_fixture_provider_without_timestamps(monkeypatch
     assert data["segments"] == []
     assert data["words"] == []
     assert data["execution"]["measurements"] == {"wall_s": 0.25}
+
+
+def test_transcribe_rejects_unrequested_word_timestamps_at_the_provider_boundary(monkeypatch):
+    import voiceover_pipeline.cli as cli
+
+    class UnexpectedWordProvider(ASRProvider):
+        provider_id = "fixture-local"
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            return ASRResult(
+                transcript="fixture transcript",
+                provider_id=self.provider_id,
+                model_id="fixture-model",
+                execution=ASRExecutionReceipt(
+                    runtime="fixture-runtime",
+                    runtime_version="1.0",
+                    resolved_device="cpu",
+                    resolved_compute="float32",
+                ),
+                words=(ASRWordSpan(text="fixture transcript", start_s=0.0, end_s=0.25),),
+                alignment_origin="native",
+            )
+
+    spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=UnexpectedWordProvider,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            forced_language=True,
+            word_timestamps=True,
+            device_modes=("cpu",),
+            compute_modes=("float32",),
+        ),
+        dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
+    )
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--model",
+            "fixture-model",
+            "--language",
+            "ru",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+        ]
+    )
+
+    with pytest.raises(cli.CliError, match="returned word timestamps when timestamp mode is none") as error:
+        cli.transcribe_cmd(args)
+
+    assert error.value.code == 30
 
 
 def test_doctor_checks_only_the_selected_asr_dependency_probe(monkeypatch, capsys):

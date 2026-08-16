@@ -1,9 +1,15 @@
 # ADR-001: Generic local ASR capability seam
 
-- Status: proposed
+- Status: accepted; family/timestamp staging superseded by the 2026-08-16 hybrid migration plan
 - Date: 2026-08-15
-- Version: 1.0
-- Scope: future local batch ASR extension; no adapter implementation in this ADR
+- Version: 1.1
+- Scope: provider-neutral ASR contract and registry; current family/runtime decisions are governed by the hybrid plan
+
+> **Current decision:** the generic seam remains authoritative, but its former
+> text-first staging is no longer a model limitation. Qwen word timestamps use
+> the separate Qwen3 Forced Aligner; Nemotron exposes native timing entries that
+> must be normalized and validated. Runtime integration and rollout now follow
+> [the hybrid migration plan](../plans/2026-08-16-audio-cpp-hybrid-migration-plan.md).
 
 ## Context
 

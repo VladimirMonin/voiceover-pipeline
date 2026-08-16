@@ -4,7 +4,7 @@
 
 | Документ | Содержание |
 |---|---|
-| [Agent CLI Contract](agent-cli-contract.md) | Контракт для машинного использования: TTS, timing и generic local ASR, включая deferred text-only Qwen3-ASR и Nemotron, JSON-ответы, exit codes (0/2/10/11/20/30/40/50), stdout/stderr, safety rules |
+| [Agent CLI Contract](agent-cli-contract.md) | Контракт для машинного использования: TTS, timing и generic local ASR, включая Qwen3-ASR, Nemotron, JSON-ответы, коды завершения (0/2/10/11/20/30/40/50), stdout/stderr и правила безопасности |
 | [Remotion Workflow](remotion-workflow.md) | Как агент Remotion использует pipeline: от сценария до captions, manifest.json как entry-point, запрет оценки duration по словам |
 | [Troubleshooting](troubleshooting.md) | Типовые ошибки: exit codes, recovery paths, зависимости |
 
@@ -17,6 +17,7 @@
 | [ADR-001: Generic local ASR](adr/ADR-001-generic-local-asr.md) | Решение о capability-aware локальном ASR: registry, typed hints, dependency/device policy и граница timing/alignment |
 | [Generic local ASR implementation plan](plans/2026-08-15-generic-local-asr-implementation-plan.md) | Последовательные offline-first срезы реализации, тестовые и benchmark-гейты |
 | [audio.cpp hybrid migration plan](plans/2026-08-16-audio-cpp-hybrid-migration-plan.md) | Runtime-neutral план переезда Qwen ASR, Nemotron, Qwen TTS и OmniVoice на audio.cpp с будущим MLX-драйвером и Faster-Whisper рядом |
+| [Local audio runtime contract](audio-cpp-runtime.md) | Контракт `LocalAudioRuntime`, закреплённая версия audio.cpp, выбор рабочего маршрута, откат и проверяемые сведения о сборке |
 | [audio.cpp feasibility report](research/2026-08-15-audio-cpp-feasibility.md) | Проверенная оценка полного перехода, optional backend и изолированного spike для Qwen/Nemotron без замены Faster-Whisper |
 | [audio.cpp hybrid consolidation addendum](research/2026-08-16-audio-cpp-hybrid-consolidation.md) | Уточнённая цель: общий runtime для Qwen ASR, Nemotron, Qwen TTS и OmniVoice при сохранении Faster-Whisper и cloud providers |
 | [Agent Development Workflow](../doc/agent-workflow.md) | Безопасный цикл работы агента: scope, dirty tree, Kanban, проверки и отдельные approvals для Git/release |

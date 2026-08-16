@@ -41,3 +41,9 @@ class ASRProvider(ABC):
 
     def list_models(self) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+
+def validate_asr_response(request: ASRRequest, result: ASRResult) -> ASRResult:
+    """Apply caller-intent validation without adding runtime details to results."""
+    result.validate_for_request(request)
+    return result
