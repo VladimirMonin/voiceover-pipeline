@@ -1,5 +1,7 @@
 # Оценка применимости audio.cpp в Voiceover Pipeline
 
+> **Уточнение владельца от 2026-08-16:** отказ от полной миграции остаётся в силе, но целевая гибридная схема теперь рассматривает перенос всех локальных non-Whisper ASR/TTS families на общий runtime. См. [датированное addendum](2026-08-16-audio-cpp-hybrid-consolidation.md).
+
 **Дата среза:** 2026-08-16
 **Voiceover Pipeline:** commit `f3cb5db77628221ef7750cd985b42158c574e1b9`
 **audio.cpp:** `main` commit `502b5b74bd26e9b4aed267d1776ecf131cae7215`, время commit `2026-08-15T19:10:16Z`.[1]
