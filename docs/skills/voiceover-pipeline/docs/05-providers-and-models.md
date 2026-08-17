@@ -1,13 +1,14 @@
 # Провайдеры, модели, голоса и цены
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
-> Здесь: 4 провайдера, 7 протестированных моделей, все голоса, реальные цены.
+> Здесь: облачные и локальные TTS-провайдеры, голоса и реальные цены.
 > Это главный справочник для выбора провайдера/модели/голоса.
 
 ## Обзор
 
-voiceover-pipeline поддерживает четыре TTS-провайдера с единым интерфейсом
-и четыре провайдера распознавания речи (timing):
+voiceover-pipeline поддерживает облачные TTS-провайдеры и две локальные
+модельные линии. Подробности нового hybrid runtime и его benchmark boundaries:
+[`docs/14-local-audio-cpp-models.md`](14-local-audio-cpp-models.md).
 
 | Провайдер | Тип | API | Валюта | Ключ | Provider ID |
 |---|---|---|---|---|---|
@@ -15,6 +16,7 @@ voiceover-pipeline поддерживает четыре TTS-провайдер�
 | Polza TTS | Cloud, TTS + ElevenLabs | `/audio/speech`, `/media` | RUB | `POLZA_API_KEY` | `polza-tts` |
 | OpenRouter TTS | Cloud, агрегатор | `/audio/speech` | USD | `OPENROUTER_API_KEY` | `openrouter-tts` |
 | Qwen-local | Local GPU | Внутрипроцессный | Бесплатно | Не нужен | `qwen-local` |
+| OmniVoice local | Local GPU | `audio.cpp` | Бесплатно, CC-BY-NC | Не нужен | `omnivoice-local` |
 
 ---
 
@@ -190,8 +192,8 @@ Open-source модель синтеза речи. Работает локаль�
 ## Распознавание речи и тайминги
 
 Подробный справочник вынесен в [`docs/13-speech-recognition-providers.md`](13-speech-recognition-providers.md):
-локальный Faster-Whisper, облачные OpenRouter Whisper, Groq Whisper и xAI STT,
-их модели, виды таймкодов и ограничения.
+локальные Faster-Whisper, Qwen3-ASR и Nemotron, облачные OpenRouter Whisper,
+Groq Whisper и xAI STT, их модели, виды таймкодов и ограничения.
 
 ---
 

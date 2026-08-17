@@ -10,10 +10,11 @@ description: >
   whisper timing, распознать речь, транскрибировать аудио, выбрать
   timing-провайдера или проверить voiceover project. Провайдеры TTS: Polza
   GPT Audio, Polza TTS (OpenAI + ElevenLabs), OpenRouter TTS (Gemini +
-  OpenAI), Qwen3-TTS (локальный GPU). Провайдеры распознавания:
-  faster-whisper (локальный), openrouter-whisper (облачный, без таймкодов),
-  groq-whisper (облачный, сегменты + слова), xai-stt (облачный, слова +
-  confidence). Агент создаёт project skeleton
+  OpenAI), Qwen3-TTS и OmniVoice (локальный GPU). Провайдеры распознавания:
+  faster-whisper, Qwen3-ASR и Nemotron (локальные), openrouter-whisper
+  (облачный, без таймкодов), groq-whisper (облачный, сегменты + слова),
+  xai-stt (облачный, слова + confidence). Локальные non-Whisper модели могут
+  работать через общий audio.cpp runtime. Агент создаёт project skeleton
   (.env.example, .gitignore, script.md, out/), просит ключи однократно,
   никогда не читает .env. Триггеры: озвучь, voiceover, TTS, тайминги,
   whisper timing, аудио для видео, подкаст, generate audio, timings for
@@ -26,7 +27,7 @@ description: >
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-| **Совместимость:** voiceover-pipeline 0.5.1, skill revision 2026-07-31.
+| **Совместимость:** voiceover-pipeline 0.5.1, skill revision 2026-08-17.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение
@@ -48,6 +49,7 @@ description: >
 | **B: Generate** | Сценарий готов, ключи есть | doctor → validate → generate → manifest.json |
 | **C: Timings only** | Готовый MP3/Opus, нужны SRT/тайминги | timings --audio --timing-provider → .timings.json + .srt |
 | **D: Troubleshoot** | Что-то сломалось | doctor --json → exit code → recovery |
+| **E: Local hybrid** | Нужны локальные ASR/TTS через `audio.cpp` | inventory → doctor → explicit runtime → receipt → cleanup |
 
 ## Когда навык должен срабатывать
 
@@ -84,6 +86,7 @@ description: >
 | По ситуации | [docs/04-input-format.md](docs/04-input-format.md) | Нужно создать или проверить сценарий |
 | По ситуации | [docs/05-providers-and-models.md](docs/05-providers-and-models.md) | Нужно выбрать TTS-провайдера, модель или голос |
 | По ситуации | [docs/13-speech-recognition-providers.md](docs/13-speech-recognition-providers.md) | Нужно выбрать локальное/облачное распознавание и вид таймкодов |
+| По ситуации | [docs/14-local-audio-cpp-models.md](docs/14-local-audio-cpp-models.md) | Нужны Qwen3-ASR, Nemotron, Qwen3-TTS, OmniVoice, benchmark или Windows boundary |
 | По ситуации | [docs/06-commands-and-flags.md](docs/06-commands-and-flags.md) | Нужен полный CLI-справочник |
 | По ситуации | [docs/07-artifacts.md](docs/07-artifacts.md) | Нужно понять что на выходе |
 | По ситуации | [docs/08-workflows.md](docs/08-workflows.md) | Нужен готовый end-to-end сценарий |
@@ -104,11 +107,15 @@ description: >
    `docs/05-providers-and-models.md`, предложи варианты. По умолчанию:
    `polza-chat-audio` с `openai/gpt-audio-mini` (дёшево, рубли) или
    `polza-tts` с `openai/gpt-4o-mini-tts` (классический TTS, ~1.07 ₽/мин).
+   Локальные `audio.cpp` routes не выбирать неявно: сначала прочитать
+   `docs/14-local-audio-cpp-models.md`, проверить модель, platform route и GPU.
 4. **Проверка окружения.** `voiceover doctor --provider <X> --with-timings [--timing-provider <Y>] --json`.
    Убедись что `workflow_ok: true`.
    Если нужны таймкоды через облако: `--timing-provider groq-whisper` или `--timing-provider xai-stt`.
 5. **Валидация сценария.** `voiceover validate --script "script.md" --json`.
    Если есть issues — покажи пользователю, не запускай генерацию.
+   Для локального TTS цифры в произносимом тексте заранее преобразуй в слова;
+   ID, пути, хэши и машинные десятичные дроби не отправляй модели как речь.
 6. **Генерация аудио.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --json --resume`.
    Не используй `--overwrite` для платной генерации; если run оборвался — продолжай через `--resume`.
 7. **Тайминги отдельно.** `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --run-id "prod" --json --overwrite`.
@@ -157,5 +164,7 @@ description: >
 - [ ] Security-first правила на первом месте
 - [ ] Все команды — bare (`voiceover ...`), кроме секции разработки
 - [ ] Цены и модели — только тестированные, с реальных прогонов
+- [ ] Локальный TTS-сценарий не содержит необработанных цифр и machine-readable ID
+- [ ] Скорость/качество локальных моделей привязаны к конкретному receipt/corpus, а static и live evidence не смешаны
 - [ ] Навык не привязан к одному агенту или IDE
 - [ ] `docs/00-version-log.md` содержит совместимость с версией CLI

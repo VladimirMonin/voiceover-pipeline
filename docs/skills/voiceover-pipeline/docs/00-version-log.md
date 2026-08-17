@@ -8,13 +8,16 @@
 | Поле | Значение |
 |---|---|
 | **Compatible app** | voiceover-pipeline 0.5.1 |
-| **Skill revision** | 2026-07-31 |
+| **Skill revision** | 2026-08-17 |
 | **Минимальная версия CLI** | 0.4.0 |
 | **Максимальная проверенная** | 0.5.1 |
 
 ## Что актуально в этой версии навыка
 
-- 4 провайдера: `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local`
+- Облачные TTS routes плюс локальные `qwen-local` и `omnivoice-local`
+- Локальные ASR routes: `faster-whisper`, `qwen-local`, `nemotron-local`
+- Общий `audio.cpp` runtime для локальных non-Whisper моделей с GPU lease,
+  lifecycle, receipts и отдельными Linux/native-Windows launchers
 - 7 протестированных моделей с реальными ценами из smoke-прогонов
 - Полные списки голосов: OpenAI TTS (11), ElevenLabs через Polza (21), Gemini TTS через OpenRouter (30), Qwen preset (9)
 - `list voices --json` контракт: `voices` как плоский массив + `voice_categories` объект
@@ -47,6 +50,7 @@
 
 | Дата | Изменение |
 |---|---|
+| 2026-08-17 | Добавлен hybrid `audio.cpp` контур: Qwen3-ASR, Nemotron, Qwen3-TTS и OmniVoice; разделены offline/static/live evidence и Linux/Windows routes; внесены measured benchmark boundaries; для локального TTS цифры, версии, проценты и дроби теперь обязательно нормализуются в произносимые слова до генерации. |
 | 2026-07-31 | Каноническая версия навыка закреплена в репозитории; справочник TTS и распознавания разделён для соблюдения лимита 300 строк; шаблон `.env.example` дополнен безопасными placeholder-ами Groq/xAI; runtime Hermes привязывается к in-repo skill. |
 | 2026-05-27 | **v0.5.0:** Cloud transcription providers. `--timing-provider` (faster-whisper | openrouter-whisper | groq-whisper | xai-stt), `list timing-providers` с 4 провайдерами, архитектура `TranscriptionProvider` ABC. Groq Whisper — сегментные и пословные таймкоды через прямой API ($0.04/час). xAI STT — пословные таймкоды с confidence через xAI API. OpenRouter Whisper — блокировка `timings`/`--with-timings` (exit code 40) из-за отсутствия таймкодов. |
 | 2026-05-10 | Добавлен Gemini prompting guide: `AUDIO PROFILE`/`SCENE`/`PERFORMANCE`/`CONTEXT`/`TRANSCRIPT`, safe audio tags, emotion recipes, voice selection, chunking guidance. |

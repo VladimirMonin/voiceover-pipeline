@@ -8,6 +8,8 @@
 | Провайдер | Где работает | Ключ | Что возвращает |
 |---|---|---|---|
 | `faster-whisper` | Локально | Не нужен | Текст, сегменты, таймкоды слов |
+| `qwen-local` | Локально | Не нужен | Текст; Forced Aligner route для уточнения границ |
+| `nemotron-local` | Локально | Не нужен | Текст и model-native timing data на поддержанном runtime |
 | `openrouter-whisper` | Облако OpenRouter | `OPENROUTER_API_KEY` | Только полный текст, без таймкодов |
 | `groq-whisper` | Облако Groq | `GROQ_API_KEY` | Сегменты и таймкоды слов |
 | `xai-stt` | Облако xAI | `X_AI_API_KEY` | Таймкоды слов и уверенность распознавания |
@@ -38,6 +40,18 @@
 - крупные модели требуют много памяти;
 - на CPU длинное аудио обрабатывается заметно медленнее;
 - CUDA зависит от совместимой NVIDIA-среды.
+
+## Qwen3-ASR и Nemotron — локально
+
+Обе модели входят в hybrid local runtime. Qwen принимает contextual text и
+использует меньше VRAM; Nemotron на измеренном корпусе был быстрее, но требует
+больше VRAM. Их точные benchmark numbers, ограничения корпуса, timing contract
+и различие между Python, Linux `audio.cpp` и native Windows route описаны в
+[`docs/14-local-audio-cpp-models.md`](14-local-audio-cpp-models.md).
+
+Не переносить цифры одного benchmark на другой runtime и не считать static
+implementation доказательством live inference. Для выбора по таймкодам сначала
+проверить, что именно текущий accepted route реально вернул сегменты/слова.
 
 ```bash
 voiceover timings \
