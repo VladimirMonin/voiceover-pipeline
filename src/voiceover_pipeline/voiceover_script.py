@@ -4,6 +4,7 @@ from typing import Any
 from .config import (
     DEFAULT_ELEVENLABS_VOICE,
     DEFAULT_FALLBACK_VOICE,
+    DEFAULT_OMNIVOICE_VOICE,
     DEFAULT_OPENAI_TTS_VOICE,
     DEFAULT_OPENROUTER_TTS_VOICE,
     DEFAULT_POLZA_TTS_VOICE,
@@ -12,6 +13,7 @@ from .config import (
     DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
     GEMINI_TTS_VOICES,
+    OMNIVOICE_LOCAL_MODEL_ID,
     OPENAI_TTS_VOICES,
     OPENROUTER_TTS_MODELS,
     POLZA_TTS_MODELS,
@@ -20,7 +22,6 @@ from .config import (
 )
 from .gemini_dialogue import error, parse_frontmatter, warning
 from .models import ScriptChunk
-
 
 VOICEOVER_FORMAT = "voiceover"
 PROMPT_SKELETON_MARKERS = [
@@ -31,13 +32,31 @@ PROMPT_SKELETON_MARKERS = [
     "CONTEXT",
     "#### TRANSCRIPT",
 ]
-SUPPORTED_PROVIDERS = ["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"]
+SUPPORTED_PROVIDERS = [
+    "polza-chat-audio",
+    "polza-tts",
+    "openrouter-tts",
+    "qwen-local",
+    "omnivoice-local",
+]
 POLZA_CHAT_AUDIO_MODELS = ["openai/gpt-audio-mini", "openai/gpt-audio"]
-POLZA_CHAT_AUDIO_VOICES = ["ash", "ballad", "coral", "verse", "marin", "cedar", "echo", "sage", "shimmer", "onyx"]
+POLZA_CHAT_AUDIO_VOICES = [
+    "ash",
+    "ballad",
+    "coral",
+    "verse",
+    "marin",
+    "cedar",
+    "echo",
+    "sage",
+    "shimmer",
+    "onyx",
+]
 MODELS_BY_PROVIDER = {
     "polza-chat-audio": POLZA_CHAT_AUDIO_MODELS,
     "polza-tts": POLZA_TTS_MODELS,
     "openrouter-tts": OPENROUTER_TTS_MODELS,
+    "omnivoice-local": [OMNIVOICE_LOCAL_MODEL_ID],
 }
 
 
@@ -69,18 +88,31 @@ def validate_voiceover_file(
     errors.extend(fm_errors)
 
     if meta.get("format") != VOICEOVER_FORMAT:
-        errors.append(error("FORMAT_NOT_VOICEOVER", "Frontmatter must contain format: voiceover.", line=1))
+        errors.append(
+            error("FORMAT_NOT_VOICEOVER", "Frontmatter must contain format: voiceover.", line=1)
+        )
 
     provider = provider_override or str(meta.get("provider") or meta.get("service") or "")
     if not provider:
-        errors.append(error("PROVIDER_MISSING", "Frontmatter must define provider or service.", line=1))
+        errors.append(
+            error("PROVIDER_MISSING", "Frontmatter must define provider or service.", line=1)
+        )
         provider = DEFAULT_PROVIDER
     if provider not in SUPPORTED_PROVIDERS:
-        errors.append(error("INVALID_PROVIDER", f"Unsupported provider: {provider}.", actual=provider, expected=SUPPORTED_PROVIDERS))
+        errors.append(
+            error(
+                "INVALID_PROVIDER",
+                f"Unsupported provider: {provider}.",
+                actual=provider,
+                expected=SUPPORTED_PROVIDERS,
+            )
+        )
 
     model = model_override or str(meta.get("model") or PROVIDER_DEFAULT_MODELS.get(provider, ""))
     if not model:
-        errors.append(error("MODEL_MISSING", "Model is required for this provider.", line=1, actual=model))
+        errors.append(
+            error("MODEL_MISSING", "Model is required for this provider.", line=1, actual=model)
+        )
     validate_model(provider, model, errors)
 
     voice = voice_override or str(meta.get("voice") or default_voice(provider, model))
@@ -88,17 +120,38 @@ def validate_voiceover_file(
 
     fallback_voice = str(meta.get("fallback_voice") or DEFAULT_FALLBACK_VOICE)
     if provider == "polza-chat-audio" and fallback_voice not in POLZA_CHAT_AUDIO_VOICES:
-        errors.append(error("INVALID_FALLBACK_VOICE", f"Fallback voice {fallback_voice} is invalid.", actual=fallback_voice, expected=POLZA_CHAT_AUDIO_VOICES))
+        errors.append(
+            error(
+                "INVALID_FALLBACK_VOICE",
+                f"Fallback voice {fallback_voice} is invalid.",
+                actual=fallback_voice,
+                expected=POLZA_CHAT_AUDIO_VOICES,
+            )
+        )
     if provider != "polza-chat-audio" and meta.get("fallback_voice"):
-        warnings.append(warning("FALLBACK_VOICE_IGNORED", "fallback_voice is only used by polza-chat-audio.", actual=fallback_voice))
+        warnings.append(
+            warning(
+                "FALLBACK_VOICE_IGNORED",
+                "fallback_voice is only used by polza-chat-audio.",
+                actual=fallback_voice,
+            )
+        )
 
     style_prompt = str(meta.get("style_prompt") or meta.get("prompt") or "")
     if style_prompt and not supports_style_prompt(provider, model):
-        warnings.append(warning("STYLE_PROMPT_IGNORED", f"style_prompt is ignored by provider/model {provider}/{model}.", actual=style_prompt[:80]))
+        warnings.append(
+            warning(
+                "STYLE_PROMPT_IGNORED",
+                f"style_prompt is ignored by provider/model {provider}/{model}.",
+                actual=style_prompt[:80],
+            )
+        )
 
     chunks = split_body_chunks(body, body_start_line, delimiter)
     if not chunks:
-        errors.append(error("CHUNK_EMPTY", "Script body contains no non-empty chunks.", line=body_start_line))
+        errors.append(
+            error("CHUNK_EMPTY", "Script body contains no non-empty chunks.", line=body_start_line)
+        )
 
     chunk_reports: list[dict[str, Any]] = []
     total_chars = 0
@@ -146,13 +199,27 @@ def chunks_from_voiceover_report(report: dict[str, Any]) -> list[ScriptChunk]:
 def validate_model(provider: str, model: str, errors: list[dict[str, Any]]) -> None:
     valid = MODELS_BY_PROVIDER.get(provider)
     if valid and model not in valid:
-        errors.append(error("INVALID_MODEL", f"Model {model} is invalid for provider {provider}.", actual=model, expected=valid))
+        errors.append(
+            error(
+                "INVALID_MODEL",
+                f"Model {model} is invalid for provider {provider}.",
+                actual=model,
+                expected=valid,
+            )
+        )
 
 
 def validate_voice(provider: str, model: str, voice: str, errors: list[dict[str, Any]]) -> None:
     voices = voices_for_provider_model(provider, model)
     if voices and voice not in voices:
-        errors.append(error("INVALID_VOICE", f"Voice {voice} is invalid for provider/model {provider}/{model}.", actual=voice, expected=voices))
+        errors.append(
+            error(
+                "INVALID_VOICE",
+                f"Voice {voice} is invalid for provider/model {provider}/{model}.",
+                actual=voice,
+                expected=voices,
+            )
+        )
 
 
 def voices_for_provider_model(provider: str, model: str) -> list[str]:
@@ -164,16 +231,26 @@ def voices_for_provider_model(provider: str, model: str) -> list[str]:
         return OPENAI_TTS_VOICES if model.startswith("openai/") else GEMINI_TTS_VOICES
     if provider == "qwen-local":
         return QWEN_PRESET_SPEAKERS
+    if provider == "omnivoice-local":
+        return [DEFAULT_OMNIVOICE_VOICE]
     return []
 
 
 def default_voice(provider: str, model: str) -> str:
     if provider == "polza-tts":
-        return DEFAULT_ELEVENLABS_VOICE if model.startswith("elevenlabs/") else DEFAULT_POLZA_TTS_VOICE
+        return (
+            DEFAULT_ELEVENLABS_VOICE if model.startswith("elevenlabs/") else DEFAULT_POLZA_TTS_VOICE
+        )
     if provider == "openrouter-tts":
-        return DEFAULT_OPENAI_TTS_VOICE if model.startswith("openai/") else DEFAULT_OPENROUTER_TTS_VOICE
+        return (
+            DEFAULT_OPENAI_TTS_VOICE
+            if model.startswith("openai/")
+            else DEFAULT_OPENROUTER_TTS_VOICE
+        )
     if provider == "qwen-local":
         return DEFAULT_QWEN_VOICE
+    if provider == "omnivoice-local":
+        return DEFAULT_OMNIVOICE_VOICE
     return DEFAULT_VOICE
 
 
@@ -194,46 +271,62 @@ def split_body_chunks(body: str, body_start_line: int, delimiter: str) -> list[d
     return chunks
 
 
-def append_chunk(chunks: list[dict[str, Any]], lines: list[tuple[int, str]], fallback_line: int) -> None:
+def append_chunk(
+    chunks: list[dict[str, Any]], lines: list[tuple[int, str]], fallback_line: int
+) -> None:
     text = "\n".join(text for _, text in lines).strip()
     if not text:
         return
     nonempty = [(line_no, text) for line_no, text in lines if text.strip()]
-    chunks.append({
-        "chunk": len(chunks) + 1,
-        "line_start": nonempty[0][0] if nonempty else fallback_line,
-        "line_end": nonempty[-1][0] if nonempty else fallback_line,
-        "text": text,
-    })
+    chunks.append(
+        {
+            "chunk": len(chunks) + 1,
+            "line_start": nonempty[0][0] if nonempty else fallback_line,
+            "line_end": nonempty[-1][0] if nonempty else fallback_line,
+            "text": text,
+        }
+    )
 
 
-def validate_plain_chunk(chunk: dict[str, Any], max_chunk_chars: int, agent: bool) -> dict[str, Any]:
+def validate_plain_chunk(
+    chunk: dict[str, Any], max_chunk_chars: int, agent: bool
+) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     text = chunk["text"]
     chars = len(text)
     if chars > max_chunk_chars:
-        errors.append(error(
-            "CHUNK_TOO_LARGE",
-            f"Chunk {chunk['chunk']} is {chars} chars, limit is {max_chunk_chars}.",
-            chunk=chunk["chunk"],
-            line_start=chunk["line_start"],
-            line_end=chunk["line_end"],
-            actual=chars,
-            limit=max_chunk_chars,
-            snippet=text[:160] if agent else None,
-            suggested_fix=f"Split chunk {chunk['chunk']} before line {(chunk['line_start'] + chunk['line_end']) // 2}.",
-        ))
+        errors.append(
+            error(
+                "CHUNK_TOO_LARGE",
+                f"Chunk {chunk['chunk']} is {chars} chars, limit is {max_chunk_chars}.",
+                chunk=chunk["chunk"],
+                line_start=chunk["line_start"],
+                line_end=chunk["line_end"],
+                actual=chars,
+                limit=max_chunk_chars,
+                snippet=text[:160] if agent else None,
+                suggested_fix=f"Split chunk {chunk['chunk']} before line {(chunk['line_start'] + chunk['line_end']) // 2}.",
+            )
+        )
     if any(ch.isdigit() for ch in text):
-        warnings.append(warning("CONTAINS_DIGITS", "Chunk contains digits; TTS pronunciation may be unexpected.", chunk=chunk["chunk"]))
+        warnings.append(
+            warning(
+                "CONTAINS_DIGITS",
+                "Chunk contains digits; TTS pronunciation may be unexpected.",
+                chunk=chunk["chunk"],
+            )
+        )
     leaked_markers = [marker for marker in PROMPT_SKELETON_MARKERS if marker in text]
     if leaked_markers:
-        warnings.append(warning(
-            "PROMPT_SKELETON_IN_BODY",
-            "Prompt direction markers found in the spoken body. Move direction into frontmatter style_prompt/prompt and keep body as transcript only.",
-            chunk=chunk["chunk"],
-            actual=leaked_markers,
-        ))
+        warnings.append(
+            warning(
+                "PROMPT_SKELETON_IN_BODY",
+                "Prompt direction markers found in the spoken body. Move direction into frontmatter style_prompt/prompt and keep body as transcript only.",
+                chunk=chunk["chunk"],
+                actual=leaked_markers,
+            )
+        )
     return {
         "chunk": chunk["chunk"],
         "line_start": chunk["line_start"],

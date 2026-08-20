@@ -48,6 +48,11 @@ def main() -> int:
         default=None,
         help="Optional non-.env text file for a prompt on/off comparison",
     )
+    parser.add_argument(
+        "--require-phrase-timing",
+        action="store_true",
+        help="Fail when a timestamp-capable adapter returns speech without finite phrase timing.",
+    )
     args = parser.parse_args()
 
     adapter = create_benchmark_adapter(
@@ -61,6 +66,7 @@ def main() -> int:
         adapter,
         corpus_root=args.corpus_root,
         prompt_text=_prompt_text(args.prompt_file),
+        require_phrase_timing=args.require_phrase_timing,
     )
     json_path, markdown_path = write_benchmark_reports(report, args.output_dir)
     print(json_path)

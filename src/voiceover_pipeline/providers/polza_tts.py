@@ -121,7 +121,9 @@ class PolzaTTSProvider(TTSProvider):
         submit_json = submit.json()
         task_id = submit_json.get("id")
         if not task_id:
-            raise RuntimeError(f"Polza Media response missing 'id'. Keys: {list(submit_json.keys())}")
+            raise RuntimeError(
+                f"Polza Media response missing 'id'. Keys: {list(submit_json.keys())}"
+            )
 
         result = self._poll_media(task_id, chunk_id)
         audio_bytes, usage, generation_id = result

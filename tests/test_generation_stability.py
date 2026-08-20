@@ -3,14 +3,14 @@ import builtins
 import json
 
 import pytest
-
 from conftest import cli_json, fixture_path
 
 
 class FakeProvider:
-    def __init__(self, failures=0):
+    def __init__(self, failures=0, raw_metadata=None):
         self.failures = failures
         self.calls = []
+        self.raw_metadata = raw_metadata or {}
 
     def synthesize_chunk(self, text, chunk_id):
         from voiceover_pipeline.models import SynthesisResult
@@ -25,6 +25,7 @@ class FakeProvider:
             transcript=text,
             generation_id=f"gen-{chunk_id}",
             client_path="fake",
+            raw_metadata=self.raw_metadata,
         )
 
 
@@ -53,11 +54,19 @@ def make_args(tmp_path, run_id="stable-run", resume=False):
 def patch_generation_io(monkeypatch):
     import voiceover_pipeline.cli as cli
 
-    monkeypatch.setattr(cli, "write_audio_as_mp3", lambda _ffmpeg, _audio, _fmt, path: path.write_bytes(b"mp3"))
+    monkeypatch.setattr(
+        cli, "write_audio_as_mp3", lambda _ffmpeg, _audio, _fmt, path: path.write_bytes(b"mp3")
+    )
     monkeypatch.setattr(cli, "trim_final_silence", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "mp3_duration_ms", lambda *_args, **_kwargs: 1000)
-    monkeypatch.setattr(cli, "concat_mp3_chunks", lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"))
-    monkeypatch.setattr(cli, "attach_costs", lambda _provider, _api_key, _model, _started, chunks: chunks)
+    monkeypatch.setattr(
+        cli,
+        "concat_mp3_chunks",
+        lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"),
+    )
+    monkeypatch.setattr(
+        cli, "attach_costs", lambda _provider, _api_key, _model, _started, chunks: chunks
+    )
 
 
 def test_generate_step_writes_state_and_log_after_each_chunk(tmp_path, monkeypatch):
@@ -72,7 +81,9 @@ def test_generate_step_writes_state_and_log_after_each_chunk(tmp_path, monkeypat
     chunks = split_markdown_by_delimiter(args.script, "******")[:2]
 
     with pytest.raises(SystemExit) as exit_info:
-        cli._generate_step(args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto")
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
 
     assert exit_info.value.code == 0
     state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
@@ -82,6 +93,74 @@ def test_generate_step_writes_state_and_log_after_each_chunk(tmp_path, monkeypat
     log_text = (paths.output_root / "generation.log").read_text(encoding="utf-8")
     assert "chunk_started" in log_text
     assert "chunk_state_saved" in log_text
+
+
+def test_generate_step_persists_the_public_omnivoice_runtime_receipt(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    receipt = {
+        "model_id": "audio-cpp/omnivoice-q8_0",
+        "sha256": "2f4be637278043c6842de5b85d681532030e9eb6ffe0f8b0e320f68238e3da8b",
+        "quantization": "Q8_0 GGUF",
+        "license": "CC-BY-NC-4.0 upstream weights; local noncommercial research only",
+        "provenance": "audio-cpp/audio.cpp-gguf@fixture; converted from OmniVoice",
+    }
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    args = make_args(tmp_path, run_id="omnivoice-receipt")
+    args.provider = "omnivoice-local"
+    args.model = "audio-cpp/omnivoice-q8_0"
+    args.voice = "built-in-female-style-condition"
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args,
+            FakeProvider(
+                raw_metadata={
+                    "runtime_receipt": receipt,
+                    "voice_selection": {
+                        "kind": "built-in-style-condition",
+                        "condition": "female",
+                        "named_preset": False,
+                        "voice_cloning": False,
+                        "voice_design": False,
+                    },
+                    "voice_session": {
+                        "strategy": "single-container-internal-text-chunking",
+                        "seed": 1234,
+                        "internal_text_chunk_size": 420,
+                    },
+                }
+            ),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "",
+            None,
+            paths,
+            None,
+            "none",
+        )
+
+    assert exit_info.value.code == 0
+    state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+    run_manifest = json.loads(paths.run_json.read_text(encoding="utf-8"))
+    assert state["chunks"][0]["runtime_receipt"] == receipt
+    assert run_manifest["chunks"][0]["runtime_receipt"] == receipt
+    assert state["chunks"][0]["voice_selection"]["condition"] == "female"
+    assert state["chunks"][0]["voice_session"] == {
+        "strategy": "single-container-internal-text-chunking",
+        "seed": 1234,
+        "internal_text_chunk_size": 420,
+    }
+    assert run_manifest["chunks"][0]["voice_selection"] == state["chunks"][0]["voice_selection"]
+    assert run_manifest["chunks"][0]["voice_session"] == state["chunks"][0]["voice_session"]
+    assert str(tmp_path) not in json.dumps(run_manifest["chunks"][0]["runtime_receipt"])
 
 
 def test_generate_step_retries_retryable_provider_errors(tmp_path, monkeypatch):
@@ -99,7 +178,9 @@ def test_generate_step_retries_retryable_provider_errors(tmp_path, monkeypatch):
     provider = FakeProvider(failures=1)
 
     with pytest.raises(SystemExit) as exit_info:
-        cli._generate_step(args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto")
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
 
     assert exit_info.value.code == 0
     assert provider.calls == ["chunk_01", "chunk_01"]
@@ -109,7 +190,11 @@ def test_resume_does_not_regenerate_completed_chunks(tmp_path, monkeypatch):
     import voiceover_pipeline.cli as cli
     from voiceover_pipeline.artifacts import build_run_paths
     from voiceover_pipeline.models import ChunkArtifact
-    from voiceover_pipeline.run_state import atomic_write_json, initial_state, upsert_completed_chunk
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        initial_state,
+        upsert_completed_chunk,
+    )
     from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
 
     patch_generation_io(monkeypatch)
@@ -150,7 +235,9 @@ def test_resume_does_not_regenerate_completed_chunks(tmp_path, monkeypatch):
     provider = FakeProvider()
 
     with pytest.raises(SystemExit) as exit_info:
-        cli._generate_step(args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto")
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
 
     assert exit_info.value.code == 0
     assert provider.calls == ["chunk_02"]
@@ -164,10 +251,14 @@ def test_overwrite_refuses_to_delete_existing_paid_chunks_without_confirmation(t
 
     code, data = cli_json(
         "generate",
-        "--provider", "polza-chat-audio",
-        "--script", str(fixture_path("smoke_test.md")),
-        "--output-dir", str(tmp_path / "out"),
-        "--run-id", "paid-run",
+        "--provider",
+        "polza-chat-audio",
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "paid-run",
         "--overwrite",
         "--json",
     )
@@ -180,14 +271,21 @@ def test_overwrite_refuses_to_delete_existing_paid_chunks_without_confirmation(t
 def test_dry_run_cost_with_limit_chunks_makes_no_tts_request(tmp_path):
     code, data = cli_json(
         "generate",
-        "--provider", "polza-tts",
-        "--model", "openai/gpt-4o-mini-tts",
-        "--voice", "ash",
-        "--script", str(fixture_path("smoke_test.md")),
-        "--output-dir", str(tmp_path / "out"),
-        "--run-id", "dry-run",
+        "--provider",
+        "polza-tts",
+        "--model",
+        "openai/gpt-4o-mini-tts",
+        "--voice",
+        "ash",
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "dry-run",
         "--dry-run-cost",
-        "--limit-chunks", "1",
+        "--limit-chunks",
+        "1",
         "--json",
     )
 
@@ -196,6 +294,125 @@ def test_dry_run_cost_with_limit_chunks_makes_no_tts_request(tmp_path):
     assert data["chunks"] == 1
     assert data["original_chunks"] == 2
     assert not (tmp_path / "out" / "dry-run").exists()
+
+
+def test_local_tts_dry_run_reports_sentence_packed_inference_chunks(tmp_path):
+    script = tmp_path / "local-report.md"
+    script.write_text(
+        " ".join(
+            f"Предложение номер словами содержит достаточно полезного текста {word}."
+            for word in (
+                "первое",
+                "второе",
+                "третье",
+                "четвёртое",
+                "пятое",
+                "шестое",
+                "седьмое",
+                "восьмое",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--model",
+        "audio-cpp/omnivoice-q8_0",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "local-dry-run",
+        "--dry-run-cost",
+        "--json",
+    )
+
+    assert code == 0
+    assert data["dry_run"] is True
+    assert isinstance(data["chunks"], int)
+    assert data["chunks"] > 1
+    assert data["original_chunks"] == data["chunks"]
+    assert not (tmp_path / "out" / "local-dry-run").exists()
+
+
+def test_local_tts_cli_rejects_raw_digits_before_runtime(tmp_path):
+    script = tmp_path / "digits.md"
+    script.write_text("Версия 3.5 готова на 25 процентов.", encoding="utf-8")
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--model",
+        "audio-cpp/omnivoice-q8_0",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "digits",
+        "--dry-run-cost",
+        "--json",
+    )
+
+    assert code == 2
+    assert "raw digits" in data["error"]
+    assert not (tmp_path / "out" / "digits").exists()
+
+
+def test_omnivoice_cli_rejects_style_controls_before_dry_run(tmp_path):
+    script = tmp_path / "style.md"
+    script.write_text("Проверка готового автоматического голоса.", encoding="utf-8")
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--model",
+        "audio-cpp/omnivoice-q8_0",
+        "--style-prompt",
+        "тёплый голос",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "style",
+        "--dry-run-cost",
+        "--json",
+    )
+
+    assert code == 2
+    assert "style controls" in data["error"]
+    assert not (tmp_path / "out" / "style").exists()
+
+
+def test_unprofiled_qwen_cli_dry_run_does_not_apply_omnivoice_digit_policy(tmp_path):
+    script = tmp_path / "qwen-digits.md"
+    script.write_text("Версия 3.5 готова на 25 процентов.", encoding="utf-8")
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "qwen-local",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "qwen-digits",
+        "--dry-run-cost",
+        "--json",
+    )
+
+    assert code == 0
+    assert data["dry_run"] is True
+    assert data["chunks"] == 1
+    assert not (tmp_path / "out" / "qwen-digits").exists()
 
 
 def test_status_reports_partial_run_12_of_105(tmp_path):
@@ -208,13 +425,20 @@ def test_status_reports_partial_run_12_of_105(tmp_path):
     for number in range(1, 13):
         chunk_id = f"chunk_{number:02d}"
         (chunks_dir / f"{chunk_id}.mp3").write_bytes(b"mp3")
-        chunks.append({"status": "completed", "number": number, "id": chunk_id, "file": f"{chunk_id}.mp3"})
-    atomic_write_json(run_dir / "run_state.json", {"chunk_count": 105, "completed_count": 12, "chunks": chunks, "errors": []})
+        chunks.append(
+            {"status": "completed", "number": number, "id": chunk_id, "file": f"{chunk_id}.mp3"}
+        )
+    atomic_write_json(
+        run_dir / "run_state.json",
+        {"chunk_count": 105, "completed_count": 12, "chunks": chunks, "errors": []},
+    )
 
     code, data = cli_json(
         "status",
-        "--output-dir", str(tmp_path / "out"),
-        "--run-id", "partial-run",
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "partial-run",
         "--json",
     )
 
@@ -234,11 +458,19 @@ def test_concat_writes_partial_ogg_name(tmp_path, monkeypatch):
     chunks_dir.mkdir(parents=True)
     for number in range(1, 13):
         (chunks_dir / f"chunk_{number:02d}.mp3").write_bytes(b"mp3")
-    atomic_write_json(run_dir / "run_state.json", {"chunk_count": 105, "completed_count": 12, "chunks": []})
+    atomic_write_json(
+        run_dir / "run_state.json", {"chunk_count": 105, "completed_count": 12, "chunks": []}
+    )
     monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
-    monkeypatch.setattr(cli, "concat_audio_files", lambda _ffmpeg, _files, output_path: output_path.write_bytes(b"ogg"))
+    monkeypatch.setattr(
+        cli,
+        "concat_audio_files",
+        lambda _ffmpeg, _files, output_path: output_path.write_bytes(b"ogg"),
+    )
 
-    args = argparse.Namespace(output_dir=tmp_path / "out", run_id="partial-run", format="ogg", json_output=False)
+    args = argparse.Namespace(
+        output_dir=tmp_path / "out", run_id="partial-run", format="ogg", json_output=False
+    )
     cli.concat_cmd(args)
 
     assert (run_dir / "partial-12-of-105.ogg").read_bytes() == b"ogg"
@@ -260,3 +492,37 @@ def test_whisper_install_message_uses_extra(monkeypatch):
         cli._preflight_timing_dependency()
 
     assert "uv sync --extra timing-whisper" in str(error.value)
+
+
+def test_timing_artifact_writer_keeps_legacy_file_names_and_manifest_shape(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.models import TimingResult, TimingSegment
+
+    audio = tmp_path / "fixture.mp3"
+    audio.write_bytes(b"fixture")
+    monkeypatch.setattr(cli.shutil, "which", lambda _command: "ffprobe")
+    monkeypatch.setattr(cli, "mp3_duration_ms", lambda _ffprobe, _audio: 1000)
+    timing = TimingResult(
+        segments=[
+            TimingSegment(
+                id=1,
+                start_sec=0.0,
+                end_sec=1.0,
+                start_ms=0,
+                end_ms=1000,
+                duration_ms=1000,
+                text="fixture",
+            )
+        ],
+        model="small",
+        backend="faster-whisper",
+    )
+
+    result = cli._write_timing_artifacts(audio, tmp_path, "legacy", timing)
+
+    manifest = json.loads((tmp_path / "legacy.timings.json").read_text(encoding="utf-8"))
+    assert result == {"segment_count": 1, "total_duration_ms": 1000}
+    assert "provider" not in manifest
+    assert (tmp_path / "legacy.srt").read_text(
+        encoding="utf-8"
+    ) == "1\n00:00:00,000 --> 00:00:01,000\nfixture\n"

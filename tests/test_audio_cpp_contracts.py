@@ -28,11 +28,15 @@ class FixtureDriver:
     closed: int = 0
 
     def health(self) -> RuntimeDriverHealth:
-        return RuntimeDriverHealth(available=self.available, remediation="install fixture" if not self.available else "")
+        return RuntimeDriverHealth(
+            available=self.available, remediation="install fixture" if not self.available else ""
+        )
 
     def invoke(self, request: LocalRuntimeRequest) -> LocalRuntimeResponse:
         self.requests.append(request)
-        return LocalRuntimeResponse(request_id=request.request_id, payload={"driver": self.driver_id})
+        return LocalRuntimeResponse(
+            request_id=request.request_id, payload={"driver": self.driver_id}
+        )
 
     def cancel(self, request_id: str) -> None:
         self.cancelled.append(request_id)
@@ -91,7 +95,9 @@ def test_local_asr_and_tts_typed_conversions_accept_valid_payloads_and_reject_ma
     assert tts_request.to_runtime_request().operation == "tts"
     assert tts_request.to_runtime_request().payload["voice"] == "fixture-voice"
     asr_response = LocalASRResponse.from_runtime_response(
-        LocalRuntimeResponse(request_id="asr-request", payload={"transcript": "fixture text", "language": "ru"})
+        LocalRuntimeResponse(
+            request_id="asr-request", payload={"transcript": "fixture text", "language": "ru"}
+        )
     )
     tts_response = LocalTTSResponse.from_runtime_response(
         LocalRuntimeResponse(request_id="tts-request", payload={"audio_path": "fixture.wav"})
@@ -103,10 +109,14 @@ def test_local_asr_and_tts_typed_conversions_accept_valid_payloads_and_reject_ma
         LocalASRResponse.from_runtime_response(LocalRuntimeResponse(request_id="asr-request"))
     with pytest.raises(RuntimeProtocolError, match="language must be a string"):
         LocalASRResponse.from_runtime_response(
-            LocalRuntimeResponse(request_id="asr-request", payload={"transcript": "fixture", "language": 1})
+            LocalRuntimeResponse(
+                request_id="asr-request", payload={"transcript": "fixture", "language": 1}
+            )
         )
     with pytest.raises(RuntimeProtocolError, match="no audio_path"):
-        LocalTTSResponse.from_runtime_response(LocalRuntimeResponse(request_id="tts-request", payload={"audio_path": ""}))
+        LocalTTSResponse.from_runtime_response(
+            LocalRuntimeResponse(request_id="tts-request", payload={"audio_path": ""})
+        )
 
 
 def test_auto_selection_preserves_python_rollback_until_family_promotion():

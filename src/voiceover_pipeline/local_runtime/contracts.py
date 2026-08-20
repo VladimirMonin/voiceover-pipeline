@@ -5,7 +5,6 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, Protocol
 
-
 RuntimeOperation = Literal["asr", "tts"]
 RuntimeChoice = Literal["python", "audio-cpp", "auto"]
 
@@ -102,20 +101,26 @@ class LocalASRRequest:
     language: str | None = None
     timestamp_mode: Literal["none", "word"] = "none"
     context_text: str | None = None
+    provider_options: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "provider_options", MappingProxyType(dict(self.provider_options)))
 
     def to_runtime_request(self) -> LocalRuntimeRequest:
+        payload: dict[str, object] = {
+            "audio_path": str(self.audio_path),
+            "model_id": self.model_id,
+            "language": self.language,
+            "timestamp_mode": self.timestamp_mode,
+            "context_text": self.context_text,
+        }
+        payload.update(self.provider_options)
         return LocalRuntimeRequest(
             request_id=self.request_id,
             operation="asr",
             family=self.family,
             provider_id=self.provider_id,
-            payload={
-                "audio_path": str(self.audio_path),
-                "model_id": self.model_id,
-                "language": self.language,
-                "timestamp_mode": self.timestamp_mode,
-                "context_text": self.context_text,
-            },
+            payload=payload,
         )
 
 
@@ -143,29 +148,81 @@ class LocalTTSRequest:
     provider_id: str
     text: str
     model_id: str
+    model_artifact_path: Path | str | None = None
     voice: str | None = None
+    language: str | None = None
+    seed: int | None = None
+    num_inference_steps: int | None = None
+    guidance_scale: float | None = None
+    mode: Literal["custom-voice", "voice-clone", "voice-design"] | None = None
+    instruction: str | None = None
+    text_chunk_size: int | None = None
+    reference_audio_path: Path | str | None = None
+    reference_text: str | None = None
 
     def to_runtime_request(self) -> LocalRuntimeRequest:
+        payload: dict[str, object] = {
+            "text": self.text,
+            "model_id": self.model_id,
+            "voice": self.voice,
+        }
+        if self.model_artifact_path is not None:
+            payload["model_artifact_path"] = str(self.model_artifact_path)
+        if self.language is not None:
+            payload["language"] = self.language
+        if self.seed is not None:
+            payload["seed"] = self.seed
+        if self.num_inference_steps is not None:
+            payload["num_inference_steps"] = self.num_inference_steps
+        if self.guidance_scale is not None:
+            payload["guidance_scale"] = self.guidance_scale
+        if self.mode is not None:
+            payload["mode"] = self.mode
+        if self.instruction is not None:
+            payload["instruction"] = self.instruction
+        if self.text_chunk_size is not None:
+            payload["text_chunk_size"] = self.text_chunk_size
+        if self.reference_audio_path is not None:
+            payload["reference_audio_path"] = str(self.reference_audio_path)
+        if self.reference_text is not None:
+            payload["reference_text"] = self.reference_text
         return LocalRuntimeRequest(
             request_id=self.request_id,
             operation="tts",
             family=self.family,
             provider_id=self.provider_id,
-            payload={"text": self.text, "model_id": self.model_id, "voice": self.voice},
+            payload=payload,
         )
 
 
 @dataclass(frozen=True)
 class LocalTTSResponse:
-    audio_path: str
+    audio_path: str | None = None
+    audio_bytes: bytes | None = None
+    audio_format: str | None = None
     payload: Mapping[str, object] = field(default_factory=dict)
+    receipt: RuntimeExecutionReceipt | None = None
 
     @classmethod
     def from_runtime_response(cls, response: LocalRuntimeResponse) -> "LocalTTSResponse":
         audio_path = response.payload.get("audio_path")
-        if not isinstance(audio_path, str) or not audio_path:
+        if audio_path is not None and (not isinstance(audio_path, str) or not audio_path):
             raise RuntimeProtocolError("Local TTS response has no audio_path")
-        return cls(audio_path=audio_path, payload=response.payload)
+        audio_bytes = response.payload.get("audio_bytes")
+        if audio_bytes is not None and (not isinstance(audio_bytes, bytes) or not audio_bytes):
+            raise RuntimeProtocolError("Local TTS response audio_bytes must be non-empty bytes")
+        if audio_path is None and audio_bytes is None:
+            raise RuntimeProtocolError("Local TTS response has no audio_path or audio_bytes")
+        audio_format = response.payload.get("audio_format")
+        if audio_bytes is not None and (not isinstance(audio_format, str) or not audio_format):
+            raise RuntimeProtocolError("Local TTS response audio_bytes require an audio_format")
+        return cls(
+            audio_path=audio_path,
+            audio_bytes=audio_bytes,
+            audio_format=audio_format if isinstance(audio_format, str) else None,
+            payload=response.payload,
+            receipt=response.receipt,
+        )
 
 
 class LocalAudioRuntimeDriver(Protocol):

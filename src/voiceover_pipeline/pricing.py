@@ -101,7 +101,9 @@ def fetch_openrouter_model_pricing(model: str) -> dict[str, Any] | None:
     return None
 
 
-def fetch_openrouter_generation_detail(api_key: str, generation_id: str | None) -> dict[str, Any] | None:
+def fetch_openrouter_generation_detail(
+    api_key: str, generation_id: str | None
+) -> dict[str, Any] | None:
     if not generation_id:
         return None
 
@@ -117,7 +119,9 @@ def fetch_openrouter_generation_detail(api_key: str, generation_id: str | None) 
     return response.json().get("data")
 
 
-def cost_from_generation(provider: str, generation: dict[str, Any] | None) -> tuple[float | None, str | None, str | None]:
+def cost_from_generation(
+    provider: str, generation: dict[str, Any] | None
+) -> tuple[float | None, str | None, str | None]:
     if not generation:
         return None, None, None
 

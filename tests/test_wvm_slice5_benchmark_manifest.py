@@ -5,7 +5,6 @@ from collections import Counter
 from pathlib import Path
 from unittest import SkipTest
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = PROJECT_ROOT / "tests" / "fixtures" / "wvm_slice5_benchmark" / "manifest.json"
 REQUIRED_CASE_KEYS = {

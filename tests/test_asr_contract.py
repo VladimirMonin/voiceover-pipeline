@@ -97,6 +97,21 @@ def test_result_rejects_non_monotonic_timestamps():
         )
 
 
+def test_result_rejects_overlapping_timestamp_spans_even_when_starts_increase():
+    with pytest.raises(ValueError, match="non-overlapping"):
+        ASRResult(
+            transcript="first second",
+            provider_id="fixture-local",
+            model_id="fixture-model",
+            execution=_receipt(),
+            words=(
+                ASRWordSpan(text="first ", start_s=0.0, end_s=99.0),
+                ASRWordSpan(text="second", start_s=1.0, end_s=2.0),
+            ),
+            alignment_origin="native",
+        )
+
+
 def test_context_glossary_and_phrase_hints_are_typed_without_generic_prompt():
     hints = ASRContextHints(
         context_text="Профиль: серверная документация",
@@ -112,7 +127,9 @@ def test_context_glossary_and_phrase_hints_are_typed_without_generic_prompt():
 
 def test_timestamp_mode_is_an_explicit_closed_request_intent_with_text_only_default():
     assert ASRRequest(audio_path=Path("fixture.wav")).timestamp_mode == "none"
-    assert ASRRequest(audio_path=Path("fixture.wav"), timestamp_mode="word").timestamp_mode == "word"
+    assert (
+        ASRRequest(audio_path=Path("fixture.wav"), timestamp_mode="word").timestamp_mode == "word"
+    )
 
     with pytest.raises(ValueError, match="timestamp mode"):
         ASRRequest(audio_path=Path("fixture.wav"), timestamp_mode=cast(ASRTimestampMode, "segment"))

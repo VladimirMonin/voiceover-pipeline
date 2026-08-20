@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 
-
 POLZA_BASE_URL = "https://polza.ai/api/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
@@ -20,11 +19,13 @@ PROVIDER_DEFAULT_MODELS = {
     "polza-tts": "openai/gpt-4o-mini-tts",
     "openrouter-tts": "google/gemini-3.1-flash-tts-preview",
     "qwen-local": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    "omnivoice-local": "audio-cpp/omnivoice-q8_0",
 }
 DEFAULT_VOICE = "ash"
 DEFAULT_OPENROUTER_TTS_VOICE = "Puck"
 DEFAULT_FALLBACK_VOICE = "onyx"
 DEFAULT_QWEN_VOICE = "Aiden"
+DEFAULT_OMNIVOICE_VOICE = "built-in-female-style-condition"
 DEFAULT_POLZA_TTS_VOICE = "alloy"
 DEFAULT_OPENAI_TTS_VOICE = "alloy"
 DEFAULT_ELEVENLABS_VOICE = "Rachel"
@@ -32,8 +33,42 @@ DEFAULT_ELEVENLABS_VOICE = "Rachel"
 DEFAULT_POLZA_TTS_MODEL = "openai/gpt-4o-mini-tts"
 DEFAULT_POLZA_TTS_RESPONSE_FORMAT = "mp3"
 
-OPENAI_TTS_VOICES = ["alloy", "ash", "ballad", "coral", "echo", "fable", "nova", "onyx", "sage", "shimmer", "verse"]
-ELEVENLABS_TTS_VOICES = ["Rachel", "Aria", "Roger", "Sarah", "Laura", "Charlie", "George", "Callum", "River", "Liam", "Charlotte", "Alice", "Matilda", "Will", "Jessica", "Eric", "Chris", "Brian", "Daniel", "Lily", "Bill"]
+OPENAI_TTS_VOICES = [
+    "alloy",
+    "ash",
+    "ballad",
+    "coral",
+    "echo",
+    "fable",
+    "nova",
+    "onyx",
+    "sage",
+    "shimmer",
+    "verse",
+]
+ELEVENLABS_TTS_VOICES = [
+    "Rachel",
+    "Aria",
+    "Roger",
+    "Sarah",
+    "Laura",
+    "Charlie",
+    "George",
+    "Callum",
+    "River",
+    "Liam",
+    "Charlotte",
+    "Alice",
+    "Matilda",
+    "Will",
+    "Jessica",
+    "Eric",
+    "Chris",
+    "Brian",
+    "Daniel",
+    "Lily",
+    "Bill",
+]
 
 POLZA_TTS_MODELS = [
     "openai/gpt-4o-mini-tts",
@@ -129,8 +164,7 @@ PODCAST_NARRATION_PROMPT = (
 )
 
 PODCAST_NARRATION_FALLBACK_PROMPT = (
-    "Спокойный живой голос подкаста. Тёплый мужской тембр, средний темп, "
-    "вдумчивая подача."
+    "Спокойный живой голос подкаста. Тёплый мужской тембр, средний темп, вдумчивая подача."
 )
 
 
@@ -155,11 +189,20 @@ QWEN_PRESET_SPEAKERS = [
 ]
 
 QWEN_MODEL_CUSTOMVOICE = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
-QWEN_MODEL_BASE = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+QWEN_MODEL_BASE = os.environ.get("VOICEOVER_QWEN_TTS_BASE_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+QWEN_MODEL_VOICE_DESIGN = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 QWEN_LANGUAGE = "Russian"
 QWEN_INSTRUCT = "Use a calm, warm, clear narration style. Speak naturally and steadily."
 QWEN_DEVICE = "cuda:0"
 QWEN_ATTN_IMPL = "eager"
+
+OMNIVOICE_LOCAL_MODEL_ID = "audio-cpp/omnivoice-q8_0"
+OMNIVOICE_DEFAULT_LANGUAGE = "ru"
+OMNIVOICE_DEFAULT_SEED = 1234
+OMNIVOICE_DEFAULT_STEPS = 32
+OMNIVOICE_DEFAULT_GUIDANCE_SCALE = 2.0
+OMNIVOICE_STYLE_CONDITION = "female"
+OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE = 420
 
 
 def model_slug(model: str) -> str:
@@ -196,9 +239,7 @@ def get_secret(name: str, env_path: Path = DEFAULT_ENV_FILE) -> str | None:
 def read_polza_key() -> str:
     env_key = get_secret("POLZA_API_KEY")
     if not env_key:
-        raise RuntimeError(
-            "POLZA_API_KEY not found. Set it in .env: POLZA_API_KEY=..."
-        )
+        raise RuntimeError("POLZA_API_KEY not found. Set it in .env: POLZA_API_KEY=...")
     return env_key.removeprefix("Bearer ").strip()
 
 

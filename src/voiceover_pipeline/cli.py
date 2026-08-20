@@ -1,12 +1,14 @@
 import argparse
 import glob as glob_mod
+import importlib.util
 import json
+import os
 import shutil
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 from .artifacts import (
     build_chunks_manifest,
@@ -17,12 +19,19 @@ from .artifacts import (
     build_timing_manifest,
     write_json,
 )
+from .asr_longform import (
+    LongFormASRMediaError,
+    transcribe_prerecorded_long_form,
+    uses_long_form_orchestration,
+)
+from .asr_timing_bridge import asr_result_to_timing
 from .config import (
     DEFAULT_ASR_COMPUTE,
     DEFAULT_ASR_DEVICE,
     DEFAULT_ELEVENLABS_VOICE,
     DEFAULT_FALLBACK_VOICE,
     DEFAULT_MODEL,
+    DEFAULT_OMNIVOICE_VOICE,
     DEFAULT_OPENAI_TTS_VOICE,
     DEFAULT_OPENROUTER_TTS_VOICE,
     DEFAULT_OUTPUT_DIR,
@@ -38,32 +47,40 @@ from .config import (
     DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
     GEMINI_TTS_VOICES,
+    OMNIVOICE_LOCAL_MODEL_ID,
+    OMNIVOICE_STYLE_CONDITION,
     OPENAI_TTS_VOICES,
     OPENROUTER_TTS_MODELS,
-    OPENROUTER_WHISPER_MODELS,
     PODCAST_NARRATION_PROMPT,
     POLZA_TTS_MODELS,
     PROVIDER_DEFAULT_MODELS,
     QWEN_INSTRUCT,
+    QWEN_MODEL_BASE,
+    QWEN_MODEL_CUSTOMVOICE,
+    QWEN_MODEL_VOICE_DESIGN,
     QWEN_PRESET_SPEAKERS,
-    read_openrouter_key,
     read_groq_key,
-    read_xai_key,
+    read_openrouter_key,
     read_polza_key,
+    read_xai_key,
 )
-from .media import check_media_tools, concat_audio_files, concat_mp3_chunks, mp3_duration_ms, trim_final_silence, write_audio_as_mp3
-from .models import ASRRequest, ChunkArtifact, ScriptChunk
 from .gemini_dialogue import (
     GEMINI_DIALOGUE_FORMAT,
-    chunks_from_validation as gemini_chunks_from_validation,
     validate_gemini_dialogue_file,
 )
-from .voiceover_script import (
-    VOICEOVER_FORMAT,
-    chunks_from_voiceover_report,
-    detect_frontmatter_format,
-    validate_voiceover_file,
+from .gemini_dialogue import (
+    chunks_from_validation as gemini_chunks_from_validation,
 )
+from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
+from .media import (
+    check_media_tools,
+    concat_audio_files,
+    concat_mp3_chunks,
+    mp3_duration_ms,
+    trim_final_silence,
+    write_audio_as_mp3,
+)
+from .models import ASRRequest, ChunkArtifact, ScriptChunk
 from .pricing import (
     cost_from_generation,
     fetch_openrouter_generation_detail,
@@ -71,13 +88,21 @@ from .pricing import (
     fetch_polza_generation_costs,
     fetch_polza_model_pricing,
 )
-from .providers import OpenRouterTTSProvider, PolzaChatAudioProvider, PolzaTTSProvider, QwenLocalTTSProvider, TTSProvider
+from .providers import (
+    OmniVoiceLocalTTSProvider,
+    OpenRouterTTSProvider,
+    PolzaChatAudioProvider,
+    PolzaTTSProvider,
+    QwenLocalTTSProvider,
+    TTSProvider,
+)
 from .providers.asr_registry import (
     ASRProviderNotFoundError,
     get_asr_provider_spec,
     list_asr_provider_specs,
 )
-from .providers.base import validate_asr_response
+from .providers.audio_cpp_omnivoice_tts import omnivoice_local_dependency_probe
+from .providers.base import TranscriptionProvider, validate_asr_response
 from .retry import RetryPolicy, run_with_retry
 from .run_state import (
     LOG_FILE,
@@ -94,6 +119,12 @@ from .run_state import (
 )
 from .script_splitter import split_markdown_by_delimiter
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
+from .voiceover_script import (
+    VOICEOVER_FORMAT,
+    chunks_from_voiceover_report,
+    detect_frontmatter_format,
+    validate_voiceover_file,
+)
 
 _EXIT_OK = 0
 _EXIT_ARGS = 2
@@ -108,6 +139,7 @@ _EXIT_OUTPUT = 50
 # ═══════════════════════════════════════════════════════════════════════════════
 # CliError
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 class CliError(RuntimeError):
     def __init__(self, message: str, code: int):
@@ -133,6 +165,7 @@ def _find_default_script() -> Path:
 # ═══════════════════════════════════════════════════════════════════════════════
 # main
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def main() -> None:
     parser = build_parser()
@@ -169,56 +202,128 @@ def main() -> None:
 # parser
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Voiceover + Whisper timing CLI for agents.")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
 
     # --------------- generate ---------------
-    gen = subparsers.add_parser("generate", help="Generate chunk MP3 + full MP3 + optional timings.")
-    gen.add_argument("--provider", choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], default=None)
+    gen = subparsers.add_parser(
+        "generate", help="Generate chunk MP3 + full MP3 + optional timings."
+    )
+    gen.add_argument(
+        "--provider",
+        choices=[
+            "polza-chat-audio",
+            "polza-tts",
+            "openrouter-tts",
+            "qwen-local",
+            "omnivoice-local",
+        ],
+        default=None,
+    )
     gen.add_argument("--model", default=argparse.SUPPRESS)
     gen.add_argument("--script", type=Path, default=_find_default_script())
     gen.add_argument("--delimiter", default="******")
     gen.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     gen.add_argument("--run-id", default="")
     gen.add_argument("--voice", default=None)
-    gen.add_argument("--format", choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT], default="markdown")
-    gen.add_argument("--max-chunk-chars", type=int, default=2000, help="Validation limit for voiceover metadata scripts.")
-    gen.add_argument("--speaker-voice", action="append", default=[], help="Gemini dialogue voice mapping, e.g. Speaker1=Puck. Can repeat.")
+    gen.add_argument(
+        "--format",
+        choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT],
+        default="markdown",
+    )
+    gen.add_argument(
+        "--max-chunk-chars",
+        type=int,
+        default=2000,
+        help="Validation limit for voiceover metadata scripts.",
+    )
+    gen.add_argument(
+        "--speaker-voice",
+        action="append",
+        default=[],
+        help="Gemini dialogue voice mapping, e.g. Speaker1=Puck. Can repeat.",
+    )
     gen.add_argument("--fallback-voice", default=DEFAULT_FALLBACK_VOICE)
     gen.add_argument("--style-prompt", default=None)
     gen.add_argument("--style-prompt-file", type=Path, default=None)
     gen.add_argument("--no-style-prompt", action="store_true")
     gen.add_argument("--no-trim", action="store_true")
-    gen.add_argument("--json", dest="json_output", action="store_true", help="Output JSON to stdout.")
+    gen.add_argument(
+        "--json", dest="json_output", action="store_true", help="Output JSON to stdout."
+    )
     gen.add_argument("--json-events", action="store_true", help="Emit progress events as NDJSON.")
     gen.add_argument("--overwrite", action="store_true", help="Overwrite existing run folder.")
-    gen.add_argument("--confirm-delete-paid-audio", action="store_true", help="Allow --overwrite to delete existing chunk audio.")
+    gen.add_argument(
+        "--confirm-delete-paid-audio",
+        action="store_true",
+        help="Allow --overwrite to delete existing chunk audio.",
+    )
     gen.add_argument("--skip-existing", action="store_true", help="Skip if run folder exists.")
-    gen.add_argument("--resume", action="store_true", help="Resume an interrupted run without regenerating completed chunks.")
-    gen.add_argument("--retries", type=int, default=3, help="Attempts per chunk for retryable provider errors.")
-    gen.add_argument("--retry-delay", type=float, default=2.0, help="Initial retry delay in seconds.")
-    gen.add_argument("--retry-max-delay", type=float, default=30.0, help="Maximum retry delay in seconds.")
+    gen.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume an interrupted run without regenerating completed chunks.",
+    )
+    gen.add_argument(
+        "--retries", type=int, default=3, help="Attempts per chunk for retryable provider errors."
+    )
+    gen.add_argument(
+        "--retry-delay", type=float, default=2.0, help="Initial retry delay in seconds."
+    )
+    gen.add_argument(
+        "--retry-max-delay", type=float, default=30.0, help="Maximum retry delay in seconds."
+    )
     gen.add_argument("--no-retry", action="store_true", help="Disable retry attempts.")
-    gen.add_argument("--limit-chunks", type=int, default=None, help="Generate only the first N chunks for a test run.")
-    gen.add_argument("--dry-run-cost", action="store_true", help="Validate and estimate generation scope without TTS calls.")
+    gen.add_argument(
+        "--limit-chunks",
+        type=int,
+        default=None,
+        help="Generate only the first N chunks for a test run.",
+    )
+    gen.add_argument(
+        "--dry-run-cost",
+        action="store_true",
+        help="Validate and estimate generation scope without TTS calls.",
+    )
 
     qwen = gen.add_argument_group("qwen-local options")
-    qwen.add_argument("--mode", choices=["preset", "clone"], default="preset")
-    qwen.add_argument("--qwen-instruct", default=None, help="Per-run speaking style instruction for qwen-local preset mode.")
+    qwen.add_argument("--mode", choices=["preset", "clone", "design"], default="preset")
+    qwen.add_argument(
+        "--qwen-instruct",
+        default=None,
+        help="Per-run speaking style instruction for qwen-local preset or design mode.",
+    )
     qwen.add_argument("--sample", type=str, default=None)
     qwen.add_argument("--sample-text", type=str, default="")
 
     tim = gen.add_argument_group("Whisper timing (optional)")
     tim.add_argument("--with-timings", action="store_true")
-    tim.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
-                     help="Transcription provider (default: faster-whisper)")
-    tim.add_argument("--timing-model", default=None, help="Provider-specific model for transcription")
-    tim.add_argument("--timing-device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"])
-    tim.add_argument("--timing-compute", default=DEFAULT_TIMING_COMPUTE, choices=["auto", "int8", "int8_float16", "float16", "float32"])
+    tim.add_argument(
+        "--timing-provider",
+        default=DEFAULT_TIMING_PROVIDER,
+        choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
+        help="Transcription provider (default: faster-whisper)",
+    )
+    tim.add_argument(
+        "--timing-model", default=None, help="Provider-specific model for transcription"
+    )
+    tim.add_argument(
+        "--timing-device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"]
+    )
+    tim.add_argument(
+        "--timing-compute",
+        default=DEFAULT_TIMING_COMPUTE,
+        choices=["auto", "int8", "int8_float16", "float16", "float32"],
+    )
     tim.add_argument("--timing-language", default=DEFAULT_TIMING_LANGUAGE)
-    tim.add_argument("--word-timestamps", action="store_true", help="Include word-level timestamps (faster-whisper + groq-whisper; openrouter-whisper ignores with a warning).")
+    tim.add_argument(
+        "--word-timestamps",
+        action="store_true",
+        help="Include word-level timestamps (faster-whisper + groq-whisper; openrouter-whisper ignores with a warning).",
+    )
 
     # --------------- split ---------------
     spl = subparsers.add_parser("split", help="Print chunk ids and character counts.")
@@ -227,13 +332,28 @@ def build_parser() -> argparse.ArgumentParser:
     spl.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- transcribe ---------------
-    asr = subparsers.add_parser("transcribe", help="Transcribe finite audio with a registered local ASR provider.")
+    asr = subparsers.add_parser(
+        "transcribe", help="Transcribe finite audio with a registered local ASR provider."
+    )
     asr.add_argument("--audio", type=str, required=True)
     asr.add_argument("--provider", required=True, help="Registered ASR provider ID.")
     asr.add_argument("--model", default=None, help="Provider-specific ASR model ID.")
     asr.add_argument("--language", default=None, help="Optional forced language.")
-    asr.add_argument("--device", default=DEFAULT_ASR_DEVICE, help="Requested device, validated against provider capabilities.")
-    asr.add_argument("--compute", default=DEFAULT_ASR_COMPUTE, help="Requested compute mode, validated against provider capabilities.")
+    asr.add_argument(
+        "--device",
+        default=DEFAULT_ASR_DEVICE,
+        help="Requested device, validated against provider capabilities.",
+    )
+    asr.add_argument(
+        "--compute",
+        default=DEFAULT_ASR_COMPUTE,
+        help="Requested compute mode, validated against provider capabilities.",
+    )
+    asr.add_argument(
+        "--word-timestamps",
+        action="store_true",
+        help="Require validated word timestamps from the selected ASR provider.",
+    )
     asr.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- timings ---------------
@@ -241,12 +361,27 @@ def build_parser() -> argparse.ArgumentParser:
     timp.add_argument("--audio", type=str, required=True)
     timp.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     timp.add_argument("--run-id", default="")
-    timp.add_argument("--timing-provider", default=DEFAULT_TIMING_PROVIDER, choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
-                      help="Transcription provider (default: faster-whisper)")
-    timp.add_argument("--model", default=None, help="Provider-specific model (e.g. openai/whisper-large-v3-turbo)")
+    timp.add_argument(
+        "--timing-provider",
+        default=DEFAULT_TIMING_PROVIDER,
+        choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
+        help="Transcription provider (default: faster-whisper)",
+    )
+    timp.add_argument(
+        "--model", default=None, help="Provider-specific model (e.g. openai/whisper-large-v3-turbo)"
+    )
     timp.add_argument("--device", default=DEFAULT_TIMING_DEVICE, choices=["auto", "cpu", "cuda"])
-    timp.add_argument("--compute", default=DEFAULT_TIMING_COMPUTE, choices=["auto", "int8", "int8_float16", "float16", "float32"])
+    timp.add_argument(
+        "--compute",
+        default=None,
+        choices=["auto", "int8", "int8_float16", "float16", "float32", "bfloat16"],
+    )
     timp.add_argument("--language", default=DEFAULT_TIMING_LANGUAGE)
+    timp.add_argument(
+        "--asr-provider",
+        default=None,
+        help="Optional registered ASR provider for generic word-timestamp artifacts.",
+    )
     timp.add_argument("--json", dest="json_output", action="store_true")
     timp.add_argument("--word-timestamps", action="store_true")
     timp.add_argument("--overwrite", action="store_true")
@@ -259,7 +394,9 @@ def build_parser() -> argparse.ArgumentParser:
     stat.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- concat ---------------
-    con = subparsers.add_parser("concat", help="Concatenate existing chunks, including partial runs.")
+    con = subparsers.add_parser(
+        "concat", help="Concatenate existing chunks, including partial runs."
+    )
     con.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     con.add_argument("--run-id", required=True)
     con.add_argument("--format", choices=["mp3", "ogg"], default="ogg")
@@ -268,32 +405,90 @@ def build_parser() -> argparse.ArgumentParser:
     # --------------- doctor ---------------
     doc = subparsers.add_parser("doctor", help="Check environment and dependencies.")
     doc.add_argument("--json", dest="json_output", action="store_true")
-    doc.add_argument("--provider", default=None, choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], help="Check provider-specific requirements.")
+    doc.add_argument(
+        "--provider",
+        default=None,
+        choices=[
+            "polza-chat-audio",
+            "polza-tts",
+            "openrouter-tts",
+            "qwen-local",
+            "omnivoice-local",
+        ],
+        help="Check provider-specific requirements.",
+    )
     doc.add_argument("--with-timings", action="store_true", help="Check timing dependencies.")
-    doc.add_argument("--timing-provider", default="faster-whisper", choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
-                    help="Timing provider to check (default: faster-whisper)")
-    doc.add_argument("--timing-device", default="cpu", choices=["auto", "cpu", "cuda"], help="Requested timing device for dependency check.")
-    doc.add_argument("--with-asr", action="store_true", help="Check a registered local ASR provider dependency boundary.")
-    doc.add_argument("--asr-provider", default=None, help="ASR provider ID to check with --with-asr.")
-    doc.add_argument("--asr-device", default=DEFAULT_ASR_DEVICE, help="Requested ASR device for the selected provider.")
-    doc.add_argument("--asr-compute", default=DEFAULT_ASR_COMPUTE, help="Requested ASR compute mode for the selected provider.")
+    doc.add_argument(
+        "--timing-provider",
+        default="faster-whisper",
+        choices=["faster-whisper", "openrouter-whisper", "groq-whisper", "xai-stt"],
+        help="Timing provider to check (default: faster-whisper)",
+    )
+    doc.add_argument(
+        "--timing-device",
+        default="cpu",
+        choices=["auto", "cpu", "cuda"],
+        help="Requested timing device for dependency check.",
+    )
+    doc.add_argument(
+        "--with-asr",
+        action="store_true",
+        help="Check a registered local ASR provider dependency boundary.",
+    )
+    doc.add_argument(
+        "--asr-provider", default=None, help="ASR provider ID to check with --with-asr."
+    )
+    doc.add_argument(
+        "--asr-device",
+        default=DEFAULT_ASR_DEVICE,
+        help="Requested ASR device for the selected provider.",
+    )
+    doc.add_argument(
+        "--asr-compute",
+        default=DEFAULT_ASR_COMPUTE,
+        help="Requested ASR compute mode for the selected provider.",
+    )
 
     # --------------- validate ---------------
     val = subparsers.add_parser("validate", help="Validate script for generation.")
     val.add_argument("--script", type=Path, required=True)
     val.add_argument("--delimiter", default="******")
-    val.add_argument("--format", choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT], default="markdown")
-    val.add_argument("--provider", choices=["polza-chat-audio", "polza-tts", "openrouter-tts", "qwen-local"], default=None)
+    val.add_argument(
+        "--format",
+        choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT],
+        default="markdown",
+    )
+    val.add_argument(
+        "--provider",
+        choices=[
+            "polza-chat-audio",
+            "polza-tts",
+            "openrouter-tts",
+            "qwen-local",
+            "omnivoice-local",
+        ],
+        default=None,
+    )
     val.add_argument("--model", default=None)
     val.add_argument("--voice", default=None)
-    val.add_argument("--speaker-voice", action="append", default=[], help="Gemini dialogue voice mapping, e.g. Speaker1=Puck. Can repeat.")
-    val.add_argument("--agent", action="store_true", help="Include agent-oriented snippets and suggested fixes.")
+    val.add_argument(
+        "--speaker-voice",
+        action="append",
+        default=[],
+        help="Gemini dialogue voice mapping, e.g. Speaker1=Puck. Can repeat.",
+    )
+    val.add_argument(
+        "--agent", action="store_true", help="Include agent-oriented snippets and suggested fixes."
+    )
     val.add_argument("--max-chunk-chars", type=int, default=2000)
     val.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- list ---------------
     lst = subparsers.add_parser("list", help="List available providers, voices, or timing models.")
-    lst.add_argument("target", choices=["providers", "voices", "timing-models", "timing-providers", "asr-providers"])
+    lst.add_argument(
+        "target",
+        choices=["providers", "voices", "timing-models", "timing-providers", "asr-providers"],
+    )
     lst.add_argument("--provider", default=None, help="Filter voices by provider.")
     lst.add_argument("--json", dest="json_output", action="store_true")
 
@@ -305,9 +500,28 @@ def build_parser() -> argparse.ArgumentParser:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _RESERVED_WINDOWS_NAMES = {
-    "CON", "PRN", "AUX", "NUL",
-    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
-    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
 }
 
 
@@ -325,7 +539,7 @@ def _validate_run_id(run_id: str) -> str:
     if "/" in run_id or "\\" in run_id:
         fail(f"Invalid --run-id: path separators not allowed: {run_id}", _EXIT_ARGS)
     if run_id in (".", ".."):
-        fail(f"Invalid --run-id: '.' and '..' not allowed", _EXIT_ARGS)
+        fail("Invalid --run-id: '.' and '..' not allowed", _EXIT_ARGS)
     if Path(run_id).is_absolute():
         fail(f"Invalid --run-id: absolute paths are not allowed: {run_id}", _EXIT_ARGS)
     normalized = run_id.rstrip(" .").upper()
@@ -348,7 +562,10 @@ def _safe_remove_run_dir(directory: Path, output_dir: Path | None = None) -> Non
         try:
             resolved.relative_to(base)
         except ValueError:
-            fail(f"Refusing to remove directory outside output-dir: {resolved} (output-dir: {base})", _EXIT_OUTPUT)
+            fail(
+                f"Refusing to remove directory outside output-dir: {resolved} (output-dir: {base})",
+                _EXIT_OUTPUT,
+            )
     shutil.rmtree(resolved)
 
 
@@ -398,10 +615,30 @@ def _resolve_style_prompt(args: argparse.Namespace) -> str | None:
 
 
 def _resolve_provider_style_prompt(args: argparse.Namespace) -> str | None:
+    if getattr(args, "provider", None) == "omnivoice-local":
+        return None
     if getattr(args, "provider", None) == "qwen-local":
         instruct = getattr(args, "qwen_instruct", None)
         return QWEN_INSTRUCT if instruct is None else instruct
     return _resolve_style_prompt(args)
+
+
+def _validate_omnivoice_options(args: argparse.Namespace) -> None:
+    if args.provider != "omnivoice-local":
+        return
+    if (
+        args.mode != "preset"
+        or args.sample is not None
+        or args.sample_text
+        or args.qwen_instruct
+        or args.style_prompt is not None
+        or args.style_prompt_file is not None
+        or args.voice not in (None, DEFAULT_OMNIVOICE_VOICE)
+    ):
+        fail(
+            "omnivoice-local uses one fixed built-in female style condition; named voices, cloning, design, Qwen options, and style controls are unavailable.",
+            _EXIT_ARGS,
+        )
 
 
 def generate(args: argparse.Namespace) -> None:
@@ -411,7 +648,10 @@ def generate(args: argparse.Namespace) -> None:
         fail(str(e), _EXIT_NO_FFMPEG)
     detected_format = detect_frontmatter_format(args.script)
     script_format = args.format
-    if script_format == "markdown" and detected_format in (VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT):
+    if script_format == "markdown" and detected_format in (
+        VOICEOVER_FORMAT,
+        GEMINI_DIALOGUE_FORMAT,
+    ):
         script_format = detected_format
     args.format = script_format
 
@@ -460,7 +700,12 @@ def generate(args: argparse.Namespace) -> None:
         args.voice = effective["voice"]
         if effective.get("fallback_voice"):
             args.fallback_voice = effective["fallback_voice"]
-        if effective.get("style_prompt") and args.style_prompt is None and args.style_prompt_file is None and not args.no_style_prompt:
+        if (
+            effective.get("style_prompt")
+            and args.style_prompt is None
+            and args.style_prompt_file is None
+            and not args.no_style_prompt
+        ):
             args.style_prompt = effective["style_prompt"]
         chunks = chunks_from_voiceover_report(voiceover_report)
     else:
@@ -468,33 +713,46 @@ def generate(args: argparse.Namespace) -> None:
         _resolve_model(args)
         chunks = split_markdown_by_delimiter(args.script, args.delimiter)
 
+    _resolve_qwen_mode_identity(args)
     _validate_model_for_provider(args.provider, args.model)
+    _validate_omnivoice_options(args)
+    try:
+        chunks = prepare_local_tts_chunks(chunks, args.provider, args.model)
+    except ValueError as exc:
+        fail(str(exc), _EXIT_ARGS)
     if not chunks:
         fail("Script produced no chunks. Check delimiter and content.", _EXIT_ARGS)
     original_chunk_count = len(chunks)
     if args.limit_chunks is not None:
         if args.limit_chunks <= 0:
             fail("--limit-chunks must be greater than zero", _EXIT_ARGS)
-        chunks = chunks[:args.limit_chunks]
+        chunks = chunks[: args.limit_chunks]
+    requested_fragment_count = len(chunks)
+    if args.provider == "omnivoice-local" and args.model == OMNIVOICE_LOCAL_MODEL_ID:
+        chunks = merge_omnivoice_session_fragments(chunks)
+    runtime_session_count = len(chunks)
     if args.run_id:
         _validate_run_id(args.run_id)
     _validate_output_dir(args.output_dir)
     paths = build_run_paths(args.output_dir, args.model, args.run_id or None)
 
     if getattr(args, "dry_run_cost", False):
-        _json_ok({
-            "status": "success",
-            "dry_run": True,
-            "provider": args.provider,
-            "model": args.model,
-            "voice": args.voice or _default_voice(args),
-            "script_format": script_format,
-            "chunks": len(chunks),
-            "original_chunks": original_chunk_count,
-            "total_characters": sum(len(chunk.text) for chunk in chunks),
-            "estimated_cost": None,
-            "estimate_note": "Exact pre-generation cost is unavailable for this provider/model without usage data.",
-        })
+        _json_ok(
+            {
+                "status": "success",
+                "dry_run": True,
+                "provider": args.provider,
+                "model": args.model,
+                "voice": args.voice or _default_voice(args),
+                "script_format": script_format,
+                "chunks": requested_fragment_count,
+                "original_chunks": original_chunk_count,
+                "runtime_sessions": runtime_session_count,
+                "total_characters": sum(len(chunk.text) for chunk in chunks),
+                "estimated_cost": None,
+                "estimate_note": "Exact pre-generation cost is unavailable for this provider/model without usage data.",
+            }
+        )
 
     if getattr(args, "with_timings", False):
         _preflight_timing_dependency(
@@ -504,7 +762,14 @@ def generate(args: argparse.Namespace) -> None:
     if paths.output_root.exists():
         if args.skip_existing:
             files = _list_artifact_files(paths)
-            _json_ok({"status": "skipped", "reason": "run folder exists", "run_id": paths.prefix, "files": files})
+            _json_ok(
+                {
+                    "status": "skipped",
+                    "reason": "run folder exists",
+                    "run_id": paths.prefix,
+                    "files": files,
+                }
+            )
             return
         if args.resume:
             pass
@@ -532,20 +797,54 @@ def generate(args: argparse.Namespace) -> None:
         args.speaker_voice_map = {}
         args.voice = requested_voice or _default_voice(args)
     style_prompt = _resolve_provider_style_prompt(args)
-    if gemini_report and not args.no_style_prompt and args.style_prompt is None and args.style_prompt_file is None:
+    if (
+        gemini_report
+        and not args.no_style_prompt
+        and args.style_prompt is None
+        and args.style_prompt_file is None
+    ):
         style_prompt = gemini_report["style_prompt"]
     prompt_mode = resolve_prompt_mode(args.provider, args.model)
     provider = build_provider(args, api_key, style_prompt, prompt_mode)
     pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
 
-    _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths, style_prompt, prompt_mode)
+    _generate_step(
+        args,
+        provider,
+        ffmpeg_path,
+        ffprobe_path,
+        chunks,
+        api_key,
+        pricing_snapshot,
+        paths,
+        style_prompt,
+        prompt_mode,
+    )
 
 
-def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, pricing_snapshot, paths, style_prompt, prompt_mode) -> None:
+def _generate_step(
+    args,
+    provider,
+    ffmpeg_path,
+    ffprobe_path,
+    chunks,
+    api_key,
+    pricing_snapshot,
+    paths,
+    style_prompt,
+    prompt_mode,
+) -> None:
     run_started_at = datetime.now(timezone.utc) - timedelta(seconds=30)
     logger = GenerationLogger(paths.output_root / LOG_FILE)
     state_path = paths.output_root / STATE_FILE
-    logger.event("info", "run_started", run_id=paths.prefix, provider=args.provider, model=args.model, chunks=len(chunks))
+    logger.event(
+        "info",
+        "run_started",
+        run_id=paths.prefix,
+        provider=args.provider,
+        model=args.model,
+        chunks=len(chunks),
+    )
     _emit_json_event(args, "run_started", run_id=paths.prefix, chunks=len(chunks))
 
     current_hash = script_hash(chunks)
@@ -553,32 +852,54 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
     if state and args.resume:
         if state.get("script_hash") != current_hash:
             logger.event("error", "resume_rejected", reason="script_hash_mismatch")
-            fail("Cannot resume: script chunks do not match the previous run_state.json.", _EXIT_PROVIDER)
+            fail(
+                "Cannot resume: script chunks do not match the previous run_state.json.",
+                _EXIT_PROVIDER,
+            )
         logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
     elif state and not args.resume:
         logger.event("info", "state_replaced", reason="fresh_run")
         state = initial_state(
-            provider=args.provider, model=args.model, voice=args.voice, script_path=args.script,
-            chunks=chunks, script_format=getattr(args, "format", "markdown"), run_id=paths.prefix,
+            provider=args.provider,
+            model=args.model,
+            voice=args.voice,
+            script_path=args.script,
+            chunks=chunks,
+            script_format=getattr(args, "format", "markdown"),
+            run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
         )
     elif args.resume:
         state = initial_state(
-            provider=args.provider, model=args.model, voice=args.voice, script_path=args.script,
-            chunks=chunks, script_format=getattr(args, "format", "markdown"), run_id=paths.prefix,
+            provider=args.provider,
+            model=args.model,
+            voice=args.voice,
+            script_path=args.script,
+            chunks=chunks,
+            script_format=getattr(args, "format", "markdown"),
+            run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
         )
-        _recover_existing_chunks(state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice)
+        _recover_existing_chunks(
+            state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice
+        )
         logger.event("info", "resume_recovered", completed=state.get("completed_count", 0))
     else:
         state = initial_state(
-            provider=args.provider, model=args.model, voice=args.voice, script_path=args.script,
-            chunks=chunks, script_format=getattr(args, "format", "markdown"), run_id=paths.prefix,
+            provider=args.provider,
+            model=args.model,
+            voice=args.voice,
+            script_path=args.script,
+            chunks=chunks,
+            script_format=getattr(args, "format", "markdown"),
+            run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
         )
     atomic_write_json(state_path, state)
 
-    chunk_artifacts: list[ChunkArtifact] = state_chunks_as_artifacts(state, paths.chunks_dir) if args.resume else []
+    chunk_artifacts: list[ChunkArtifact] = (
+        state_chunks_as_artifacts(state, paths.chunks_dir) if args.resume else []
+    )
     chunk_artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
     completed = completed_numbers(state)
     total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
@@ -592,19 +913,31 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
     for chunk in chunks:
         output_path = paths.chunks_dir / f"{chunk.id}.mp3"
         if chunk.number in completed and output_path.exists():
-            logger.event("info", "chunk_skipped_resume", chunk=chunk.number, id=chunk.id, file=output_path.name)
-            _emit_json_event(args, "chunk_skipped", chunk=chunk.number, id=chunk.id, reason="resume")
+            logger.event(
+                "info",
+                "chunk_skipped_resume",
+                chunk=chunk.number,
+                id=chunk.id,
+                file=output_path.name,
+            )
+            _emit_json_event(
+                args, "chunk_skipped", chunk=chunk.number, id=chunk.id, reason="resume"
+            )
             continue
         if not args.json_output:
             print(f"Generating {chunk.id}/{len(chunks):02d}: {output_path.name}")
-        logger.event("info", "chunk_started", chunk=chunk.number, id=chunk.id, file=output_path.name)
+        logger.event(
+            "info", "chunk_started", chunk=chunk.number, id=chunk.id, file=output_path.name
+        )
         _emit_json_event(args, "chunk_started", chunk=chunk.number, id=chunk.id)
 
         try:
             result = run_with_retry(
                 lambda: provider.synthesize_chunk(chunk.text, chunk.id),
                 policy=retry_policy,
-                on_retry=lambda attempt, error, delay: _log_retry(logger, args, chunk, attempt, error, delay),
+                on_retry=lambda attempt, error, delay: _log_retry(
+                    logger, args, chunk, attempt, error, delay
+                ),
             )
         except Exception as e:
             append_error(state, chunk_id=chunk.id, message=str(e))
@@ -612,15 +945,25 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
             logger.event("error", "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
             _emit_json_event(args, "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
             fail(f"Failed to synthesize {chunk.id}: {e}", _EXIT_PROVIDER)
-        logger.event("info", "chunk_provider_response", chunk=chunk.number, id=chunk.id, generation_id=result.generation_id)
+        logger.event(
+            "info",
+            "chunk_provider_response",
+            chunk=chunk.number,
+            id=chunk.id,
+            generation_id=result.generation_id,
+        )
         try:
             write_audio_as_mp3(ffmpeg_path, result.audio_bytes, result.audio_format, output_path)
         except Exception as e:
             append_error(state, chunk_id=chunk.id, message=str(e))
             atomic_write_json(state_path, state)
-            logger.event("error", "chunk_write_failed", chunk=chunk.number, id=chunk.id, error=str(e))
+            logger.event(
+                "error", "chunk_write_failed", chunk=chunk.number, id=chunk.id, error=str(e)
+            )
             fail(f"Failed to write chunk audio {output_path}: {e}", _EXIT_OUTPUT)
-        logger.event("info", "chunk_file_saved", chunk=chunk.number, id=chunk.id, file=output_path.name)
+        logger.event(
+            "info", "chunk_file_saved", chunk=chunk.number, id=chunk.id, file=output_path.name
+        )
         if not args.no_trim:
             try:
                 trim_final_silence(ffmpeg_path, ffprobe_path, output_path)
@@ -628,7 +971,9 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
             except Exception as e:
                 append_error(state, chunk_id=chunk.id, message=str(e))
                 atomic_write_json(state_path, state)
-                logger.event("error", "chunk_trim_failed", chunk=chunk.number, id=chunk.id, error=str(e))
+                logger.event(
+                    "error", "chunk_trim_failed", chunk=chunk.number, id=chunk.id, error=str(e)
+                )
                 fail(f"Failed to trim chunk audio {output_path}: {e}", _EXIT_OUTPUT)
 
         duration_ms = mp3_duration_ms(ffprobe_path, output_path)
@@ -637,34 +982,69 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         total_duration_ms = end_ms
 
         artifact = ChunkArtifact(
-            number=chunk.number, id=chunk.id, file=output_path.name,
-            duration_ms=duration_ms, duration_sec=round(duration_ms / 1000, 3),
-            start_ms=start_ms, end_ms=end_ms, text_characters=len(chunk.text),
-            transcript=result.transcript, client_path=result.client_path,
+            number=chunk.number,
+            id=chunk.id,
+            file=output_path.name,
+            duration_ms=duration_ms,
+            duration_sec=round(duration_ms / 1000, 3),
+            start_ms=start_ms,
+            end_ms=end_ms,
+            text_characters=len(chunk.text),
+            transcript=result.transcript,
+            client_path=result.client_path,
             generation_id=result.generation_id,
+            runtime_receipt=_public_runtime_receipt(result),
+            voice_selection=_public_voice_selection(result),
+            voice_session=_public_voice_session(result),
             **_direct_cost_kwargs(args.provider, result),
         )
         chunk_artifacts_by_number[chunk.number] = artifact
-        upsert_completed_chunk(state, artifact=artifact, model=args.model, voice=args.voice, text=chunk.text)
+        upsert_completed_chunk(
+            state, artifact=artifact, model=args.model, voice=args.voice, text=chunk.text
+        )
         atomic_write_json(state_path, state)
-        logger.event("info", "chunk_state_saved", chunk=chunk.number, id=chunk.id, state=state_path.name)
-        _emit_json_event(args, "chunk_saved", chunk=chunk.number, id=chunk.id, file=output_path.name, duration_ms=duration_ms)
+        logger.event(
+            "info", "chunk_state_saved", chunk=chunk.number, id=chunk.id, state=state_path.name
+        )
+        _emit_json_event(
+            args,
+            "chunk_saved",
+            chunk=chunk.number,
+            id=chunk.id,
+            file=output_path.name,
+            duration_ms=duration_ms,
+        )
         if not args.json_output:
             print(f"Saved {output_path.name}: {duration_ms} ms")
 
-    chunk_artifacts = [chunk_artifacts_by_number[number] for number in sorted(chunk_artifacts_by_number)]
+    chunk_artifacts = [
+        chunk_artifacts_by_number[number] for number in sorted(chunk_artifacts_by_number)
+    ]
 
     time.sleep(2)
-    chunk_artifacts = attach_costs(args.provider, api_key, args.model, run_started_at, chunk_artifacts)
-    cost_total, cost_total_exact, cost_currency, cost_source = summarize_costs(args.provider, chunk_artifacts)
+    chunk_artifacts = attach_costs(
+        args.provider, api_key, args.model, run_started_at, chunk_artifacts
+    )
+    cost_total, cost_total_exact, cost_currency, cost_source = summarize_costs(
+        args.provider, chunk_artifacts
+    )
 
     chunks_manifest = build_chunks_manifest(
-        provider=args.provider, model=args.model, voice=args.voice,
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
         style_prompt=style_prompt,
-        script=args.script, chunks_dir=paths.chunks_dir, pricing_snapshot=pricing_snapshot,
-        cost_exact_available=cost_total is not None, cost_total=cost_total,
-        cost_total_exact=cost_total_exact, cost_currency=cost_currency, cost_source=cost_source,
-        chunk_artifacts=chunk_artifacts, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path,
+        script=args.script,
+        chunks_dir=paths.chunks_dir,
+        pricing_snapshot=pricing_snapshot,
+        cost_exact_available=cost_total is not None,
+        cost_total=cost_total,
+        cost_total_exact=cost_total_exact,
+        cost_currency=cost_currency,
+        cost_source=cost_source,
+        chunk_artifacts=chunk_artifacts,
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
         prompt_mode=prompt_mode,
         script_format=getattr(args, "format", "markdown"),
         speaker_voice_map=getattr(args, "speaker_voice_map", None) or None,
@@ -683,7 +1063,9 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         logger.event("error", "concat_failed", error=str(e))
         fail(f"Failed to concat MP3 chunks: {e}", _EXIT_OUTPUT)
     main_duration_ms = mp3_duration_ms(ffprobe_path, paths.full_mp3)
-    logger.event("info", "concat_complete", output=paths.full_mp3.name, duration_ms=main_duration_ms)
+    logger.event(
+        "info", "concat_complete", output=paths.full_mp3.name, duration_ms=main_duration_ms
+    )
     run_manifest = build_run_manifest(chunks_manifest, paths, main_duration_ms)
     try:
         write_json(paths.run_json, run_manifest)
@@ -695,15 +1077,23 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
         try:
             logger.event("info", "timings_started", audio=paths.full_mp3.name)
             timing_info = _extract_timings(
-                audio_path=paths.full_mp3, output_dir=paths.output_root, prefix=paths.prefix,
+                audio_path=paths.full_mp3,
+                output_dir=paths.output_root,
+                prefix=paths.prefix,
                 timing_provider=getattr(args, "timing_provider", "faster-whisper"),
-                model=args.timing_model, device=args.timing_device,
-                compute_type=args.timing_compute, language=args.timing_language,
-                word_timestamps=args.word_timestamps, quiet=args.json_output,
+                model=args.timing_model,
+                device=args.timing_device,
+                compute_type=args.timing_compute,
+                language=args.timing_language,
+                word_timestamps=args.word_timestamps,
+                quiet=args.json_output,
             )
         except ModuleNotFoundError as exc:
             logger.event("error", "timings_failed", error=str(exc))
-            fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
+            fail(
+                f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
+                _EXIT_MISSING_DEP,
+            )
         except Exception as exc:
             logger.event("error", "timings_failed", error=str(exc))
             fail(
@@ -725,12 +1115,18 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
     logger.event("info", "run_complete", run_id=paths.prefix, duration_ms=main_duration_ms)
     _emit_json_event(args, "run_complete", run_id=paths.prefix, duration_ms=main_duration_ms)
     if args.json_output:
-        _json_ok({
-            "status": "success", "provider": args.provider, "model": args.model,
-            "run_id": paths.prefix, "files": files, "duration_ms": main_duration_ms,
-            "segment_count": timing_info["segment_count"] if timing_info else None,
-            "cost": {"total": cost_total, "currency": cost_currency},
-        })
+        _json_ok(
+            {
+                "status": "success",
+                "provider": args.provider,
+                "model": args.model,
+                "run_id": paths.prefix,
+                "files": files,
+                "duration_ms": main_duration_ms,
+                "segment_count": timing_info["segment_count"] if timing_info else None,
+                "cost": {"total": cost_total, "currency": cost_currency},
+            }
+        )
     else:
         print(f"Full MP3: {paths.full_mp3}")
         print(f"Run manifest: {paths.run_json}")
@@ -741,13 +1137,16 @@ def _generate_step(args, provider, ffmpeg_path, ffprobe_path, chunks, api_key, p
 # split / timings / doctor / validate / list
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 def split_cmd(args: argparse.Namespace) -> None:
     script = Path(args.script)
     if not script.exists():
         fail(f"Script file not found: {script}", _EXIT_ARGS)
     chunks = split_markdown_by_delimiter(script, args.delimiter)
     if args.json_output:
-        _json_ok({"status": "success", "chunks": [{"id": c.id, "chars": len(c.text)} for c in chunks]})
+        _json_ok(
+            {"status": "success", "chunks": [{"id": c.id, "chars": len(c.text)} for c in chunks]}
+        )
     else:
         for chunk in chunks:
             print(f"{chunk.id}: {len(chunk.text)} chars")
@@ -781,9 +1180,28 @@ def _validate_asr_request_options(args: argparse.Namespace, spec) -> None:
             f"ASR provider {spec.provider_id} does not support forced language selection",
             _EXIT_ARGS,
         )
+    if getattr(args, "word_timestamps", False) and not capabilities.word_timestamps:
+        fail(
+            f"ASR provider {spec.provider_id} does not support word timestamps",
+            _EXIT_ARGS,
+        )
 
 
 def _asr_result_payload(result, source_audio: Path) -> dict:
+    execution = {
+        "runtime": result.execution.runtime,
+        "runtime_version": result.execution.runtime_version,
+        "model_revision": result.execution.model_revision,
+        "device": result.execution.resolved_device,
+        "compute": result.execution.resolved_compute,
+        "measurements": dict(result.execution.measurements),
+    }
+    if result.execution.raw_timestamp_entries:
+        execution["raw_timestamp_entries"] = [
+            dict(entry) for entry in result.execution.raw_timestamp_entries
+        ]
+    if result.execution.long_form is not None:
+        execution["long_form"] = dict(result.execution.long_form)
     return {
         "status": "success",
         "provider": result.provider_id,
@@ -806,14 +1224,7 @@ def _asr_result_payload(result, source_audio: Path) -> dict:
             }
             for word in result.words
         ],
-        "execution": {
-            "runtime": result.execution.runtime,
-            "runtime_version": result.execution.runtime_version,
-            "model_revision": result.execution.model_revision,
-            "device": result.execution.resolved_device,
-            "compute": result.execution.resolved_compute,
-            "measurements": dict(result.execution.measurements),
-        },
+        "execution": execution,
     }
 
 
@@ -840,9 +1251,18 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
         language=args.language,
         device=args.device,
         compute=args.compute,
+        timestamp_mode="word" if args.word_timestamps else "none",
     )
+    provider = spec.factory()
     try:
-        result = validate_asr_response(request, spec.factory().transcribe(request))
+        raw_result = (
+            transcribe_prerecorded_long_form(provider, request)
+            if uses_long_form_orchestration(spec.provider_id)
+            else provider.transcribe(request)
+        )
+        result = validate_asr_response(request, raw_result)
+    except LongFormASRMediaError as exc:
+        fail(str(exc), _EXIT_NO_FFMPEG)
     except ModuleNotFoundError as exc:
         fail(f"Missing dependency for ASR provider {spec.provider_id}: {exc}", _EXIT_MISSING_DEP)
     except Exception as exc:
@@ -854,12 +1274,20 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
             f"ASR provider {spec.provider_id} returned provider ID {result.provider_id}",
             _EXIT_PROVIDER,
         )
-    if any(segment.start_s is not None for segment in result.segments) and not capabilities.segment_timestamps:
-        fail(f"ASR provider {spec.provider_id} returned undeclared segment timestamps", _EXIT_PROVIDER)
+    if (
+        any(segment.start_s is not None for segment in result.segments)
+        and not capabilities.segment_timestamps
+    ):
+        fail(
+            f"ASR provider {spec.provider_id} returned undeclared segment timestamps",
+            _EXIT_PROVIDER,
+        )
     if result.words and not capabilities.word_timestamps:
         fail(f"ASR provider {spec.provider_id} returned undeclared word timestamps", _EXIT_PROVIDER)
     if result.alignment_origin == "forced" and not capabilities.forced_alignment:
-        fail(f"ASR provider {spec.provider_id} returned undeclared forced alignment", _EXIT_PROVIDER)
+        fail(
+            f"ASR provider {spec.provider_id} returned undeclared forced alignment", _EXIT_PROVIDER
+        )
 
     data = _asr_result_payload(result, audio_path)
     if args.json_output:
@@ -888,12 +1316,22 @@ def run_timings(args: argparse.Namespace) -> None:
             srt_path = output_dir / f"{run_id}.srt"
             files = {"timings_json": str(timing_json), "srt": str(srt_path)}
             if args.json_output:
-                _json_ok({"status": "skipped", "reason": "output dir exists", "run_id": run_id, "files": files})
+                _json_ok(
+                    {
+                        "status": "skipped",
+                        "reason": "output dir exists",
+                        "run_id": run_id,
+                        "files": files,
+                    }
+                )
             else:
                 print(f"Skipping: output dir exists: {output_dir}")
             return
         if not args.overwrite:
-            fail(f"Output dir exists: {output_dir}. Use --overwrite or --skip-existing.", _EXIT_PROVIDER)
+            fail(
+                f"Output dir exists: {output_dir}. Use --overwrite or --skip-existing.",
+                _EXIT_PROVIDER,
+            )
         _safe_remove_run_dir(output_dir, args.output_dir)
 
     try:
@@ -902,22 +1340,51 @@ def run_timings(args: argparse.Namespace) -> None:
         fail(f"Failed to create output directory {output_dir}: {e}", _EXIT_OUTPUT)
 
     try:
-        timing = _extract_timings(
-            audio_path=audio_path, output_dir=output_dir, prefix=run_id,
-            timing_provider=args.timing_provider, model=args.model,
-            device=args.device, compute_type=args.compute,
-            language=args.language, word_timestamps=args.word_timestamps,
-            quiet=args.json_output,
-        )
+        if args.asr_provider:
+            timing = _extract_asr_timings(
+                audio_path=audio_path,
+                output_dir=output_dir,
+                prefix=run_id,
+                provider_id=args.asr_provider,
+                model=args.model,
+                device=args.device,
+                compute=args.compute or "auto",
+                language=args.language,
+            )
+        else:
+            timing = _extract_timings(
+                audio_path=audio_path,
+                output_dir=output_dir,
+                prefix=run_id,
+                timing_provider=args.timing_provider,
+                model=args.model,
+                device=args.device,
+                compute_type=args.compute or DEFAULT_TIMING_COMPUTE,
+                language=args.language,
+                word_timestamps=args.word_timestamps,
+                quiet=args.json_output,
+            )
     except ModuleNotFoundError as exc:
-        fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
+        fail(
+            f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
+            _EXIT_MISSING_DEP,
+        )
     except Exception as exc:
         fail(f"Whisper timing failed: {exc}", _EXIT_WHISPER)
 
-    files = {"timings_json": str(output_dir / f"{run_id}.timings.json"), "srt": str(output_dir / f"{run_id}.srt")}
+    files = {
+        "timings_json": str(output_dir / f"{run_id}.timings.json"),
+        "srt": str(output_dir / f"{run_id}.srt"),
+    }
     if args.json_output:
-        _json_ok({"status": "success", "files": files, "segment_count": timing["segment_count"],
-                   "duration_ms": timing["total_duration_ms"]})
+        _json_ok(
+            {
+                "status": "success",
+                "files": files,
+                "segment_count": timing["segment_count"],
+                "duration_ms": timing["total_duration_ms"],
+            }
+        )
     else:
         print(f"Timings JSON: {files['timings_json']}")
         print(f"SRT: {files['srt']}")
@@ -1031,6 +1498,14 @@ def doctor_cmd(args: argparse.Namespace) -> None:
         pass
     results["openrouter_key"] = {"ok": or_ok, "required": need_or}
 
+    omnivoice_health = None
+    if args.provider == "omnivoice-local":
+        omnivoice_health = omnivoice_local_dependency_probe()
+        results["omnivoice_local"] = {
+            "ok": omnivoice_health.available,
+            "required": True,
+        }
+
     need_whisper = bool(args.with_timings)
     timing_provider = getattr(args, "timing_provider", "faster-whisper")
     need_asr = bool(getattr(args, "with_asr", False))
@@ -1085,57 +1560,76 @@ def doctor_cmd(args: argparse.Namespace) -> None:
             pass
         results["xai_stt_key"] = {"ok": whisper_ok, "required": need_whisper}
     else:
-        whisper_ok = False
         try:
-            import faster_whisper
-            whisper_ok = True
-        except ImportError:
-            pass
+            whisper_ok = importlib.util.find_spec("faster_whisper") is not None
+        except ValueError:
+            # Lightweight test doubles can exist in sys.modules without a module spec.
+            whisper_ok = "faster_whisper" in sys.modules
         results["faster_whisper"] = {"ok": whisper_ok, "required": need_whisper}
 
-    need_cuda = (args.provider == "qwen-local") or (args.timing_device == "cuda")
+    need_cuda = args.provider in {"qwen-local", "omnivoice-local"} or args.timing_device == "cuda"
     cuda_available = False
-    try:
-        import torch
-        cuda_available = torch.cuda.is_available()
-    except ImportError:
-        pass
+    if args.provider == "omnivoice-local":
+        from .local_runtime.lifecycle import probe_local_gpu_state
+
+        cuda_available = probe_local_gpu_state().probe_error is None
+    else:
+        try:
+            import torch
+
+            cuda_available = torch.cuda.is_available()
+        except ImportError:
+            pass
     results["cuda"] = {"ok": cuda_available, "required": need_cuda}
 
     required_ok = all(info.get("ok", False) for info in results.values() if info.get("required"))
-    optional_ok = all(info.get("ok", False) for info in results.values() if not info.get("required"))
+    optional_ok = all(
+        info.get("ok", False) for info in results.values() if not info.get("required")
+    )
     workflow_ok = required_ok
 
     warnings: list[str] = []
     if not cuda_available and not need_cuda:
-        warnings.append("CUDA is unavailable: qwen-local and cuda timings will not work, but cloud TTS and CPU timings are OK.")
+        warnings.append(
+            "CUDA is unavailable: qwen-local, omnivoice-local, and cuda timings will not work, but cloud TTS and CPU timings are OK."
+        )
     if not cuda_available and need_cuda:
-        warnings.append("CUDA is unavailable but required for the selected provider or timing device.")
+        warnings.append(
+            "CUDA is unavailable but required for the selected provider or timing device."
+        )
     if not whisper_ok and need_whisper:
         if timing_provider == "openrouter-whisper":
-            warnings.append("OPENROUTER_API_KEY is missing. Set it in .env: OPENROUTER_API_KEY=sk-or-v1-...")
+            warnings.append(
+                "OPENROUTER_API_KEY is missing. Set it in .env: OPENROUTER_API_KEY=sk-or-v1-..."
+            )
         elif timing_provider == "groq-whisper":
             warnings.append("GROQ_API_KEY is missing. Set it in .env: GROQ_API_KEY=gsk_...")
         elif timing_provider == "xai-stt":
             warnings.append("X_AI_API_KEY is missing. Set it in .env: X_AI_API_KEY=xai-...")
         else:
-            warnings.append("faster-whisper is not installed. Install with: uv sync --extra timing-whisper")
+            warnings.append(
+                "faster-whisper is not installed. Install with: uv sync --extra timing-whisper"
+            )
     if asr_health is not None and not asr_health.available:
         warnings.append(asr_health.remediation)
+    if omnivoice_health is not None and not omnivoice_health.available:
+        warnings.append(omnivoice_health.remediation)
     if not polza_ok and need_polza:
         warnings.append("POLZA_API_KEY is missing. Set it in .env: POLZA_API_KEY=...")
     if not or_ok and need_or:
         warnings.append("OPENROUTER_API_KEY is missing. Set it in .env: OPENROUTER_API_KEY=...")
 
     if args.json_output:
-        _json_ok({
-            "status": "success",
-            "required_ok": required_ok,
-            "optional_ok": optional_ok,
-            "workflow_ok": workflow_ok,
-            "checks": results,
-            "warnings": warnings,
-        })
+        _json_ok(
+            {
+                "status": "success",
+                "required_ok": required_ok,
+                "optional_ok": optional_ok,
+                "workflow_ok": workflow_ok,
+                "checks": results,
+                "warnings": warnings,
+            }
+        )
     else:
         for name, info in results.items():
             status = "OK" if info.get("ok") else "MISSING"
@@ -1152,7 +1646,10 @@ def validate_cmd(args: argparse.Namespace) -> None:
 
     detected_format = detect_frontmatter_format(script)
     script_format = args.format
-    if script_format == "markdown" and detected_format in (VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT):
+    if script_format == "markdown" and detected_format in (
+        VOICEOVER_FORMAT,
+        GEMINI_DIALOGUE_FORMAT,
+    ):
         script_format = detected_format
 
     if script_format == GEMINI_DIALOGUE_FORMAT:
@@ -1211,7 +1708,9 @@ def validate_cmd(args: argparse.Namespace) -> None:
         chars = len(chunk_text)
         total_chars += chars
         if chars > args.max_chunk_chars:
-            issues.append({"chunk": idx, "type": "too_long", "chars": chars, "limit": args.max_chunk_chars})
+            issues.append(
+                {"chunk": idx, "type": "too_long", "chars": chars, "limit": args.max_chunk_chars}
+            )
 
     warnings = []
     for idx, chunk_text in chunk_list:
@@ -1222,33 +1721,71 @@ def validate_cmd(args: argparse.Namespace) -> None:
     ok = len(issues) == 0
 
     if args.json_output:
-        _json_ok({"status": "success" if ok else "warning", "valid": ok, "chunks": len(chunk_list),
-                   "total_chars": total_chars, "issues": issues, "warnings": warnings})
+        _json_ok(
+            {
+                "status": "success" if ok else "warning",
+                "valid": ok,
+                "chunks": len(chunk_list),
+                "total_chars": total_chars,
+                "issues": issues,
+                "warnings": warnings,
+            }
+        )
     else:
         print(f"Script: {script}")
         print(f"Chunks: {len(chunk_list)}, Total chars: {total_chars}")
         print(f"Valid: {ok}")
         for issue in issues:
-            print(f"  ISSUE chunk {issue['chunk']}: {issue['type']} ({issue['chars']} chars > {issue['limit']})")
+            print(
+                f"  ISSUE chunk {issue['chunk']}: {issue['type']} ({issue['chars']} chars > {issue['limit']})"
+            )
 
 
 def list_cmd(args: argparse.Namespace) -> None:
+    data: dict[str, Any]
     if args.target == "providers":
         data = {
             "providers": [
-                {"id": "polza-chat-audio", "models": ["openai/gpt-audio-mini", "openai/gpt-audio"], "currency": "RUB"},
+                {
+                    "id": "polza-chat-audio",
+                    "models": ["openai/gpt-audio-mini", "openai/gpt-audio"],
+                    "currency": "RUB",
+                },
                 {"id": "polza-tts", "models": POLZA_TTS_MODELS, "currency": "RUB"},
                 {"id": "openrouter-tts", "models": OPENROUTER_TTS_MODELS, "currency": "USD"},
-                {"id": "qwen-local", "modes": ["preset", "clone"], "currency": "RUB", "cost": "free"},
+                {
+                    "id": "qwen-local",
+                    "modes": ["preset", "clone"],
+                    "currency": "RUB",
+                    "cost": "free",
+                },
+                {
+                    "id": "omnivoice-local",
+                    "models": [OMNIVOICE_LOCAL_MODEL_ID],
+                    "modes": ["built-in-style-condition"],
+                    "license": "CC-BY-NC-4.0 upstream weights; local noncommercial research only",
+                },
             ]
         }
     elif args.target == "voices":
         provider = args.provider or "polza-chat-audio"
         voices_flat = {
-            "polza-chat-audio": ["ash", "ballad", "coral", "verse", "marin", "cedar", "echo", "sage", "shimmer", "onyx"],
+            "polza-chat-audio": [
+                "ash",
+                "ballad",
+                "coral",
+                "verse",
+                "marin",
+                "cedar",
+                "echo",
+                "sage",
+                "shimmer",
+                "onyx",
+            ],
             "polza-tts": OPENAI_TTS_VOICES + ELEVENLABS_TTS_VOICES,
             "openrouter-tts": GEMINI_TTS_VOICES + OPENAI_TTS_VOICES,
             "qwen-local": QWEN_PRESET_SPEAKERS,
+            "omnivoice-local": [],
         }
         voice_categories = {
             "polza-tts": {
@@ -1261,13 +1798,27 @@ def list_cmd(args: argparse.Namespace) -> None:
             },
         }
         data = {"provider": provider, "voices": voices_flat.get(provider, [])}
+        if provider == "omnivoice-local":
+            data["voice_selection"] = {
+                "kind": "built-in-style-condition",
+                "condition": OMNIVOICE_STYLE_CONDITION,
+                "named_preset": False,
+                "voice_cloning": False,
+                "voice_design": False,
+            }
         if provider in voice_categories:
             data["voice_categories"] = voice_categories[provider]
     elif args.target == "timing-models":
         data = {
             "timing_models": [
                 {"id": "base", "parameters_m": 74, "disk_mb": 148, "speed": "fastest"},
-                {"id": "small", "parameters_m": 244, "disk_mb": 486, "speed": "fast", "default": True},
+                {
+                    "id": "small",
+                    "parameters_m": 244,
+                    "disk_mb": 486,
+                    "speed": "fast",
+                    "default": True,
+                },
                 {"id": "medium", "parameters_m": 769, "disk_mb": 1536, "speed": "balanced"},
                 {"id": "large-v3-turbo", "parameters_m": 809, "disk_mb": 1620, "speed": "slow"},
                 {"id": "large-v3", "parameters_m": 1550, "disk_mb": 3090, "speed": "slowest"},
@@ -1281,10 +1832,26 @@ def list_cmd(args: argparse.Namespace) -> None:
                     "type": "local",
                     "models": [
                         {"id": "base", "parameters_m": 74, "disk_mb": 148, "speed": "fastest"},
-                        {"id": "small", "parameters_m": 244, "disk_mb": 486, "speed": "fast", "default": True},
+                        {
+                            "id": "small",
+                            "parameters_m": 244,
+                            "disk_mb": 486,
+                            "speed": "fast",
+                            "default": True,
+                        },
                         {"id": "medium", "parameters_m": 769, "disk_mb": 1536, "speed": "balanced"},
-                        {"id": "large-v3-turbo", "parameters_m": 809, "disk_mb": 1620, "speed": "slow"},
-                        {"id": "large-v3", "parameters_m": 1550, "disk_mb": 3090, "speed": "slowest"},
+                        {
+                            "id": "large-v3-turbo",
+                            "parameters_m": 809,
+                            "disk_mb": 1620,
+                            "speed": "slow",
+                        },
+                        {
+                            "id": "large-v3",
+                            "parameters_m": 1550,
+                            "disk_mb": 3090,
+                            "speed": "slowest",
+                        },
                     ],
                 },
                 {
@@ -1292,8 +1859,14 @@ def list_cmd(args: argparse.Namespace) -> None:
                     "type": "cloud",
                     "currency": "USD",
                     "models": [
-                        {"id": "openai/whisper-large-v3-turbo", "description": "Optimized Whisper Large V3 — fast, 99+ languages"},
-                        {"id": "openai/whisper-large-v3", "description": "Whisper Large V3 — highest accuracy"},
+                        {
+                            "id": "openai/whisper-large-v3-turbo",
+                            "description": "Optimized Whisper Large V3 — fast, 99+ languages",
+                        },
+                        {
+                            "id": "openai/whisper-large-v3",
+                            "description": "Whisper Large V3 — highest accuracy",
+                        },
                         {"id": "openai/whisper-1", "description": "Whisper v1 — legacy, cheapest"},
                     ],
                 },
@@ -1303,8 +1876,15 @@ def list_cmd(args: argparse.Namespace) -> None:
                     "currency": "USD",
                     "timestamps": ["segment", "word"],
                     "models": [
-                        {"id": "whisper-large-v3-turbo", "description": "Optimized Whisper Large V3 Turbo — fast, 99+ languages", "default": True},
-                        {"id": "whisper-large-v3", "description": "Whisper Large V3 — highest accuracy"},
+                        {
+                            "id": "whisper-large-v3-turbo",
+                            "description": "Optimized Whisper Large V3 Turbo — fast, 99+ languages",
+                            "default": True,
+                        },
+                        {
+                            "id": "whisper-large-v3",
+                            "description": "Whisper Large V3 — highest accuracy",
+                        },
                     ],
                 },
                 {
@@ -1313,7 +1893,11 @@ def list_cmd(args: argparse.Namespace) -> None:
                     "currency": "USD",
                     "timestamps": ["word"],
                     "models": [
-                        {"id": "grok-stt", "description": "Grok STT — word-level timestamps, 12 formats, multichannel, diarization", "default": True},
+                        {
+                            "id": "grok-stt",
+                            "description": "Grok STT — word-level timestamps, 12 formats, multichannel, diarization",
+                            "default": True,
+                        },
                     ],
                 },
             ]
@@ -1331,6 +1915,7 @@ def list_cmd(args: argparse.Namespace) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 def _preflight_timing_dependency(timing_provider: str = "faster-whisper") -> None:
     if timing_provider == "openrouter-whisper":
@@ -1352,7 +1937,10 @@ def _preflight_timing_dependency(timing_provider: str = "faster-whisper") -> Non
         try:
             import faster_whisper  # noqa: F401
         except ModuleNotFoundError as exc:
-            fail(f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper", _EXIT_MISSING_DEP)
+            fail(
+                f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
+                _EXIT_MISSING_DEP,
+            )
 
 
 def _has_paid_chunk_audio(paths) -> bool:
@@ -1365,7 +1953,14 @@ def _emit_json_event(args, event: str, **fields) -> None:
     print(json.dumps({"event": event, **fields}, ensure_ascii=False), flush=True)
 
 
-def _log_retry(logger: GenerationLogger, args, chunk: ScriptChunk, attempt: int, error: BaseException, delay: float) -> None:
+def _log_retry(
+    logger: GenerationLogger,
+    args,
+    chunk: ScriptChunk,
+    attempt: int,
+    error: BaseException,
+    delay: float,
+) -> None:
     logger.event(
         "warn",
         "chunk_retry",
@@ -1375,7 +1970,9 @@ def _log_retry(logger: GenerationLogger, args, chunk: ScriptChunk, attempt: int,
         delay_sec=round(delay, 2),
         error=str(error),
     )
-    _emit_json_event(args, "chunk_retry", chunk=chunk.number, id=chunk.id, attempt=attempt, error=str(error))
+    _emit_json_event(
+        args, "chunk_retry", chunk=chunk.number, id=chunk.id, attempt=attempt, error=str(error)
+    )
 
 
 def _recover_existing_chunks(
@@ -1429,6 +2026,7 @@ def _find_full_audio(run_dir: Path) -> Path | None:
             return path
     return None
 
+
 def _resolve_audio(raw: str) -> Path:
     if "*" in raw or "?" in raw:
         matches = sorted(glob_mod.glob(raw))
@@ -1440,7 +2038,70 @@ def _resolve_audio(raw: str) -> Path:
     return Path(raw)
 
 
-def _extract_timings(audio_path, output_dir, prefix, timing_provider, model, device, compute_type, language, word_timestamps=False, quiet=False):
+def _write_timing_artifacts(audio_path, output_dir, prefix, timing):
+    ffprobe_path = shutil.which("ffprobe")
+    duration_ms = (
+        mp3_duration_ms(ffprobe_path, audio_path)
+        if ffprobe_path
+        else sum(seg.duration_ms for seg in timing.segments)
+    )
+    timing_json = output_dir / f"{prefix}.timings.json"
+    write_json(timing_json, build_timing_manifest(timing, duration_ms))
+    srt_path = output_dir / f"{prefix}.srt"
+    srt_path.write_text(build_srt(timing), encoding="utf-8")
+    return {"segment_count": len(timing.segments), "total_duration_ms": duration_ms}
+
+
+def _extract_asr_timings(
+    audio_path, output_dir, prefix, provider_id, model, device, compute, language
+):
+    spec = get_asr_provider_spec(provider_id)
+    args = argparse.Namespace(
+        device=device,
+        compute=compute,
+        model=model,
+        language=language,
+        word_timestamps=True,
+    )
+    _validate_asr_request_options(args, spec)
+    health = spec.dependency_probe()
+    if not health.available:
+        raise ModuleNotFoundError(health.remediation)
+    model_id = model or next((item["id"] for item in spec.models if item.get("default")), None)
+    request = ASRRequest(
+        audio_path=audio_path,
+        model_id=model_id,
+        language=language,
+        device=device,
+        compute=compute,
+        timestamp_mode="word",
+    )
+    result = validate_asr_response(request, spec.factory().transcribe(request))
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        raise RuntimeError("FFprobe is required to validate generic ASR timestamp bounds")
+    source_duration_s = mp3_duration_ms(ffprobe_path, audio_path) / 1000
+    timing = asr_result_to_timing(
+        result,
+        source_audio=str(audio_path.resolve()),
+        source_duration_s=source_duration_s,
+    )
+    return _write_timing_artifacts(audio_path, output_dir, prefix, timing)
+
+
+def _extract_timings(
+    audio_path,
+    output_dir,
+    prefix,
+    timing_provider,
+    model,
+    device,
+    compute_type,
+    language,
+    word_timestamps=False,
+    quiet=False,
+):
+    provider: TranscriptionProvider
     if timing_provider == "openrouter-whisper":
         fail(
             "openrouter-whisper does NOT return segment or word-level timestamps. "
@@ -1455,46 +2116,41 @@ def _extract_timings(audio_path, output_dir, prefix, timing_provider, model, dev
         )
     elif timing_provider == "groq-whisper":
         from .providers.groq_whisper import GroqWhisperProvider
+
         effective_model = model or "whisper-large-v3-turbo"
         provider = GroqWhisperProvider(model=effective_model)
     elif timing_provider == "xai-stt":
         from .providers.xai_stt import XAISttProvider
+
         effective_model = model or "grok-stt"
         provider = XAISttProvider(model=effective_model)
     else:
         from .providers.faster_whisper import FasterWhisperProvider
+
         effective_model = model or DEFAULT_TIMING_MODEL
         provider = FasterWhisperProvider(
-            model_size=effective_model, device=device, compute_type=compute_type,
+            model_size=effective_model,
+            device=device,
+            compute_type=compute_type,
         )
 
     timing = provider.transcribe(
-        audio_path=audio_path, language=language,
-        word_timestamps=word_timestamps, quiet=quiet,
+        audio_path=audio_path,
+        language=language,
+        word_timestamps=word_timestamps,
+        quiet=quiet,
     )
 
-    ffprobe_path = shutil.which("ffprobe")
-    duration_ms = mp3_duration_ms(ffprobe_path, audio_path) if ffprobe_path else sum(
-        seg.duration_ms for seg in timing.segments
-    )
-
-    timing_json = output_dir / f"{prefix}.timings.json"
     try:
-        write_json(timing_json, build_timing_manifest(timing, duration_ms))
+        result = _write_timing_artifacts(audio_path, output_dir, prefix, timing)
     except Exception as e:
-        fail(f"Failed to write {timing_json}: {e}", _EXIT_OUTPUT)
-
-    srt_path = output_dir / f"{prefix}.srt"
-    try:
-        srt_path.write_text(build_srt(timing), encoding="utf-8")
-    except OSError as e:
-        fail(f"Failed to write {srt_path}: {e}", _EXIT_OUTPUT)
+        fail(f"Failed to write timing artifacts: {e}", _EXIT_OUTPUT)
 
     if not quiet:
-        print(f"Timings JSON: {timing_json}")
-        print(f"SRT: {srt_path}")
+        print(f"Timings JSON: {output_dir / f'{prefix}.timings.json'}")
+        print(f"SRT: {output_dir / f'{prefix}.srt'}")
 
-    return {"segment_count": len(timing.segments), "total_duration_ms": duration_ms}
+    return result
 
 
 def _list_artifact_files(paths) -> dict:
@@ -1539,6 +2195,7 @@ _VALID_MODELS_BY_PROVIDER = {
     ],
     "polza-tts": POLZA_TTS_MODELS,
     "openrouter-tts": OPENROUTER_TTS_MODELS,
+    "omnivoice-local": [OMNIVOICE_LOCAL_MODEL_ID],
 }
 
 
@@ -1547,14 +2204,27 @@ def _resolve_model(args: argparse.Namespace) -> None:
         args.model = PROVIDER_DEFAULT_MODELS.get(args.provider, DEFAULT_MODEL)
 
 
+def _resolve_qwen_mode_identity(args: argparse.Namespace) -> None:
+    if args.provider != "qwen-local":
+        return
+    mode = getattr(args, "mode", "preset")
+    if mode == "preset":
+        args.model = QWEN_MODEL_CUSTOMVOICE
+    elif mode == "clone":
+        args.model = QWEN_MODEL_BASE
+        args.voice = "clone"
+    elif mode == "design":
+        args.model = QWEN_MODEL_VOICE_DESIGN
+        args.voice = "design"
+
+
 def _validate_model_for_provider(provider: str, model: str) -> None:
     valid = _VALID_MODELS_BY_PROVIDER.get(provider, [])
     if not valid:
         return
     if model not in valid:
         fail(
-            f"Model '{model}' is not valid for provider '{provider}'. "
-            f"Valid models: {valid}",
+            f"Model '{model}' is not valid for provider '{provider}'. Valid models: {valid}",
             _EXIT_ARGS,
         )
 
@@ -1579,6 +2249,51 @@ def _direct_cost_kwargs(provider: str, result) -> dict:
     }
 
 
+def _public_runtime_receipt(result) -> dict[str, str] | None:
+    receipt = (result.raw_metadata or {}).get("runtime_receipt")
+    if receipt is None:
+        return None
+    required_keys = {"model_id", "sha256", "quantization", "license", "provenance"}
+    if not isinstance(receipt, dict) or set(receipt) != required_keys:
+        raise RuntimeError("Local TTS provider returned an invalid public runtime receipt")
+    if not all(isinstance(value, str) and value for value in receipt.values()):
+        raise RuntimeError("Local TTS provider returned an invalid public runtime receipt")
+    return dict(receipt)
+
+
+def _public_voice_selection(result) -> dict[str, object] | None:
+    selection = (result.raw_metadata or {}).get("voice_selection")
+    if selection is None:
+        return None
+    expected = {
+        "kind": "built-in-style-condition",
+        "condition": OMNIVOICE_STYLE_CONDITION,
+        "named_preset": False,
+        "voice_cloning": False,
+        "voice_design": False,
+    }
+    if selection != expected:
+        raise RuntimeError("Local TTS provider returned an invalid public voice selection")
+    return dict(expected)
+
+
+def _public_voice_session(result) -> dict[str, object] | None:
+    session = (result.raw_metadata or {}).get("voice_session")
+    if session is None:
+        return None
+    if (
+        not isinstance(session, dict)
+        or set(session) != {"strategy", "seed", "internal_text_chunk_size"}
+        or session.get("strategy") != "single-container-internal-text-chunking"
+        or isinstance(session.get("seed"), bool)
+        or not isinstance(session.get("seed"), int)
+        or isinstance(session.get("internal_text_chunk_size"), bool)
+        or not isinstance(session.get("internal_text_chunk_size"), int)
+    ):
+        raise RuntimeError("Local TTS provider returned an invalid public voice session")
+    return dict(session)
+
+
 def _default_voice(args: argparse.Namespace) -> str:
     if args.provider == "polza-tts":
         if args.model and args.model.startswith("elevenlabs/"):
@@ -1590,6 +2305,8 @@ def _default_voice(args: argparse.Namespace) -> str:
         return DEFAULT_OPENROUTER_TTS_VOICE
     if args.provider == "qwen-local":
         return DEFAULT_QWEN_VOICE
+    if args.provider == "omnivoice-local":
+        return DEFAULT_OMNIVOICE_VOICE
     return DEFAULT_VOICE
 
 
@@ -1604,14 +2321,18 @@ def read_api_key(args: argparse.Namespace) -> str:
             return read_openrouter_key()
         except RuntimeError as e:
             fail(str(e), _EXIT_NO_KEY)
-    if args.provider == "qwen-local":
+    if args.provider in {"qwen-local", "omnivoice-local"}:
         return ""
     raise RuntimeError(f"Unsupported provider: {args.provider}")
 
 
-def build_provider(args: argparse.Namespace, api_key: str, style_prompt: str | None, prompt_mode: str) -> TTSProvider:
+def build_provider(
+    args: argparse.Namespace, api_key: str, style_prompt: str | None, prompt_mode: str
+) -> TTSProvider:
     if args.provider == "polza-chat-audio":
-        return PolzaChatAudioProvider(api_key=api_key, model=args.model, voice=args.voice, fallback_voice=args.fallback_voice)
+        return PolzaChatAudioProvider(
+            api_key=api_key, model=args.model, voice=args.voice, fallback_voice=args.fallback_voice
+        )
     if args.provider == "polza-tts":
         return PolzaTTSProvider(api_key=api_key, model=args.model, voice=args.voice)
     if args.provider == "openrouter-tts":
@@ -1625,13 +2346,29 @@ def build_provider(args: argparse.Namespace, api_key: str, style_prompt: str | N
         )
     if args.provider == "qwen-local":
         instruct = getattr(args, "qwen_instruct", None)
+        provider_kwargs = {
+            "mode": args.mode,
+            "voice": None if args.mode == "design" else args.voice,
+            "instruct": QWEN_INSTRUCT if instruct is None else instruct,
+            "sample_path": args.sample,
+            "sample_text": args.sample_text,
+        }
+        runtime = os.environ.get("VOICEOVER_QWEN_TTS_RUNTIME", "python").strip()
+        if runtime == "audio-cpp":
+            from .providers.audio_cpp_qwen_tts import AudioCppQwenTTSProvider
+
+            return AudioCppQwenTTSProvider.from_environment(**provider_kwargs)
+        if runtime != "python":
+            fail(
+                "VOICEOVER_QWEN_TTS_RUNTIME must be either 'python' or 'audio-cpp'.",
+                _EXIT_ARGS,
+            )
         return QwenLocalTTSProvider(
-            mode=args.mode,
-            voice=args.voice,
-            instruct=QWEN_INSTRUCT if instruct is None else instruct,
-            sample_path=args.sample,
-            sample_text=args.sample_text,
+            **provider_kwargs,
         )
+    if args.provider == "omnivoice-local":
+        _validate_omnivoice_options(args)
+        return OmniVoiceLocalTTSProvider.from_environment()
     raise RuntimeError(f"Unsupported provider: {args.provider}")
 
 
@@ -1644,13 +2381,20 @@ def fetch_pricing_snapshot(provider: str, api_key: str, model: str) -> dict | No
 
 
 def attach_costs(provider, api_key, model, run_started_at, chunks):
-    if provider == "qwen-local":
+    if provider in {"qwen-local", "omnivoice-local"}:
         enriched = []
         for chunk in chunks:
-            enriched.append(ChunkArtifact(**{**chunk.__dict__, "cost": 0.0, "cost_exact": "0.0", "cost_currency": "RUB"}))
+            enriched.append(
+                ChunkArtifact(
+                    **{**chunk.__dict__, "cost": 0.0, "cost_exact": "0.0", "cost_currency": "RUB"}
+                )
+            )
         return enriched
+    generations: list[dict[str, Any] | None] = []
     if provider in ("polza-chat-audio", "polza-tts"):
-        generations = fetch_polza_generation_costs(api_key, model, run_started_at, len(chunks))
+        generations.extend(
+            fetch_polza_generation_costs(api_key, model, run_started_at, len(chunks))
+        )
     else:
         generations = []
         for chunk in chunks:
@@ -1666,17 +2410,30 @@ def attach_costs(provider, api_key, model, run_started_at, chunks):
     enriched = []
     for chunk, generation in zip(chunks, generations):
         cost, cost_exact, currency = cost_from_generation(provider, generation)
-        enriched.append(ChunkArtifact(**{
-            **chunk.__dict__,
-            "generation_id": generation.get("id") or chunk.generation_id if generation else chunk.generation_id,
-            "cost_rub": cost if currency == "RUB" else None,
-            "cost_rub_exact": cost_exact if currency == "RUB" else None,
-            "cost": cost, "cost_exact": cost_exact, "cost_currency": currency,
-            "usage": generation.get("usage") if generation else None,
-            "generation_time_ms": generation.get("generationTimeMs") or generation.get("generation_time") if generation else None,
-            "generated_at": generation.get("createdAt") or generation.get("created_at") if generation else None,
-            "generation_detail_source": generation_source(provider) if generation else None,
-        }))
+        enriched.append(
+            ChunkArtifact(
+                **{
+                    **chunk.__dict__,
+                    "generation_id": generation.get("id") or chunk.generation_id
+                    if generation
+                    else chunk.generation_id,
+                    "cost_rub": cost if currency == "RUB" else None,
+                    "cost_rub_exact": cost_exact if currency == "RUB" else None,
+                    "cost": cost,
+                    "cost_exact": cost_exact,
+                    "cost_currency": currency,
+                    "usage": generation.get("usage") if generation else None,
+                    "generation_time_ms": generation.get("generationTimeMs")
+                    or generation.get("generation_time")
+                    if generation
+                    else None,
+                    "generated_at": generation.get("createdAt") or generation.get("created_at")
+                    if generation
+                    else None,
+                    "generation_detail_source": generation_source(provider) if generation else None,
+                }
+            )
+        )
     return enriched
 
 
@@ -1685,7 +2442,7 @@ def summarize_costs(provider: str, chunks: list[ChunkArtifact]) -> tuple:
         return None, None, None, None
     total = sum(float(chunk.cost or 0) for chunk in chunks)
     currency = chunks[0].cost_currency
-    source = generation_source(provider) if provider != "qwen-local" else "qwen-local (free)"
+    source = generation_source(provider)
     return round(total, 8), str(round(total, 8)), currency, source
 
 
@@ -1695,6 +2452,7 @@ def generation_source(provider: str) -> str:
         "polza-tts": "Polza API usage.cost_rub or GET /api/v1/history/generations/{id}",
         "openrouter-tts": "OpenRouter GET /api/v1/generation?id=...",
         "qwen-local": "qwen-local (free)",
+        "omnivoice-local": "omnivoice-local (local model; no billing request)",
     }.get(provider, "unknown")
 
 

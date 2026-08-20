@@ -26,7 +26,9 @@ def check_media_tools() -> tuple[str, str]:
     return ffmpeg_path, ffprobe_path
 
 
-def write_audio_as_mp3(ffmpeg_path: str, audio_bytes: bytes, audio_format: str, output_path: Path) -> None:
+def write_audio_as_mp3(
+    ffmpeg_path: str, audio_bytes: bytes, audio_format: str, output_path: Path
+) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if audio_format == "mp3":

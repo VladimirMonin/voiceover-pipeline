@@ -1,20 +1,20 @@
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from voiceover_pipeline.models import SynthesisResult
-from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
-from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+import pytest
+
 from voiceover_pipeline.config import (
-    PODCAST_NARRATION_PROMPT,
     TTS_PROMPT_MODE_NATIVE,
-    TTS_PROMPT_MODE_PREFIX,
     TTS_PROMPT_MODE_NONE,
+    TTS_PROMPT_MODE_PREFIX,
 )
+from voiceover_pipeline.models import SynthesisResult
+from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
 from voiceover_pipeline.tts_prompting import (
-    resolve_prompt_mode,
-    build_request_body,
     build_prompted_input,
+    build_request_body,
     read_style_prompt_from_file,
+    resolve_prompt_mode,
 )
 
 
@@ -37,6 +37,7 @@ class TestPolzaTTSProvider:
 
     def test_synthesize_media_elevenlabs(self):
         import json
+
         from voiceover_pipeline.config import POLZA_BASE_URL
 
         mock_submit = MagicMock()
@@ -59,8 +60,13 @@ class TestPolzaTTSProvider:
         mock_dl.status_code = 200
         mock_dl.content = b"fake-elevenlabs-audio"
 
-        with patch("voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_submit) as mock_post:
-            with patch("voiceover_pipeline.providers.polza_tts.requests.get", side_effect=[mock_poll, mock_dl]) as mock_get:
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_submit
+        ) as mock_post:
+            with patch(
+                "voiceover_pipeline.providers.polza_tts.requests.get",
+                side_effect=[mock_poll, mock_dl],
+            ) as mock_get:
                 with patch("voiceover_pipeline.providers.polza_tts.time.sleep", return_value=None):
                     p = PolzaTTSProvider(
                         api_key="sk-test",
@@ -80,7 +86,9 @@ class TestPolzaTTSProvider:
 
         assert mock_get.call_count == 2
         assert result.audio_bytes == b"fake-elevenlabs-audio"
-        import base64, json
+        import base64
+        import json
+
         from voiceover_pipeline.config import POLZA_BASE_URL
 
         audio_b64 = base64.b64encode(b"fake-audio-bytes").decode()
@@ -92,7 +100,9 @@ class TestPolzaTTSProvider:
         mock_response.json.return_value = resp_json
         mock_response.headers = {"X-Generation-Id": "gen-123"}
 
-        with patch("voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = PolzaTTSProvider(api_key="sk-test", model="openai/gpt-4o-mini-tts", voice="ash")
             result = p.synthesize_chunk("Hello world", "chunk_01")
 
@@ -118,20 +128,25 @@ class TestPolzaTTSProvider:
         mock_response.content = b"{}"
         mock_response.json.return_value = {}
 
-        with patch("voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response):
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response
+        ):
             p = PolzaTTSProvider(api_key="sk-test", model="openai/gpt-4o-mini-tts", voice="ash")
             with pytest.raises(RuntimeError, match="HTTP 500"):
                 p.synthesize_chunk("Hello", "chunk_01")
 
     def test_synthesize_chunk_empty_body(self):
         import json
+
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.content = json.dumps({"audio": ""}).encode()
         mock_response.json.return_value = {"audio": ""}
         mock_response.headers = {}
 
-        with patch("voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response):
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response
+        ):
             p = PolzaTTSProvider(api_key="sk-test", model="openai/gpt-4o-mini-tts", voice="ash")
             with pytest.raises(RuntimeError, match="missing"):
                 p.synthesize_chunk("Hello", "chunk_01")
@@ -160,7 +175,9 @@ class TestOpenRouterTTSProviderOpenAI:
         mock_response.content = b"fake-audio"
         mock_response.headers = {"X-Generation-Id": "gen-or-1"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="openai/gpt-4o-mini-tts-2025-12-15",
@@ -182,7 +199,9 @@ class TestOpenRouterTTSProviderOpenAI:
         mock_response.content = b"fake-audio-gemini"
         mock_response.headers = {"X-Generation-Id": "gen-gemini-1"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -203,7 +222,9 @@ class TestOpenRouterTTSProviderOpenAI:
         mock_response.content = b"fake-audio-gemini"
         mock_response.headers = {"X-Generation-Id": "gen-gemini-multi"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -228,7 +249,9 @@ class TestOpenRouterTTSProviderOpenAI:
         mock_response.content = b"fake-audio-gemini"
         mock_response.headers = {"X-Generation-Id": "gen-gemini-2"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -250,7 +273,9 @@ class TestGeminiExplicitPromptModes:
         mock_response.content = b"fake-audio"
         mock_response.headers = {"X-Generation-Id": "gen-1"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -270,7 +295,9 @@ class TestGeminiExplicitPromptModes:
         mock_response.content = b"fake-audio"
         mock_response.headers = {"X-Generation-Id": "gen-2"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -290,7 +317,9 @@ class TestGeminiExplicitPromptModes:
         mock_response.content = b"fake-audio"
         mock_response.headers = {"X-Generation-Id": "gen-3"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -312,7 +341,9 @@ class TestUnknownGoogleModelFallback:
         mock_response.content = b"fake-audio"
         mock_response.headers = {"X-Generation-Id": "gen-future-1"}
 
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response) as mock_post:
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-2.5-pro-tts",
@@ -340,11 +371,15 @@ class TestPromptModeResolution:
         assert mode == TTS_PROMPT_MODE_NONE
 
     def test_explicit_none_overrides(self):
-        mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview", TTS_PROMPT_MODE_NONE)
+        mode = resolve_prompt_mode(
+            "openrouter-tts", "google/gemini-3.1-flash-tts-preview", TTS_PROMPT_MODE_NONE
+        )
         assert mode == TTS_PROMPT_MODE_NONE
 
     def test_explicit_prefix_overrides(self):
-        mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview", TTS_PROMPT_MODE_PREFIX)
+        mode = resolve_prompt_mode(
+            "openrouter-tts", "google/gemini-3.1-flash-tts-preview", TTS_PROMPT_MODE_PREFIX
+        )
         assert mode == TTS_PROMPT_MODE_PREFIX
 
     def test_unknown_provider_model_resolves_to_none(self):

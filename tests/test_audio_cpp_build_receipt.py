@@ -5,13 +5,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "build_audio_cpp.py"
 PINNED_AUDIO_CPP_REVISION = "502b5b74bd26e9b4aed267d1776ecf131cae7215"
 
 
-def test_build_helper_emits_cpu_cuda_selection_metadata_without_configuring_or_downloading(tmp_path: Path):
+def test_build_helper_emits_cpu_cuda_selection_metadata_without_configuring_or_downloading(
+    tmp_path: Path,
+):
     completed = subprocess.run(
         [
             sys.executable,

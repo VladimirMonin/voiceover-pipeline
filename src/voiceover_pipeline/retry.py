@@ -29,11 +29,14 @@ class RetryPolicy:
 
 
 def is_retryable_error(error: BaseException) -> bool:
-    if isinstance(error, (
-        requests.Timeout,
-        requests.ConnectionError,
-        requests.exceptions.ChunkedEncodingError,
-    )):
+    if isinstance(
+        error,
+        (
+            requests.Timeout,
+            requests.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
         return True
     if isinstance(error, (FileNotFoundError, PermissionError, ValueError)):
         return False

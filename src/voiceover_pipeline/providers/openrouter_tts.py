@@ -57,7 +57,9 @@ class OpenRouterTTSProvider(TTSProvider):
         except RuntimeError as error:
             if "No successful provider responses" not in str(error):
                 raise
-            print(f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.")
+            print(
+                f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt."
+            )
             return self._request_audio(text=text, style_prompt=self.fallback_style_prompt)
 
     def _request_audio(self, text: str, style_prompt: str | None) -> SynthesisResult:
@@ -74,9 +76,7 @@ class OpenRouterTTSProvider(TTSProvider):
                 "speaker_voice_configs": [
                     {
                         "speaker": speaker,
-                        "voice_config": {
-                            "prebuilt_voice_config": {"voice_name": voice}
-                        },
+                        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
                     }
                     for speaker, voice in self.speaker_voice_map.items()
                 ]

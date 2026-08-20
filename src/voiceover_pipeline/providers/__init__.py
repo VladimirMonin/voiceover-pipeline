@@ -1,3 +1,5 @@
+from typing import Any
+
 from .asr_registry import (
     ASRDependencyHealth,
     ASRProviderNotFoundError,
@@ -6,7 +8,8 @@ from .asr_registry import (
     get_asr_provider_spec,
     list_asr_provider_specs,
 )
-from .base import ASRProvider, TTSProvider, TranscriptionProvider
+from .audio_cpp_omnivoice_tts import OmniVoiceLocalTTSProvider
+from .base import ASRProvider, TranscriptionProvider, TTSProvider
 from .faster_whisper import FasterWhisperProvider
 from .groq_whisper import GroqWhisperProvider
 from .openrouter_tts import OpenRouterTTSProvider
@@ -15,10 +18,13 @@ from .polza_chat_audio import PolzaChatAudioProvider
 from .polza_tts import PolzaTTSProvider
 from .xai_stt import XAISttProvider
 
+QwenLocalTTSProvider: Any
 try:
-    from .qwen_local import QwenLocalTTSProvider
+    from .qwen_local import QwenLocalTTSProvider as _QwenLocalTTSProvider
+
+    QwenLocalTTSProvider = _QwenLocalTTSProvider
 except ModuleNotFoundError:
-    QwenLocalTTSProvider = None  # type: ignore[assignment]
+    QwenLocalTTSProvider = None
 
 __all__ = [
     "ASRDependencyHealth",
@@ -35,6 +41,7 @@ __all__ = [
     "OpenRouterTTSProvider",
     "PolzaTTSProvider",
     "XAISttProvider",
+    "OmniVoiceLocalTTSProvider",
     "get_asr_provider_spec",
     "list_asr_provider_specs",
 ]

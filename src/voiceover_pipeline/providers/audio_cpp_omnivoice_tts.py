@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+from shutil import which
+from typing import Any
+from uuid import uuid4
+
+from voiceover_pipeline.audio_cpp.inventory import PINNED_AUDIO_CPP_REVISION
+from voiceover_pipeline.config import (
+    OMNIVOICE_DEFAULT_GUIDANCE_SCALE,
+    OMNIVOICE_DEFAULT_LANGUAGE,
+    OMNIVOICE_DEFAULT_SEED,
+    OMNIVOICE_DEFAULT_STEPS,
+    OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
+    OMNIVOICE_LOCAL_MODEL_ID,
+    OMNIVOICE_STYLE_CONDITION,
+)
+from voiceover_pipeline.local_runtime.contracts import (
+    LocalTTSRequest,
+    RuntimeDriverHealth,
+    RuntimeUnavailableError,
+)
+from voiceover_pipeline.local_runtime.drivers.audio_cpp import AudioCppRuntimeDriver
+from voiceover_pipeline.local_runtime.gpu_lease import GPULeaseManager
+from voiceover_pipeline.local_runtime.lifecycle import GPULifecycleOwner, probe_local_gpu_state
+from voiceover_pipeline.local_runtime.manager import LocalAudioRuntime
+from voiceover_pipeline.local_runtime.registry import LocalRuntimeRegistry
+from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+    NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
+    AudioCppNativeCLITransport,
+    discover_native_audio_cpp_install,
+)
+from voiceover_pipeline.local_runtime.transports.audio_cpp_omnivoice import (
+    PINNED_AUDIO_CPP_OMNIVOICE_BINARY_SHA256,
+    AudioCppOmniVoiceCLITransport,
+    VerifiedOmniVoiceModel,
+    admit_omnivoice_model,
+)
+from voiceover_pipeline.models import SynthesisResult
+from voiceover_pipeline.providers.base import TTSProvider
+
+OMNIVOICE_FAMILY = "omnivoice"
+OMNIVOICE_LOCAL_PROVIDER_ID = "omnivoice-local"
+_OMNIVOICE_MODEL_ENV = "VOICEOVER_OMNIVOICE_MODEL"
+_OMNIVOICE_CONTAINER_COMMAND_ENV = "VOICEOVER_OMNIVOICE_CONTAINER_COMMAND_JSON"
+_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE_ENV = "VOICEOVER_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE"
+_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE_ACKNOWLEDGMENT = "accept-cc-by-nc-4.0-local-use"
+_OMNIVOICE_MIN_FREE_VRAM_MB = 4096
+_OMNIVOICE_MAX_GPU_UTILIZATION_PERCENT = 90
+OMNIVOICE_INSTALL_REMEDIATION = (
+    "OmniVoice local runtime is unavailable. Set VOICEOVER_OMNIVOICE_MODEL to the approved "
+    "local Q8_0 artifact, set VOICEOVER_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE to "
+    "accept-cc-by-nc-4.0-local-use, and configure a local container command before retrying."
+)
+
+
+def _container_command_from_environment() -> tuple[str, ...]:
+    raw = os.environ.get(_OMNIVOICE_CONTAINER_COMMAND_ENV, "").strip()
+    if not raw:
+        return ("docker",)
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{_OMNIVOICE_CONTAINER_COMMAND_ENV} must be a JSON array of argv strings"
+        ) from exc
+    if (
+        not isinstance(parsed, list)
+        or not parsed
+        or not all(isinstance(part, str) and part and "\x00" not in part for part in parsed)
+    ):
+        raise ValueError(f"{_OMNIVOICE_CONTAINER_COMMAND_ENV} must be a JSON array of argv strings")
+    return tuple(parsed)
+
+
+def _admitted_omnivoice_model_from_environment() -> VerifiedOmniVoiceModel | None:
+    model_path = os.environ.get(_OMNIVOICE_MODEL_ENV, "").strip()
+    acknowledgment = os.environ.get(_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE_ENV, "").strip()
+    if not model_path or acknowledgment != _OMNIVOICE_NONCOMMERCIAL_LOCAL_USE_ACKNOWLEDGMENT:
+        return None
+    try:
+        return admit_omnivoice_model(model_path=Path(model_path), model_id=OMNIVOICE_LOCAL_MODEL_ID)
+    except (OSError, ValueError):
+        return None
+
+
+def _re_admit_omnivoice_model(
+    admitted_model: VerifiedOmniVoiceModel | None,
+) -> VerifiedOmniVoiceModel | None:
+    """Re-check caller-provided admission at each exported provider boundary."""
+    if admitted_model is None:
+        return _admitted_omnivoice_model_from_environment()
+    acknowledgment = os.environ.get(_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE_ENV, "").strip()
+    if acknowledgment != _OMNIVOICE_NONCOMMERCIAL_LOCAL_USE_ACKNOWLEDGMENT:
+        return None
+    try:
+        return admit_omnivoice_model(
+            model_path=admitted_model.model_path,
+            model_id=admitted_model.model_id,
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def omnivoice_local_dependency_probe(
+    admitted_model: VerifiedOmniVoiceModel | None = None,
+) -> RuntimeDriverHealth:
+    model = _re_admit_omnivoice_model(admitted_model)
+    if model is None:
+        return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+    if sys.platform.startswith("win"):
+        native_executable = os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip()
+        if not native_executable:
+            return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+        try:
+            discover_native_audio_cpp_install(
+                Path(native_executable), required_model_paths=(model.model_path,)
+            )
+        except ValueError:
+            return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+        return RuntimeDriverHealth(available=True)
+    try:
+        command = _container_command_from_environment()
+    except ValueError:
+        return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+    if which(command[0]) is None:
+        return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+    return RuntimeDriverHealth(available=True)
+
+
+class OmniVoiceLocalTTSProvider(TTSProvider):
+    """Offline OmniVoice route with one fixed built-in female style condition."""
+
+    provider_id = OMNIVOICE_LOCAL_PROVIDER_ID
+
+    def __init__(
+        self,
+        runtime: LocalAudioRuntime | None = None,
+        *,
+        admitted_model: VerifiedOmniVoiceModel | None = None,
+        model_id: str = OMNIVOICE_LOCAL_MODEL_ID,
+        language: str = OMNIVOICE_DEFAULT_LANGUAGE,
+        seed: int = OMNIVOICE_DEFAULT_SEED,
+        num_inference_steps: int = OMNIVOICE_DEFAULT_STEPS,
+        guidance_scale: float = OMNIVOICE_DEFAULT_GUIDANCE_SCALE,
+    ) -> None:
+        self._runtime = runtime
+        self._admitted_model = _re_admit_omnivoice_model(admitted_model)
+        if self._admitted_model is not None and model_id != self._admitted_model.model_id:
+            raise ValueError("OmniVoice provider model_id does not match the admitted model")
+        self._model_id = (
+            self._admitted_model.model_id if self._admitted_model is not None else model_id
+        )
+        self._language = language
+        self._seed = seed
+        self._num_inference_steps = num_inference_steps
+        self._guidance_scale = guidance_scale
+
+    @classmethod
+    def from_environment(cls) -> "OmniVoiceLocalTTSProvider":
+        admitted_model = _admitted_omnivoice_model_from_environment()
+        health = omnivoice_local_dependency_probe(admitted_model)
+        if not health.available:
+            return cls()
+        assert admitted_model is not None
+        if sys.platform.startswith("win"):
+            install = discover_native_audio_cpp_install(
+                Path(os.environ[NATIVE_AUDIO_CPP_EXECUTABLE_ENV]),
+                required_model_paths=(admitted_model.model_path,),
+            )
+            transport = AudioCppNativeCLITransport(
+                executable_path=install.executable_path,
+                model_paths={OMNIVOICE_FAMILY: admitted_model.model_path},
+            )
+            binary_path: Path | None = install.executable_path
+            build_hash = install.files[install.executable_path.name]
+            transport_name = "native-cli"
+        else:
+            transport = AudioCppOmniVoiceCLITransport(
+                model=admitted_model,
+                container_command=_container_command_from_environment(),
+            )
+            binary_path = None
+            build_hash = PINNED_AUDIO_CPP_OMNIVOICE_BINARY_SHA256
+            transport_name = "container-cli"
+        driver = AudioCppRuntimeDriver(
+            binary_path=binary_path,
+            source_revision=PINNED_AUDIO_CPP_REVISION,
+            transport=transport,
+            build_hash=build_hash,
+            transport_name=transport_name,
+        )
+        return cls(
+            LocalAudioRuntime(
+                LocalRuntimeRegistry((driver,)),
+                lifecycle=_omnivoice_gpu_lifecycle(),
+            ),
+            admitted_model=admitted_model,
+        )
+
+    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+        if self._runtime is None:
+            raise ModuleNotFoundError(OMNIVOICE_INSTALL_REMEDIATION)
+        if self._admitted_model is None:
+            raise RuntimeUnavailableError("OmniVoice runtime requires an admitted model")
+        response = self._runtime.execute_tts(
+            LocalTTSRequest(
+                request_id=uuid4().hex,
+                family=OMNIVOICE_FAMILY,
+                provider_id=self.provider_id,
+                text=text,
+                model_id=self._model_id,
+                voice=None,
+                language=self._language,
+                instruction=OMNIVOICE_STYLE_CONDITION,
+                text_chunk_size=OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
+                seed=self._seed,
+                num_inference_steps=self._num_inference_steps,
+                guidance_scale=self._guidance_scale,
+            ),
+            runtime_choice="audio-cpp",
+        )
+        if response.audio_bytes is None or response.audio_format != "wav":
+            raise RuntimeUnavailableError("OmniVoice runtime did not return validated WAV audio")
+        metadata: dict[str, Any] = {
+            "provider": self.provider_id,
+            "family": OMNIVOICE_FAMILY,
+            "seed": self._seed,
+            "voice_selection": {
+                "kind": "built-in-style-condition",
+                "condition": OMNIVOICE_STYLE_CONDITION,
+                "named_preset": False,
+                "voice_cloning": False,
+                "voice_design": False,
+            },
+            "voice_session": {
+                "strategy": "single-container-internal-text-chunking",
+                "seed": self._seed,
+                "internal_text_chunk_size": OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
+            },
+            "sample_rate_hz": response.payload.get("sample_rate_hz"),
+            "channels": response.payload.get("channels"),
+            "duration_s": response.payload.get("duration_s"),
+        }
+        metadata["runtime_receipt"] = self._admitted_model.public_receipt()
+        if response.receipt is not None:
+            metadata["runtime"] = {
+                "driver_id": response.receipt.driver_id,
+                "transport": response.receipt.transport,
+                "source_revision": response.receipt.source_revision,
+                "build_hash": response.receipt.build_hash,
+            }
+        return SynthesisResult(
+            audio_bytes=response.audio_bytes,
+            audio_format="wav",
+            transcript=text,
+            client_path=self.provider_id,
+            raw_metadata=metadata,
+        )
+
+
+def _omnivoice_gpu_lifecycle() -> GPULifecycleOwner:
+    return GPULifecycleOwner(
+        GPULeaseManager(
+            metadata_path=Path(tempfile.gettempdir()) / "voiceover-pipeline-gpu-lease.json"
+        ),
+        probe=probe_local_gpu_state,
+        min_free_vram_mb=_OMNIVOICE_MIN_FREE_VRAM_MB,
+        max_utilization_percent=_OMNIVOICE_MAX_GPU_UTILIZATION_PERCENT,
+    )

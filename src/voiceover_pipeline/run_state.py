@@ -8,7 +8,6 @@ from typing import Any
 
 from .models import ChunkArtifact, ScriptChunk
 
-
 STATE_FILE = "run_state.json"
 LOG_FILE = "generation.log"
 
@@ -78,7 +77,9 @@ def completed_numbers(state: dict[str, Any] | None) -> set[int]:
     return {
         int(item["number"])
         for item in state.get("chunks", [])
-        if isinstance(item, dict) and item.get("status") == "completed" and item.get("number") is not None
+        if isinstance(item, dict)
+        and item.get("status") == "completed"
+        and item.get("number") is not None
     }
 
 
@@ -95,6 +96,9 @@ def artifact_from_state(item: dict[str, Any]) -> ChunkArtifact:
         transcript=item.get("transcript"),
         client_path=item.get("client_path"),
         generation_id=item.get("generation_id"),
+        runtime_receipt=item.get("runtime_receipt"),
+        voice_selection=item.get("voice_selection"),
+        voice_session=item.get("voice_session"),
         cost_rub=item.get("cost_rub"),
         cost_rub_exact=item.get("cost_rub_exact"),
         cost=item.get("cost"),
@@ -107,7 +111,9 @@ def artifact_from_state(item: dict[str, Any]) -> ChunkArtifact:
     )
 
 
-def state_chunks_as_artifacts(state: dict[str, Any] | None, chunks_dir: Path) -> list[ChunkArtifact]:
+def state_chunks_as_artifacts(
+    state: dict[str, Any] | None, chunks_dir: Path
+) -> list[ChunkArtifact]:
     if not state:
         return []
     artifacts = []
@@ -147,6 +153,9 @@ def upsert_completed_chunk(
         "text_characters": artifact.text_characters,
         "transcript": artifact.transcript,
         "client_path": artifact.client_path,
+        "runtime_receipt": artifact.runtime_receipt,
+        "voice_selection": artifact.voice_selection,
+        "voice_session": artifact.voice_session,
         "cost": artifact.cost,
         "cost_exact": artifact.cost_exact,
         "cost_currency": artifact.cost_currency,
@@ -155,15 +164,21 @@ def upsert_completed_chunk(
         "usage": artifact.usage,
         "generated_at": utc_now(),
     }
-    state["chunks"] = [entry for entry in state.get("chunks", []) if entry.get("number") != artifact.number]
+    state["chunks"] = [
+        entry for entry in state.get("chunks", []) if entry.get("number") != artifact.number
+    ]
     state["chunks"].append({key: value for key, value in item.items() if value is not None})
     state["chunks"].sort(key=lambda entry: int(entry["number"]))
-    state["completed_count"] = len([entry for entry in state["chunks"] if entry.get("status") == "completed"])
+    state["completed_count"] = len(
+        [entry for entry in state["chunks"] if entry.get("status") == "completed"]
+    )
     state["updated_at"] = utc_now()
 
 
 def append_error(state: dict[str, Any], *, chunk_id: str | None, message: str) -> None:
-    state.setdefault("errors", []).append({"at": utc_now(), "chunk_id": chunk_id, "message": message})
+    state.setdefault("errors", []).append(
+        {"at": utc_now(), "chunk_id": chunk_id, "message": message}
+    )
     state["status"] = "failed"
     state["updated_at"] = utc_now()
 

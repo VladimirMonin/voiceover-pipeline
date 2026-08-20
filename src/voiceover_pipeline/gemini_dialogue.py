@@ -5,7 +5,6 @@ from typing import Any
 from .config import GEMINI_TTS_VOICES
 from .models import ScriptChunk
 
-
 GEMINI_DIALOGUE_FORMAT = "gemini-dialogue"
 GEMINI_TTS_MODEL = "google/gemini-3.1-flash-tts-preview"
 DEFAULT_MAX_CHUNK_BYTES = 3500
@@ -68,17 +67,25 @@ def validate_gemini_dialogue_file(
     errors.extend(fm_errors)
 
     if meta.get("format") != GEMINI_DIALOGUE_FORMAT:
-        errors.append(error("FORMAT_NOT_GEMINI_DIALOGUE", "Frontmatter must contain format: gemini-dialogue.", line=1))
+        errors.append(
+            error(
+                "FORMAT_NOT_GEMINI_DIALOGUE",
+                "Frontmatter must contain format: gemini-dialogue.",
+                line=1,
+            )
+        )
 
     active_model = model or str(meta.get("model") or "")
     if active_model != GEMINI_TTS_MODEL:
-        errors.append(error(
-            "MODEL_NOT_GEMINI_TTS",
-            f"Gemini dialogue requires model {GEMINI_TTS_MODEL}.",
-            line=1,
-            actual=active_model or None,
-            expected=GEMINI_TTS_MODEL,
-        ))
+        errors.append(
+            error(
+                "MODEL_NOT_GEMINI_TTS",
+                f"Gemini dialogue requires model {GEMINI_TTS_MODEL}.",
+                line=1,
+                actual=active_model or None,
+                expected=GEMINI_TTS_MODEL,
+            )
+        )
 
     speaker_voice_map = extract_speaker_voice_map(meta, errors)
     apply_speaker_voice_overrides(speaker_voice_map, speaker_voice_overrides or [], errors)
@@ -88,7 +95,9 @@ def validate_gemini_dialogue_file(
     max_chunk_bytes = extract_max_chunk_bytes(meta, warnings)
     chunks = split_dialogue_chunks(body, body_start_line, delimiter)
     if not chunks:
-        errors.append(error("CHUNK_EMPTY", "Script body contains no non-empty chunks.", line=body_start_line))
+        errors.append(
+            error("CHUNK_EMPTY", "Script body contains no non-empty chunks.", line=body_start_line)
+        )
 
     chunk_reports: list[dict[str, Any]] = []
     total_bytes = 0
@@ -135,7 +144,18 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int, list[dict[st
     errors: list[dict[str, Any]] = []
     lines = text.splitlines()
     if not lines or lines[0].strip() != "---":
-        return {}, text, 1, [error("FRONTMATTER_MISSING", "Gemini dialogue script requires YAML-like frontmatter.", line=1)]
+        return (
+            {},
+            text,
+            1,
+            [
+                error(
+                    "FRONTMATTER_MISSING",
+                    "Gemini dialogue script requires YAML-like frontmatter.",
+                    line=1,
+                )
+            ],
+        )
 
     end_index = None
     for idx in range(1, len(lines)):
@@ -143,7 +163,12 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int, list[dict[st
             end_index = idx
             break
     if end_index is None:
-        return {}, "", len(lines) + 1, [error("FRONTMATTER_YAML_INVALID", "Frontmatter closing --- was not found.", line=1)]
+        return (
+            {},
+            "",
+            len(lines) + 1,
+            [error("FRONTMATTER_YAML_INVALID", "Frontmatter closing --- was not found.", line=1)],
+        )
 
     try:
         meta = parse_simple_yaml(lines[1:end_index], start_line=2)
@@ -151,7 +176,7 @@ def parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int, list[dict[st
         meta = {}
         errors.append(error("FRONTMATTER_YAML_INVALID", str(exc), line=1))
 
-    body = "\n".join(lines[end_index + 1:])
+    body = "\n".join(lines[end_index + 1 :])
     return meta, body, end_index + 2, errors
 
 
@@ -217,7 +242,9 @@ def parse_speakers(lines: list[str], idx: int, start_line: int) -> tuple[dict[st
             idx += 1
             continue
         if current is None:
-            raise ValueError(f"Speaker property without speaker at {start_line + idx}: {raw.rstrip()}")
+            raise ValueError(
+                f"Speaker property without speaker at {start_line + idx}: {raw.rstrip()}"
+            )
         line = raw.strip()
         if ":" not in line:
             raise ValueError(f"Expected speaker key: value at {start_line + idx}: {raw.rstrip()}")
@@ -244,7 +271,9 @@ def parse_list(lines: list[str], idx: int) -> tuple[list[str], int]:
 
 def parse_scalar(value: str) -> Any:
     value = value.strip()
-    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
         return value[1:-1]
     if value.isdigit():
         return int(value)
@@ -271,28 +300,60 @@ def extract_speaker_voice_map(meta: dict[str, Any], errors: list[dict[str, Any]]
     return speaker_voice_map
 
 
-def apply_speaker_voice_overrides(speaker_voice_map: dict[str, str], overrides: list[str], errors: list[dict[str, Any]]) -> None:
+def apply_speaker_voice_overrides(
+    speaker_voice_map: dict[str, str], overrides: list[str], errors: list[dict[str, Any]]
+) -> None:
     for item in overrides:
         if "=" not in item:
-            errors.append(error("SPEAKER_VOICE_INVALID", f"Invalid --speaker-voice value: {item}. Use Speaker1=Puck."))
+            errors.append(
+                error(
+                    "SPEAKER_VOICE_INVALID",
+                    f"Invalid --speaker-voice value: {item}. Use Speaker1=Puck.",
+                )
+            )
             continue
         speaker, voice = item.split("=", 1)
         speaker = speaker.strip()
         voice = voice.strip()
         if not speaker or not voice:
-            errors.append(error("SPEAKER_VOICE_INVALID", f"Invalid --speaker-voice value: {item}. Use Speaker1=Puck."))
+            errors.append(
+                error(
+                    "SPEAKER_VOICE_INVALID",
+                    f"Invalid --speaker-voice value: {item}. Use Speaker1=Puck.",
+                )
+            )
             continue
         speaker_voice_map[speaker] = voice
 
 
 def validate_speakers(speaker_voice_map: dict[str, str], errors: list[dict[str, Any]]) -> None:
     if len(speaker_voice_map) > 2:
-        errors.append(error("TOO_MANY_SPEAKERS", "Gemini TTS supports at most two speakers.", actual=len(speaker_voice_map), limit=2))
+        errors.append(
+            error(
+                "TOO_MANY_SPEAKERS",
+                "Gemini TTS supports at most two speakers.",
+                actual=len(speaker_voice_map),
+                limit=2,
+            )
+        )
     for speaker, voice in speaker_voice_map.items():
         if not re.match(r"^[A-Za-z0-9]+$", speaker):
-            errors.append(error("INVALID_SPEAKER_ALIAS", f"Speaker alias must be alphanumeric without whitespace: {speaker}", actual=speaker))
+            errors.append(
+                error(
+                    "INVALID_SPEAKER_ALIAS",
+                    f"Speaker alias must be alphanumeric without whitespace: {speaker}",
+                    actual=speaker,
+                )
+            )
         if voice not in GEMINI_TTS_VOICES:
-            errors.append(error("INVALID_VOICE", f"Voice {voice} is not a Gemini TTS voice.", actual=voice, expected="one of GEMINI_TTS_VOICES"))
+            errors.append(
+                error(
+                    "INVALID_VOICE",
+                    f"Voice {voice} is not a Gemini TTS voice.",
+                    actual=voice,
+                    expected="one of GEMINI_TTS_VOICES",
+                )
+            )
 
 
 def extract_allowed_tags(meta: dict[str, Any]) -> set[str]:
@@ -306,7 +367,14 @@ def extract_max_chunk_bytes(meta: dict[str, Any], warnings: list[dict[str, Any]]
     raw = meta.get("max_chunk_bytes")
     if isinstance(raw, int) and raw > 0:
         if raw > HARD_MAX_CHUNK_BYTES:
-            warnings.append(warning("MAX_CHUNK_BYTES_ABOVE_HARD_LIMIT", "max_chunk_bytes exceeds hard Gemini safety limit.", actual=raw, limit=HARD_MAX_CHUNK_BYTES))
+            warnings.append(
+                warning(
+                    "MAX_CHUNK_BYTES_ABOVE_HARD_LIMIT",
+                    "max_chunk_bytes exceeds hard Gemini safety limit.",
+                    actual=raw,
+                    limit=HARD_MAX_CHUNK_BYTES,
+                )
+            )
         return raw
     return DEFAULT_MAX_CHUNK_BYTES
 
@@ -358,28 +426,39 @@ def validate_chunk(
     text = chunk["text"]
     utf8_bytes = len(text.encode("utf-8"))
     if not text:
-        errors.append(error("CHUNK_EMPTY", f"Chunk {chunk['chunk']} is empty.", chunk=chunk["chunk"], line=chunk["line_start"]))
+        errors.append(
+            error(
+                "CHUNK_EMPTY",
+                f"Chunk {chunk['chunk']} is empty.",
+                chunk=chunk["chunk"],
+                line=chunk["line_start"],
+            )
+        )
     if utf8_bytes > max_chunk_bytes:
-        errors.append(error(
-            "CHUNK_TOO_LARGE",
-            f"Chunk {chunk['chunk']} is {utf8_bytes} UTF-8 bytes, limit is {max_chunk_bytes}.",
-            chunk=chunk["chunk"],
-            line_start=chunk["line_start"],
-            line_end=chunk["line_end"],
-            actual=utf8_bytes,
-            limit=max_chunk_bytes,
-            suggested_fix=f"Split chunk {chunk['chunk']} before line {(chunk['line_start'] + chunk['line_end']) // 2}.",
-        ))
+        errors.append(
+            error(
+                "CHUNK_TOO_LARGE",
+                f"Chunk {chunk['chunk']} is {utf8_bytes} UTF-8 bytes, limit is {max_chunk_bytes}.",
+                chunk=chunk["chunk"],
+                line_start=chunk["line_start"],
+                line_end=chunk["line_end"],
+                actual=utf8_bytes,
+                limit=max_chunk_bytes,
+                suggested_fix=f"Split chunk {chunk['chunk']} before line {(chunk['line_start'] + chunk['line_end']) // 2}.",
+            )
+        )
     if utf8_bytes > HARD_MAX_CHUNK_BYTES:
-        errors.append(error(
-            "CHUNK_EXCEEDS_HARD_LIMIT",
-            f"Chunk {chunk['chunk']} exceeds hard safety limit {HARD_MAX_CHUNK_BYTES} UTF-8 bytes.",
-            chunk=chunk["chunk"],
-            line_start=chunk["line_start"],
-            line_end=chunk["line_end"],
-            actual=utf8_bytes,
-            limit=HARD_MAX_CHUNK_BYTES,
-        ))
+        errors.append(
+            error(
+                "CHUNK_EXCEEDS_HARD_LIMIT",
+                f"Chunk {chunk['chunk']} exceeds hard safety limit {HARD_MAX_CHUNK_BYTES} UTF-8 bytes.",
+                chunk=chunk["chunk"],
+                line_start=chunk["line_start"],
+                line_end=chunk["line_end"],
+                actual=utf8_bytes,
+                limit=HARD_MAX_CHUNK_BYTES,
+            )
+        )
 
     for line_no, raw_line in chunk["lines"]:
         line = raw_line.strip()
@@ -388,43 +467,65 @@ def validate_chunk(
         match = _SPEAKER_RE.match(line)
         if not match:
             if any(marker in line for marker in PROMPT_SKELETON_MARKERS):
-                errors.append(error(
-                    "PROMPT_SKELETON_IN_DIALOGUE_BODY",
-                    "Do not paste the full Gemini prompt skeleton into the dialogue body. Put direction in frontmatter (vibe/profile) and keep body as SpeakerAlias: spoken text only.",
+                errors.append(
+                    error(
+                        "PROMPT_SKELETON_IN_DIALOGUE_BODY",
+                        "Do not paste the full Gemini prompt skeleton into the dialogue body. Put direction in frontmatter (vibe/profile) and keep body as SpeakerAlias: spoken text only.",
+                        chunk=chunk["chunk"],
+                        line=line_no,
+                        snippet=line if agent else None,
+                        suggested_fix="Move AUDIO PROFILE/SCENE/PERFORMANCE/CONTEXT into frontmatter fields, then keep only Speaker1: and Speaker2: lines in the body.",
+                    )
+                )
+                continue
+            errors.append(
+                error(
+                    "LINE_WITHOUT_SPEAKER",
+                    "Every non-empty dialogue line must start with SpeakerAlias: text.",
                     chunk=chunk["chunk"],
                     line=line_no,
                     snippet=line if agent else None,
-                    suggested_fix="Move AUDIO PROFILE/SCENE/PERFORMANCE/CONTEXT into frontmatter fields, then keep only Speaker1: and Speaker2: lines in the body.",
-                ))
-                continue
-            errors.append(error(
-                "LINE_WITHOUT_SPEAKER",
-                "Every non-empty dialogue line must start with SpeakerAlias: text.",
-                chunk=chunk["chunk"],
-                line=line_no,
-                snippet=line if agent else None,
-                suggested_fix="Rewrite as Speaker1: text or Speaker2: text.",
-            ))
+                    suggested_fix="Rewrite as Speaker1: text or Speaker2: text.",
+                )
+            )
             continue
         speaker, replica = match.groups()
         turn_count += 1
         speakers.add(speaker)
         if speaker not in speaker_voice_map:
-            errors.append(error("UNKNOWN_SPEAKER", f"Unknown speaker {speaker}.", chunk=chunk["chunk"], line=line_no, actual=speaker))
+            errors.append(
+                error(
+                    "UNKNOWN_SPEAKER",
+                    f"Unknown speaker {speaker}.",
+                    chunk=chunk["chunk"],
+                    line=line_no,
+                    actual=speaker,
+                )
+            )
         if not replica.strip():
-            errors.append(error("EMPTY_REPLICA", "Replica text is empty.", chunk=chunk["chunk"], line=line_no, actual=speaker))
+            errors.append(
+                error(
+                    "EMPTY_REPLICA",
+                    "Replica text is empty.",
+                    chunk=chunk["chunk"],
+                    line=line_no,
+                    actual=speaker,
+                )
+            )
         for tag in _TAG_RE.findall(replica):
             normalized = tag.strip()
             tags.append(normalized)
             if normalized not in allowed_tags:
-                errors.append(error(
-                    "INVALID_AUDIO_TAG",
-                    f"Audio tag [{normalized}] is not in allowed_tags.",
-                    chunk=chunk["chunk"],
-                    line=line_no,
-                    actual=normalized,
-                    expected=sorted(allowed_tags),
-                ))
+                errors.append(
+                    error(
+                        "INVALID_AUDIO_TAG",
+                        f"Audio tag [{normalized}] is not in allowed_tags.",
+                        chunk=chunk["chunk"],
+                        line=line_no,
+                        actual=normalized,
+                        expected=sorted(allowed_tags),
+                    )
+                )
 
     return {
         "chunk": chunk["chunk"],
@@ -443,7 +544,9 @@ def validate_chunk(
 
 
 def build_style_prompt(meta: dict[str, Any], speaker_voice_map: dict[str, str]) -> str:
-    vibe = str(meta.get("vibe") or "Russian technical podcast. Calm, smart, warm, conversational.").strip()
+    vibe = str(
+        meta.get("vibe") or "Russian technical podcast. Calm, smart, warm, conversational."
+    ).strip()
     speakers = meta.get("speakers") if isinstance(meta.get("speakers"), dict) else {}
     speaker_lines = []
     for speaker, voice in speaker_voice_map.items():
@@ -452,14 +555,16 @@ def build_style_prompt(meta: dict[str, Any], speaker_voice_map: dict[str, str]) 
         display_name = details.get("display_name") if isinstance(details, dict) else None
         label = f"{speaker} ({display_name})" if display_name else speaker
         speaker_lines.append(f"{label}: use voice {voice}. {profile or ''}".strip())
-    return " ".join([
-        "Synthesize speech for a two-speaker Russian podcast.",
-        "Do not read frontmatter, instructions, delimiter lines, or speaker labels aloud.",
-        "Use speaker labels only to assign voices.",
-        "Respect English inline audio tags in square brackets.",
-        vibe,
-        " ".join(speaker_lines),
-    ]).strip()
+    return " ".join(
+        [
+            "Synthesize speech for a two-speaker Russian podcast.",
+            "Do not read frontmatter, instructions, delimiter lines, or speaker labels aloud.",
+            "Use speaker labels only to assign voices.",
+            "Respect English inline audio tags in square brackets.",
+            vibe,
+            " ".join(speaker_lines),
+        ]
+    ).strip()
 
 
 def error(code: str, message: str, **kwargs: Any) -> dict[str, Any]:

@@ -6,7 +6,6 @@ segment-level timestamps (unlike OpenRouter which drops everything but text).
 API reference: https://console.groq.com/docs/speech-to-text
 """
 
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -16,12 +15,10 @@ import requests
 
 from voiceover_pipeline.config import (
     GROQ_BASE_URL,
-    GROQ_WHISPER_MODELS,
     read_groq_key,
 )
 from voiceover_pipeline.models import TimingResult, TimingSegment
 from voiceover_pipeline.providers.base import TranscriptionProvider
-
 
 _AUDIO_FORMAT_MAP = {
     ".mp3": "mp3",
@@ -131,9 +128,7 @@ class GroqWhisperProvider(TranscriptionProvider):
 
         if resp.status_code >= 400:
             detail = resp.text[:500]
-            raise RuntimeError(
-                f"Groq API error {resp.status_code}: {detail}"
-            )
+            raise RuntimeError(f"Groq API error {resp.status_code}: {detail}")
 
         result = resp.json()
 
@@ -186,9 +181,7 @@ class GroqWhisperProvider(TranscriptionProvider):
                 )
         else:
             # Fallback: single segment from full text (shouldn't happen often)
-            duration_ms = round(
-                (result.get("duration", 0) or 0) * 1000
-            )
+            duration_ms = round((result.get("duration", 0) or 0) * 1000)
             segments = [
                 TimingSegment(
                     id=0,

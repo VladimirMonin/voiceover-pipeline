@@ -35,6 +35,9 @@ class ChunkArtifact:
     transcript: str | None
     client_path: str | None
     generation_id: str | None
+    runtime_receipt: dict[str, str] | None = None
+    voice_selection: dict[str, Any] | None = None
+    voice_session: dict[str, Any] | None = None
     cost_rub: float | None = None
     cost_rub_exact: str | None = None
     cost: float | None = None
@@ -80,7 +83,7 @@ class TimingResult:
     source_audio: str = ""
 
 
-ASRAlignmentOrigin = Literal["native", "forced"]
+ASRAlignmentOrigin = Literal["native", "forced", "chunked"]
 ASRPhraseStrength = Literal["mild", "normal", "strong"]
 ASRTimestampMode = Literal["none", "word"]
 
@@ -151,11 +154,23 @@ class ASRExecutionReceipt:
     resolved_device: str = "cpu"
     resolved_compute: str = "auto"
     measurements: Mapping[str, float] = field(default_factory=dict)
+    raw_timestamp_entries: tuple[Mapping[str, object], ...] = ()
+    long_form: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         if not self.runtime.strip():
             raise ValueError("ASR runtime must not be blank")
         object.__setattr__(self, "measurements", MappingProxyType(dict(self.measurements)))
+        raw_entries: list[Mapping[str, object]] = []
+        for entry in self.raw_timestamp_entries:
+            if not isinstance(entry, Mapping):
+                raise ValueError("ASR raw timestamp entries must be mappings")
+            raw_entries.append(MappingProxyType(dict(entry)))
+        object.__setattr__(self, "raw_timestamp_entries", tuple(raw_entries))
+        if self.long_form is not None:
+            if not isinstance(self.long_form, Mapping):
+                raise ValueError("ASR long-form execution evidence must be a mapping")
+            object.__setattr__(self, "long_form", MappingProxyType(dict(self.long_form)))
 
 
 @dataclass(frozen=True)
@@ -207,14 +222,15 @@ class ASRCapabilities:
 
 
 def _validate_monotonic_spans(spans: tuple[ASRSegment | ASRWordSpan, ...]) -> None:
-    previous_start: float | None = None
+    previous_end: float | None = None
     for span in spans:
         start = span.start_s
-        if start is None:
+        end = span.end_s
+        if start is None or end is None:
             continue
-        if previous_start is not None and start < previous_start:
-            raise ValueError("ASR timestamps must be monotonic")
-        previous_start = start
+        if previous_end is not None and start < previous_end:
+            raise ValueError("ASR timestamps must be monotonic and non-overlapping")
+        previous_end = end
 
 
 def _normalized_asr_text(text: str) -> str:
@@ -236,8 +252,8 @@ class ASRResult:
     def __post_init__(self) -> None:
         object.__setattr__(self, "segments", tuple(self.segments))
         object.__setattr__(self, "words", tuple(self.words))
-        if self.alignment_origin not in (None, "native", "forced"):
-            raise ValueError("ASR alignment origin must be native or forced")
+        if self.alignment_origin not in (None, "native", "forced", "chunked"):
+            raise ValueError("ASR alignment origin must be native, forced, or chunked")
         if self.duration_s is not None and self.duration_s < 0:
             raise ValueError("ASR duration must be non-negative")
         _validate_monotonic_spans(self.segments)
@@ -249,17 +265,30 @@ class ASRResult:
             normalized_words = _normalized_asr_text("".join(word.text for word in self.words))
             if normalized_words != normalized_transcript:
                 raise ValueError("ASR word spans must correspond to the transcript")
-        has_timestamps = any(segment.start_s is not None for segment in self.segments) or bool(self.words)
+        has_timestamps = any(segment.start_s is not None for segment in self.segments) or bool(
+            self.words
+        )
         if has_timestamps and self.alignment_origin is None:
             raise ValueError("ASR timestamps require an alignment origin")
         if self.duration_s is not None:
-            timed_spans = (*self.segments, *self.words)
-            if any(span.end_s is not None and span.end_s > self.duration_s for span in timed_spans):
-                raise ValueError("ASR timestamps must not exceed source duration")
+            self.validate_timestamp_bounds(self.duration_s)
+
+    def validate_timestamp_bounds(self, source_duration_s: float) -> None:
+        if not isfinite(source_duration_s) or source_duration_s < 0:
+            raise ValueError("ASR source duration must be finite and non-negative")
+        segment_out_of_bounds = any(
+            segment.end_s is not None and segment.end_s > source_duration_s
+            for segment in self.segments
+        )
+        word_out_of_bounds = any(word.end_s > source_duration_s for word in self.words)
+        if segment_out_of_bounds or word_out_of_bounds:
+            raise ValueError("ASR timestamps must not exceed source duration")
 
     def validate_for_request(self, request: ASRRequest) -> None:
         """Validate result guarantees that depend on the caller's typed intent."""
         if request.timestamp_mode == "word" and self.transcript.strip() and not self.words:
-            raise ValueError("ASR requested word timestamps but returned no word spans for speech output")
+            raise ValueError(
+                "ASR requested word timestamps but returned no word spans for speech output"
+            )
         if request.timestamp_mode == "none" and self.words:
             raise ValueError("ASR returned word timestamps when timestamp mode is none")

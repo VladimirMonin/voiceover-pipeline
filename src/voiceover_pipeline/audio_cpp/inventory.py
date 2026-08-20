@@ -1,11 +1,10 @@
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from hashlib import sha256
 from pathlib import Path
-import subprocess
 from typing import Literal
-
 
 PINNED_AUDIO_CPP_REVISION = "502b5b74bd26e9b4aed267d1776ecf131cae7215"
 AudioCppBackend = Literal["cpu", "cuda", "hip", "vulkan", "metal"]
@@ -65,11 +64,17 @@ AUDIO_CPP_FAMILY_INVENTORY: tuple[AudioCppFamilyInventory, ...] = (
     AudioCppFamilyInventory(
         family="omnivoice",
         provider_id="omnivoice-local",
-        model_id="not-selected",
+        model_id="audio-cpp/omnivoice-q8_0",
         timestamp_origin="none",
-        prompt_contract="typed voice and style fields",
-        license="not-recorded-until-artifact-install",
-        provenance="model selection and license gate remain pending",
+        prompt_contract="offline AutoVoice only; clone/design/style inputs unavailable",
+        model_sha256="2f4be637278043c6842de5b85d681532030e9eb6ffe0f8b0e320f68238e3da8b",
+        quantization="Q8_0 GGUF",
+        license="CC-BY-NC-4.0 upstream weights; local noncommercial research only",
+        provenance=(
+            "audio-cpp/audio.cpp-gguf@c3857f1ec35cfea8993924e7c2a6f682b5dc060b "
+            "OmniVoice-GGUF/omnivoice-q8_0.gguf; converted from k2-fsa/OmniVoice; "
+            "runtime audio.cpp@502b5b74bd26e9b4aed267d1776ecf131cae7215"
+        ),
     ),
 )
 
@@ -120,9 +125,7 @@ class AudioCppBuildPlan:
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_CXX_COMPILER={self.compiler}",
         )
-        backend_definitions = (
-            ("ENGINE_ENABLE_CUDA", "ON" if self.backend == "cuda" else "OFF"),
-        )
+        backend_definitions = (("ENGINE_ENABLE_CUDA", "ON" if self.backend == "cuda" else "OFF"),)
         return command + tuple(
             f"-D{name}={value}" for name, value in (*backend_definitions, *self.cmake_definitions)
         )

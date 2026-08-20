@@ -8,6 +8,8 @@ from .contracts import (
     LocalTTSResponse,
     RuntimeDriverHealth,
 )
+from .gpu_lease import GPULease, GPULeaseCancelledError, GPULeaseManager
+from .lifecycle import GPULifecycleBlockedError, GPULifecycleOwner, GPUSnapshot
 from .manager import LocalAudioRuntime
 from .registry import LocalRuntimeRegistry
 
@@ -16,6 +18,12 @@ __all__ = [
     "LocalASRResponse",
     "LocalAudioRuntime",
     "LocalAudioRuntimeDriver",
+    "GPULease",
+    "GPULeaseCancelledError",
+    "GPULeaseManager",
+    "GPULifecycleBlockedError",
+    "GPULifecycleOwner",
+    "GPUSnapshot",
     "LocalRuntimeRegistry",
     "LocalRuntimeRequest",
     "LocalRuntimeResponse",

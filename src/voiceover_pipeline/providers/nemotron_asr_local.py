@@ -1,16 +1,14 @@
 import importlib
+import os
 from typing import Any
 
 from voiceover_pipeline.models import ASRCapabilities, ASRExecutionReceipt, ASRRequest, ASRResult
 from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth, ASRProviderSpec
 from voiceover_pipeline.providers.base import ASRProvider
 
-
 NEMOTRON_ASR_PROVIDER_ID = "nemotron-local"
 NEMOTRON_ASR_MODEL_ID = "nvidia/nemotron-3.5-asr-streaming-0.6b"
-NEMOTRON_ASR_INSTALL_REMEDIATION = (
-    "Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying."
-)
+NEMOTRON_ASR_INSTALL_REMEDIATION = "Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying."
 _NEMOTRON_LANGUAGE_LOCALES = {
     "de": "de-DE",
     "en": "en-US",
@@ -20,6 +18,12 @@ _NEMOTRON_LANGUAGE_LOCALES = {
 
 
 def nemotron_asr_dependency_probe() -> ASRDependencyHealth:
+    if os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip():
+        from voiceover_pipeline.providers.audio_cpp_nemotron_asr import (
+            audio_cpp_nemotron_asr_dependency_probe,
+        )
+
+        return audio_cpp_nemotron_asr_dependency_probe()
     try:
         transformers = importlib.import_module("transformers")
         importlib.import_module("accelerate")
@@ -52,17 +56,25 @@ class NemotronLocalASRProvider(ASRProvider):
 
     def _load_model(self, request: ASRRequest) -> None:
         import transformers
-        from transformers import AutoModelForRNNT, AutoProcessor
+        from transformers import AutoProcessor
 
+        auto_model_for_rnnt = getattr(transformers, "AutoModelForRNNT")
         model_id = request.model_id or NEMOTRON_ASR_MODEL_ID
         self._processor = AutoProcessor.from_pretrained(model_id)
-        self._model = AutoModelForRNNT.from_pretrained(model_id, device_map=request.device).eval()
+        self._model = auto_model_for_rnnt.from_pretrained(
+            model_id, device_map=request.device
+        ).eval()
         self._loaded_model_id = model_id
         self._loaded_device = request.device
         self._loaded_compute = request.compute
         self._runtime_version = getattr(transformers, "__version__", None)
 
     def transcribe(self, request: ASRRequest) -> ASRResult:
+        if request.timestamp_mode == "word":
+            raise ValueError(
+                "Nemotron Python fallback does not support word timestamps; "
+                "set VOICEOVER_AUDIO_CPP_BINARY to use the native audio.cpp route"
+            )
         model_id = request.model_id or NEMOTRON_ASR_MODEL_ID
         if (
             self._model is None
@@ -104,13 +116,25 @@ class NemotronLocalASRProvider(ASRProvider):
         )
 
 
+def nemotron_asr_provider_factory() -> ASRProvider:
+    """Choose the explicit audio.cpp route without renaming the family provider."""
+    if os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip():
+        from voiceover_pipeline.providers.audio_cpp_nemotron_asr import AudioCppNemotronASRProvider
+
+        return AudioCppNemotronASRProvider.from_environment()
+    return NemotronLocalASRProvider()
+
+
 NEMOTRON_ASR_PROVIDER_SPEC = ASRProviderSpec(
     provider_id=NEMOTRON_ASR_PROVIDER_ID,
-    description="Local Nemotron 3.5 batch ASR with text-only contract; no phrase boosting or timestamps.",
-    factory=NemotronLocalASRProvider,
+    description="Local Nemotron 3.5 ASR with runtime-selected native word timestamps.",
+    factory=nemotron_asr_provider_factory,
     models=({"id": NEMOTRON_ASR_MODEL_ID, "default": True},),
     capabilities=ASRCapabilities(
         batch_audio=True,
+        forced_language=True,
+        segment_timestamps=True,
+        word_timestamps=True,
         device_modes=("cpu", "cuda"),
         compute_modes=("auto",),
     ),

@@ -99,6 +99,20 @@ def test_list_qwen_voices_match_official_custom_voice_model():
     ]
 
 
+def test_list_omnivoice_voice_contract_exposes_style_condition_not_a_named_voice():
+    code, data = cli_json("list", "voices", "--provider", "omnivoice-local", "--json")
+
+    assert code == 0
+    assert data["voices"] == []
+    assert data["voice_selection"] == {
+        "kind": "built-in-style-condition",
+        "condition": "female",
+        "named_preset": False,
+        "voice_cloning": False,
+        "voice_design": False,
+    }
+
+
 def test_list_polza_tts_providers():
     code, data = cli_json("list", "providers", "--json")
     assert code == 0
@@ -139,6 +153,7 @@ def test_doctor_polza_tts_requires_polza_key():
 
 def test_polza_tts_provider_importable():
     from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+
     p = PolzaTTSProvider(api_key="test-key", model="openai/gpt-4o-mini-tts", voice="ash")
     assert p.provider_id == "polza-tts"
     assert p.model == "openai/gpt-4o-mini-tts"
@@ -146,15 +161,19 @@ def test_polza_tts_provider_importable():
 
 
 def test_openrouter_openai_model_voice_default(tmp_path):
-    from voiceover_pipeline.cli import _default_voice
     import argparse
+
+    from voiceover_pipeline.cli import _default_voice
+
     ns = argparse.Namespace(provider="openrouter-tts", model="openai/gpt-4o-mini-tts-2025-12-15")
     assert _default_voice(ns) == "alloy"
 
 
 def test_openrouter_gemini_model_voice_default(tmp_path):
-    from voiceover_pipeline.cli import _default_voice
     import argparse
+
+    from voiceover_pipeline.cli import _default_voice
+
     ns = argparse.Namespace(provider="openrouter-tts", model="google/gemini-3.1-flash-tts-preview")
     assert _default_voice(ns) == "Puck"
 
@@ -184,17 +203,21 @@ def test_timings_missing_audio():
 
 def test_polza_tts_model_default():
     from voiceover_pipeline.config import PROVIDER_DEFAULT_MODELS
+
     assert PROVIDER_DEFAULT_MODELS["polza-tts"] == "openai/gpt-4o-mini-tts"
 
 
 def test_openrouter_tts_model_default():
     from voiceover_pipeline.config import PROVIDER_DEFAULT_MODELS
+
     assert PROVIDER_DEFAULT_MODELS["openrouter-tts"] == "google/gemini-3.1-flash-tts-preview"
 
 
 def test_model_validation_rejects_invalid():
-    from voiceover_pipeline.cli import _validate_model_for_provider, CliError
     import pytest
+
+    from voiceover_pipeline.cli import CliError, _validate_model_for_provider
+
     with pytest.raises(CliError) as exc_info:
         _validate_model_for_provider("polza-tts", "openai/gpt-audio-mini")
     assert exc_info.value.code == 2
@@ -203,6 +226,7 @@ def test_model_validation_rejects_invalid():
 def test_direct_cost_kwargs_populates_for_polza_tts():
     from voiceover_pipeline.cli import _direct_cost_kwargs
     from voiceover_pipeline.models import SynthesisResult
+
     result = SynthesisResult(
         audio_bytes=b"fake",
         audio_format="mp3",
@@ -217,6 +241,7 @@ def test_direct_cost_kwargs_populates_for_polza_tts():
 def test_direct_cost_kwargs_none_for_other_providers():
     from voiceover_pipeline.cli import _direct_cost_kwargs
     from voiceover_pipeline.models import SynthesisResult
+
     result = SynthesisResult(
         audio_bytes=b"fake",
         audio_format="mp3",
@@ -228,12 +253,13 @@ def test_direct_cost_kwargs_none_for_other_providers():
 
 def test_gemini_prompt_mode_in_manifest_is_native():
     from voiceover_pipeline.tts_prompting import resolve_prompt_mode
+
     mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
     assert mode == "native"
 
 
 def test_qwen_instruct_flag_reaches_local_provider():
-    from voiceover_pipeline.cli import build_parser, build_provider, _resolve_provider_style_prompt
+    from voiceover_pipeline.cli import _resolve_provider_style_prompt, build_parser, build_provider
 
     parser = build_parser()
     parsed = parser.parse_args(
@@ -248,7 +274,8 @@ def test_qwen_instruct_flag_reaches_local_provider():
 
 def test_qwen_instruct_defaults_for_backward_compatibility():
     import argparse
-    from voiceover_pipeline.cli import build_provider, _resolve_provider_style_prompt
+
+    from voiceover_pipeline.cli import _resolve_provider_style_prompt, build_provider
     from voiceover_pipeline.config import QWEN_INSTRUCT
 
     args = argparse.Namespace(
@@ -265,8 +292,8 @@ def test_qwen_instruct_defaults_for_backward_compatibility():
 
 
 def test_style_prompt_flags_accepted_by_parser():
-    import argparse
     from pathlib import Path
+
     from voiceover_pipeline.cli import build_parser
 
     parser = build_parser()
@@ -276,3 +303,22 @@ def test_style_prompt_flags_accepted_by_parser():
     assert parsed.style_prompt == "test_prompt"
     assert parsed.no_style_prompt is True
     assert parsed.style_prompt_file == Path("prompt.txt")
+
+
+def test_timings_asr_provider_is_explicit_and_faster_whisper_remains_default():
+    from voiceover_pipeline.cli import build_parser
+
+    parser = build_parser()
+    legacy = parser.parse_args("timings --audio recording.wav".split())
+    generic = parser.parse_args("timings --audio recording.wav --asr-provider qwen-local".split())
+
+    assert legacy.timing_provider == "faster-whisper"
+    assert legacy.asr_provider is None
+    assert generic.asr_provider == "qwen-local"
+    assert generic.compute is None
+    assert (
+        parser.parse_args(
+            "timings --audio recording.wav --asr-provider qwen-local --compute bfloat16".split()
+        ).compute
+        == "bfloat16"
+    )

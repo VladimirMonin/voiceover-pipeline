@@ -1,0 +1,49 @@
+{
+  "annotation": {
+    "accuracy_limit_ms": 100,
+    "annotator": "Terra",
+    "method": "manual direct-audio inspection: Opus bytes decoded locally to PCM, then waveform and spectrogram inspection with silence boundaries; no ASR output was consulted",
+    "rounding": "0.01 s",
+    "source": "WVM Slice 5 local-only assets; audio remains outside this repository"
+  },
+  "cases": [
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_normal_settings_model.ogg",
+      "case_id": "manual_ru_normal_settings_model",
+      "category": "positive_speech",
+      "duration_s": 3.6065,
+      "expected_text": "Открой настройки и выбери меньшую модель.",
+      "expected_speech_window_s": [0.33, 3.21],
+      "expected_word_timestamps": [
+        {"end_s": 0.5, "start_s": 0.33, "text": "Открой"},
+        {"end_s": 1.0, "start_s": 0.56, "text": "настройки"},
+        {"end_s": 1.27, "start_s": 1.06, "text": "и"},
+        {"end_s": 1.48, "start_s": 1.33, "text": "выбери"},
+        {"end_s": 2.73, "start_s": 1.74, "text": "меньшую"},
+        {"end_s": 3.21, "start_s": 2.73, "text": "модель."}
+      ],
+      "language": "ru",
+      "sha256": "db0e7e8af75d0e59de2daa359c2603012ddac0658061d5deb1769097d19621d7",
+      "source_case_id": "p0_ru_normal_settings_model"
+    },
+    {
+      "audio_path": "tests/assets/whisper/slice5/ru_da_da_emphasis.ogg",
+      "case_id": "manual_ru_da_da_emphasis",
+      "category": "positive_speech",
+      "duration_s": 2.2865,
+      "expected_text": "Да, да, именно так.",
+      "expected_speech_window_s": [0.34, 1.93],
+      "expected_word_timestamps": [
+        {"end_s": 0.7, "start_s": 0.34, "text": "Да,"},
+        {"end_s": 1.16, "start_s": 0.7, "text": "да,"},
+        {"end_s": 1.8, "start_s": 1.26, "text": "именно"},
+        {"end_s": 1.93, "start_s": 1.85, "text": "так."}
+      ],
+      "language": "ru",
+      "sha256": "a73de4b766703d2c83f662fe1724fd615504d2f76616305751e29cb3dd990888",
+      "source_case_id": "p1_ru_da_da_emphasis"
+    }
+  ],
+  "corpus_id": "wvm-qwen-manual-russian-timing-v1",
+  "schema_version": 1
+}

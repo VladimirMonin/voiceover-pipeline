@@ -8,7 +8,6 @@ import requests
 
 from voiceover_pipeline.config import (
     OPENROUTER_BASE_URL,
-    OPENROUTER_WHISPER_MODELS,
     read_openrouter_key,
 )
 from voiceover_pipeline.models import TimingResult, TimingSegment
@@ -45,10 +44,21 @@ def _detect_audio_duration_ms(audio_path: Path) -> int:
         return 0
     try:
         import subprocess
+
         result = subprocess.run(
-            [ffprobe, "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", str(audio_path)],
-            capture_output=True, text=True, timeout=30,
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(audio_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         return int(float(result.stdout.strip()) * 1000)
     except Exception:

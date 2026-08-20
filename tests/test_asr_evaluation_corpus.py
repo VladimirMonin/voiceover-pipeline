@@ -5,7 +5,6 @@ from pathlib import Path
 
 from conftest import fixture_path
 
-
 CORPUS_ROOT = fixture_path("asr_evaluation")
 MANIFEST_PATH = CORPUS_ROOT / "manifest.json"
 REQUIRED_CASE_KEYS = {

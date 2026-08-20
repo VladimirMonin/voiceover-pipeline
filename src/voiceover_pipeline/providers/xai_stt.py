@@ -6,7 +6,6 @@ Endpoint: POST https://api.x.ai/v1/stt
 API reference: https://docs.x.ai/developers/model-capabilities/audio/speech-to-text
 """
 
-import shutil
 import sys
 import time
 from pathlib import Path
@@ -20,7 +19,6 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.models import TimingResult, TimingSegment
 from voiceover_pipeline.providers.base import TranscriptionProvider
-
 
 _AUDIO_FORMAT_MAP = {
     ".mp3": "mp3",
@@ -93,8 +91,7 @@ class XAISttProvider(TranscriptionProvider):
 
         if not quiet:
             print(
-                f"Uploading {file_size_mb:.1f} MB to xAI STT "
-                f"(language={language or 'auto'})...",
+                f"Uploading {file_size_mb:.1f} MB to xAI STT (language={language or 'auto'})...",
                 file=sys.stderr,
             )
 
@@ -112,9 +109,7 @@ class XAISttProvider(TranscriptionProvider):
 
         if resp.status_code >= 400:
             detail = resp.text[:500]
-            raise RuntimeError(
-                f"xAI STT API error {resp.status_code}: {detail}"
-            )
+            raise RuntimeError(f"xAI STT API error {resp.status_code}: {detail}")
 
         result = resp.json()
 
@@ -144,9 +139,7 @@ class XAISttProvider(TranscriptionProvider):
                 w_start = w.get("start", 0.0)
                 # New segment if gap > 0.5s
                 if current_words and (w_start - last_end) > 0.5:
-                    seg_text = " ".join(
-                        cw.get("text", "").strip() for cw in current_words
-                    )
+                    seg_text = " ".join(cw.get("text", "").strip() for cw in current_words)
                     seg_end = current_words[-1].get("end", last_end)
                     start_ms = round(segment_start * 1000)
                     end_ms = round(seg_end * 1000)
@@ -167,7 +160,9 @@ class XAISttProvider(TranscriptionProvider):
                                     "confidence": cw.get("confidence"),
                                 }
                                 for cw in current_words
-                            ] if word_timestamps else None,
+                            ]
+                            if word_timestamps
+                            else None,
                         )
                     )
                     seg_id += 1
@@ -179,9 +174,7 @@ class XAISttProvider(TranscriptionProvider):
 
             # Flush last segment
             if current_words:
-                seg_text = " ".join(
-                    cw.get("text", "").strip() for cw in current_words
-                )
+                seg_text = " ".join(cw.get("text", "").strip() for cw in current_words)
                 seg_end = current_words[-1].get("end", last_end)
                 start_ms = round(segment_start * 1000)
                 end_ms = round(seg_end * 1000)
@@ -202,15 +195,15 @@ class XAISttProvider(TranscriptionProvider):
                                 "confidence": cw.get("confidence"),
                             }
                             for cw in current_words
-                        ] if word_timestamps else None,
+                        ]
+                        if word_timestamps
+                        else None,
                     )
                 )
 
         # Fallback: single segment from full text
         if not segments:
-            duration_ms = round(
-                (result.get("duration", 0) or 0) * 1000
-            )
+            duration_ms = round((result.get("duration", 0) or 0) * 1000)
             segments = [
                 TimingSegment(
                     id=0,

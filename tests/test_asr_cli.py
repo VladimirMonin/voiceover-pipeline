@@ -4,11 +4,17 @@ import sys
 import types
 
 import pytest
-
 from conftest import cli_json, fixture_path
-from voiceover_pipeline.models import ASRCapabilities, ASRExecutionReceipt, ASRRequest, ASRResult, ASRWordSpan
-from voiceover_pipeline.providers.base import ASRProvider
+
+from voiceover_pipeline.models import (
+    ASRCapabilities,
+    ASRExecutionReceipt,
+    ASRRequest,
+    ASRResult,
+    ASRWordSpan,
+)
 from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth, ASRProviderSpec
+from voiceover_pipeline.providers.base import ASRProvider
 
 
 def test_list_asr_providers_reads_registry_listing(monkeypatch, capsys):
@@ -19,7 +25,9 @@ def test_list_asr_providers_reads_registry_listing(monkeypatch, capsys):
         description="Offline fixture provider",
         factory=lambda: None,
         models=({"id": "fixture-model"},),
-        capabilities=ASRCapabilities(batch_audio=True, device_modes=("cpu",), compute_modes=("float32",)),
+        capabilities=ASRCapabilities(
+            batch_audio=True, device_modes=("cpu",), compute_modes=("float32",)
+        ),
         dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
     )
     monkeypatch.setattr(cli, "list_asr_provider_specs", lambda: [spec])
@@ -66,7 +74,9 @@ def test_transcribe_parser_has_finite_audio_controls_but_no_generic_prompt_flags
     assert parsed.device == "cpu"
     assert parsed.compute == "float32"
     with pytest.raises(SystemExit):
-        parser.parse_args("transcribe --audio audio.wav --provider fixture-local --prompt ignored".split())
+        parser.parse_args(
+            "transcribe --audio audio.wav --provider fixture-local --prompt ignored".split()
+        )
 
 
 def _fixture_spec(*, available=True):
@@ -146,6 +156,35 @@ def test_transcribe_normalizes_a_fixture_provider_without_timestamps(monkeypatch
     assert data["execution"]["measurements"] == {"wall_s": 0.25}
 
 
+def test_asr_json_payload_preserves_native_raw_timestamp_entries():
+    import voiceover_pipeline.cli as cli
+
+    result = ASRResult(
+        transcript="native word",
+        provider_id="fixture-local",
+        model_id="fixture-model",
+        words=(
+            ASRWordSpan(text="native ", start_s=0.0, end_s=0.1),
+            ASRWordSpan(text="word", start_s=0.2, end_s=0.3),
+        ),
+        alignment_origin="native",
+        execution=ASRExecutionReceipt(
+            runtime="fixture-runtime",
+            raw_timestamp_entries=(
+                {"text": "▁native", "start_s": 0.0, "end_s": 0.1},
+                {"text": "▁word", "start_s": 0.2, "end_s": 0.3},
+            ),
+        ),
+    )
+
+    payload = cli._asr_result_payload(result, fixture_path("smoke_test.md"))
+
+    assert payload["execution"]["raw_timestamp_entries"] == [
+        {"text": "▁native", "start_s": 0.0, "end_s": 0.1},
+        {"text": "▁word", "start_s": 0.2, "end_s": 0.3},
+    ]
+
+
 def test_transcribe_rejects_unrequested_word_timestamps_at_the_provider_boundary(monkeypatch):
     import voiceover_pipeline.cli as cli
 
@@ -200,16 +239,79 @@ def test_transcribe_rejects_unrequested_word_timestamps_at_the_provider_boundary
         ]
     )
 
-    with pytest.raises(cli.CliError, match="returned word timestamps when timestamp mode is none") as error:
+    with pytest.raises(
+        cli.CliError, match="returned word timestamps when timestamp mode is none"
+    ) as error:
         cli.transcribe_cmd(args)
 
     assert error.value.code == 30
 
 
+def test_transcribe_word_timestamp_flag_reaches_declared_provider(monkeypatch, capsys):
+    import voiceover_pipeline.cli as cli
+
+    requests: list[ASRRequest] = []
+
+    class TimedProvider(ASRProvider):
+        provider_id = "fixture-local"
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            requests.append(request)
+            return ASRResult(
+                transcript="fixture transcript",
+                provider_id=self.provider_id,
+                model_id="fixture-model",
+                execution=ASRExecutionReceipt(
+                    runtime="fixture", resolved_device="cpu", resolved_compute="float32"
+                ),
+                words=(ASRWordSpan(text="fixture transcript", start_s=0.0, end_s=0.25),),
+                alignment_origin="native",
+            )
+
+    spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=TimedProvider,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            word_timestamps=True,
+            device_modes=("cpu",),
+            compute_modes=("float32",),
+        ),
+        dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
+    )
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            "--word-timestamps",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.transcribe_cmd(args)
+
+    assert exit_info.value.code == 0
+    assert requests[0].timestamp_mode == "word"
+    assert json.loads(capsys.readouterr().out)["timestamp_mode"] == "native"
+
+
 def test_doctor_checks_only_the_selected_asr_dependency_probe(monkeypatch, capsys):
     import voiceover_pipeline.cli as cli
 
-    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec(available=False))
+    monkeypatch.setattr(
+        cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec(available=False)
+    )
     monkeypatch.setattr(cli.shutil, "which", lambda _command: "/fixture/bin")
     monkeypatch.setattr(cli, "read_polza_key", lambda: "fixture")
     monkeypatch.setattr(cli, "read_openrouter_key", lambda: "fixture")

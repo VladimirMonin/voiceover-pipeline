@@ -88,10 +88,14 @@ def test_registry_unknown_provider_fails_closed_without_fallback():
 
 def test_dependency_probe_returns_redacted_remedy_without_factory_execution():
     registry = ASRProviderRegistry(
-        (_spec(probe=lambda: ASRDependencyHealth(
-            available=False,
-            remediation="Install the approved optional ASR runtime.",
-        )),)
+        (
+            _spec(
+                probe=lambda: ASRDependencyHealth(
+                    available=False,
+                    remediation="Install the approved optional ASR runtime.",
+                )
+            ),
+        )
     )
 
     health = registry.get("fixture-local").dependency_probe()

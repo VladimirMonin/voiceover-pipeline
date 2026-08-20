@@ -76,7 +76,9 @@ voiceover-pipeline = "voiceover_pipeline.cli:main"
 
 [dependency-groups]
 dev = [
+  "mypy>=2.3.1",
   "pytest>=8.0.0",
+  "ruff>=0.16.3",
 ]
 
 [tool.uv]
@@ -86,6 +88,22 @@ conflicts = [
   [{ extra = "asr-qwen" }, { extra = "asr-nemotron" }],
   [{ extra = "asr-nemotron" }, { extra = "voiceover-qwen" }],
 ]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/voiceover_pipeline"]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/voiceover_pipeline"]

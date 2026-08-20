@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -22,11 +22,23 @@ def test_inventory_covers_first_release_local_families_and_preserves_existing_id
     assert by_family["qwen3-forced-aligner"].timestamp_origin == "forced"
     assert by_family["nemotron-3.5-asr"].provider_id == "nemotron-local"
     assert by_family["nemotron-3.5-asr"].timestamp_origin == "native"
-    assert by_family["nemotron-3.5-asr"].prompt_contract == "typed language/task dictionary; phrase hints unavailable"
+    assert (
+        by_family["nemotron-3.5-asr"].prompt_contract
+        == "typed language/task dictionary; phrase hints unavailable"
+    )
     assert by_family["qwen3-tts"].provider_id == "qwen-local"
-    assert by_family["omnivoice"].provider_id == "omnivoice-local"
+    omnivoice = by_family["omnivoice"]
+    assert omnivoice.provider_id == "omnivoice-local"
     assert find_family_inventory("omnivoice").promotion_state == "inventory-only"
-    assert all(item.model_sha256 is None and item.quantization is None for item in AUDIO_CPP_FAMILY_INVENTORY)
+    assert (
+        omnivoice.model_sha256 == "2f4be637278043c6842de5b85d681532030e9eb6ffe0f8b0e320f68238e3da8b"
+    )
+    assert omnivoice.quantization == "Q8_0 GGUF"
+    assert all(
+        item.model_sha256 is None and item.quantization is None
+        for item in AUDIO_CPP_FAMILY_INVENTORY
+        if item.family != "omnivoice"
+    )
     assert all(item.license and item.provenance for item in AUDIO_CPP_FAMILY_INVENTORY)
 
 
@@ -103,18 +115,30 @@ def test_receipt_requires_a_verified_clean_pinned_source(tmp_path: Path, monkeyp
     source_dir = plan.source_dir
     source_dir.mkdir()
     subprocess.run(("git", "init", str(source_dir)), check=True, capture_output=True, text=True)
-    subprocess.run(("git", "-C", str(source_dir), "config", "user.email", "fixture@example.invalid"), check=True)
+    subprocess.run(
+        ("git", "-C", str(source_dir), "config", "user.email", "fixture@example.invalid"),
+        check=True,
+    )
     subprocess.run(("git", "-C", str(source_dir), "config", "user.name", "Fixture"), check=True)
     (source_dir / "fixture.txt").write_text("fixture", encoding="utf-8")
     subprocess.run(("git", "-C", str(source_dir), "add", "fixture.txt"), check=True)
-    subprocess.run(("git", "-C", str(source_dir), "commit", "-m", "fixture"), check=True, capture_output=True, text=True)
+    subprocess.run(
+        ("git", "-C", str(source_dir), "commit", "-m", "fixture"),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
     with pytest.raises(ValueError, match="pinned candidate"):
         build_receipt(plan, binary_path=binary)
 
-    monkeypatch.setattr(inventory, "inspect_pinned_source", lambda _source: (PINNED_AUDIO_CPP_REVISION, False))
+    monkeypatch.setattr(
+        inventory, "inspect_pinned_source", lambda _source: (PINNED_AUDIO_CPP_REVISION, False)
+    )
     receipt = build_receipt(plan, binary_path=binary)
 
-    assert receipt.binary_sha256 == "1415625b88688bab59304bae5c6eba0a682cc322bc348013a20e0611f9977835"
+    assert (
+        receipt.binary_sha256 == "1415625b88688bab59304bae5c6eba0a682cc322bc348013a20e0611f9977835"
+    )
     assert receipt.model_families == tuple(item.family for item in AUDIO_CPP_FAMILY_INVENTORY)
     with pytest.raises(ValueError, match="hash"):
         build_receipt(
@@ -122,6 +146,8 @@ def test_receipt_requires_a_verified_clean_pinned_source(tmp_path: Path, monkeyp
             binary_path=binary,
             expected_binary_sha256="0" * 64,
         )
-    monkeypatch.setattr(inventory, "inspect_pinned_source", lambda _source: (PINNED_AUDIO_CPP_REVISION, True))
+    monkeypatch.setattr(
+        inventory, "inspect_pinned_source", lambda _source: (PINNED_AUDIO_CPP_REVISION, True)
+    )
     with pytest.raises(ValueError, match="dirty"):
         build_receipt(plan, binary_path=binary)

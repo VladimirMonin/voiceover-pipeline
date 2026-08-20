@@ -91,7 +91,9 @@ def build_chunks_manifest(
     )
 
 
-def build_run_manifest(chunks_manifest: dict[str, Any], paths: RunPaths, main_duration_ms: int) -> dict[str, Any]:
+def build_run_manifest(
+    chunks_manifest: dict[str, Any], paths: RunPaths, main_duration_ms: int
+) -> dict[str, Any]:
     cost_total = chunks_manifest.get("cost_total")
     return drop_none(
         {
@@ -121,6 +123,7 @@ def build_timing_manifest(timing: TimingResult, duration_ms: int) -> dict[str, A
             "source_audio": timing.source_audio,
             "model": timing.model,
             "backend": timing.backend,
+            "provider": timing.provider,
             "device": timing.device,
             "compute_type": timing.compute_type,
             "language": timing.language,

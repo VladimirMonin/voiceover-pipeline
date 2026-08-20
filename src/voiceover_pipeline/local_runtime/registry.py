@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from voiceover_pipeline.local_runtime.contracts import LocalAudioRuntimeDriver, RuntimeDriverNotFoundError
+from voiceover_pipeline.local_runtime.contracts import (
+    LocalAudioRuntimeDriver,
+    RuntimeDriverNotFoundError,
+)
 
 
 class LocalRuntimeRegistry:

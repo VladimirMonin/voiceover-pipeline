@@ -5,14 +5,14 @@ import types
 from dataclasses import replace
 
 import pytest
-
 from conftest import fixture_path
+
 from voiceover_pipeline.models import ASRContextHints, ASRPhraseHint, ASRRequest
 from voiceover_pipeline.providers import asr_registry
 from voiceover_pipeline.providers.asr_registry import ASRProviderRegistry
 
 
-def test_nemotron_asr_registry_listing_declares_only_verified_batch_capabilities():
+def test_nemotron_asr_registry_listing_declares_native_word_timestamps_but_not_phrase_boosting():
     from voiceover_pipeline.providers.nemotron_asr_local import NEMOTRON_ASR_PROVIDER_SPEC
 
     capabilities = NEMOTRON_ASR_PROVIDER_SPEC.capabilities
@@ -25,10 +25,31 @@ def test_nemotron_asr_registry_listing_declares_only_verified_batch_capabilities
     assert capabilities.streaming is False
     assert capabilities.contextual_bias is False
     assert capabilities.phrase_boosting is False
-    assert capabilities.segment_timestamps is False
-    assert capabilities.word_timestamps is False
+    assert capabilities.segment_timestamps is True
+    assert capabilities.forced_language is True
+    assert capabilities.word_timestamps is True
     assert capabilities.forced_alignment is False
     assert capabilities.confidence is False
+
+
+def test_nemotron_python_fallback_rejects_word_timestamps_before_loading_a_model():
+    from voiceover_pipeline.providers.nemotron_asr_local import (
+        NEMOTRON_ASR_MODEL_ID,
+        NemotronLocalASRProvider,
+    )
+
+    provider = NemotronLocalASRProvider()
+
+    with pytest.raises(ValueError, match="set VOICEOVER_AUDIO_CPP_BINARY"):
+        provider.transcribe(
+            ASRRequest(
+                audio_path="fixture.wav",
+                model_id=NEMOTRON_ASR_MODEL_ID,
+                timestamp_mode="word",
+            )
+        )
+
+    assert provider._model is None
 
 
 def test_nemotron_asr_factory_and_listing_do_not_import_optional_runtime(monkeypatch):
@@ -103,7 +124,11 @@ def test_nemotron_asr_provider_maps_fixture_text_without_hints_or_timestamps(mon
         feature_extractor = types.SimpleNamespace(sampling_rate=16000)
 
         def __call__(self, audio, *, sampling_rate, language):
-            calls["processor"] = {"audio": audio, "sampling_rate": sampling_rate, "language": language}
+            calls["processor"] = {
+                "audio": audio,
+                "sampling_rate": sampling_rate,
+                "language": language,
+            }
             return FakeInputs(input_features="fixture-features")
 
         def decode(self, sequences, *, skip_special_tokens):
@@ -238,7 +263,9 @@ def test_nemotron_asr_cli_fails_closed_when_selected_runtime_is_unavailable(monk
         NEMOTRON_ASR_PROVIDER_SPEC,
         dependency_probe=nemotron_asr_local.nemotron_asr_dependency_probe,
     )
-    monkeypatch.setattr(asr_registry, "ASR_PROVIDER_REGISTRY", ASRProviderRegistry((unavailable_spec,)))
+    monkeypatch.setattr(
+        asr_registry, "ASR_PROVIDER_REGISTRY", ASRProviderRegistry((unavailable_spec,))
+    )
     monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: unavailable_spec)
 
     args = cli.build_parser().parse_args(

@@ -17,6 +17,7 @@ def _detect_device(requested: str) -> str:
     if requested == "auto":
         try:
             import torch
+
             return "cuda" if torch.cuda.is_available() else "cpu"
         except ImportError:
             return "cpu"
@@ -30,6 +31,7 @@ def _detect_compute_type(requested: str, device: str) -> str:
         return "int8"
     try:
         import torch
+
         if torch.cuda.is_available():
             cap = torch.cuda.get_device_capability(0)
             if cap[0] >= 12:
@@ -75,9 +77,7 @@ class FasterWhisperProvider(TranscriptionProvider):
     def list_models(self) -> list[dict[str, Any]]:
         models: list[dict[str, Any]] = []
         for model_id in WHISPER_HF_REPOS:
-            params_m, disk_mb = TIMING_MODEL_SIZES.get(
-                model_id, (0, 0)
-            )
+            params_m, disk_mb = TIMING_MODEL_SIZES.get(model_id, (0, 0))
             entry: dict[str, Any] = {
                 "id": model_id,
                 "parameters_m": params_m,
@@ -110,9 +110,7 @@ class FasterWhisperProvider(TranscriptionProvider):
         resolved_device = _detect_device(self.device)
         resolved_compute = _detect_compute_type(self.compute_type, resolved_device)
 
-        hf_repo = WHISPER_HF_REPOS.get(
-            self.model_size, WHISPER_HF_REPOS["small"]
-        )
+        hf_repo = WHISPER_HF_REPOS.get(self.model_size, WHISPER_HF_REPOS["small"])
 
         _log(
             f"Loading Whisper model {self.model_size} ({hf_repo}) "
@@ -128,9 +126,7 @@ class FasterWhisperProvider(TranscriptionProvider):
                 compute_type=resolved_compute,
             )
         except Exception as first_error:
-            fallback_compute = (
-                "float32" if resolved_device == "cpu" else "float16"
-            )
+            fallback_compute = "float32" if resolved_device == "cpu" else "float16"
             _log(
                 f"  First attempt failed ({first_error}), retrying with "
                 f"compute_type={fallback_compute}"
