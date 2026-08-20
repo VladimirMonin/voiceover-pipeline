@@ -505,6 +505,117 @@ def test_long_form_text_only_uses_contiguous_inputs_and_preserves_repeated_bound
     assert chunks[1]["input_start_s"] == pytest.approx(chunks[0]["input_end_s"])
 
 
+def test_long_form_validates_chunk_timestamps_against_actual_extracted_duration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "extracted-duration.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+
+    def late_extract(
+        _ffmpeg_path: str,
+        _source: Path,
+        chunk: longform.ASRChunkPlan,
+        output_path: Path,
+    ) -> float:
+        output_path.write_bytes(b"fixture")
+        return chunk.input_duration_s + 0.05
+
+    monkeypatch.setattr(longform, "_extract_chunk", late_extract)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (ASRWordSpan(text="first", start_s=0.0, end_s=0.2),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (ASRWordSpan(text="tail", start_s=0.0, end_s=0.2),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert [word.start_s for word in result.words] == pytest.approx([0.0, 109.0])
+    assert result.transcript == "first tail"
+
+
+def test_long_form_rejects_chunk_timestamp_beyond_actual_extracted_duration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "beyond-extracted.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (
+                    ASRWordSpan(text="alpha ", start_s=0.0, end_s=0.4),
+                    ASRWordSpan(text="beta", start_s=109.6, end_s=110.1),
+                ),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (ASRWordSpan(text="tail", start_s=0.0, end_s=0.2),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    with pytest.raises(longform.LongFormASRError, match="beyond its bounded input"):
+        longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+
+def test_long_form_accepts_chunk_timestamp_inside_extraction_delta_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "delta-window.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+
+    def late_extract(
+        _ffmpeg_path: str,
+        _source: Path,
+        chunk: longform.ASRChunkPlan,
+        output_path: Path,
+    ) -> float:
+        output_path.write_bytes(b"fixture")
+        return chunk.input_duration_s + 0.05
+
+    monkeypatch.setattr(longform, "_extract_chunk", late_extract)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (
+                    ASRWordSpan(text="alpha ", start_s=0.0, end_s=0.4),
+                    ASRWordSpan(text="beta", start_s=109.6, end_s=110.06),
+                ),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (ASRWordSpan(text="tail", start_s=0.0, end_s=0.2),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert [word.start_s for word in result.words] == pytest.approx([0.0, 109.6])
+    assert [word.end_s for word in result.words] == pytest.approx([0.4, 110.06])
+    assert result.transcript == "alpha beta"
+
+
 def test_long_form_fails_closed_when_an_extracted_chunk_duration_is_short(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

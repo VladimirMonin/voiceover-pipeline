@@ -481,3 +481,38 @@ def test_audio_cpp_nemotron_clamp_preserves_monotonicity_and_end_at_least_start(
     for previous, current in zip(result.words, result.words[1:]):
         assert current.start_s >= previous.end_s
     assert all(word.end_s >= word.start_s for word in result.words)
+
+
+def test_audio_cpp_nemotron_rejects_word_far_beyond_staged_duration():
+    provider = _provider(
+        {
+            "transcript": "Сбой таймбазы",
+            "duration_s": 1.0,
+            "word_timestamps": [
+                {"text": "▁Сбой", "start_s": 0.0, "end_s": 0.6},
+                {"text": "таймбазы", "start_s": 2.5, "end_s": 3.0},
+            ],
+        }
+    )
+
+    with pytest.raises(ValueError, match="trailing tolerance"):
+        provider.transcribe(ASRRequest(audio_path="fixture.wav", timestamp_mode="word"))
+
+
+def test_audio_cpp_nemotron_clamps_word_within_bounded_trailing_tolerance():
+    provider = _provider(
+        {
+            "transcript": "Граница",
+            "duration_s": 1.0,
+            "word_timestamps": [
+                {"text": "▁Гра", "start_s": 0.0, "end_s": 0.6},
+                {"text": "ница", "start_s": 0.6, "end_s": 1.08},
+            ],
+        }
+    )
+
+    result = provider.transcribe(ASRRequest(audio_path="fixture.wav", timestamp_mode="word"))
+
+    assert [(word.text, word.start_s, word.end_s) for word in result.words] == [
+        ("Граница", 0.0, 1.0),
+    ]

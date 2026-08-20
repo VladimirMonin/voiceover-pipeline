@@ -152,7 +152,7 @@ def transcribe_prerecorded_long_form(provider: ASRProvider, request: ASRRequest)
                 raise
             except Exception as exc:
                 raise LongFormASRError(f"ASR chunk {plan.index} failed: {exc}") from exc
-            _validate_chunk_result(plan, result)
+            _validate_chunk_result(plan, output_duration_s, result)
             chunk_results.append((plan, result, output_duration_s))
 
     return _merge_chunk_results(
@@ -316,13 +316,13 @@ def _validate_extracted_duration(plan: ASRChunkPlan, output_duration_s: float) -
         )
 
 
-def _validate_chunk_result(plan: ASRChunkPlan, result: ASRResult) -> None:
-    if result.duration_s is not None and result.duration_s > plan.input_duration_s + _EPSILON_S:
+def _validate_chunk_result(plan: ASRChunkPlan, output_duration_s: float, result: ASRResult) -> None:
+    if result.duration_s is not None and result.duration_s > output_duration_s + _EPSILON_S:
         raise LongFormASRError(f"ASR chunk {plan.index} reported duration beyond its bounded input")
     if any(
-        segment.end_s is not None and segment.end_s > plan.input_duration_s + _EPSILON_S
+        segment.end_s is not None and segment.end_s > output_duration_s + _EPSILON_S
         for segment in result.segments
-    ) or any(word.end_s > plan.input_duration_s + _EPSILON_S for word in result.words):
+    ) or any(word.end_s > output_duration_s + _EPSILON_S for word in result.words):
         raise LongFormASRError(
             f"ASR chunk {plan.index} returned timestamp beyond its bounded input"
         )

@@ -51,6 +51,7 @@ NEMOTRON_ASR_FAMILY = "nemotron-3.5-asr"
 NEMOTRON_AUDIO_CPP_MODEL_ENV = "VOICEOVER_AUDIO_CPP_NEMOTRON_MODEL"
 NEMOTRON_AUDIO_CPP_MIN_FREE_VRAM_MB = 4096
 NEMOTRON_AUDIO_CPP_MAX_GPU_UTILIZATION_PERCENT = 90
+NEMOTRON_AUDIO_CPP_TRAILING_CLAMP_TOLERANCE_S = 0.1
 AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION = "audio.cpp Nemotron ASR runtime is unavailable. Set VOICEOVER_AUDIO_CPP_BINARY to the pinned JSON driver before retrying."
 
 
@@ -215,15 +216,23 @@ def _clamp_words_to_duration(
     """Clamp native word spans to the real staged-audio duration.
 
     The native Nemotron runtime may emit a trailing RNN-T token a few frames
-    beyond the actual audio length; such entries are clamped (not rejected) so
-    the strict ASR bounds validation treats them as a tolerance at the audio
-    boundary. Clamping preserves ``end >= start`` and word monotonicity because
-    ``min(value, duration)`` is monotone. A word whose entire span lies beyond
-    the duration collapses to a zero-length span at the boundary instead of
-    being dropped, keeping transcript correspondence intact.
+    beyond the actual audio length; entries within a bounded trailing tolerance
+    are clamped (not rejected) so the strict ASR bounds validation treats them
+    as a tolerance at the audio boundary. Clamping preserves ``end >= start``
+    and word monotonicity because ``min(value, duration)`` is monotone. A word
+    whose entire span lies beyond the duration collapses to a zero-length span
+    at the boundary instead of being dropped, keeping transcript correspondence
+    intact. Entries beyond the tolerance are rejected instead of silently
+    normalized, so a wrong timebase or severe decoder failure is not hidden.
     """
     if duration_s is None or duration_s <= 0 or not words:
         return words
+    for word in words:
+        if word.end_s > duration_s + NEMOTRON_AUDIO_CPP_TRAILING_CLAMP_TOLERANCE_S:
+            raise ValueError(
+                "Nemotron native word timestamp exceeds the staged-audio duration beyond "
+                "the trailing tolerance; refusing to clamp an invalid timebase"
+            )
     clamped: list[ASRWordSpan] = []
     for word in words:
         start_s = min(word.start_s, duration_s)
