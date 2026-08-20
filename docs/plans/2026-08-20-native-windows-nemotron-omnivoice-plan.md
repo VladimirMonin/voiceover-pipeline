@@ -1,6 +1,7 @@
 # Native Windows plan: Nemotron prompts/timestamps and OmniVoice clone/design
 
-> **Status:** planned. This document authorizes no download, tool installation,
+> **Status:** in progress; offline foundation landed; native live acceptance pending.
+> This document authorizes no download, tool installation,
 > model acquisition, live GPU inference, publication, commit, or push. Each such
 > action requires the owner's explicit approval when its gate is reached.
 
@@ -369,3 +370,280 @@ voice (OmniVoice, `omnivoice-local` fixed-style preset on the native Windows
 route). The script must summarize what was implemented, what was verified, and
 what remains as known limitations — without absolute paths, model weights,
 prompt/reference text, credentials, or anything private.
+
+## Execution Ledger — зафиксирован целиком 2026-08-20
+
+Берём максимальную цель: полный native Windows DoD, включая Nemotron, OmniVoice clone/design, live-приёмку, документацию и финальный женский аудиоотчёт.
+
+**Текущее состояние**
+Пять сабов независимо подтвердили:
+
+- Серии 1–2 завершены.
+- Серия 3 завершена только offline: admission, receipts и тесты есть, реальной Windows-сборки ещё нет.
+- Nemotron на Windows по-прежнему заблокирован в `from_environment`, контекст отклоняется, CLI не разрешает `--runtime audio-cpp`.
+- OmniVoice clone/design существуют только как контракт и CLI-валидация; provider и transport поддерживают только fixed-style.
+- Текущий package admission не связывает receipt с pinned revision, CUDA и требуемыми model families.
+- Codebase/Serena недоступны; ast-grep подтвердил основные точки интеграции. По правилам репозитория восстановление code-intelligence routes входит в первый gate.
+
+**Документ-план**
+Не создаём второй конкурирующий план. Расширяем:
+
+`docs/plans/2026-08-20-native-windows-nemotron-omnivoice-plan.md`
+
+Первое изменение документа:
+
+- Статус: `in progress; offline foundation landed; native live acceptance pending`.
+- Таблица состояния всех серий.
+- Execution ledger с карточками ниже.
+- Decision log.
+- Approval/live-gate register.
+- Шаблоны evidence и rollback.
+- Ссылки на коммиты `a845a7c`, `dee8854`, `64df7ea`.
+- Исторический `Current Seams` помечается состоянием на `2f420c2`.
+
+## Волна 0: Preflight
+
+| Карточка | Работа | Критерий завершения |
+|---|---|---|
+| `NW-00` | Синхронизировать план и `docs/README.md` | Документы отражают фактический статус без live-заявлений |
+| `NW-01` | Восстановить Codebase/Serena, собрать ast-grep evidence | Cross-layer implementation разрешён правилами репозитория |
+| `NW-02` | Автоматически обнаружить local upstream, MSVC, CMake, CUDA, native package и модели | Получена безопасная матрица `present/missing/version`, без чтения `.env` и вывода приватных путей |
+
+Preflight не устанавливает и не запускает модели.
+
+## Волна 1: Заморозить upstream-контракт
+
+### `NW-03`: audio.cpp compatibility spike
+
+Из pinned source и реального `audiocpp_cli.exe --help` фиксируем:
+
+- Windows CMake/CUDA flags и target name.
+- Nemotron family token, model shape и output schema.
+- Настоящий механизм contextual prompt.
+- Единицы и timebase word timestamps.
+- OmniVoice fixed/clone/design tasks и аргументы.
+- Требования к reference audio и transcript.
+- Возможность file/stdin transport для приватного текста.
+
+Если pinned revision не поддерживает обязательный prompt или clone/design:
+
+- Делаем минимальное native-расширение.
+- Коммитим его в отдельном upstream checkout.
+- Задаём новую immutable revision.
+- Не выдаём patched binary за исходный `502b5b...`.
+
+Никакие Qwen task names не переиспользуются по предположению.
+
+## Волна 2: Реальный native package
+
+### `NW-04A`: Package hardening
+
+Изменения:
+
+- Receipt обязан совпадать с pinned source revision.
+- Receipt обязан объявлять `cuda`, архитектуру и нужные model families/features.
+- Все build identity fields становятся обязательными.
+- Admission возвращает проверенные receipt facts.
+- Legacy `discover_native_audio_cpp_install` делегирует единому admission.
+- Transport принимает как model file, так и directory package.
+- Исправляется ложное распознавание MSVC-флагов вроде `/O2` как absolute paths.
+- Receipt и closure записываются атомарно.
+- Source checkout проверяется на pinned HEAD и чистоту.
+
+Основные файлы:
+
+- `scripts/build_audio_cpp.py`
+- `audio_cpp/inventory.py`
+- `audio_cpp_package.py`
+- `audio_cpp_cli.py`
+
+### `NW-04B`: Build и closure
+
+- Out-of-tree Windows build.
+- Рекурсивный PE dependency scan.
+- Исключение системных DLL.
+- Staging immutable package вне Git.
+- Генерация receipt и closure по фактическим байтам.
+- Independent hash verification.
+- Central package admission.
+- `--help` и CUDA probe только после structural admission.
+
+## Волна 3: Общий native transport
+
+### `NW-05`: Private staging и codec
+
+Один координатор владеет общим `audio_cpp_cli.py`, чтобы сабы не конфликтовали.
+
+Реализуем:
+
+- ASR input всегда staging в 16 kHz mono PCM WAV.
+- Duration измеряется по staged WAV.
+- Reference audio копируется под нейтральным именем в private workspace.
+- Prompt, transcript и design instruction передаются через доказанный file/stdin механизм.
+- Sensitive text не появляется в argv, exception, stdout, receipt или metadata.
+- Cleanup работает после success, error, timeout и cancellation.
+- Unicode/space paths покрываются тестами.
+- OmniVoice output строго проверяется как non-empty 24 kHz mono WAV.
+- Nemotron raw entries сохраняют `keep`, offsets и upstream timing fields.
+
+## Волна 4: Offline implementation
+
+### `NW-06`: Nemotron
+
+- Windows provider создаётся только после package admission.
+- `--runtime audio-cpp` выбирает native route и никогда не откатывается на Python.
+- Native route требует CUDA.
+- `context_text` отображается только в доказанное upstream-поле.
+- Glossary, phrase hints и initial prompt остаются fail-closed.
+- Native words нормализуются и проверяются на monotonicity, bounds и transcript correspondence.
+- `alignment_origin="native"` выставляется только после полной валидации.
+- Long-form offsets применяются ровно один раз.
+- Execution receipt различает runtime revision и model revision.
+- Doctor возвращает точные reason codes.
+- Python Nemotron остаётся явным rollback route.
+- `auto` пока не продвигается.
+
+### `NW-07`: OmniVoice
+
+- `OmniVoiceRequest` подключается к `LocalTTSRequest` как family-specific contract.
+- Sensitive fields получают `repr=False`.
+- Provider принимает fixed-style, clone и design.
+- CLI перестаёт возвращать `not implemented` для валидных запросов.
+- Clone требует reference audio и точный transcript.
+- Design требует instruction и запрещает reference fields.
+- Session strategy учитывает mode и identity.
+- Разные references/instructions не объединяются в одну сессию.
+- Public metadata содержит mode и provenance, но не paths/text.
+- Windows metadata больше не сообщает `single-container`.
+- Capability listing остаётся консервативным до live acceptance.
+
+Обе карточки получают отдельного implementer-саба и отдельного reviewer-саба.
+
+## Волна 5: Offline acceptance
+
+### `NW-08`
+
+Фокусные тесты:
+
+```powershell
+uv run pytest -q `
+  tests/test_audio_cpp_package.py `
+  tests/test_audio_cpp_build_producer.py `
+  tests/test_audio_cpp_native_cli.py `
+  tests/test_audio_cpp_nemotron_asr.py `
+  tests/test_nemotron_asr_provider.py `
+  tests/test_nemotron_word_normalization.py `
+  tests/test_asr_contract.py `
+  tests/test_asr_cli.py `
+  tests/test_asr_longform.py `
+  tests/test_audio_cpp_contracts.py `
+  tests/test_audio_cpp_omnivoice_tts.py `
+  tests/test_audio_cpp_omnivoice_cli.py `
+  tests/test_cli_validation.py `
+  tests/test_cli_json_contract.py `
+  tests/test_generation_stability.py `
+  tests/test_local_tts_text.py
+```
+
+Обязательные gates:
+
+```powershell
+uv run ruff check src tests
+uv run ruff format --check src tests
+uv run mypy --no-incremental
+uv run pytest
+git diff --check
+```
+
+Полный baseline сравнивается в отдельном clean worktree, без stash/reset текущего дерева. Новые failures в package, native Windows, privacy, JSON или lifecycle не допускаются.
+
+## Волна 6: Live acceptance
+
+GPU-тесты идут строго последовательно.
+
+### `NW-09`: Nemotron live
+
+- Direct finite-audio smoke.
+- VOP prompt-off.
+- Тот же audio с prompt-on.
+- Подтверждение prompt effect или native acknowledgement.
+- Короткий русский timestamp case.
+- Long-form case через границу chunk.
+- No-speech case.
+- Cancellation и timeout.
+- Минимум три последовательных prompt-on run.
+- Контроль VRAM/RAM, процессов, lease и cleanup.
+
+### `NW-10`: OmniVoice live
+
+- Fixed-style, clone и design direct smoke.
+- Короткий русский VOP run для каждого режима.
+- Clone A/B/A для проверки reference isolation.
+- Design A/B/A для проверки instruction isolation.
+- Bounded long-form clone/design.
+- Cancellation во время clone staging/inference.
+- Минимум три последовательных run каждого режима.
+- Проверка WAV, MP3 conversion, quality, continuity, VRAM/RAM и cleanup.
+
+Любая ошибка оставляет соответствующую capability непродвинутой.
+
+## Волна 7: Документация и завершение
+
+### `NW-11`: Final docs
+
+Обновляются:
+
+- `docs/agent-cli-contract.md`
+- `docs/audio-cpp-runtime.md`
+- `docs/omnivoice-local-tts.md`
+- `docs/README.md`
+- skill docs по providers/commands/troubleshooting
+
+Создаются после фактической проверки:
+
+- `docs/native-windows-audio-cpp-provisioning.md`
+- `docs/nemotron-local-asr.md`
+- `docs/reports/2026-08-20-native-windows-nemotron-omnivoice-acceptance.md`
+
+Acceptance report содержит только safe IDs, versions, hashes, durations, timings и invariant booleans. Raw audio, prompts, transcripts, paths и model weights остаются вне Git.
+
+### `NW-12`: Closing voiceover
+
+Только после sealed acceptance record:
+
+- Native Windows `omnivoice-local`.
+- Fixed-style female preset.
+- Простой русский рассказ о реализации, проверках и ограничениях.
+- MP3, script, hash и metadata вне Git.
+- Проверка duration, audio format, cleanup и отсутствия приватных данных.
+
+## Коммиты
+
+Планируем отдельные коммиты:
+
+1. `docs: synchronize native Windows execution plan`
+2. `feat: harden native audio.cpp package identity`
+3. `feat: add private native audio staging`
+4. `feat: enable native Windows Nemotron ASR`
+5. `feat: add OmniVoice clone and design modes`
+6. `docs: record native Windows acceptance`
+
+Каждый коммит создаётся только после focused tests и independent review. Push выполняется после проверки всей включённой серии.
+
+## Реалистичный срок
+
+При наличии upstream, toolchain и моделей:
+
+| Этап | Оценка |
+|---|---:|
+| Plan/preflight | 30–60 минут |
+| Compatibility spike | 45–90 минут |
+| Package/build | 1.5–3 часа |
+| Offline implementation | 3–5 часов |
+| Offline review | около 1 часа |
+| Live acceptance | 2–4 часа |
+| Docs/voiceover | 45–90 минут |
+
+Полный путь занимает примерно 8–14 часов. Если upstream не имеет prompt или clone/design и потребуется C++ extension, это главный риск выхода за сегодня. В таком случае offline-кандидат всё равно доводится до зелёного состояния, но live capability не объявляется готовой.
+
+После выхода из Plan Mode начинаем с `NW-00`, `NW-01` и автоматического preflight, без дополнительных открытых опросов.
