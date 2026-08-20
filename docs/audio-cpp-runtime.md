@@ -26,8 +26,24 @@ The subprocess transport runs without a shell, gives the child only a small
 runtime-library/locale environment allow-list, creates a private per-request
 temporary directory, bounds execution time, captures diagnostics without
 placing them in public errors, and terminates the complete process group on
-cancellation or timeout. The shared GPU lease and live resource gates are not
-part of this foundation; they are a later, separate lifecycle slice.
+cancellation or timeout. On Windows it uses a new process group plus
+CTRL_BREAK/terminate/kill escalation rather than POSIX session or `killpg`.
+The shared GPU lease and live resource gates are not part of this foundation;
+they are a later, separate lifecycle slice.
+
+For a strict JSON TTS reply, the child may declare a WAV `response.audio_path`
+inside that private workspace. Before cleanup, the subprocess transport resolves
+and bounds that artifact, rejects missing, non-file, escaped or oversized paths,
+then returns copied `audio_bytes` with `audio_format: "wav"`; it does not return
+the temporary path to the typed provider response.
+
+The native Windows CLI route accepts only an explicit `.exe` package with a
+co-located `audio_cpp_dependency_closure.json`; every listed EXE/DLL file is
+SHA-256 checked before provider selection. Its typed codec keeps VOP envelopes
+independent of Docker/WSL paths and uses private output workspaces for text,
+word, segment and WAV outputs. The code and fake-process tests cover launch,
+cleanup and cancellation mechanics only: no Windows binary, model load, CUDA
+probe or inference claim follows from this boundary.
 
 ## Build metadata boundary
 

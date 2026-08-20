@@ -11,7 +11,7 @@
 | Qwen Forced Aligner | уточнение границ | внутренний Qwen route | отдельная модель |
 | Nemotron 3.5 ASR | быстрое локальное распознавание | `nemotron-local` | Python rollback; explicit `audio.cpp` |
 | Qwen3-TTS | preset, cloning, voice design | `qwen-local` | Python default; explicit `audio.cpp` |
-| OmniVoice | offline AutoVoice | `omnivoice-local` | explicit `audio.cpp` |
+| OmniVoice | offline built-in female style condition | `omnivoice-local` | explicit `audio.cpp` |
 
 Faster-Whisper остаётся отдельным runtime. Облачные провайдеры не подменяются
 локальными. Выбор `audio.cpp` должен быть явным и fail-closed.
@@ -119,6 +119,23 @@ Qwen `audio.cpp` route использует отдельный Forced Aligner. N
 Этот baseline относится к Python route и включает cold model load. Не выдавать
 его за скорость нового `audio.cpp` Qwen3-TTS route: для него нужен отдельный
 live measurement.
+
+### Qwen3-TTS Linux container config
+
+`audio.cpp` выбирается только явным `VOICEOVER_QWEN_TTS_RUNTIME=audio-cpp`.
+Указать `VOICEOVER_AUDIO_CPP_QWEN_TTS_MODEL` нужно на локальную директорию
+Safetensors-пакета с `model.safetensors`, `config.json`, `tokenizer_config.json`
+и поддиректорией `speech_tokenizer`; VOP ничего не скачивает и не требует
+искусственный GGUF-файл. Опциональный
+`VOICEOVER_AUDIO_CPP_CONTAINER_COMMAND_JSON` — JSON argv для локального Docker
+command, default `["docker"]`; shell-like строка недопустима.
+
+Pinned Linux container запускается без сети, с read-only root, ограниченным
+`/tmp`, GPU и отдельной private output directory. CustomVoice передаёт
+`speaker` и `instruct` в task `tts`; Base clone — readonly WAV и reference text
+в `clon`; VoiceDesign — `instruct` в `vdes`. Это contract/offline evidence, не
+live claim: для каждого варианта нужен отдельно установленный package и
+разрешённый реальный GPU run.
 
 ## Числительные для локального TTS
 

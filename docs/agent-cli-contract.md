@@ -68,14 +68,16 @@
 
 ## `doctor --json`
 
-Проверяет: Python, FFmpeg, FFprobe, `.env`, ключи, faster-whisper, CUDA.
+Проверяет: Python, FFmpeg, FFprobe, `.env`, ключи, faster-whisper, CUDA и
+явно выбранную локальную конфигурацию OmniVoice.
 
-Без флагов проверяет общее окружение (Polza cloud TTS baseline; faster-whisper и CUDA становятся required только с `--with-timings` или `--provider qwen-local`). Локальный ASR runtime проверяется только при явных `--with-asr --asr-provider <id>`; CUDA сама по себе не является ASR healthcheck.
+Без флагов проверяет общее окружение (Polza cloud TTS baseline; faster-whisper и CUDA становятся required только с `--with-timings` или `--provider qwen-local|omnivoice-local`). Локальный ASR runtime проверяется только при явных `--with-asr --asr-provider <id>`; CUDA сама по себе не является ASR healthcheck.
 
 С флагами проверяет конкретный workflow:
 
 ```powershell
 voiceover doctor --provider qwen-local --json           # нужен CUDA
+voiceover doctor --provider omnivoice-local --json      # нужен CUDA и явный local model path
 voiceover doctor --with-timings --timing-device cpu --json  # нужен faster-whisper
 voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-compute auto --json
 ```
@@ -133,6 +135,46 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
 `generate_custom_voice(..., instruct=...)` только для текущего прогона. Если
 флаг не указан, сохраняется прежний дефолт `QWEN_INSTRUCT` из `config.py`.
 
+`VOICEOVER_QWEN_TTS_RUNTIME=python` — неявный и явный rollback route для
+`qwen-local`. Значение `audio-cpp` явно выбирает
+`AudioCppQwenTTSProvider`; эта selection не переключается автоматически.
+Для Linux container route обязательна существующая локальная директория
+`VOICEOVER_AUDIO_CPP_QWEN_TTS_MODEL` с `model.safetensors`, `config.json`,
+`tokenizer_config.json` и пакетом `speech_tokenizer`. Опциональный
+`VOICEOVER_AUDIO_CPP_CONTAINER_COMMAND_JSON` задаёт JSON-массив argv локального
+container command; default — `["docker"]`, shell-like строка недопустима.
+Маршрут использует фиксированный pinned image и не принимает JSON-driver из
+`VOICEOVER_AUDIO_CPP_BINARY` как production transport. Отсутствующий или
+некорректный ресурс fail-closed и не возвращает Python route. Проверенный пакет
+передаётся только в typed runtime JSON как `payload.model_artifact_path` вместе
+с mode-specific `model_id` и `mode`; subprocess не наследует произвольное
+окружение для выбора модели. Любое другое значение
+`VOICEOVER_QWEN_TTS_RUNTIME` — invalid args (exit code `2`).
+
+### `omnivoice-local`: fixed offline female style condition
+
+`omnivoice-local` — явный offline-only provider с единственной моделью
+`audio-cpp/omnivoice-q8_0`. На Linux он использует pinned audio.cpp CUDA
+container, встроенное условие `female`, fixed seed и internal text chunks по 420 символов. Это не AutoVoice и не named preset/voice ID. VOP объединяет подготовленные fragments в один запрос, поэтому audio.cpp обрабатывает их в одной container/model session. Перед `generate` требуется задать
+`VOICEOVER_OMNIVOICE_MODEL` на локальный Q8_0 GGUF и явно подтвердить local-only
+noncommercial use: `VOICEOVER_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE=accept-cc-by-nc-4.0-local-use`.
+VOP не скачивает модель; до provider/runtime он потоково проверяет SHA-256 exact artifact.
+Опциональный `VOICEOVER_OMNIVOICE_CONTAINER_COMMAND_JSON` — JSON argv для
+локального Docker command (default `["docker"]`). `doctor` проверяет этот
+явный file/config boundary и GPU probe, но не загружает модель и не доказывает
+реальный container inference.
+
+Named `--voice`, `--mode clone`, `--sample`, `--sample-text` и `--qwen-instruct` для этого
+provider fail closed: named preset, cloning, design, streaming и Qwen options не входят в
+контракт. На Windows Docker/WSL не выбираются: нужен
+`VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE` с рядом лежащим
+`audio_cpp_dependency_closure.json`, проверяющим SHA-256 EXE/DLL closure, и
+`VOICEOVER_OMNIVOICE_MODEL` и тот же noncommercial-use acknowledgment. Отсутствующий,
+несовпавший SHA-256 или closure даёт unavailable route; fallback к container нет. Это
+статически проверенный factory/package route, а не claim о Windows inference/readiness.
+Полный pinned receipt и ограничения
+лицензии: [OmniVoice Local TTS](omnivoice-local-tts.md).
+
 ## `generate --json` (output)
 
 ```json
@@ -176,10 +218,12 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
 
 ## `transcribe --audio --json`
 
-`transcribe` — отдельная finite-audio ASR-команда. Она не вызывает `timings`,
-не создаёт SRT и не синтезирует сегменты по всей длине аудио. Первый core slice
-не реализует streaming, VAD/session lifecycle, cloud fallback или загрузку
-моделей.
+`transcribe` — отдельная ASR-команда для конечного аудиофайла. Она не вызывает
+`timings` и не создаёт SRT. Для `qwen-local` и `nemotron-local` длинная
+предзаписанная запись обрабатывается автоматически: CLI измеряет источник через
+`ffprobe`, извлекает последовательные ограниченные `ffmpeg`-фрагменты и
+собирает их в один результат. Generic streaming/session lifecycle, cloud
+fallback и загрузка моделей командой не заявлены.
 
 ```powershell
 voiceover list asr-providers --json
@@ -198,14 +242,16 @@ voiceover transcribe `
   или облако запрещён.
 - `--model`, `--language`, `--device` и `--compute` валидируются по capability
   выбранного provider до его factory/runtime. `qwen-local` и `nemotron-local`
-  — text-only ASR IDs; неизвестный ID по-прежнему fail-closed.
+  сохраняют свои отдельные family IDs; неизвестный ID по-прежнему fail-closed.
 - Публичных флагов `--prompt`, `--context`, `--glossary` или числового phrase
   boost нет. В API typed `ASRContextHints` различает `context_text`, glossary
   profile/digest/selected terms, `ASRPhraseHint` с силой `mild|normal|strong` и
   adapter-specific `initial_prompt`; они не записываются в стандартный receipt.
-- `timestamp_mode: "none"` означает text-only ASR. `segments` или `words`
-  появляются только при заявленных provider capabilities; timestamps требуют
-  `native` или `forced` origin. Text-only ответ не допускается к SRT.
+- `timestamp_mode: "none"` означает обычный text-only ответ adapter. `segments`
+  или `words` появляются только при заявленных provider capabilities;
+  timestamps имеют origin `native`, `forced` или `chunked`. `chunked` —
+  консервативный span внешнего long-form фрагмента, а не claim о native/forced
+  word alignment. Text-only ответ не допускается к SRT.
 
 ```json
 {
@@ -230,7 +276,36 @@ voiceover transcribe `
 }
 ```
 
-### Qwen3-ASR text-only optional runtime
+Если native ASR route запросил word timestamps, `execution` дополнительно
+может содержать `raw_timestamp_entries`: неизменённые записи runtime до
+нормализации в canonical VOP words. Поле отсутствует у text-only результатов.
+
+Для `qwen-local` и `nemotron-local` источник длиннее 120 s планируется с
+target 110 s в рабочем окне 90–120 s и hard maximum 120 s. Запросы с word
+timestamps используют 1 s overlap и позиционную дедупликацию по абсолютным
+меткам; text-only маршруты используют смежные фрагменты без overlap, чтобы не
+угадывать повторяющийся текст. При доступности выбирается близкая
+low-energy/silence boundary, но не раньше 90 s (кроме естественно короткого
+final tail). Один provider instance вызывается последовательно с одинаковыми
+typed request options на каждом фрагменте.
+`duration_s` такого результата равен длительности исходника, а
+`execution.long_form` добавляет проверяемые `source_duration_s`,
+`covered_duration_s`, `processed_duration_s`, `coverage_verified` и manifest
+каждого фрагмента (`input_*`, измеренный `output_duration_s`, его delta и
+допуск, `output_status`, `coverage_*`, status и counts). Для decoded
+MP3/codec seek-timebase границы допускается только bounded 0.10 s delta
+от плановой длительности каждого фрагмента; большее расхождение остаётся
+fail-closed. Планировщик
+отклоняет gap, отсутствующий tail, выход за hard limit и известный
+token/truncation signal; ошибочный `ffprobe`/`ffmpeg` boundary возвращает exit
+code `11`. Последний неполный external chunk создаётся явно — VOP не использует
+strict-`<` streaming loop, который мог бы молча отбросить хвост.
+Text-only long-form использует смежные фрагменты без audio-overlap: повторяющиеся
+слова на соседних границах сохраняются как распознанная речь, а не удаляются
+эвристически. Word-timed маршруты сохраняют 1 s overlap и дедуплицируют только
+по доказанным позиционным меткам.
+
+### Qwen3-ASR local optional runtime
 
 `qwen-local` в ASR registry — отдельное пространство имён от одноимённого TTS
 provider. Его default model — `Qwen/Qwen3-ASR-0.6B`; runtime устанавливается
@@ -254,49 +329,83 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
   `--context`/`--prompt` flags и cloud fallback отсутствуют.
 - Capability допускает request `--device cpu|cuda` и `--compute
   auto|bfloat16|float32`; `auto` выбирает `float32` для CPU и `bfloat16` для
-  opt-in CUDA. `doctor` проверяет только импорт runtime, не наличие модели и не
-  пригодность GPU.
-- Adapter выдаёт transcript, effective language и execution receipt. Он не
-  объявляет segment/word timestamps, forced alignment, confidence или streaming;
-  результат всегда text-only (`timestamp_mode: "none"`) и не создаёт SRT.
+  opt-in CUDA. Python route допускается только с уже размещёнными official
+  model and Hugging Face cache directories under `/media/v/storage`; it passes
+  these paths and `local_files_only=True` to the runtime, so it cannot download
+  or use a root cache. `doctor` checks that local admission without loading a
+  model or assessing GPU suitability.
+- Для короткого input adapter выдаёт transcript, effective language и execution
+  receipt. Для long-form public CLI выполняет описанную выше external
+  orchestration, поэтому Qwen не является short-audio-only route. Text-only
+  long result получает `chunked` segment spans; word request uses separately
+  admitted local official ForcedAligner, merges absolute canonical words and
+  сохраняет `alignment_origin="forced"`. Confidence и generic streaming не
+  заявлены.
 - Отсутствующий selected runtime возвращает exit code `10` и одну remediation:
   `qwen-asr runtime is unavailable. Install an approved qwen-asr runtime before retrying.`
+- На Windows optional audio.cpp Qwen ASR route требует
+  `VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE`, рядом лежащий checksummed
+  `audio_cpp_dependency_closure.json`, `VOICEOVER_AUDIO_CPP_QWEN_ASR_MODEL`
+  и `VOICEOVER_AUDIO_CPP_QWEN_FORCED_ALIGNER_MODEL`. Docker/WSL fallback не
+  выбирается; отсутствие package/model closure остаётся unavailable. Этот
+  static contract не доказывает Windows inference/readiness.
+- При отсутствии required local model/cache directories under `/media/v/storage`
+  selected Python route also returns exit code `10`, without a network attempt.
 
 Установленный пакет, модельные веса, конкретный response schema и CPU/GPU
 совместимость не доказаны этим offline slice. Они требуют отдельного
 owner-approved local runtime experiment; CLI не загружает модель автоматически.
 
-### Nemotron ASR text-only optional runtime
+### Nemotron ASR: Python fallback и opt-in audio.cpp native timestamps
 
-`nemotron-local` — отдельный local ASR ID к NVIDIA Nemotron 3.5 через Hugging
-Face Transformers: `AutoProcessor` готовит audio и locale, а
-`AutoModelForRNNT.generate(...)` возвращает text-only transcript. Default
-identifier — `nvidia/nemotron-3.5-asr-streaming-0.6b`; он не утверждает
-доступность артефакта, совместимость версии или пригодность оборудования.
+`nemotron-local` сохраняет один public family ID для NVIDIA Nemotron 3.5.
+Без `VOICEOVER_AUDIO_CPP_BINARY` factory выбирает существующий deferred-import
+Python/Transformers adapter; при явном binary route выбирается pinned
+`audio.cpp` adapter. Default identifier —
+`nvidia/nemotron-3.5-asr-streaming-0.6b`; он не утверждает доступность
+артефакта, совместимость версии или пригодность оборудования.
 
 ```powershell
 voiceover list asr-providers --json
 voiceover doctor --with-asr --asr-provider nemotron-local --asr-device cpu --asr-compute auto --json
 ```
 
-- Runtime boundary deferred-import: registry/listing и factory не импортируют
-  `transformers`; optional extra `asr-nemotron` фиксирует совместимый runtime,
-  но CLI ничего не скачивает до explicit transcription request.
-- Adapter принимает finite batch audio, запрашивает `--device cpu|cuda` и только
-  `--compute auto`. Для известных ISO language codes он передаёт Nemotron locale;
-  `context_text`, glossary, `phrase_hints` и `initial_prompt` не передаются.
-  Official model API документирует language conditioning, но не contextual bias
-  или phrase boosting, поэтому обе capability не заявлены.
-- Streaming, segment/word timestamps, forced alignment и confidence также не
-  заявлены. Результат всегда text-only (`timestamp_mode: "none"`), не создаёт
-  SRT и не является timing bridge.
-- Missing selected runtime возвращает exit code `10` и одну remediation:
-  `Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying.`
+- Registry/listing и factory остаются deferred-import. Optional extra
+  `asr-nemotron` нужен только Python fallback; CLI ничего не скачивает до
+  explicit transcription request. При выбранном audio.cpp route dependency probe
+  проверяет только configured driver boundary.
+- Adapter принимает finite batch audio, `--device cpu|cuda`, `--compute auto`
+  и language. В audio.cpp route он передаёт language без локального mapping в
+  `--language`; pinned Nemotron session выбирает integer prompt ID из
+  `prompt_dictionary` processor config модели. VOP не отправляет prompt ID,
+  task или request-side prompt dictionary. Пустой language оставляет source
+  default; неизвестный language отклоняется source. Это model conditioning, а
+  не свободный context prompt.
+- `timestamp_mode: "word"` в audio.cpp route включает `--words-out` и возвращает
+  native RNN-T tokenizer entries. SentencePiece/metaspace chunks детерминированно сливаются
+  в canonical words; punctuation остаётся у слова, нулевые spans допустимы,
+  confidence остаётся `null`. Raw entries сохраняются в receipt до такого
+  слияния. Python fallback остаётся text-only.
+- `context_text`, glossary, `phrase_hints` и `initial_prompt` fail closed в
+  audio.cpp route. Пиннутый offline wire contract не доказывает phrase boosting:
+  hotword/term extension остаётся capability-unavailable, пока не появятся
+  decoder and live term evidence. В long-form public CLI Nemotron также
+  использует external bounded orchestration: Python text-only fallback получает
+  `chunked` segments, а native audio.cpp words сохраняют normalised native
+  timestamps с absolute offsets. Поэтому Nemotron не является short-audio-only
+  route; generic streaming, forced alignment и confidence по-прежнему не
+  заявлены.
+- `transcribe` с missing selected Python runtime возвращает exit code `10` с
+  remediation `Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying.`
+  Missing selected audio.cpp route в `transcribe` также возвращает exit code `10` с remediation
+  `audio.cpp Nemotron ASR runtime is unavailable. Set VOICEOVER_AUDIO_CPP_BINARY to the pinned JSON driver before retrying.`
+  `doctor --with-asr` не запускает модель: он помечает ASR provider unavailable
+  и добавляет ту же remediation в JSON `warnings`.
 
-Этот contract покрыт mocked fixtures. Установленный Transformers runtime,
-модельные веса/revision, точный response schema, phrase boosting, timestamps,
-streaming, CPU/GPU compatibility и качество не проверялись; для каждого нужен
-отдельный owner-approved local experiment.
+Этот contract покрыт mocked fixtures. Не выполнялись реальный audio.cpp binary,
+модельные веса/revision, RNN-T decoder parity, phrase boosting, streaming,
+CPU/GPU compatibility и качество таймкодов; для них нужен отдельный approved
+offline/local runtime experiment.
 
 ### `generate --json` (skipped)
 
@@ -416,6 +525,7 @@ voiceover generate `
 - Whisper text может содержать ошибки — используй утверждённый сценарий для captions, Whisper только для timing
 - `--word-timestamps` подходит для visual highlights, но не гарантирует семантически точных границ слов
 - Cloud prices are snapshots из API на момент прогона, не гарантия
-- Qwen-local требует CUDA GPU
+- Qwen-local и omnivoice-local требуют CUDA GPU
+- OmniVoice local uses the Linux container route or a statically checked native-Windows factory; native Windows inference/readiness is not claimed
 - Первый Whisper запуск скачивает модель (~486 MB) из HuggingFace
 - При `--with-timings` ошибка Whisper — hard failure (code 40), но MP3 уже сохранён

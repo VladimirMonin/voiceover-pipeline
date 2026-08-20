@@ -18,6 +18,7 @@
 | [Generic local ASR implementation plan](plans/2026-08-15-generic-local-asr-implementation-plan.md) | Последовательные offline-first срезы реализации, тестовые и benchmark-гейты |
 | [audio.cpp hybrid migration plan](plans/2026-08-16-audio-cpp-hybrid-migration-plan.md) | Runtime-neutral план переезда Qwen ASR, Nemotron, Qwen TTS и OmniVoice на audio.cpp с будущим MLX-драйвером и Faster-Whisper рядом |
 | [Local audio runtime contract](audio-cpp-runtime.md) | Контракт `LocalAudioRuntime`, закреплённая версия audio.cpp, выбор рабочего маршрута, откат и проверяемые сведения о сборке |
+| [audio.cpp Qwen ASR container recipe](audio-cpp-qwen-container-recipe.md) | Проверенный immutable CUDA image, read-only model mounts, JSON adapter и конфигурация Qwen word timestamps без inference claim |
 | [audio.cpp feasibility report](research/2026-08-15-audio-cpp-feasibility.md) | Проверенная оценка полного перехода, optional backend и изолированного spike для Qwen/Nemotron без замены Faster-Whisper |
 | [audio.cpp hybrid consolidation addendum](research/2026-08-16-audio-cpp-hybrid-consolidation.md) | Уточнённая цель: общий runtime для Qwen ASR, Nemotron, Qwen TTS и OmniVoice при сохранении Faster-Whisper и cloud providers |
 | [Agent Development Workflow](../doc/agent-workflow.md) | Безопасный цикл работы агента: scope, dirty tree, Kanban, проверки и отдельные approvals для Git/release |
@@ -27,6 +28,7 @@
 | [Polza TTS Models](polza-tts-models.md) | Polza AI: OpenAI TTS через `/audio/speech`, ElevenLabs Turbo 2.5 и Multilingual v2 через `/media` |
 | [OpenRouter TTS](openrouter-tts-models.md) | OpenRouter TTS: Google Gemini, OpenAI GPT-4o Mini TTS — голоса, style prompt, цены |
 | [Qwen Local](qwen-local-tts.md) | Qwen3-TTS локально: preset-голоса, клонирование голоса, бесплатно (GPU) |
+| [OmniVoice Local TTS](omnivoice-local-tts.md) | Явный offline встроенный female style condition через pinned Linux CUDA container; Q8_0, provenance и platform boundary |
 
 ## Быстрый старт
 
