@@ -225,9 +225,7 @@ def test_omnivoice_clone_rejects_blank_reference_text(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["clone", "design"])
-def test_valid_omnivoice_clone_and_design_fail_closed_before_provider_construction(
-    monkeypatch, tmp_path, mode
-):
+def test_valid_omnivoice_clone_and_design_reach_provider_construction(monkeypatch, tmp_path, mode):
     import voiceover_pipeline.cli as cli
 
     reference_audio = tmp_path / "reference.wav"
@@ -240,15 +238,24 @@ def test_valid_omnivoice_clone_and_design_fail_closed_before_provider_constructi
     else:
         arguments.extend(["--design-instruction", "warm and clear"])
     args = cli.build_parser().parse_args(arguments)
+    constructed: dict[str, object] = {}
 
-    monkeypatch.setattr(
-        cli.OmniVoiceLocalTTSProvider,
-        "from_environment",
-        lambda: pytest.fail("fixed-style provider must not be constructed"),
-    )
-    with pytest.raises(cli.CliError, match="not implemented") as error:
-        cli.build_provider(args, api_key="", style_prompt=None, prompt_mode="none")
-    assert error.value.code == 2
+    def fake_from_environment(**kwargs):
+        constructed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(cli.OmniVoiceLocalTTSProvider, "from_environment", fake_from_environment)
+
+    provider = cli.build_provider(args, api_key="", style_prompt=None, prompt_mode="none")
+
+    assert provider is not None
+    if mode == "clone":
+        assert constructed["mode"] == "clone"
+        assert constructed["reference_audio_path"] == reference_audio
+        assert constructed["reference_text"] == "reference"
+    else:
+        assert constructed["mode"] == "design"
+        assert constructed["design_instruction"] == "warm and clear"
 
 
 def test_omnivoice_fixed_preset_validation_remains_available():

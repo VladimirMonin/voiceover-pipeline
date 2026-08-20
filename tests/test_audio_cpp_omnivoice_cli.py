@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 
 from voiceover_pipeline.config import OMNIVOICE_LOCAL_MODEL_ID
-from voiceover_pipeline.local_runtime.contracts import RuntimeProtocolError
+from voiceover_pipeline.local_runtime.contracts import RuntimeProtocolError, RuntimeTransportError
 from voiceover_pipeline.local_runtime.transports import audio_cpp_omnivoice
 from voiceover_pipeline.local_runtime.transports.audio_cpp_container import (
     PINNED_AUDIO_CPP_CONTAINER_IMAGE,
@@ -29,7 +29,8 @@ def _request_payload(text: str = "Привет") -> dict[str, object]:
             "model_id": OMNIVOICE_LOCAL_MODEL_ID,
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "fixed-style",
+            "style_condition": "female",
             "text_chunk_size": 420,
             "seed": 1234,
             "num_inference_steps": 32,
@@ -150,3 +151,91 @@ def test_cancellation_terminates_an_active_process(monkeypatch, tmp_path: Path):
     transport.cancel("active")
 
     assert terminated == [active_process]
+
+
+def _clone_payload(reference_path: Path) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": OMNIVOICE_LOCAL_MODEL_ID,
+            "voice": None,
+            "language": "ru",
+            "omnivoice_mode": "clone",
+            "text_chunk_size": 420,
+            "seed": 1234,
+            "num_inference_steps": 32,
+            "guidance_scale": 2.0,
+            "reference_audio_path": str(reference_path),
+            "reference_text": "Текст референса",
+        },
+    }
+
+
+def _design_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": OMNIVOICE_LOCAL_MODEL_ID,
+            "voice": None,
+            "language": "ru",
+            "omnivoice_mode": "design",
+            "design_instruction": "warm and clear",
+            "text_chunk_size": 420,
+            "seed": 1234,
+            "num_inference_steps": 32,
+            "guidance_scale": 2.0,
+        },
+    }
+
+
+def test_container_transport_clone_fails_closed_without_staged_reference(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(audio_cpp_omnivoice.sys, "platform", "linux")
+    transport = _transport(monkeypatch, tmp_path)
+    reference_path = tmp_path / "reference.wav"
+    _write_wav(reference_path)
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("no container process may start for an unstaged clone")
+
+    monkeypatch.setattr(subprocess, "Popen", unexpected_popen)
+
+    with pytest.raises(RuntimeTransportError, match="clone reference audio is unavailable"):
+        transport.invoke("clone-1", _clone_payload(reference_path))
+
+
+def test_container_transport_design_passes_instruction_argv(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(audio_cpp_omnivoice.sys, "platform", "linux")
+    transport = _transport(monkeypatch, tmp_path)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = tuple(command)
+        captured["kwargs"] = kwargs
+        output_mount = next(
+            command[index + 1]
+            for index, item in enumerate(command)
+            if item == "--mount" and "dst=/output" in command[index + 1]
+        )
+        output_directory = Path(output_mount.split("src=", 1)[1].split(",", 1)[0])
+        _write_wav(output_directory / "omnivoice.wav")
+        return _CompletedProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    response = cast(dict[str, Any], transport.invoke("design-1", _design_payload()))
+
+    command = cast(tuple[str, ...], captured["command"])
+    assert command[command.index("--instruct") + 1] == "warm and clear"
+    assert "--voice-ref" not in command
+    assert "--reference-text" not in command
+    assert response["response"]["audio_format"] == "wav"

@@ -218,29 +218,60 @@ def build_audio_cpp_family_arguments(
     _append_optional(command, "--voice", payload.get("voice"))
     _append_optional(command, "--language", payload.get("language"))
     if family == "omnivoice":
-        command.extend(
-            (
-                "--instruct",
-                _required_string(payload, "instruction", "OmniVoice style condition"),
-                "--text-chunk-size",
-                str(payload["text_chunk_size"]),
-                "--mode",
-                "offline",
-                "--seed",
-                str(payload["seed"]),
-                "--num-inference-steps",
-                str(payload["num_inference_steps"]),
-                "--guidance-scale",
-                str(payload["guidance_scale"]),
-            )
-        )
-        if reference_audio_argument is not None:
+        mode = payload.get("omnivoice_mode")
+        if mode == "clone":
+            if reference_audio_argument is None:
+                raise RuntimeTransportError("audio.cpp clone reference audio is unavailable")
             command.extend(
                 (
                     "--voice-ref",
                     reference_audio_argument,
                     "--reference-text",
                     _required_string(payload, "reference_text", "reference text"),
+                    "--text-chunk-size",
+                    str(payload["text_chunk_size"]),
+                    "--mode",
+                    "offline",
+                    "--seed",
+                    str(payload["seed"]),
+                    "--num-inference-steps",
+                    str(payload["num_inference_steps"]),
+                    "--guidance-scale",
+                    str(payload["guidance_scale"]),
+                )
+            )
+        elif mode == "design":
+            command.extend(
+                (
+                    "--instruct",
+                    _required_string(payload, "design_instruction", "design instruction"),
+                    "--text-chunk-size",
+                    str(payload["text_chunk_size"]),
+                    "--mode",
+                    "offline",
+                    "--seed",
+                    str(payload["seed"]),
+                    "--num-inference-steps",
+                    str(payload["num_inference_steps"]),
+                    "--guidance-scale",
+                    str(payload["guidance_scale"]),
+                )
+            )
+        else:
+            command.extend(
+                (
+                    "--instruct",
+                    _required_string(payload, "style_condition", "OmniVoice style condition"),
+                    "--text-chunk-size",
+                    str(payload["text_chunk_size"]),
+                    "--mode",
+                    "offline",
+                    "--seed",
+                    str(payload["seed"]),
+                    "--num-inference-steps",
+                    str(payload["num_inference_steps"]),
+                    "--guidance-scale",
+                    str(payload["guidance_scale"]),
                 )
             )
     return tuple(command)
@@ -743,6 +774,9 @@ def _validate_tts_request(family: str, payload: Mapping[str, object]) -> None:
                 "text_chunk_size",
                 "reference_audio_path",
                 "reference_text",
+                "omnivoice_mode",
+                "style_condition",
+                "design_instruction",
             }
         )
     _reject_unexpected_fields(payload, allowed)
@@ -771,7 +805,6 @@ def _validate_tts_request(family: str, payload: Mapping[str, object]) -> None:
         seed = payload.get("seed")
         steps = payload.get("num_inference_steps")
         guidance = payload.get("guidance_scale")
-        _required_string(payload, "instruction", "OmniVoice style condition")
         text_chunk_size = payload.get("text_chunk_size")
         if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
             raise RuntimeProtocolError("OmniVoice request seed must be a non-negative integer")
@@ -796,6 +829,62 @@ def _validate_tts_request(family: str, payload: Mapping[str, object]) -> None:
             raise RuntimeProtocolError(
                 "OmniVoice request text chunk size must be a positive integer"
             )
+        mode = payload.get("omnivoice_mode")
+        if payload.get("instruction") is not None:
+            raise RuntimeProtocolError(
+                "OmniVoice request does not accept the Qwen instruction field"
+            )
+        if mode is None:
+            _required_string(payload, "style_condition", "OmniVoice style condition")
+            if (
+                payload.get("reference_audio_path") is not None
+                or payload.get("reference_text") is not None
+            ):
+                raise RuntimeProtocolError(
+                    "OmniVoice fixed-style request does not accept clone fields"
+                )
+            if payload.get("design_instruction") is not None:
+                raise RuntimeProtocolError(
+                    "OmniVoice fixed-style request does not accept design fields"
+                )
+            return
+        if mode not in ("fixed-style", "clone", "design"):
+            raise RuntimeProtocolError("OmniVoice request has an unsupported mode")
+        if mode == "fixed-style":
+            _required_string(payload, "style_condition", "OmniVoice style condition")
+            if (
+                payload.get("reference_audio_path") is not None
+                or payload.get("reference_text") is not None
+            ):
+                raise RuntimeProtocolError(
+                    "OmniVoice fixed-style request does not accept clone fields"
+                )
+            if payload.get("design_instruction") is not None:
+                raise RuntimeProtocolError(
+                    "OmniVoice fixed-style request does not accept design fields"
+                )
+            return
+        if mode == "clone":
+            _required_string(payload, "reference_audio_path", "reference audio path")
+            _required_string(payload, "reference_text", "reference text")
+            if (
+                payload.get("style_condition") is not None
+                or payload.get("design_instruction") is not None
+            ):
+                raise RuntimeProtocolError(
+                    "OmniVoice clone request does not accept style or design fields"
+                )
+            return
+        _required_string(payload, "design_instruction", "design instruction")
+        if payload.get("style_condition") is not None:
+            raise RuntimeProtocolError(
+                "OmniVoice design request does not accept fixed-style fields"
+            )
+        if (
+            payload.get("reference_audio_path") is not None
+            or payload.get("reference_text") is not None
+        ):
+            raise RuntimeProtocolError("OmniVoice design request does not accept clone fields")
 
 
 def _validate_qwen_tts_request(payload: Mapping[str, object]) -> None:

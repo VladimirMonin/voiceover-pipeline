@@ -175,6 +175,115 @@ def test_omnivoice_mode_contract_rejects_missing_or_cross_mode_fields(mode, kwar
         OmniVoiceRequest(mode=mode, **kwargs)
 
 
+def _omnivoice_tts_request(**overrides) -> LocalTTSRequest:
+    fields = {
+        "request_id": "tts-request",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "text": "fixture text",
+        "model_id": "audio-cpp/omnivoice-q8_0",
+        "language": "ru",
+        "seed": 1,
+        "num_inference_steps": 2,
+        "guidance_scale": 1.0,
+        "text_chunk_size": 420,
+    }
+    fields.update(overrides)
+    return LocalTTSRequest(**fields)
+
+
+def test_local_tts_request_carries_omnivoice_mode_fields_without_qwen_mode_collision():
+    fixed = _omnivoice_tts_request(omnivoice_mode="fixed-style", style_condition="female")
+    clone = _omnivoice_tts_request(
+        omnivoice_mode="clone",
+        reference_audio_path="fixture.wav",
+        reference_text="reference transcript",
+    )
+    design = _omnivoice_tts_request(omnivoice_mode="design", design_instruction="warm and clear")
+
+    assert fixed.to_runtime_request().payload["omnivoice_mode"] == "fixed-style"
+    assert fixed.to_runtime_request().payload["style_condition"] == "female"
+    assert "mode" not in fixed.to_runtime_request().payload
+    assert clone.to_runtime_request().payload["omnivoice_mode"] == "clone"
+    assert clone.to_runtime_request().payload["reference_text"] == "reference transcript"
+    assert design.to_runtime_request().payload["omnivoice_mode"] == "design"
+    assert design.to_runtime_request().payload["design_instruction"] == "warm and clear"
+
+
+def test_local_tts_request_hides_sensitive_omnivoice_fields_from_repr():
+    clone = _omnivoice_tts_request(
+        omnivoice_mode="clone",
+        reference_audio_path="fixture.wav",
+        reference_text="secret reference transcript",
+    )
+    design = _omnivoice_tts_request(
+        omnivoice_mode="design", design_instruction="secret design instruction"
+    )
+
+    assert "secret reference transcript" not in repr(clone)
+    assert "secret design instruction" not in repr(design)
+    assert "fixture.wav" in repr(clone)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    (
+        ({"omnivoice_mode": "clone"}, "reference audio"),
+        ({"omnivoice_mode": "clone", "reference_audio_path": "fixture.wav"}, "reference text"),
+        ({"omnivoice_mode": "design"}, "instruction"),
+        (
+            {
+                "omnivoice_mode": "fixed-style",
+                "reference_audio_path": "fixture.wav",
+            },
+            "fixed-style",
+        ),
+        (
+            {
+                "omnivoice_mode": "fixed-style",
+                "reference_text": "reference transcript",
+            },
+            "fixed-style",
+        ),
+        (
+            {
+                "omnivoice_mode": "fixed-style",
+                "design_instruction": "design instruction",
+            },
+            "fixed-style",
+        ),
+        (
+            {
+                "omnivoice_mode": "clone",
+                "reference_audio_path": "fixture.wav",
+                "reference_text": "reference",
+                "style_condition": "female",
+            },
+            "style or design",
+        ),
+        (
+            {
+                "omnivoice_mode": "design",
+                "design_instruction": "warm",
+                "reference_audio_path": "fixture.wav",
+            },
+            "fixed-style or clone",
+        ),
+        (
+            {
+                "omnivoice_mode": "fixed-style",
+                "style_condition": "female",
+                "instruction": "Qwen instruction",
+            },
+            "Qwen instruction",
+        ),
+    ),
+)
+def test_local_tts_request_rejects_missing_or_cross_mode_omnivoice_fields(kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        _omnivoice_tts_request(**kwargs)
+
+
 def test_auto_selection_preserves_python_rollback_until_family_promotion():
     python = FixtureDriver("python")
     audio_cpp = FixtureDriver("audio-cpp", available=False)

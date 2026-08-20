@@ -131,7 +131,7 @@ def test_generate_step_persists_the_public_omnivoice_runtime_receipt(tmp_path, m
                         "voice_design": False,
                     },
                     "voice_session": {
-                        "strategy": "single-container-internal-text-chunking",
+                        "strategy": "single-native-invocation-internal-text-chunking",
                         "seed": 1234,
                         "internal_text_chunk_size": 420,
                     },
@@ -154,7 +154,7 @@ def test_generate_step_persists_the_public_omnivoice_runtime_receipt(tmp_path, m
     assert run_manifest["chunks"][0]["runtime_receipt"] == receipt
     assert state["chunks"][0]["voice_selection"]["condition"] == "female"
     assert state["chunks"][0]["voice_session"] == {
-        "strategy": "single-container-internal-text-chunking",
+        "strategy": "single-native-invocation-internal-text-chunking",
         "seed": 1234,
         "internal_text_chunk_size": 420,
     }

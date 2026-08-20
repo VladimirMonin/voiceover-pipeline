@@ -142,6 +142,43 @@ def test_omnivoice_session_merge_preserves_prepared_fragment_order_in_one_reques
     ]
 
 
+def test_omnivoice_session_merge_requires_clone_reference_identity() -> None:
+    fragments = [
+        ScriptChunk(number=1, id="chunk_01_part_01", text="Первое предложение."),
+        ScriptChunk(number=2, id="chunk_01_part_02", text="Второе предложение."),
+    ]
+
+    with pytest.raises(ValueError, match="reference audio and text"):
+        merge_omnivoice_session_fragments(
+            fragments, mode="clone", reference_audio_path=None, reference_text="reference"
+        )
+    with pytest.raises(ValueError, match="reference audio and text"):
+        merge_omnivoice_session_fragments(
+            fragments, mode="clone", reference_audio_path="ref.wav", reference_text=""
+        )
+
+    merged = merge_omnivoice_session_fragments(
+        fragments, mode="clone", reference_audio_path="ref.wav", reference_text="reference"
+    )
+    assert len(merged) == 1
+    assert merged[0].text == "Первое предложение. Второе предложение."
+
+
+def test_omnivoice_session_merge_requires_design_instruction() -> None:
+    fragments = [
+        ScriptChunk(number=1, id="chunk_01_part_01", text="Первое предложение."),
+    ]
+
+    with pytest.raises(ValueError, match="non-empty instruction"):
+        merge_omnivoice_session_fragments(fragments, mode="design", design_instruction="")
+
+    merged = merge_omnivoice_session_fragments(
+        fragments, mode="design", design_instruction="warm and clear"
+    )
+    assert len(merged) == 1
+    assert merged[0].text == "Первое предложение."
+
+
 def test_local_tts_does_not_orphan_a_short_intro_from_its_following_sentence() -> None:
     source = ScriptChunk(
         number=1,

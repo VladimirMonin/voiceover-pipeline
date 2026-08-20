@@ -715,8 +715,7 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
         if reference_audio is None or reference_text is None or not reference_text.strip():
             fail(
                 "omnivoice-local clone mode requires a readable reference audio file via "
-                "--reference-audio and non-empty --reference-text; the fixed female style "
-                "condition route cannot clone voices.",
+                "--reference-audio and non-empty --reference-text.",
                 _EXIT_ARGS,
             )
         if design_instruction is not None:
@@ -743,11 +742,7 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
             )
         except ValueError as exc:
             fail(str(exc), _EXIT_ARGS)
-        fail(
-            "omnivoice-local clone mode is not implemented by the current provider path; "
-            "refusing to use the fixed female style condition provider.",
-            _EXIT_ARGS,
-        )
+        return
 
     if reference_audio is not None or reference_text is not None:
         fail(
@@ -763,11 +758,6 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
         OmniVoiceRequest(mode="design", instruction=design_instruction)
     except ValueError as exc:
         fail(str(exc), _EXIT_ARGS)
-    fail(
-        "omnivoice-local design mode is not implemented by the current provider path; "
-        "refusing to use the fixed female style condition provider.",
-        _EXIT_ARGS,
-    )
 
 
 def generate(args: argparse.Namespace) -> None:
@@ -859,7 +849,13 @@ def generate(args: argparse.Namespace) -> None:
         chunks = chunks[: args.limit_chunks]
     requested_fragment_count = len(chunks)
     if args.provider == "omnivoice-local" and args.model == OMNIVOICE_LOCAL_MODEL_ID:
-        chunks = merge_omnivoice_session_fragments(chunks)
+        chunks = merge_omnivoice_session_fragments(
+            chunks,
+            mode=getattr(args, "mode", "preset"),
+            reference_audio_path=getattr(args, "reference_audio", None),
+            reference_text=getattr(args, "reference_text", None),
+            design_instruction=getattr(args, "design_instruction", None),
+        )
     runtime_session_count = len(chunks)
     if args.run_id:
         _validate_run_id(args.run_id)
@@ -2465,16 +2461,31 @@ def _public_voice_selection(result) -> dict[str, object] | None:
     selection = (result.raw_metadata or {}).get("voice_selection")
     if selection is None:
         return None
-    expected = {
-        "kind": "built-in-style-condition",
-        "condition": OMNIVOICE_STYLE_CONDITION,
-        "named_preset": False,
-        "voice_cloning": False,
-        "voice_design": False,
-    }
-    if selection != expected:
+    if not isinstance(selection, dict):
         raise RuntimeError("Local TTS provider returned an invalid public voice selection")
-    return dict(expected)
+    kind = selection.get("kind")
+    if kind == "built-in-style-condition":
+        expected = {
+            "kind": "built-in-style-condition",
+            "condition": OMNIVOICE_STYLE_CONDITION,
+            "named_preset": False,
+            "voice_cloning": False,
+            "voice_design": False,
+        }
+        if selection != expected:
+            raise RuntimeError("Local TTS provider returned an invalid public voice selection")
+        return dict(expected)
+    if kind in ("reference-clone", "design-instruction"):
+        expected = {
+            "kind": kind,
+            "named_preset": False,
+            "voice_cloning": kind == "reference-clone",
+            "voice_design": kind == "design-instruction",
+        }
+        if selection != expected:
+            raise RuntimeError("Local TTS provider returned an invalid public voice selection")
+        return dict(expected)
+    raise RuntimeError("Local TTS provider returned an invalid public voice selection")
 
 
 def _public_voice_session(result) -> dict[str, object] | None:
@@ -2484,7 +2495,12 @@ def _public_voice_session(result) -> dict[str, object] | None:
     if (
         not isinstance(session, dict)
         or set(session) != {"strategy", "seed", "internal_text_chunk_size"}
-        or session.get("strategy") != "single-container-internal-text-chunking"
+        or session.get("strategy")
+        not in {
+            "single-native-invocation-internal-text-chunking",
+            "reference-isolated-native-session",
+            "design-instruction-native-session",
+        }
         or isinstance(session.get("seed"), bool)
         or not isinstance(session.get("seed"), int)
         or isinstance(session.get("internal_text_chunk_size"), bool)
@@ -2568,7 +2584,24 @@ def build_provider(
         )
     if args.provider == "omnivoice-local":
         _validate_omnivoice_options(args)
-        return OmniVoiceLocalTTSProvider.from_environment()
+        omni_kwargs: dict[str, Any] = {}
+        mode = getattr(args, "mode", "preset")
+        if mode == "clone":
+            omni_kwargs.update(
+                {
+                    "mode": "clone",
+                    "reference_audio_path": args.reference_audio,
+                    "reference_text": args.reference_text,
+                }
+            )
+        elif mode == "design":
+            omni_kwargs.update(
+                {
+                    "mode": "design",
+                    "design_instruction": args.design_instruction,
+                }
+            )
+        return OmniVoiceLocalTTSProvider.from_environment(**omni_kwargs)
     raise RuntimeError(f"Unsupported provider: {args.provider}")
 
 

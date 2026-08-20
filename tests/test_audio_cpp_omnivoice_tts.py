@@ -64,7 +64,8 @@ def test_typed_tts_contract_carries_omnivoice_controls_and_receipt():
         text="Проверка",
         model_id=OMNIVOICE_LOCAL_MODEL_ID,
         language="ru",
-        instruction="female",
+        omnivoice_mode="fixed-style",
+        style_condition="female",
         text_chunk_size=420,
         seed=1234,
         num_inference_steps=32,
@@ -88,11 +89,12 @@ def test_typed_tts_contract_carries_omnivoice_controls_and_receipt():
         "model_id": OMNIVOICE_LOCAL_MODEL_ID,
         "voice": None,
         "language": "ru",
-        "instruction": "female",
         "text_chunk_size": 420,
         "seed": 1234,
         "num_inference_steps": 32,
         "guidance_scale": 2.0,
+        "omnivoice_mode": "fixed-style",
+        "style_condition": "female",
     }
     assert response.audio_bytes == b"wav"
     assert response.audio_format == "wav"
@@ -122,7 +124,8 @@ def test_provider_returns_wav_bytes_with_exact_admitted_model_receipt(monkeypatc
     assert runtime.request is not None
     assert runtime.request.model_id == OMNIVOICE_LOCAL_MODEL_ID
     assert runtime.request.voice is None
-    assert runtime.request.instruction == "female"
+    assert runtime.request.omnivoice_mode == "fixed-style"
+    assert runtime.request.style_condition == "female"
     assert runtime.request.text_chunk_size == 420
     assert runtime.request.seed == OMNIVOICE_DEFAULT_SEED
     assert runtime.request.num_inference_steps == OMNIVOICE_DEFAULT_STEPS
@@ -138,7 +141,7 @@ def test_provider_returns_wav_bytes_with_exact_admitted_model_receipt(monkeypatc
         "voice_design": False,
     }
     assert result.raw_metadata["voice_session"] == {
-        "strategy": "single-container-internal-text-chunking",
+        "strategy": "single-native-invocation-internal-text-chunking",
         "seed": OMNIVOICE_DEFAULT_SEED,
         "internal_text_chunk_size": 420,
     }
@@ -172,7 +175,8 @@ def test_provider_uses_one_runtime_request_for_multiple_omnivoice_fragments(monk
     assert len(results) == 1
     assert len(runtime.requests) == 1
     assert runtime.requests[0].text == "Первая фраза. Вторая фраза. Третья фраза."
-    assert runtime.requests[0].instruction == "female"
+    assert runtime.requests[0].omnivoice_mode == "fixed-style"
+    assert runtime.requests[0].style_condition == "female"
     assert runtime.requests[0].text_chunk_size == 420
 
 
@@ -182,6 +186,76 @@ def test_provider_fails_closed_when_an_injected_runtime_has_no_admitted_model():
 
     with pytest.raises(RuntimeUnavailableError, match="admitted model"):
         provider.synthesize_chunk("Привет, мир!", "chunk_01")
+
+
+def test_provider_clone_mode_stages_reference_fields_and_metadata(monkeypatch, tmp_path):
+    runtime = _Runtime(
+        LocalTTSResponse(
+            audio_bytes=b"RIFFfixtureWAVE",
+            audio_format="wav",
+            payload={"sample_rate_hz": 24_000, "channels": 1, "duration_s": 0.01},
+        )
+    )
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"fixture")
+    provider = OmniVoiceLocalTTSProvider(
+        cast(Any, runtime),
+        admitted_model=_admitted_model(monkeypatch, tmp_path),
+        mode="clone",
+        reference_audio_path=reference,
+        reference_text="Текст референса",
+    )
+
+    result = provider.synthesize_chunk("Привет, мир!", "chunk_01")
+
+    assert runtime.request is not None
+    assert runtime.request.omnivoice_mode == "clone"
+    assert runtime.request.reference_audio_path == reference
+    assert runtime.request.reference_text == "Текст референса"
+    assert runtime.request.style_condition is None
+    assert runtime.request.design_instruction is None
+    assert result.raw_metadata["voice_selection"] == {
+        "kind": "reference-clone",
+        "named_preset": False,
+        "voice_cloning": True,
+        "voice_design": False,
+    }
+    assert result.raw_metadata["voice_session"]["strategy"] == ("reference-isolated-native-session")
+    assert "Текст референса" not in str(result.raw_metadata)
+    assert str(reference) not in str(result.raw_metadata)
+
+
+def test_provider_design_mode_passes_instruction_and_metadata(monkeypatch, tmp_path):
+    runtime = _Runtime(
+        LocalTTSResponse(
+            audio_bytes=b"RIFFfixtureWAVE",
+            audio_format="wav",
+            payload={"sample_rate_hz": 24_000, "channels": 1, "duration_s": 0.01},
+        )
+    )
+    provider = OmniVoiceLocalTTSProvider(
+        cast(Any, runtime),
+        admitted_model=_admitted_model(monkeypatch, tmp_path),
+        mode="design",
+        design_instruction="warm and clear",
+    )
+
+    result = provider.synthesize_chunk("Привет, мир!", "chunk_01")
+
+    assert runtime.request is not None
+    assert runtime.request.omnivoice_mode == "design"
+    assert runtime.request.design_instruction == "warm and clear"
+    assert runtime.request.style_condition is None
+    assert runtime.request.reference_audio_path is None
+    assert runtime.request.reference_text is None
+    assert result.raw_metadata["voice_selection"] == {
+        "kind": "design-instruction",
+        "named_preset": False,
+        "voice_cloning": False,
+        "voice_design": True,
+    }
+    assert result.raw_metadata["voice_session"]["strategy"] == ("design-instruction-native-session")
+    assert "warm and clear" not in str(result.raw_metadata)
 
 
 def test_provider_rejects_a_caller_model_id_that_differs_from_admission(monkeypatch, tmp_path):
@@ -312,11 +386,6 @@ def test_cli_explicitly_accepts_the_opt_in_provider():
 
     assert args.provider == "omnivoice-local"
     assert _resolve_provider_style_prompt(args) is None
-    clone_args = build_parser().parse_args(
-        ["generate", "--provider", "omnivoice-local", "--mode", "clone"]
-    )
-    with pytest.raises(CliError, match="female style condition"):
-        build_provider(clone_args, api_key="", style_prompt=None, prompt_mode="default")
     style_args = build_parser().parse_args(
         ["generate", "--provider", "omnivoice-local", "--style-prompt", "тёплый голос"]
     )

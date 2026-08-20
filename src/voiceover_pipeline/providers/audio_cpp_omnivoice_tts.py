@@ -21,6 +21,7 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.local_runtime.contracts import (
     LocalTTSRequest,
+    OmniVoiceMode,
     RuntimeDriverHealth,
     RuntimeUnavailableError,
 )
@@ -150,7 +151,7 @@ def omnivoice_local_dependency_probe(
 
 
 class OmniVoiceLocalTTSProvider(TTSProvider):
-    """Offline OmniVoice route with one fixed built-in female style condition."""
+    """Offline OmniVoice route with fixed-style, clone, and design modes."""
 
     provider_id = OMNIVOICE_LOCAL_PROVIDER_ID
 
@@ -164,6 +165,10 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
         seed: int = OMNIVOICE_DEFAULT_SEED,
         num_inference_steps: int = OMNIVOICE_DEFAULT_STEPS,
         guidance_scale: float = OMNIVOICE_DEFAULT_GUIDANCE_SCALE,
+        mode: str = "preset",
+        reference_audio_path: Path | str | None = None,
+        reference_text: str | None = None,
+        design_instruction: str | None = None,
     ) -> None:
         self._runtime = runtime
         self._admitted_model = _re_admit_omnivoice_model(admitted_model)
@@ -176,13 +181,17 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
         self._seed = seed
         self._num_inference_steps = num_inference_steps
         self._guidance_scale = guidance_scale
+        self._mode = mode
+        self._reference_audio_path = reference_audio_path
+        self._reference_text = reference_text
+        self._design_instruction = design_instruction
 
     @classmethod
-    def from_environment(cls) -> "OmniVoiceLocalTTSProvider":
+    def from_environment(cls, **kwargs: Any) -> "OmniVoiceLocalTTSProvider":
         admitted_model = _admitted_omnivoice_model_from_environment()
         health = omnivoice_local_dependency_probe(admitted_model)
         if not health.available:
-            return cls()
+            return cls(**kwargs)
         assert admitted_model is not None
         if sys.platform.startswith("win"):
             install = admit_audio_cpp_native_package(
@@ -217,6 +226,7 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
                 lifecycle=_omnivoice_gpu_lifecycle(),
             ),
             admitted_model=admitted_model,
+            **kwargs,
         )
 
     def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
@@ -224,6 +234,13 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
             raise ModuleNotFoundError(OMNIVOICE_INSTALL_REMEDIATION)
         if self._admitted_model is None:
             raise RuntimeUnavailableError("OmniVoice runtime requires an admitted model")
+        (
+            omnivoice_mode,
+            style_condition,
+            design_instruction,
+            reference_audio_path,
+            reference_text,
+        ) = self._mode_request_fields()
         response = self._runtime.execute_tts(
             LocalTTSRequest(
                 request_id=uuid4().hex,
@@ -233,11 +250,15 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
                 model_id=self._model_id,
                 voice=None,
                 language=self._language,
-                instruction=OMNIVOICE_STYLE_CONDITION,
                 text_chunk_size=OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
                 seed=self._seed,
                 num_inference_steps=self._num_inference_steps,
                 guidance_scale=self._guidance_scale,
+                omnivoice_mode=omnivoice_mode,
+                style_condition=style_condition,
+                design_instruction=design_instruction,
+                reference_audio_path=reference_audio_path,
+                reference_text=reference_text,
             ),
             runtime_choice="audio-cpp",
         )
@@ -247,18 +268,8 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
             "provider": self.provider_id,
             "family": OMNIVOICE_FAMILY,
             "seed": self._seed,
-            "voice_selection": {
-                "kind": "built-in-style-condition",
-                "condition": OMNIVOICE_STYLE_CONDITION,
-                "named_preset": False,
-                "voice_cloning": False,
-                "voice_design": False,
-            },
-            "voice_session": {
-                "strategy": "single-container-internal-text-chunking",
-                "seed": self._seed,
-                "internal_text_chunk_size": OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
-            },
+            "voice_selection": self._voice_selection_metadata(),
+            "voice_session": self._voice_session_metadata(),
             "sample_rate_hz": response.payload.get("sample_rate_hz"),
             "channels": response.payload.get("channels"),
             "duration_s": response.payload.get("duration_s"),
@@ -278,6 +289,57 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
             client_path=self.provider_id,
             raw_metadata=metadata,
         )
+
+    def _mode_request_fields(
+        self,
+    ) -> tuple[OmniVoiceMode, str | None, str | None, Path | str | None, str | None]:
+        if self._mode == "clone":
+            return (
+                "clone",
+                None,
+                None,
+                self._reference_audio_path,
+                self._reference_text,
+            )
+        if self._mode == "design":
+            return ("design", None, self._design_instruction, None, None)
+        return ("fixed-style", OMNIVOICE_STYLE_CONDITION, None, None, None)
+
+    def _voice_selection_metadata(self) -> dict[str, Any]:
+        if self._mode == "clone":
+            return {
+                "kind": "reference-clone",
+                "named_preset": False,
+                "voice_cloning": True,
+                "voice_design": False,
+            }
+        if self._mode == "design":
+            return {
+                "kind": "design-instruction",
+                "named_preset": False,
+                "voice_cloning": False,
+                "voice_design": True,
+            }
+        return {
+            "kind": "built-in-style-condition",
+            "condition": OMNIVOICE_STYLE_CONDITION,
+            "named_preset": False,
+            "voice_cloning": False,
+            "voice_design": False,
+        }
+
+    def _voice_session_metadata(self) -> dict[str, Any]:
+        if self._mode == "clone":
+            strategy = "reference-isolated-native-session"
+        elif self._mode == "design":
+            strategy = "design-instruction-native-session"
+        else:
+            strategy = "single-native-invocation-internal-text-chunking"
+        return {
+            "strategy": strategy,
+            "seed": self._seed,
+            "internal_text_chunk_size": OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
+        }
 
 
 def _omnivoice_gpu_lifecycle() -> GPULifecycleOwner:

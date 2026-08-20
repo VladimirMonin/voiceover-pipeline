@@ -299,7 +299,7 @@ def test_native_windows_launcher_stages_reference_audio_under_neutral_name(
                 "model_id": "audio-cpp/omnivoice-q8_0",
                 "voice": None,
                 "language": "ru",
-                "instruction": "female",
+                "omnivoice_mode": "clone",
                 "text_chunk_size": 420,
                 "seed": 1,
                 "num_inference_steps": 2,
@@ -318,6 +318,115 @@ def test_native_windows_launcher_stages_reference_audio_under_neutral_name(
     assert command[command.index("--reference-text") + 1] == "Текст референса"
     assert response["ok"] is True
     assert not Path(captured["kwargs"]["cwd"]).exists()
+
+
+def test_native_windows_launcher_design_mode_passes_instruction_without_reference(
+    monkeypatch, tmp_path: Path
+):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    model = tmp_path / "omnivoice.gguf"
+    model.write_bytes(b"model")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"omnivoice": model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+    captured: dict[str, Any] = {}
+
+    class CompletedProcess:
+        returncode = 0
+        pid = 4243
+
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            return "", ""
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, *, timeout: float) -> int:
+            return self.returncode
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = tuple(command)
+        captured["kwargs"] = kwargs
+        _write_wav(Path(command[command.index("--out") + 1]))
+        return CompletedProcess()
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", fake_popen)
+
+    response = transport.invoke(
+        "design-1",
+        {
+            "schema_version": 1,
+            "operation": "tts",
+            "family": "omnivoice",
+            "provider_id": "omnivoice-local",
+            "payload": {
+                "text": "Привет",
+                "model_id": "audio-cpp/omnivoice-q8_0",
+                "voice": None,
+                "language": "ru",
+                "omnivoice_mode": "design",
+                "design_instruction": "warm and clear",
+                "text_chunk_size": 420,
+                "seed": 1,
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+            },
+        },
+    )
+
+    command = captured["command"]
+    assert command[command.index("--instruct") + 1] == "warm and clear"
+    assert "--voice-ref" not in command
+    assert "--reference-text" not in command
+    assert response["ok"] is True
+    assert not Path(captured["kwargs"]["cwd"]).exists()
+
+
+def test_native_windows_launcher_rejects_qwen_instruction_field_for_omnivoice(
+    monkeypatch, tmp_path: Path
+):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    model = tmp_path / "omnivoice.gguf"
+    model.write_bytes(b"model")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"omnivoice": model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("no process may start for a Qwen-field request")
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", unexpected_popen)
+    request = {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": "audio-cpp/omnivoice-q8_0",
+            "voice": None,
+            "language": "ru",
+            "omnivoice_mode": "fixed-style",
+            "style_condition": "female",
+            "instruction": "Qwen instruction",
+            "text_chunk_size": 420,
+            "seed": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 1.0,
+        },
+    }
+    with pytest.raises(RuntimeProtocolError, match="Qwen instruction"):
+        transport.invoke("qwen-field", request)
 
 
 def test_native_windows_launcher_rejects_blank_or_missing_reference_audio(
@@ -349,7 +458,7 @@ def test_native_windows_launcher_rejects_blank_or_missing_reference_audio(
             "model_id": "audio-cpp/omnivoice-q8_0",
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "clone",
             "text_chunk_size": 420,
             "seed": 1,
             "num_inference_steps": 2,
@@ -377,7 +486,7 @@ def test_native_windows_launcher_rejects_blank_or_missing_reference_audio(
             "model_id": "audio-cpp/omnivoice-q8_0",
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "clone",
             "text_chunk_size": 420,
             "seed": 1,
             "num_inference_steps": 2,
@@ -422,7 +531,7 @@ def test_native_windows_launcher_rejects_stereo_reference_audio(monkeypatch, tmp
             "model_id": "audio-cpp/omnivoice-q8_0",
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "clone",
             "text_chunk_size": 420,
             "seed": 1,
             "num_inference_steps": 2,
@@ -635,7 +744,8 @@ def test_native_windows_launcher_decodes_wav_receipt_and_cleans_up(monkeypatch, 
                 "model_id": "audio-cpp/omnivoice-q8_0",
                 "voice": None,
                 "language": "ru",
-                "instruction": "female",
+                "omnivoice_mode": "fixed-style",
+                "style_condition": "female",
                 "text_chunk_size": 420,
                 "seed": 1,
                 "num_inference_steps": 2,
@@ -679,7 +789,8 @@ def test_native_windows_launcher_cancels_before_and_during_launch(monkeypatch, t
             "model_id": "audio-cpp/omnivoice-q8_0",
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "fixed-style",
+            "style_condition": "female",
             "text_chunk_size": 420,
             "seed": 1,
             "num_inference_steps": 2,
@@ -768,7 +879,8 @@ def test_shared_family_codec_uses_no_container_paths_for_all_declared_families(t
             "text": "Привет",
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "fixed-style",
+            "style_condition": "female",
             "text_chunk_size": 420,
             "seed": 1,
             "num_inference_steps": 2,
@@ -904,7 +1016,8 @@ def test_model_directory_package_resolves_single_gguf_for_cli_arguments(tmp_path
             "model_id": "audio-cpp/omnivoice-q8_0",
             "voice": None,
             "language": "ru",
-            "instruction": "female",
+            "omnivoice_mode": "fixed-style",
+            "style_condition": "female",
             "text_chunk_size": 420,
             "seed": 1,
             "num_inference_steps": 2,
@@ -929,7 +1042,8 @@ def test_model_directory_without_gguf_artifact_fails_closed(tmp_path: Path):
                 "model_id": "audio-cpp/omnivoice-q8_0",
                 "voice": None,
                 "language": "ru",
-                "instruction": "female",
+                "omnivoice_mode": "fixed-style",
+                "style_condition": "female",
                 "text_chunk_size": 420,
                 "seed": 1,
                 "num_inference_steps": 2,
@@ -953,7 +1067,8 @@ def test_model_directory_with_multiple_gguf_artifacts_fails_closed(tmp_path: Pat
                 "text": "Hello",
                 "voice": None,
                 "language": "ru",
-                "instruction": "instruction",
+                "omnivoice_mode": "fixed-style",
+                "style_condition": "female",
                 "text_chunk_size": 420,
                 "seed": 1,
                 "num_inference_steps": 2,
@@ -1013,7 +1128,8 @@ def test_transport_accepts_model_directory_packages(monkeypatch, tmp_path: Path)
                 "model_id": "audio-cpp/omnivoice-q8_0",
                 "voice": None,
                 "language": "ru",
-                "instruction": "female",
+                "omnivoice_mode": "fixed-style",
+                "style_condition": "female",
                 "text_chunk_size": 420,
                 "seed": 1,
                 "num_inference_steps": 2,

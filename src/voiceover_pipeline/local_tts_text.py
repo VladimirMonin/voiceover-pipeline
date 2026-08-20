@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 
 from .config import OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE, OMNIVOICE_LOCAL_MODEL_ID
@@ -72,11 +73,30 @@ def prepare_local_tts_chunks(
     return prepared
 
 
-def merge_omnivoice_session_fragments(fragments: Iterable[ScriptChunk]) -> list[ScriptChunk]:
-    """Create one OmniVoice request so its internal 420-character chunks share one session."""
+def merge_omnivoice_session_fragments(
+    fragments: Iterable[ScriptChunk],
+    *,
+    mode: str = "preset",
+    reference_audio_path: Path | str | None = None,
+    reference_text: str | None = None,
+    design_instruction: str | None = None,
+) -> list[ScriptChunk]:
+    """Create one OmniVoice request so its internal 420-character chunks share one session.
+
+    The session identity is the mode plus the reference/design fields: different
+    modes, reference audio, or design instructions belong to different voice
+    sessions and are never merged into one request. Within a single generate
+    call every fragment shares one identity, so they merge into one session.
+    """
     prepared = list(fragments)
     if not prepared:
         return []
+    if mode == "clone":
+        if reference_audio_path is None or reference_text is None or not reference_text.strip():
+            raise ValueError("OmniVoice clone session requires reference audio and text")
+    elif mode == "design":
+        if design_instruction is None or not design_instruction.strip():
+            raise ValueError("OmniVoice design session requires a non-empty instruction")
     return [
         ScriptChunk(
             number=1,

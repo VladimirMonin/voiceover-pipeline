@@ -204,7 +204,42 @@ class LocalTTSRequest:
     instruction: str | None = None
     text_chunk_size: int | None = None
     reference_audio_path: Path | str | None = None
-    reference_text: str | None = None
+    reference_text: str | None = field(default=None, repr=False)
+    omnivoice_mode: OmniVoiceMode | None = None
+    style_condition: str | None = None
+    design_instruction: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.omnivoice_mode is None:
+            return
+        if self.omnivoice_mode not in ("fixed-style", "clone", "design"):
+            raise ValueError("OmniVoice mode must be fixed-style, clone, or design")
+        if self.instruction is not None:
+            raise ValueError("OmniVoice requests do not accept the Qwen instruction field")
+        has_style_condition = self.style_condition is not None and self.style_condition.strip()
+        has_design_instruction = (
+            self.design_instruction is not None and self.design_instruction.strip()
+        )
+        has_reference_audio = (
+            self.reference_audio_path is not None and str(self.reference_audio_path).strip()
+        )
+        has_reference_text = self.reference_text is not None and self.reference_text.strip()
+        if self.omnivoice_mode == "clone":
+            if not has_reference_audio:
+                raise ValueError("OmniVoice clone mode requires reference audio")
+            if not has_reference_text:
+                raise ValueError("OmniVoice clone mode requires non-empty reference text")
+            if has_style_condition or has_design_instruction:
+                raise ValueError("OmniVoice clone mode does not accept style or design fields")
+        elif self.omnivoice_mode == "design":
+            if not has_design_instruction:
+                raise ValueError("OmniVoice design mode requires non-empty instruction")
+            if has_style_condition or has_reference_audio or has_reference_text:
+                raise ValueError(
+                    "OmniVoice design mode does not accept fixed-style or clone fields"
+                )
+        elif has_reference_audio or has_reference_text or has_design_instruction:
+            raise ValueError("OmniVoice fixed-style mode does not accept clone/design-only fields")
 
     def to_runtime_request(self) -> LocalRuntimeRequest:
         payload: dict[str, object] = {
@@ -232,6 +267,12 @@ class LocalTTSRequest:
             payload["reference_audio_path"] = str(self.reference_audio_path)
         if self.reference_text is not None:
             payload["reference_text"] = self.reference_text
+        if self.omnivoice_mode is not None:
+            payload["omnivoice_mode"] = self.omnivoice_mode
+        if self.style_condition is not None:
+            payload["style_condition"] = self.style_condition
+        if self.design_instruction is not None:
+            payload["design_instruction"] = self.design_instruction
         return LocalRuntimeRequest(
             request_id=self.request_id,
             operation="tts",

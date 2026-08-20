@@ -420,7 +420,48 @@ def test_transcribe_explicit_audio_cpp_is_structured_fail_closed_error():
         ("design", ("--design-instruction", "warm and clear")),
     ],
 )
-def test_omnivoice_clone_and_design_fail_closed_as_single_json_error(tmp_path, mode, mode_args):
+def test_omnivoice_clone_and_design_reach_provider_fail_as_single_json_error(
+    tmp_path, mode, mode_args
+):
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"fixture")
+    resolved_mode_args = [value.format(reference_audio=reference_audio) for value in mode_args]
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--mode",
+        mode,
+        *resolved_mode_args,
+        "--json",
+    )
+
+    assert code == 30
+    assert data["status"] == "error"
+    assert data["code"] == 30
+    assert "not implemented" not in data["error"]
+    assert len(data) == 3
+
+
+@pytest.mark.parametrize(
+    ("mode", "mode_args", "message"),
+    [
+        ("clone", (), "reference audio"),
+        ("clone", ("--reference-audio", "{reference_audio}"), "reference-text"),
+        ("design", (), "design-instruction"),
+        (
+            "design",
+            ("--reference-audio", "{reference_audio}", "--reference-text", "reference"),
+            "rejects",
+        ),
+    ],
+)
+def test_omnivoice_invalid_clone_and_design_keep_exit_two_contract(
+    tmp_path, mode, mode_args, message
+):
     reference_audio = tmp_path / "reference.wav"
     reference_audio.write_bytes(b"fixture")
     resolved_mode_args = [value.format(reference_audio=reference_audio) for value in mode_args]
@@ -440,5 +481,5 @@ def test_omnivoice_clone_and_design_fail_closed_as_single_json_error(tmp_path, m
     assert code == 2
     assert data["status"] == "error"
     assert data["code"] == 2
-    assert "not implemented" in data["error"]
+    assert message in data["error"]
     assert len(data) == 3
