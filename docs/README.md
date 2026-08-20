@@ -17,6 +17,7 @@
 | [ADR-001: Generic local ASR](adr/ADR-001-generic-local-asr.md) | Решение о capability-aware локальном ASR: registry, typed hints, dependency/device policy и граница timing/alignment |
 | [Generic local ASR implementation plan](plans/2026-08-15-generic-local-asr-implementation-plan.md) | Последовательные offline-first срезы реализации, тестовые и benchmark-гейты |
 | [audio.cpp hybrid migration plan](plans/2026-08-16-audio-cpp-hybrid-migration-plan.md) | Runtime-neutral план переезда Qwen ASR, Nemotron, Qwen TTS и OmniVoice на audio.cpp с будущим MLX-драйвером и Faster-Whisper рядом |
+| [Native Windows Nemotron and OmniVoice plan](plans/2026-08-20-native-windows-nemotron-omnivoice-plan.md) | Серия native Windows-задач без Docker/WSL: portable runtime, package/build gates, Nemotron prompt плюс word timestamps, OmniVoice clone/design и live-приёмка |
 | [Local audio runtime contract](audio-cpp-runtime.md) | Контракт `LocalAudioRuntime`, закреплённая версия audio.cpp, выбор рабочего маршрута, откат и проверяемые сведения о сборке |
 | [audio.cpp Qwen ASR container recipe](audio-cpp-qwen-container-recipe.md) | Проверенный immutable CUDA image, read-only model mounts, JSON adapter и конфигурация Qwen word timestamps без inference claim |
 | [audio.cpp feasibility report](research/2026-08-15-audio-cpp-feasibility.md) | Проверенная оценка полного перехода, optional backend и изолированного spike для Qwen/Nemotron без замены Faster-Whisper |
