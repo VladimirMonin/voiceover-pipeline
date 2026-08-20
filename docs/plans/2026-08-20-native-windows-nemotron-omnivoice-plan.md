@@ -360,3 +360,12 @@ Before marking the series complete, record locally:
 
 Do not place private audio, prompt text, reference transcripts, absolute user
 paths, model weights, or credentials in this record or in Git.
+
+## Closing Voiceover
+
+After the final acceptance record is written, generate a closing voiceover
+narrating the completed work in plain, non-technical language. Use the female
+voice (OmniVoice, `omnivoice-local` fixed-style preset on the native Windows
+route). The script must summarize what was implemented, what was verified, and
+what remains as known limitations — without absolute paths, model weights,
+prompt/reference text, credentials, or anything private.
