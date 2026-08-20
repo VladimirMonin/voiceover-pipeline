@@ -488,6 +488,7 @@ def test_doctor_checks_only_the_selected_asr_dependency_probe(monkeypatch, capsy
         "ok": False,
         "provider": "fixture-local",
         "required": True,
+        "reason_code": "unavailable",
     }
     assert data["workflow_ok"] is False
     assert "Install the approved optional ASR runtime." in data["warnings"]

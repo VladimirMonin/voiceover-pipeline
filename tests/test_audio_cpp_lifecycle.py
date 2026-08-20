@@ -514,3 +514,41 @@ def test_windows_doctor_json_health_structure(monkeypatch, capsys):
     assert data["status"] == "success"
     assert data["checks"]["cuda"] == {"ok": True, "required": True}
     assert data["checks"]["omnivoice_local"] == {"ok": True, "required": True}
+
+
+def test_windows_doctor_json_reports_structured_native_package_reason(monkeypatch, capsys):
+    import json
+
+    import voiceover_pipeline.cli as cli
+
+    monkeypatch.setattr(cli, "read_polza_key", lambda: "fixture")
+    monkeypatch.setattr(cli, "read_openrouter_key", lambda: "fixture")
+    monkeypatch.setattr(cli, "read_groq_key", lambda: "fixture")
+    monkeypatch.setattr(cli, "read_xai_key", lambda: "fixture")
+    monkeypatch.setattr(cli.shutil, "which", lambda _command: "/fixture/bin")
+    monkeypatch.setattr(
+        cli,
+        "omnivoice_local_dependency_probe",
+        lambda: SimpleNamespace(
+            available=False, remediation="fixture remediation", reason_code="missing_receipt"
+        ),
+    )
+    monkeypatch.setattr(
+        lifecycle_mod,
+        "probe_local_gpu_state",
+        lambda: SimpleNamespace(probe_error=None),
+    )
+    args = cli.build_parser().parse_args(
+        "doctor --provider omnivoice-local --timing-device cuda --json".split()
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.doctor_cmd(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 0
+    assert data["checks"]["omnivoice_local"] == {
+        "ok": False,
+        "required": True,
+        "reason_code": "missing_receipt",
+    }

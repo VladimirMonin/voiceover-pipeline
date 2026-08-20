@@ -465,6 +465,7 @@ def test_qwen_asr_doctor_uses_selected_dependency_probe(monkeypatch, capsys):
         "ok": False,
         "provider": "qwen-local",
         "required": True,
+        "reason_code": "unavailable",
     }
     assert (
         "qwen-asr runtime is unavailable. Install an approved qwen-asr runtime before retrying."

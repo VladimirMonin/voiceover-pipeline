@@ -32,13 +32,16 @@ from voiceover_pipeline.local_runtime.registry import LocalRuntimeRegistry
 from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
     NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
     AudioCppNativeCLITransport,
-    discover_native_audio_cpp_install,
 )
 from voiceover_pipeline.local_runtime.transports.audio_cpp_omnivoice import (
     PINNED_AUDIO_CPP_OMNIVOICE_BINARY_SHA256,
     AudioCppOmniVoiceCLITransport,
     VerifiedOmniVoiceModel,
     admit_omnivoice_model,
+)
+from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
+    AudioCppPackageError,
+    admit_audio_cpp_native_package,
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
@@ -115,13 +118,27 @@ def omnivoice_local_dependency_probe(
     if sys.platform.startswith("win"):
         native_executable = os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip()
         if not native_executable:
-            return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+            return RuntimeDriverHealth(
+                available=False,
+                remediation=OMNIVOICE_INSTALL_REMEDIATION,
+                reason_code="missing_native_executable",
+            )
         try:
-            discover_native_audio_cpp_install(
+            admit_audio_cpp_native_package(
                 Path(native_executable), required_model_paths=(model.model_path,)
             )
+        except AudioCppPackageError as exc:
+            return RuntimeDriverHealth(
+                available=False,
+                remediation=OMNIVOICE_INSTALL_REMEDIATION,
+                reason_code=exc.code,
+            )
         except ValueError:
-            return RuntimeDriverHealth(available=False, remediation=OMNIVOICE_INSTALL_REMEDIATION)
+            return RuntimeDriverHealth(
+                available=False,
+                remediation=OMNIVOICE_INSTALL_REMEDIATION,
+                reason_code="invalid_native_package",
+            )
         return RuntimeDriverHealth(available=True)
     try:
         command = _container_command_from_environment()
@@ -168,7 +185,7 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
             return cls()
         assert admitted_model is not None
         if sys.platform.startswith("win"):
-            install = discover_native_audio_cpp_install(
+            install = admit_audio_cpp_native_package(
                 Path(os.environ[NATIVE_AUDIO_CPP_EXECUTABLE_ENV]),
                 required_model_paths=(admitted_model.model_path,),
             )

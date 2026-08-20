@@ -153,6 +153,9 @@ class AudioCppBuildReceipt:
     binary_sha256: str
     model_families: tuple[str, ...]
     cmake_definitions: tuple[tuple[str, str], ...]
+    cmake_version: str | None = None
+    cuda_toolkit_version: str | None = None
+    architecture: str | None = None
 
 
 def find_family_inventory(family: str) -> AudioCppFamilyInventory:

@@ -1660,6 +1660,10 @@ def doctor_cmd(args: argparse.Namespace) -> None:
             "ok": omnivoice_health.available,
             "required": True,
         }
+        if not omnivoice_health.available:
+            results["omnivoice_local"]["reason_code"] = (
+                omnivoice_health.reason_code or "invalid_native_package"
+            )
 
     need_whisper = bool(args.with_timings)
     timing_provider = getattr(args, "timing_provider", "faster-whisper")
@@ -1689,6 +1693,8 @@ def doctor_cmd(args: argparse.Namespace) -> None:
             "provider": asr_spec.provider_id,
             "required": True,
         }
+        if not asr_health.available:
+            results["asr_provider"]["reason_code"] = asr_health.reason_code or "unavailable"
 
     if timing_provider == "openrouter-whisper":
         whisper_ok = False

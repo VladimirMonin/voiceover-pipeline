@@ -191,7 +191,9 @@ def audio_cpp_nemotron_asr_dependency_probe() -> ASRDependencyHealth:
     binary = os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip()
     if not binary or sys.platform.startswith("win"):
         return ASRDependencyHealth(
-            available=False, remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION
+            available=False,
+            remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION,
+            reason_code="native_unavailable",
         )
     driver = AudioCppRuntimeDriver(
         binary_path=Path(binary),

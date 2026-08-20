@@ -36,6 +36,7 @@ class RuntimeTransportError(RuntimeErrorBase):
 class RuntimeDriverHealth:
     available: bool
     remediation: str = ""
+    reason_code: str | None = None
 
 
 @dataclass(frozen=True)

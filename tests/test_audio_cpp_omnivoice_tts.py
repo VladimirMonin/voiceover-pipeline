@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -241,6 +242,29 @@ def test_omnivoice_admission_requires_explicit_noncommercial_local_use_opt_in(
 
     assert health.available is False
     assert provider._runtime is None
+
+
+def test_windows_probe_maps_native_package_failure_to_structured_reason(monkeypatch, tmp_path):
+    model = tmp_path / "approved.gguf"
+    model.write_bytes(b"approved artifact bytes")
+    admitted_model = VerifiedOmniVoiceModel(
+        model_path=model,
+        model_id=OMNIVOICE_LOCAL_MODEL_ID,
+        sha256="approved",
+        quantization="q8_0",
+        license="non-commercial",
+        provenance="fixture",
+    )
+    monkeypatch.setattr(
+        audio_cpp_omnivoice_tts, "_re_admit_omnivoice_model", lambda _m: admitted_model
+    )
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setenv("VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE", str(tmp_path / "missing.exe"))
+
+    health = audio_cpp_omnivoice_tts.omnivoice_local_dependency_probe(model)
+
+    assert health.available is False
+    assert health.reason_code == "missing_executable"
 
 
 def test_admitted_omnivoice_model_receipt_has_exact_public_provenance(monkeypatch, tmp_path):

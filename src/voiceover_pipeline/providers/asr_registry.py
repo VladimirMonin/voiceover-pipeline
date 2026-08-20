@@ -10,6 +10,7 @@ from voiceover_pipeline.providers.base import ASRProvider
 class ASRDependencyHealth:
     available: bool
     remediation: str
+    reason_code: str | None = None
 
 
 class ASRProviderNotFoundError(ValueError):

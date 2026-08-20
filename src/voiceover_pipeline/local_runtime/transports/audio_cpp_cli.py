@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import signal
@@ -17,6 +16,7 @@ from threading import RLock
 from typing import Final
 
 from voiceover_pipeline.local_runtime.contracts import RuntimeProtocolError, RuntimeTransportError
+from voiceover_pipeline.local_runtime.transports.audio_cpp_package import stream_sha256
 
 NATIVE_AUDIO_CPP_EXECUTABLE_ENV: Final = "VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE"
 NATIVE_AUDIO_CPP_CLOSURE_MANIFEST: Final = "audio_cpp_dependency_closure.json"
@@ -133,7 +133,7 @@ def discover_native_audio_cpp_install(
         candidate = executable.parent / relative
         if not candidate.is_file():
             raise ValueError("audio.cpp native dependency closure is incomplete")
-        actual_digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        actual_digest = stream_sha256(candidate)
         if actual_digest != expected_digest.casefold():
             raise ValueError("audio.cpp native dependency closure checksum did not match")
         files[relative.as_posix()] = actual_digest

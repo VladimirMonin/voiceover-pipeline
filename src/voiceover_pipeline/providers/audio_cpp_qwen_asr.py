@@ -278,5 +278,9 @@ def _execution_receipt(
 def audio_cpp_qwen_asr_dependency_probe() -> ASRDependencyHealth:
     provider = AudioCppQwenASRProvider.from_environment()
     if provider._runtime is None:
-        return ASRDependencyHealth(available=False, remediation=AUDIO_CPP_QWEN_INSTALL_REMEDIATION)
+        return ASRDependencyHealth(
+            available=False,
+            remediation=AUDIO_CPP_QWEN_INSTALL_REMEDIATION,
+            reason_code="invalid_native_package",
+        )
     return ASRDependencyHealth(available=True, remediation="")

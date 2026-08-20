@@ -322,6 +322,7 @@ def test_nemotron_asr_doctor_uses_selected_dependency_probe(monkeypatch, capsys)
         "ok": False,
         "provider": "nemotron-local",
         "required": True,
+        "reason_code": "unavailable",
     }
     assert (
         "Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying."

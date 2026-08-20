@@ -47,6 +47,21 @@ def _write_closure(package: Path) -> None:
     manifest.write_text(
         json.dumps({"schema_version": 1, "files": files}, sort_keys=True), encoding="utf-8"
     )
+    executable = package / "audiocpp_cli.exe"
+    receipt = {
+        "schema_version": 1,
+        "source_revision": "502b5b74bd26e9b4aed267d1776ecf131cae7215",
+        "compiler": "cl.exe",
+        "cmake_version": "3.30.1",
+        "cuda_toolkit_version": "12.6.0",
+        "architecture": "x86_64",
+        "build_flags": "Release",
+        "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "model_families": ["qwen3-asr", "omnivoice"],
+    }
+    (package / "build_receipt.json").write_text(
+        json.dumps(receipt, sort_keys=True), encoding="utf-8"
+    )
 
 
 def _qwen_request(audio_path: Path) -> dict[str, object]:
