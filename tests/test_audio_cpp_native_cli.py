@@ -5,6 +5,7 @@ import json
 import threading
 import wave
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -24,6 +25,14 @@ def _write_wav(path: Path) -> None:
         output.setsampwidth(2)
         output.setframerate(24_000)
         output.writeframes(b"\x00\x00" * 240)
+
+
+def _write_staged_wav(path: Path) -> None:
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\x00\x00" * 16_000)
 
 
 def _package(tmp_path: Path) -> tuple[Path, Path]:
@@ -115,7 +124,9 @@ def test_nemotron_codec_passes_model_owned_language_without_a_prompt_dictionary(
         model_paths={"nemotron-3.5-asr": model},
         output_directory=tmp_path / "output",
     )
+    assert arguments[arguments.index("--family") + 1] == "nemotron_asr"
     assert arguments[arguments.index("--language") + 1] == "ru-RU"
+    assert "--text" not in arguments
 
     payload["nemotron_asr"] = {"prompt_dictionary": {"id": "invented"}}
     with pytest.raises(RuntimeProtocolError, match="unsupported runtime fields"):
@@ -144,7 +155,7 @@ def test_native_discovery_requires_a_checksummed_colocated_dependency_closure(tm
         discover_native_audio_cpp_install(executable)
 
 
-def test_native_windows_launcher_preserves_unicode_space_argv_decodes_words_and_cleans_up(
+def test_native_windows_launcher_stages_unicode_space_audio_decodes_words_and_cleans_up(
     monkeypatch, tmp_path: Path
 ):
     from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
@@ -164,6 +175,7 @@ def test_native_windows_launcher_preserves_unicode_space_argv_decodes_words_and_
         timeout_seconds=2,
     )
     captured: dict[str, Any] = {}
+    staged_audio: str | None = None
 
     class CompletedProcess:
         returncode = 0
@@ -179,9 +191,22 @@ def test_native_windows_launcher_preserves_unicode_space_argv_decodes_words_and_
         def wait(self, *, timeout: float) -> int:
             return self.returncode
 
+    def fake_run(command, **kwargs):
+        nonlocal staged_audio
+        assert kwargs["check"] is False
+        assert kwargs["cwd"] is not None
+        _write_staged_wav(Path(command[-1]))
+        return SimpleNamespace(returncode=0)
+
     def fake_popen(command, **kwargs):
+        nonlocal staged_audio
         captured["command"] = tuple(command)
         captured["kwargs"] = kwargs
+        staged_audio = command[command.index("--audio") + 1]
+        with wave.open(staged_audio, "rb") as audio:
+            assert audio.getnchannels() == 1
+            assert audio.getsampwidth() == 2
+            assert audio.getframerate() == 16_000
         text_out = Path(command[command.index("--text-out") + 1])
         text_out.write_text("Привет мир\n", encoding="utf-8")
         words_out = Path(command[command.index("--words-out") + 1])
@@ -196,6 +221,7 @@ def test_native_windows_launcher_preserves_unicode_space_argv_decodes_words_and_
         )
         return CompletedProcess()
 
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "run", fake_run)
     monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", fake_popen)
 
     response = transport.invoke("request-1", _qwen_request(audio_path))
@@ -205,17 +231,358 @@ def test_native_windows_launcher_preserves_unicode_space_argv_decodes_words_and_
     command = captured["command"]
     assert command[0] == str(executable.resolve())
     assert str(asr_model.resolve()) in command
-    assert str(audio_path) in command
+    assert str(audio_path) not in command
+    assert staged_audio is not None
+    assert staged_audio == command[command.index("--audio") + 1]
     assert "Сохрани PostgreSQL." in command
     assert captured["kwargs"]["shell"] is False
     assert captured["kwargs"]["creationflags"] == audio_cpp_cli._windows_creation_flags()
     assert "start_new_session" not in captured["kwargs"]
     assert response_payload["transcript"] == "Привет мир"
+    assert response_payload["duration_s"] == 1.0
     assert response_payload["words"] == [
         {"text": "Привет", "start_s": 0.1, "end_s": 0.6},
         {"text": "мир", "start_s": 0.7, "end_s": 0.9},
     ]
     assert response_payload["segments"] == [{"start_s": 0.1, "end_s": 0.9, "text": "Привет мир"}]
+    assert not Path(captured["kwargs"]["cwd"]).exists()
+
+
+def test_native_windows_launcher_stages_reference_audio_under_neutral_name(
+    monkeypatch, tmp_path: Path
+):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    model = tmp_path / "omnivoice.gguf"
+    model.write_bytes(b"model")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"omnivoice": model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+    captured: dict[str, Any] = {}
+    reference_path = tmp_path / "мой референс с пробелом.wav"
+    _write_wav(reference_path)
+
+    class CompletedProcess:
+        returncode = 0
+        pid = 4242
+
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            return "", ""
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, *, timeout: float) -> int:
+            return self.returncode
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = tuple(command)
+        captured["kwargs"] = kwargs
+        _write_wav(Path(command[command.index("--out") + 1]))
+        return CompletedProcess()
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", fake_popen)
+
+    response = transport.invoke(
+        "clone-1",
+        {
+            "schema_version": 1,
+            "operation": "tts",
+            "family": "omnivoice",
+            "provider_id": "omnivoice-local",
+            "payload": {
+                "text": "Привет",
+                "model_id": "audio-cpp/omnivoice-q8_0",
+                "voice": None,
+                "language": "ru",
+                "instruction": "female",
+                "text_chunk_size": 420,
+                "seed": 1,
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+                "reference_audio_path": str(reference_path),
+                "reference_text": "Текст референса",
+            },
+        },
+    )
+
+    command = captured["command"]
+    staged_reference = command[command.index("--voice-ref") + 1]
+    assert staged_reference.endswith("reference.wav")
+    assert Path(staged_reference).parent == Path(captured["kwargs"]["cwd"])
+    assert str(reference_path) not in command
+    assert command[command.index("--reference-text") + 1] == "Текст референса"
+    assert response["ok"] is True
+    assert not Path(captured["kwargs"]["cwd"]).exists()
+
+
+def test_native_windows_launcher_rejects_blank_or_missing_reference_audio(
+    monkeypatch, tmp_path: Path
+):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    model = tmp_path / "omnivoice.gguf"
+    model.write_bytes(b"model")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"omnivoice": model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("no process may start for an invalid reference")
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", unexpected_popen)
+    request = {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": "audio-cpp/omnivoice-q8_0",
+            "voice": None,
+            "language": "ru",
+            "instruction": "female",
+            "text_chunk_size": 420,
+            "seed": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 1.0,
+            "reference_audio_path": str(tmp_path / "missing-ref.wav"),
+            "reference_text": "Текст референса",
+        },
+    }
+    with pytest.raises(RuntimeProtocolError, match="unavailable"):
+        transport.invoke("clone-missing", request)
+
+    not_a_wav = tmp_path / "not-a-wav.wav"
+    not_a_wav.write_bytes(b"garbage")
+    request["payload"]["reference_audio_path"] = str(not_a_wav)
+    with pytest.raises(RuntimeProtocolError, match="readable WAV"):
+        transport.invoke("clone-garbage", request)
+
+    one_sided = {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": "audio-cpp/omnivoice-q8_0",
+            "voice": None,
+            "language": "ru",
+            "instruction": "female",
+            "text_chunk_size": 420,
+            "seed": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 1.0,
+            "reference_audio_path": str(not_a_wav),
+        },
+    }
+    with pytest.raises(RuntimeProtocolError, match="clone requires both"):
+        transport.invoke("clone-one-sided", one_sided)
+
+
+def test_native_windows_launcher_rejects_stereo_reference_audio(monkeypatch, tmp_path: Path):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    model = tmp_path / "omnivoice.gguf"
+    model.write_bytes(b"model")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"omnivoice": model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("no process may start for an invalid reference")
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", unexpected_popen)
+    stereo_reference = tmp_path / "stereo-ref.wav"
+    with wave.open(str(stereo_reference), "wb") as output:
+        output.setnchannels(2)
+        output.setsampwidth(2)
+        output.setframerate(24_000)
+        output.writeframes(b"\x00\x00" * 480)
+    request = {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": "audio-cpp/omnivoice-q8_0",
+            "voice": None,
+            "language": "ru",
+            "instruction": "female",
+            "text_chunk_size": 420,
+            "seed": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 1.0,
+            "reference_audio_path": str(stereo_reference),
+            "reference_text": "Текст референса",
+        },
+    }
+    with pytest.raises(RuntimeProtocolError, match="mono"):
+        transport.invoke("clone-stereo", request)
+
+
+def test_native_windows_launcher_failing_staging_cleans_up_and_never_starts(
+    monkeypatch, tmp_path: Path
+):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    asr_model = tmp_path / "qwen asr.gguf"
+    asr_model.write_bytes(b"asr")
+    audio_path = tmp_path / "input.ogg"
+    audio_path.write_bytes(b"fixture")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"qwen3-asr": asr_model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+    workspaces: list[Path] = []
+
+    def fake_run(command, **kwargs):
+        workspaces.append(Path(kwargs["cwd"]))
+        return SimpleNamespace(returncode=1)
+
+    def unexpected_popen(*_args, **_kwargs):
+        raise AssertionError("staging failure must never start a process")
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", unexpected_popen)
+
+    with pytest.raises(RuntimeTransportError, match="input preparation failed"):
+        transport.invoke("staging-fail", _qwen_request(audio_path))
+
+    assert len(workspaces) == 1
+    assert not workspaces[0].exists()
+
+
+def test_native_windows_launcher_timeout_cleans_up_staged_audio(monkeypatch, tmp_path: Path):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    asr_model = tmp_path / "qwen asr.gguf"
+    asr_model.write_bytes(b"model")
+    aligner = tmp_path / "qwen aligner.gguf"
+    aligner.write_bytes(b"aligner")
+    audio_path = tmp_path / "input.ogg"
+    audio_path.write_bytes(b"fixture")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"qwen3-asr": asr_model, "qwen3-forced-aligner": aligner},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+    workspaces: list[Path] = []
+
+    def fake_run(command, **kwargs):
+        _write_staged_wav(Path(command[-1]))
+        return SimpleNamespace(returncode=0)
+
+    class BlockingProcess:
+        pid = 99887
+
+        def communicate(self, *, timeout: float):
+            raise audio_cpp_cli.subprocess.TimeoutExpired("audiocpp_cli.exe", timeout)
+
+        def poll(self):
+            return None
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    def fake_popen(command, **kwargs):
+        workspaces.append(Path(kwargs["cwd"]))
+        return BlockingProcess()
+
+    def fake_terminate(process):
+        pass
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(transport, "_terminate_process", fake_terminate)
+
+    with pytest.raises(RuntimeTransportError, match="timed out"):
+        transport.invoke("timeout-1", _qwen_request(audio_path))
+
+    assert len(workspaces) == 1
+    assert not workspaces[0].exists()
+
+
+def test_native_windows_launcher_nemotron_invokes_staged_audio_without_prompt_text(
+    monkeypatch, tmp_path: Path
+):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    nemotron_model = tmp_path / "nemotron.gguf"
+    nemotron_model.write_bytes(b"model")
+    audio_path = tmp_path / "вход с пробелом.wav"
+    audio_path.write_bytes(b"fixture")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"nemotron-3.5-asr": nemotron_model},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+    captured: dict[str, Any] = {}
+
+    class CompletedProcess:
+        returncode = 0
+        pid = 8888
+
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            return "", ""
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def wait(self, *, timeout: float) -> int:
+            return self.returncode
+
+    def fake_run(command, **kwargs):
+        _write_staged_wav(Path(command[-1]))
+        return SimpleNamespace(returncode=0)
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = tuple(command)
+        captured["kwargs"] = kwargs
+        text_out = Path(command[command.index("--text-out") + 1])
+        text_out.write_text("Привет\n", encoding="utf-8")
+        words_out = Path(command[command.index("--words-out") + 1])
+        words_out.write_text(
+            '[{"word":"Привет","start_sample":0,"end_sample":16000}]', encoding="utf-8"
+        )
+        return CompletedProcess()
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "run", fake_run)
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", fake_popen)
+
+    response = transport.invoke("nemotron-1", _nemotron_request(audio_path))
+    response_payload = response["response"]
+    assert isinstance(response_payload, dict)
+
+    command = captured["command"]
+    assert command[command.index("--family") + 1] == "nemotron_asr"
+    assert "--text" not in command
+    assert str(audio_path) not in command
+    assert command[command.index("--audio") + 1].endswith("input.wav")
+    assert response_payload["duration_s"] == 1.0
+    assert response_payload["transcript"] == "Привет"
+    assert response_payload["word_timestamps"] == [{"text": "Привет", "start_s": 0.0, "end_s": 1.0}]
     assert not Path(captured["kwargs"]["cwd"]).exists()
 
 
@@ -420,7 +787,7 @@ def test_shared_family_codec_uses_no_container_paths_for_all_declared_families(t
             "--task",
             payload["operation"],
             "--family",
-            family.replace("-", "_").replace(".", "_"),
+            "nemotron_asr" if family == "nemotron-3.5-asr" else family.replace("-", "_"),
         )
         assert all("docker" not in part.casefold() and "/app" not in part for part in command)
 

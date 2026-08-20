@@ -56,7 +56,7 @@ def test_audio_cpp_nemotron_passes_exact_language_and_maps_native_words():
                 {"text": " Post", "start_s": 0.8, "end_s": 0.9, "frame_index": 8},
                 {"text": "gre", "start_s": 0.8, "end_s": 1.0, "frame_index": 8},
                 {"text": "SQL", "start_s": 1.0, "end_s": 1.1, "frame_index": 10},
-                {"text": "▁discard", "start_s": 1.2, "end_s": 1.3, "keep": False},
+                {"text": "", "start_s": 1.2, "end_s": 1.3, "frame_index": 12},
             ],
         }
     )

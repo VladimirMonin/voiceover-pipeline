@@ -24,9 +24,10 @@ def normalize_nemotron_word_timestamps(
     The runtime emits tokenizer chunks, possibly with several entries on the same
     RNN-T frame. A leading SentencePiece metaspace or the ASCII space emitted by
     audio.cpp starts a new canonical word; punctuation without either marker stays
-    attached to the preceding word. Entries
-    outside the driver's explicit keep span are retained in the raw receipt but
-    excluded from the canonical word result.
+    attached to the preceding word. Entries excluded by the optional ``keep``
+    field, when present, are retained in the raw receipt but excluded from the
+    canonical word result. Pinned upstream revisions do not emit ``keep``, so its
+    absence is tolerated; blank entries are always dropped.
     """
 
     offset = _finite_number(response_offset_s, "response_offset_s")
@@ -43,8 +44,12 @@ def normalize_nemotron_word_timestamps(
             continue
 
         text = entry.get("text")
-        if not isinstance(text, str) or not text:
+        if text is None:
+            continue
+        if not isinstance(text, str):
             raise ValueError(f"Nemotron word timestamp {index} text must be a non-empty string")
+        if not text.strip():
+            continue
         start_s = (
             offset
             + _entry_offset(entry, index)

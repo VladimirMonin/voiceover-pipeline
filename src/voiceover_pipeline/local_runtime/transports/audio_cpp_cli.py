@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import wave
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from io import BytesIO
 from math import isfinite
@@ -46,7 +47,7 @@ _FAMILY_SPECS: Final = {
         operation="asr",
         provider_id="nemotron-local",
         model_id="nvidia/nemotron-3.5-asr-streaming-0.6b",
-        cli_family="nemotron_3_5_asr",
+        cli_family="nemotron_asr",
     ),
     "qwen3-tts": _FamilySpec(
         operation="tts",
@@ -146,7 +147,13 @@ def build_audio_cpp_family_arguments(
     reference_audio_argument: str | None = None,
     wav_filename: str = "speech.wav",
 ) -> tuple[str, ...]:
-    """Map a decoded family request to CLI argv without choosing a launcher."""
+    """Map a decoded family request to CLI argv without choosing a launcher.
+
+    Sensitive text (prompt/context, transcript, reference transcript, design
+    instruction) is passed to the native process via argv flags because the
+    pinned upstream revision provides no file/stdin transport. It must never
+    appear in exceptions, logs, receipts, or metadata.
+    """
 
     spec = _FAMILY_SPECS.get(family)
     if spec is None:
@@ -176,7 +183,7 @@ def build_audio_cpp_family_arguments(
         if isinstance(language, str) and language:
             command.extend(("--language", language))
         context_text = payload.get("context_text")
-        if isinstance(context_text, str) and context_text:
+        if family == "qwen3-asr" and isinstance(context_text, str) and context_text:
             command.extend(("--text", context_text))
         if payload.get("timestamp_mode") == "word":
             command.extend(("--words-out", str(output_directory / "words.json")))
@@ -227,6 +234,15 @@ def build_audio_cpp_family_arguments(
                 str(payload["guidance_scale"]),
             )
         )
+        if reference_audio_argument is not None:
+            command.extend(
+                (
+                    "--voice-ref",
+                    reference_audio_argument,
+                    "--reference-text",
+                    _required_string(payload, "reference_text", "reference text"),
+                )
+            )
     return tuple(command)
 
 
@@ -285,12 +301,110 @@ def _gguf_artifacts_in_directory(model_directory: Path) -> tuple[Path, ...]:
     return artifacts
 
 
+def _stage_asr_audio(
+    *,
+    source_path: Path,
+    staged_path: Path,
+    ffmpeg_command: Sequence[str],
+    timeout_seconds: float,
+    child_environment: Mapping[str, str],
+) -> None:
+    """Convert arbitrary input audio into a private 16 kHz mono 16-bit PCM WAV."""
+    if not source_path.is_file():
+        raise RuntimeTransportError("audio.cpp input audio is unavailable")
+    try:
+        completed = subprocess.run(
+            [
+                *ffmpeg_command,
+                "-nostdin",
+                "-v",
+                "error",
+                "-y",
+                "-i",
+                str(source_path),
+                "-ar",
+                str(_STAGED_AUDIO_RATE_HZ),
+                "-ac",
+                "1",
+                "-c:a",
+                "pcm_s16le",
+                str(staged_path),
+            ],
+            check=False,
+            cwd=staged_path.parent,
+            env=dict(child_environment),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeTransportError("audio.cpp input preparation failed") from exc
+    if completed.returncode != 0:
+        raise RuntimeTransportError("audio.cpp input preparation failed")
+
+
+def _stage_reference_audio(request: Mapping[str, object], workspace: Path) -> Path | None:
+    """Copy clone reference audio under a neutral name into the private workspace.
+
+    Clone reference audio must be a mono WAV file. Sensitive text (reference
+    transcript, instruction) is passed to the native process via argv flags:
+    the pinned upstream revision exposes no file/stdin transport. Never include
+    such text in exceptions, logs, receipts, or metadata.
+    """
+    raw_reference = request.get("reference_audio_path")
+    if raw_reference is None:
+        return None
+    if not isinstance(raw_reference, str) or not raw_reference:
+        raise RuntimeProtocolError("audio.cpp clone reference audio is unavailable")
+    try:
+        source = Path(raw_reference).resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise RuntimeProtocolError("audio.cpp clone reference audio is unavailable") from exc
+    if not source.is_file():
+        raise RuntimeProtocolError("audio.cpp clone reference audio must be a regular file")
+    staged = workspace / "reference.wav"
+    try:
+        shutil.copyfile(source, staged)
+        os.chmod(staged, 0o600)
+        with wave.open(str(staged), "rb") as audio:
+            if audio.getnframes() <= 0:
+                raise RuntimeProtocolError(
+                    "audio.cpp clone reference audio contains no audio frames"
+                )
+            if audio.getnchannels() != 1:
+                raise RuntimeProtocolError("audio.cpp clone reference audio must be mono")
+    except RuntimeProtocolError:
+        raise
+    except (EOFError, OSError, wave.Error) as exc:
+        raise RuntimeProtocolError(
+            "audio.cpp clone reference audio is not a readable WAV file"
+        ) from exc
+    return staged
+
+
+def _staged_audio_duration_s(staged_audio_path: Path) -> float:
+    try:
+        with wave.open(str(staged_audio_path), "rb") as audio:
+            if audio.getnchannels() != 1 or audio.getframerate() != _STAGED_AUDIO_RATE_HZ:
+                raise RuntimeProtocolError("audio.cpp input staging produced an invalid WAV format")
+            duration_s = audio.getnframes() / audio.getframerate()
+    except (OSError, wave.Error) as exc:
+        raise RuntimeProtocolError(
+            "audio.cpp input staging did not produce a readable WAV"
+        ) from exc
+    if duration_s <= 0:
+        raise RuntimeProtocolError("audio.cpp staged input audio contains no frames")
+    return duration_s
+
+
 def build_audio_cpp_cli_arguments(
     *,
     family: str,
     payload: Mapping[str, object],
     model_paths: Mapping[str, Path],
     output_directory: Path,
+    audio_argument: str | None = None,
+    reference_audio_argument: str | None = None,
 ) -> tuple[str, ...]:
     """Map a decoded request to native ``audiocpp_cli`` argv arguments."""
 
@@ -310,7 +424,9 @@ def build_audio_cpp_cli_arguments(
         payload=payload,
         model_argument=model_argument,
         output_directory=output_directory,
+        audio_argument=audio_argument,
         forced_aligner_argument=forced_aligner,
+        reference_audio_argument=reference_audio_argument,
     )
 
 
@@ -408,10 +524,13 @@ class AudioCppNativeCLITransport:
         model_paths: Mapping[str, Path],
         timeout_seconds: float = 300.0,
         host_platform: str | None = None,
+        ffmpeg_command: Sequence[str] = ("ffmpeg",),
     ) -> None:
         self._host_platform = host_platform or sys.platform
         if not self._host_platform.startswith("win"):
             raise ValueError("audio.cpp native CLI transport is Windows-only")
+        if not ffmpeg_command or not all(ffmpeg_command):
+            raise ValueError("audio.cpp ffmpeg command must not be empty")
         executable = executable_path.expanduser().resolve()
         if executable.suffix.casefold() != ".exe" or not executable.is_file():
             raise ValueError("audio.cpp native executable is unavailable")
@@ -428,6 +547,7 @@ class AudioCppNativeCLITransport:
         self._executable_path = executable
         self._model_paths = resolved_models
         self._timeout_seconds = timeout_seconds
+        self._ffmpeg_command = tuple(ffmpeg_command)
         self._lock = RLock()
         self._processes: dict[str, subprocess.Popen[str] | None] = {}
         self._cancelled: set[str] = set()
@@ -436,12 +556,34 @@ class AudioCppNativeCLITransport:
         request = decode_audio_cpp_cli_request(payload)
         family = request["family"]
         assert isinstance(family, str)
+        spec = _FAMILY_SPECS[family]
         with self._lock:
             self._processes[request_id] = None
         try:
             with tempfile.TemporaryDirectory(prefix=_PRIVATE_TMP_PREFIX) as temporary_directory:
                 workspace = Path(temporary_directory)
                 output_directory = workspace / "output"
+                with self._lock:
+                    if request_id in self._cancelled:
+                        raise RuntimeTransportError("audio.cpp native invocation cancelled")
+                staged_audio_path: Path | None = None
+                staged_duration_s: float | None = None
+                if spec.operation == "asr":
+                    raw_audio = request["audio_path"]
+                    assert isinstance(raw_audio, str)
+                    staged_audio_path = workspace / "input.wav"
+                    _stage_asr_audio(
+                        source_path=Path(raw_audio),
+                        staged_path=staged_audio_path,
+                        ffmpeg_command=self._ffmpeg_command,
+                        timeout_seconds=self._timeout_seconds,
+                        child_environment=_windows_child_environment(),
+                    )
+                    staged_duration_s = _staged_audio_duration_s(staged_audio_path)
+                else:
+                    staged_reference_path = _stage_reference_audio(request, workspace)
+                    if staged_reference_path is not None:
+                        staged_audio_path = staged_reference_path
                 with self._lock:
                     if request_id in self._cancelled:
                         raise RuntimeTransportError("audio.cpp native invocation cancelled")
@@ -452,6 +594,16 @@ class AudioCppNativeCLITransport:
                         payload=request,
                         model_paths=self._model_paths,
                         output_directory=output_directory,
+                        audio_argument=(
+                            str(staged_audio_path)
+                            if spec.operation == "asr" and staged_audio_path is not None
+                            else None
+                        ),
+                        reference_audio_argument=(
+                            str(staged_audio_path)
+                            if spec.operation != "asr" and staged_audio_path is not None
+                            else None
+                        ),
                     ),
                 )
                 with self._lock:
@@ -472,11 +624,12 @@ class AudioCppNativeCLITransport:
                     raise RuntimeTransportError(
                         f"audio.cpp native process exited with code {process.returncode}"
                     )
-                return decode_audio_cpp_cli_response(
+                return self._decode_response(
                     request_id=request_id,
                     family=family,
-                    payload=request,
+                    request=request,
                     output_directory=output_directory,
+                    staged_duration_s=staged_duration_s,
                 )
         finally:
             with self._lock:
@@ -513,6 +666,32 @@ class AudioCppNativeCLITransport:
             )
         except OSError as exc:
             raise RuntimeTransportError("audio.cpp native process could not be started") from exc
+
+    @staticmethod
+    def _decode_response(
+        *,
+        request_id: str,
+        family: str,
+        request: Mapping[str, object],
+        output_directory: Path,
+        staged_duration_s: float | None,
+    ) -> Mapping[str, object]:
+        encoded = decode_audio_cpp_cli_response(
+            request_id=request_id,
+            family=family,
+            payload=request,
+            output_directory=output_directory,
+        )
+        if staged_duration_s is None:
+            return encoded
+        response = encoded["response"]
+        assert isinstance(response, Mapping)
+        return {
+            "schema_version": 1,
+            "request_id": request_id,
+            "ok": True,
+            "response": {**response, "duration_s": staged_duration_s},
+        }
 
     @staticmethod
     def _terminate_process(process: subprocess.Popen[str]) -> None:
@@ -562,6 +741,8 @@ def _validate_tts_request(family: str, payload: Mapping[str, object]) -> None:
                 "guidance_scale",
                 "instruction",
                 "text_chunk_size",
+                "reference_audio_path",
+                "reference_text",
             }
         )
     _reject_unexpected_fields(payload, allowed)
@@ -570,6 +751,20 @@ def _validate_tts_request(family: str, payload: Mapping[str, object]) -> None:
         value = payload.get(field)
         if value is not None and not isinstance(value, str):
             raise RuntimeProtocolError(f"audio.cpp CLI request {field} must be a string or null")
+    reference_audio_path = payload.get("reference_audio_path")
+    if reference_audio_path is not None and (
+        not isinstance(reference_audio_path, str) or not reference_audio_path.strip()
+    ):
+        raise RuntimeProtocolError(
+            "audio.cpp CLI request reference audio path must be a string or null"
+        )
+    reference_text = payload.get("reference_text")
+    if reference_text is not None and not isinstance(reference_text, str):
+        raise RuntimeProtocolError("audio.cpp CLI request reference text must be a string or null")
+    if (reference_audio_path is None) != (reference_text is None):
+        raise RuntimeProtocolError(
+            "audio.cpp CLI request clone requires both reference audio and reference text"
+        )
     if family == "omnivoice":
         if not isinstance(payload.get("language"), str) or not str(payload["language"]).strip():
             raise RuntimeProtocolError("OmniVoice request language must not be blank")

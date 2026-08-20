@@ -24,10 +24,12 @@ def test_normalizes_sentencepiece_cyrillic_latin_terms_punctuation_and_shared_fr
     ]
 
 
-def test_normalizer_keeps_zero_duration_spans_and_drops_explicit_out_of_keep_entries():
+def test_normalizer_keeps_zero_duration_spans_and_drops_blank_or_out_of_keep_entries():
     words = normalize_nemotron_word_timestamps(
         (
             {"text": "▁ноль", "start_s": 0.0, "end_s": 0.0},
+            {"text": "", "start_s": 0.1, "end_s": 0.2},
+            {"text": "   ", "start_s": 0.2, "end_s": 0.25},
             {"text": "▁skip", "start_s": 0.1, "end_s": 0.2, "keep": False},
             {"text": "▁one", "start_s": 0.3, "end_s": 0.3},
         )
@@ -51,6 +53,20 @@ def test_normalizer_keeps_zero_duration_spans_and_drops_explicit_out_of_keep_ent
 def test_normalizer_rejects_malformed_raw_entries(entries, message):
     with pytest.raises(ValueError, match=message):
         normalize_nemotron_word_timestamps(entries)
+
+
+def test_normalizer_accepts_entries_without_a_keep_field():
+    words = normalize_nemotron_word_timestamps(
+        (
+            {"text": "▁first", "start_s": 0.0, "end_s": 0.2},
+            {"text": "▁second", "start_s": 0.3, "end_s": 0.5},
+        )
+    )
+
+    assert [(word.text, word.start_s, word.end_s) for word in words] == [
+        ("first ", 0.0, 0.2),
+        ("second", 0.3, 0.5),
+    ]
 
 
 def test_normalizer_rejects_overlapping_canonical_words_at_chunk_boundary():

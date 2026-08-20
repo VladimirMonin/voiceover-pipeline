@@ -378,8 +378,8 @@ prompt/reference text, credentials, or anything private.
 **Текущее состояние**
 Пять сабов независимо подтвердили:
 
-- Серии 1–2 завершены.
-- Серия 3 завершена только offline: admission, receipts и тесты есть, реальной Windows-сборки ещё нет.
+- Серии 1–2 завершены (зафиксированы коммитами `a845a7c`, `dee8854`).
+- Серия 3 завершена только offline (зафиксирована коммитом `64df7ea`): admission, receipts и тесты есть, реальной Windows-сборки ещё нет.
 - Nemotron на Windows по-прежнему заблокирован в `from_environment`, контекст отклоняется, CLI не разрешает `--runtime audio-cpp`.
 - OmniVoice clone/design существуют только как контракт и CLI-валидация; provider и transport поддерживают только fixed-style.
 - Текущий package admission не связывает receipt с pinned revision, CUDA и требуемыми model families.
@@ -479,7 +479,7 @@ Preflight не устанавливает и не запускает модел�
 - ASR input всегда staging в 16 kHz mono PCM WAV.
 - Duration измеряется по staged WAV.
 - Reference audio копируется под нейтральным именем в private workspace.
-- Prompt, transcript и design instruction передаются через доказанный file/stdin механизм.
+- Prompt, transcript и design instruction передаются через argv-флаги, доказанные upstream-контрактом (`--text` для Qwen3 ASR, `--reference-text`/`--instruct` для OmniVoice); file/stdin transport в pinned revision отсутствует — argv-видимость в process list является известным ограничением.
 - Sensitive text не появляется в argv, exception, stdout, receipt или metadata.
 - Cleanup работает после success, error, timeout и cancellation.
 - Unicode/space paths покрываются тестами.
