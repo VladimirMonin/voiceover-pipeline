@@ -631,6 +631,67 @@ def test_native_windows_launcher_timeout_cleans_up_staged_audio(monkeypatch, tmp
     assert not workspaces[0].exists()
 
 
+def test_decode_nemotron_word_response_with_missing_words_json_returns_empty_list(
+    tmp_path: Path,
+):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        decode_audio_cpp_cli_response,
+    )
+
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "transcript.txt").write_text("", encoding="utf-8")
+    response = decode_audio_cpp_cli_response(
+        request_id="silence-1",
+        family="nemotron-3.5-asr",
+        payload={"timestamp_mode": "word"},
+        output_directory=output,
+    )
+
+    assert response["ok"] is True
+    response_payload = response["response"]
+    assert isinstance(response_payload, dict)
+    assert response_payload["transcript"] == ""
+    assert response_payload["word_timestamps"] == []
+
+
+def test_decode_qwen_missing_words_json_in_word_mode_still_fails_closed(tmp_path: Path):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        decode_audio_cpp_cli_response,
+    )
+
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "transcript.txt").write_text("speech", encoding="utf-8")
+    with pytest.raises(RuntimeProtocolError, match="valid words JSON"):
+        decode_audio_cpp_cli_response(
+            request_id="qwen-1",
+            family="qwen3-asr",
+            payload={"timestamp_mode": "word"},
+            output_directory=output,
+        )
+
+
+def test_decode_nemotron_words_keeps_raw_end_sample_for_provider_clamping(tmp_path: Path):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        decode_audio_cpp_words,
+    )
+
+    words_path = tmp_path / "words.json"
+    words_path.write_text(
+        '[{"word":"first","start_sample":0,"end_sample":6400},'
+        '{"word":"trailing","start_sample":14400,"end_sample":16500}]',
+        encoding="utf-8",
+    )
+
+    words = decode_audio_cpp_words(words_path)
+
+    assert words == [
+        {"text": "first", "start_s": 0.0, "end_s": 0.4},
+        {"text": "trailing", "start_s": 0.9, "end_s": 1.03125},
+    ]
+
+
 def test_native_windows_launcher_nemotron_invokes_staged_audio_without_prompt_text(
     monkeypatch, tmp_path: Path
 ):

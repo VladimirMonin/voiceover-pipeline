@@ -129,14 +129,6 @@ def test_audio_cpp_nemotron_rejects_unsupported_free_or_hotword_prompts(hints):
         ({"transcript": "speech", "word_timestamps": []}, "returned no words"),
         (
             {
-                "transcript": "speech",
-                "word_timestamps": [{"text": "▁speech", "start_s": 0.0, "end_s": 2.0}],
-                "duration_s": 1.0,
-            },
-            "must not exceed source duration",
-        ),
-        (
-            {
                 "transcript": "different",
                 "word_timestamps": [{"text": "▁speech", "start_s": 0.0, "end_s": 0.1}],
             },
@@ -445,3 +437,47 @@ def test_transcribe_uses_staged_wav_duration_from_payload():
     result = provider.transcribe(ASRRequest(audio_path="fixture.wav"))
 
     assert result.duration_s == 3.5
+
+
+def test_audio_cpp_nemotron_clamps_trailing_word_to_staged_duration():
+    provider = _provider(
+        {
+            "transcript": "Привет",
+            "duration_s": 1.0,
+            "word_timestamps": [
+                {"text": "▁При", "start_s": 0.0, "end_s": 0.6},
+                {"text": "вет", "start_s": 0.6, "end_s": 1.031},
+            ],
+        }
+    )
+
+    result = provider.transcribe(ASRRequest(audio_path="fixture.wav", timestamp_mode="word"))
+
+    assert [(word.text, word.start_s, word.end_s) for word in result.words] == [
+        ("Привет", 0.0, 1.0),
+    ]
+    assert result.duration_s == 1.0
+
+
+def test_audio_cpp_nemotron_clamp_preserves_monotonicity_and_end_at_least_start():
+    provider = _provider(
+        {
+            "transcript": "Привет мир",
+            "duration_s": 1.0,
+            "word_timestamps": [
+                {"text": "▁При", "start_s": 0.0, "end_s": 0.6},
+                {"text": "вет", "start_s": 0.6, "end_s": 0.9},
+                {"text": "▁мир", "start_s": 1.02, "end_s": 1.031},
+            ],
+        }
+    )
+
+    result = provider.transcribe(ASRRequest(audio_path="fixture.wav", timestamp_mode="word"))
+
+    assert [(word.text, word.start_s, word.end_s) for word in result.words] == [
+        ("Привет ", 0.0, 0.9),
+        ("мир", 1.0, 1.0),
+    ]
+    for previous, current in zip(result.words, result.words[1:]):
+        assert current.start_s >= previous.end_s
+    assert all(word.end_s >= word.start_s for word in result.words)

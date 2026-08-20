@@ -502,12 +502,13 @@ def decode_audio_cpp_cli_response(
         "transcript": _read_text_output(output_directory / "transcript.txt"),
     }
     if payload.get("timestamp_mode") == "word":
-        words = decode_audio_cpp_words(output_directory / "words.json")
         if family == "nemotron-3.5-asr":
-            response["word_timestamps"] = words
+            response["word_timestamps"] = decode_audio_cpp_words(
+                output_directory / "words.json", missing_ok=True
+            )
         else:
             response["forced_aligner_available"] = True
-            response["words"] = words
+            response["words"] = decode_audio_cpp_words(output_directory / "words.json")
     segments = _decode_json_output(output_directory / "segments.json", "segments")
     if segments is not None:
         response["segments"] = segments
@@ -519,8 +520,12 @@ def decode_audio_cpp_cli_response(
     }
 
 
-def decode_audio_cpp_words(words_path: Path) -> list[dict[str, object]]:
-    raw = _decode_json_output(words_path, "words")
+def decode_audio_cpp_words(
+    words_path: Path, *, missing_ok: bool = False
+) -> list[dict[str, object]]:
+    raw = _decode_json_output(words_path, "words", missing_ok=missing_ok)
+    if raw is None:
+        return []
     if isinstance(raw, Mapping):
         raw = raw.get("words", raw.get("word_timestamps"))
     if not isinstance(raw, list):
@@ -964,8 +969,8 @@ def _read_text_output(path: Path) -> str:
         ) from exc
 
 
-def _decode_json_output(path: Path, label: str) -> object | None:
-    if not path.is_file() and label == "segments":
+def _decode_json_output(path: Path, label: str, *, missing_ok: bool = False) -> object | None:
+    if not path.is_file() and (label == "segments" or missing_ok):
         return None
     try:
         return json.loads(path.read_text(encoding="utf-8"))

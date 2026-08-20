@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 from collections.abc import Mapping
+from dataclasses import replace
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -32,7 +33,13 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
     AudioCppPackageError,
     admit_audio_cpp_native_package,
 )
-from voiceover_pipeline.models import ASRContextHints, ASRExecutionReceipt, ASRRequest, ASRResult
+from voiceover_pipeline.models import (
+    ASRContextHints,
+    ASRExecutionReceipt,
+    ASRRequest,
+    ASRResult,
+    ASRWordSpan,
+)
 from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth
 from voiceover_pipeline.providers.base import ASRProvider, validate_asr_response
 from voiceover_pipeline.providers.nemotron_asr_local import (
@@ -106,6 +113,7 @@ class AudioCppNemotronASRProvider(ASRProvider):
                     payload.get("chunk_offset_s", 0.0), "chunk_offset_s"
                 ),
             )
+            words = _clamp_words_to_duration(words, duration_s)
             if local_response.transcript.strip() and not words:
                 raise ValueError("Nemotron native timestamps returned no words for speech output")
             result = ASRResult(
@@ -199,6 +207,31 @@ def _raw_timestamp_entries(
             raise ValueError(f"Nemotron native word timestamp {index} must be an object")
         entries.append(entry)
     return tuple(entries)
+
+
+def _clamp_words_to_duration(
+    words: tuple[ASRWordSpan, ...], duration_s: float | None
+) -> tuple[ASRWordSpan, ...]:
+    """Clamp native word spans to the real staged-audio duration.
+
+    The native Nemotron runtime may emit a trailing RNN-T token a few frames
+    beyond the actual audio length; such entries are clamped (not rejected) so
+    the strict ASR bounds validation treats them as a tolerance at the audio
+    boundary. Clamping preserves ``end >= start`` and word monotonicity because
+    ``min(value, duration)`` is monotone. A word whose entire span lies beyond
+    the duration collapses to a zero-length span at the boundary instead of
+    being dropped, keeping transcript correspondence intact.
+    """
+    if duration_s is None or duration_s <= 0 or not words:
+        return words
+    clamped: list[ASRWordSpan] = []
+    for word in words:
+        start_s = min(word.start_s, duration_s)
+        end_s = min(word.end_s, duration_s)
+        if end_s < start_s:
+            end_s = start_s
+        clamped.append(replace(word, start_s=start_s, end_s=end_s))
+    return tuple(clamped)
 
 
 def _audio_cpp_gpu_lifecycle() -> GPULifecycleOwner:

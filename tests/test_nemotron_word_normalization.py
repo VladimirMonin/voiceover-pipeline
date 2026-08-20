@@ -77,3 +77,18 @@ def test_normalizer_rejects_overlapping_canonical_words_at_chunk_boundary():
                 {"text": "▁second", "start_s": 0.7, "end_s": 1.0},
             )
         )
+
+
+def test_normalizer_keeps_raw_end_beyond_duration_for_later_clamping():
+    words = normalize_nemotron_word_timestamps(
+        (
+            {"text": "▁first", "start_s": 0.0, "end_s": 0.4},
+            {"text": "▁trailing", "start_s": 0.9, "end_s": 1.031},
+        )
+    )
+
+    assert [(word.text, word.start_s, word.end_s) for word in words] == [
+        ("first ", 0.0, 0.4),
+        ("trailing", 0.9, 1.031),
+    ]
+    assert words[-1].end_s > 1.0
