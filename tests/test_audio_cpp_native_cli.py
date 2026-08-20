@@ -241,8 +241,22 @@ def test_native_windows_launcher_stages_unicode_space_audio_decodes_words_and_cl
     assert response_payload["transcript"] == "Привет мир"
     assert response_payload["duration_s"] == 1.0
     assert response_payload["words"] == [
-        {"text": "Привет", "start_s": 0.1, "end_s": 0.6},
-        {"text": "мир", "start_s": 0.7, "end_s": 0.9},
+        {
+            "word": "Привет",
+            "start_sample": 1600,
+            "end_sample": 9600,
+            "text": "Привет",
+            "start_s": 0.1,
+            "end_s": 0.6,
+        },
+        {
+            "word": "мир",
+            "start_sample": 11200,
+            "end_sample": 14400,
+            "text": "мир",
+            "start_s": 0.7,
+            "end_s": 0.9,
+        },
     ]
     assert response_payload["segments"] == [{"start_s": 0.1, "end_s": 0.9, "text": "Привет мир"}]
     assert not Path(captured["kwargs"]["cwd"]).exists()
@@ -653,6 +667,7 @@ def test_decode_nemotron_word_response_with_missing_words_json_returns_empty_lis
     assert isinstance(response_payload, dict)
     assert response_payload["transcript"] == ""
     assert response_payload["word_timestamps"] == []
+    assert response_payload["words_emitted"] is False
 
 
 def test_decode_qwen_missing_words_json_in_word_mode_still_fails_closed(tmp_path: Path):
@@ -687,8 +702,77 @@ def test_decode_nemotron_words_keeps_raw_end_sample_for_provider_clamping(tmp_pa
     words = decode_audio_cpp_words(words_path)
 
     assert words == [
-        {"text": "first", "start_s": 0.0, "end_s": 0.4},
-        {"text": "trailing", "start_s": 0.9, "end_s": 1.03125},
+        {
+            "word": "first",
+            "start_sample": 0,
+            "end_sample": 6400,
+            "text": "first",
+            "start_s": 0.0,
+            "end_s": 0.4,
+        },
+        {
+            "word": "trailing",
+            "start_sample": 14400,
+            "end_sample": 16500,
+            "text": "trailing",
+            "start_s": 0.9,
+            "end_s": 1.03125,
+        },
+    ]
+
+
+def test_decode_nemotron_words_preserves_raw_provenance_fields(tmp_path: Path):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        decode_audio_cpp_words,
+    )
+
+    words_path = tmp_path / "words.json"
+    words_path.write_text(
+        '[{"word":"keep","start_sample":0,"end_sample":1600,"keep":true},'
+        '{"word":"drop","start_sample":1600,"end_sample":3200,"keep":false},'
+        '{"word":"","start_sample":3200,"end_sample":4800},'
+        '{"word":"offset","start_sample":4800,"end_sample":6400,"chunk_offset_s":1.5}]',
+        encoding="utf-8",
+    )
+
+    words = decode_audio_cpp_words(words_path, allow_blank_text=True)
+
+    assert words == [
+        {
+            "word": "keep",
+            "start_sample": 0,
+            "end_sample": 1600,
+            "keep": True,
+            "text": "keep",
+            "start_s": 0.0,
+            "end_s": 0.1,
+        },
+        {
+            "word": "drop",
+            "start_sample": 1600,
+            "end_sample": 3200,
+            "keep": False,
+            "text": "drop",
+            "start_s": 0.1,
+            "end_s": 0.2,
+        },
+        {
+            "word": "",
+            "start_sample": 3200,
+            "end_sample": 4800,
+            "text": "",
+            "start_s": 0.2,
+            "end_s": 0.3,
+        },
+        {
+            "word": "offset",
+            "start_sample": 4800,
+            "end_sample": 6400,
+            "chunk_offset_s": 1.5,
+            "text": "offset",
+            "start_s": 0.3,
+            "end_s": 0.4,
+        },
     ]
 
 
@@ -752,7 +836,17 @@ def test_native_windows_launcher_nemotron_invokes_staged_audio_without_prompt_te
     assert command[command.index("--audio") + 1].endswith("input.wav")
     assert response_payload["duration_s"] == 1.0
     assert response_payload["transcript"] == "Привет"
-    assert response_payload["word_timestamps"] == [{"text": "Привет", "start_s": 0.0, "end_s": 1.0}]
+    assert response_payload["words_emitted"] is True
+    assert response_payload["word_timestamps"] == [
+        {
+            "word": "Привет",
+            "start_sample": 0,
+            "end_sample": 16000,
+            "text": "Привет",
+            "start_s": 0.0,
+            "end_s": 1.0,
+        }
+    ]
     assert not Path(captured["kwargs"]["cwd"]).exists()
 
 

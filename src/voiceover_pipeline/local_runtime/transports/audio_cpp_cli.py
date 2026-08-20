@@ -504,8 +504,9 @@ def decode_audio_cpp_cli_response(
     if payload.get("timestamp_mode") == "word":
         if family == "nemotron-3.5-asr":
             response["word_timestamps"] = decode_audio_cpp_words(
-                output_directory / "words.json", missing_ok=True
+                output_directory / "words.json", missing_ok=True, allow_blank_text=True
             )
+            response["words_emitted"] = (output_directory / "words.json").is_file()
         else:
             response["forced_aligner_available"] = True
             response["words"] = decode_audio_cpp_words(output_directory / "words.json")
@@ -521,7 +522,7 @@ def decode_audio_cpp_cli_response(
 
 
 def decode_audio_cpp_words(
-    words_path: Path, *, missing_ok: bool = False
+    words_path: Path, *, missing_ok: bool = False, allow_blank_text: bool = False
 ) -> list[dict[str, object]]:
     raw = _decode_json_output(words_path, "words", missing_ok=missing_ok)
     if raw is None:
@@ -537,13 +538,16 @@ def decode_audio_cpp_words(
         text = raw_word.get("word", raw_word.get("text"))
         start_sample = raw_word.get("start_sample")
         end_sample = raw_word.get("end_sample")
-        if not isinstance(text, str) or not text:
+        if not isinstance(text, str) or (not text and not allow_blank_text):
             raise RuntimeProtocolError(f"audio.cpp CLI word {index} has no text")
         start_s = _sample_seconds(start_sample, index, "start")
         end_s = _sample_seconds(end_sample, index, "end")
         if end_s < start_s:
             raise RuntimeProtocolError(f"audio.cpp CLI word {index} has reversed boundaries")
-        word: dict[str, object] = {"text": text, "start_s": start_s, "end_s": end_s}
+        word = dict(raw_word)
+        word["text"] = text
+        word["start_s"] = start_s
+        word["end_s"] = end_s
         if "confidence" in raw_word:
             word["confidence"] = raw_word["confidence"]
         words.append(word)

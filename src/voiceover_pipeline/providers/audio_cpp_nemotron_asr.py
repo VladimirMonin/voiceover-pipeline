@@ -105,6 +105,7 @@ class AudioCppNemotronASRProvider(ASRProvider):
         raw_timestamp_entries = _raw_timestamp_entries(
             payload, required=request.timestamp_mode == "word"
         )
+        measurements = _emission_measurements(payload)
 
         result_language = local_response.language or request.language or ""
         if request.timestamp_mode == "word":
@@ -125,7 +126,9 @@ class AudioCppNemotronASRProvider(ASRProvider):
                 duration_s=duration_s,
                 words=words,
                 alignment_origin="native",
-                execution=_execution_receipt(response.receipt, request, raw_timestamp_entries),
+                execution=_execution_receipt(
+                    response.receipt, request, raw_timestamp_entries, measurements
+                ),
             )
         else:
             result = ASRResult(
@@ -134,7 +137,9 @@ class AudioCppNemotronASRProvider(ASRProvider):
                 model_id=model_id,
                 language=result_language,
                 duration_s=duration_s,
-                execution=_execution_receipt(response.receipt, request, raw_timestamp_entries),
+                execution=_execution_receipt(
+                    response.receipt, request, raw_timestamp_entries, measurements
+                ),
             )
         return validate_asr_response(request, result)
 
@@ -271,6 +276,7 @@ def _execution_receipt(
     receipt: RuntimeExecutionReceipt | None,
     request: ASRRequest,
     raw_timestamp_entries: tuple[Mapping[str, object], ...],
+    measurements: Mapping[str, float] | None = None,
 ) -> ASRExecutionReceipt:
     return ASRExecutionReceipt(
         runtime=receipt.driver_id if receipt is not None else "audio-cpp",
@@ -278,8 +284,22 @@ def _execution_receipt(
         model_revision=None,
         resolved_device=request.device,
         resolved_compute=request.compute,
+        measurements=measurements or {},
         raw_timestamp_entries=raw_timestamp_entries,
     )
+
+
+def _emission_measurements(payload: Mapping[str, object]) -> dict[str, float]:
+    """Mirror native words-emission status into numeric receipt measurements.
+
+    ``words_emitted`` distinguishes a native run that truly produced no speech
+    (no words file) from a run whose words were merely empty; both are legal,
+    but only the former is direct evidence of a no-speech outcome.
+    """
+    words_emitted = payload.get("words_emitted")
+    if isinstance(words_emitted, bool):
+        return {"native_words_emitted": 1.0 if words_emitted else 0.0}
+    return {}
 
 
 def audio_cpp_nemotron_asr_dependency_probe() -> ASRDependencyHealth:
