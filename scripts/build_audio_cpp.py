@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from voiceover_pipeline.audio_cpp.inventory import (
     PINNED_AUDIO_CPP_REVISION,
     AudioCppBuildPlan,
     find_family_inventory,
+    inspect_pinned_source,
 )
 from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
     NATIVE_AUDIO_CPP_BUILD_RECEIPT,
@@ -28,6 +30,7 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
 
 BUILD_RECEIPT_SCHEMA_VERSION = 1
 CLOSURE_MANIFEST_SCHEMA_VERSION = 1
+DEFAULT_NATIVE_BACKEND = "cuda"
 
 
 def _cmake_definition(value: str) -> tuple[str, str]:
@@ -89,7 +92,11 @@ def build_parser() -> argparse.ArgumentParser:
     receipt_arguments.add_argument("--compiler-version", type=_non_blank)
     receipt_arguments.add_argument("--cmake-version", type=_non_blank)
     receipt_arguments.add_argument("--cuda-toolkit-version", type=_non_blank)
-    receipt_arguments.add_argument("--architecture", type=_non_blank)
+    receipt_arguments.add_argument(
+        "--architecture",
+        type=_non_blank,
+        help="Windows target architecture (for example x86_64 or amd64).",
+    )
     receipt_arguments.add_argument("--build-flag", action="append", type=_non_blank, default=[])
     receipt_arguments.add_argument("--model-family", action="append", type=_non_blank, default=[])
     return parser
@@ -112,10 +119,17 @@ def _require_inside(package_root: Path, candidate: Path, label: str) -> Path:
     return resolved
 
 
+def _atomic_write_json(path: Path, document: object) -> None:
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(json.dumps(document, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+    os.replace(temporary, path)
+
+
 def _write_receipt(
     *,
     executable: Path,
     source_revision: str,
+    backend: str,
     compiler: str,
     compiler_version: str | None,
     cmake_version: str,
@@ -128,6 +142,7 @@ def _write_receipt(
     document = {
         "schema_version": BUILD_RECEIPT_SCHEMA_VERSION,
         "source_revision": source_revision,
+        "backend": backend,
         "compiler": " ".join(part for part in (compiler, compiler_version) if part),
         "cmake_version": cmake_version,
         "cuda_toolkit_version": cuda_toolkit_version,
@@ -136,10 +151,7 @@ def _write_receipt(
         "binary_sha256": binary_sha256,
         "model_families": list(model_families),
     }
-    (executable.parent / NATIVE_AUDIO_CPP_BUILD_RECEIPT).write_text(
-        json.dumps(document, ensure_ascii=False, sort_keys=True),
-        encoding="utf-8",
-    )
+    _atomic_write_json(executable.parent / NATIVE_AUDIO_CPP_BUILD_RECEIPT, document)
 
 
 def _write_closure_manifest(
@@ -153,13 +165,9 @@ def _write_closure_manifest(
     for path in (executable, *closure_dlls, *model_files):
         relative = path.resolve().relative_to(package_root).as_posix()
         entries[relative] = stream_sha256(path)
-    (package_root / NATIVE_AUDIO_CPP_CLOSURE_MANIFEST).write_text(
-        json.dumps(
-            {"schema_version": CLOSURE_MANIFEST_SCHEMA_VERSION, "files": entries},
-            ensure_ascii=False,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
+    _atomic_write_json(
+        package_root / NATIVE_AUDIO_CPP_CLOSURE_MANIFEST,
+        {"schema_version": CLOSURE_MANIFEST_SCHEMA_VERSION, "files": entries},
     )
 
 
@@ -174,6 +182,12 @@ def emit_build_evidence(args: argparse.Namespace) -> None:
         raise SystemExit(
             "audio.cpp build evidence requires cmake version, CUDA toolkit version and architecture"
         )
+    if args.source is not None:
+        source_revision, source_dirty = inspect_pinned_source(args.source)
+        if source_revision != args.source_revision:
+            raise SystemExit("audio.cpp source checkout does not match the build evidence")
+        if source_dirty:
+            raise SystemExit("audio.cpp build evidence refuses a dirty source tree")
     for family in args.model_family:
         try:
             find_family_inventory(family)
@@ -194,6 +208,7 @@ def emit_build_evidence(args: argparse.Namespace) -> None:
     _write_receipt(
         executable=args.binary,
         source_revision=args.source_revision,
+        backend=args.backend or DEFAULT_NATIVE_BACKEND,
         compiler=args.compiler,
         compiler_version=args.compiler_version,
         cmake_version=args.cmake_version,

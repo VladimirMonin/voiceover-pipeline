@@ -51,6 +51,7 @@ def _write_closure(package: Path) -> None:
     receipt = {
         "schema_version": 1,
         "source_revision": "502b5b74bd26e9b4aed267d1776ecf131cae7215",
+        "backend": "cuda",
         "compiler": "cl.exe",
         "cmake_version": "3.30.1",
         "cuda_toolkit_version": "12.6.0",
@@ -521,6 +522,143 @@ def test_windows_provider_selection_requires_native_package_and_never_defaults_t
 
     monkeypatch.delenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV)
     assert audio_cpp_qwen_asr.AudioCppQwenASRProvider.from_environment()._runtime is None
+
+
+def test_model_directory_package_resolves_single_gguf_for_cli_arguments(tmp_path: Path):
+    model_directory = tmp_path / "models" / "omnivoice"
+    model_directory.mkdir(parents=True)
+    model_file = model_directory / "omnivoice-q8_0.gguf"
+    model_file.write_bytes(b"model")
+
+    command = build_audio_cpp_cli_arguments(
+        family="omnivoice",
+        payload={
+            "text": "Привет",
+            "model_id": "audio-cpp/omnivoice-q8_0",
+            "voice": None,
+            "language": "ru",
+            "instruction": "female",
+            "text_chunk_size": 420,
+            "seed": 1,
+            "num_inference_steps": 2,
+            "guidance_scale": 1.0,
+        },
+        model_paths={"omnivoice": model_directory},
+        output_directory=tmp_path / "output",
+    )
+
+    assert command[command.index("--model") + 1] == str(model_file.resolve())
+
+
+def test_model_directory_without_gguf_artifact_fails_closed(tmp_path: Path):
+    empty_directory = tmp_path / "models" / "empty"
+    empty_directory.mkdir(parents=True)
+
+    with pytest.raises(RuntimeTransportError, match="no GGUF artifact"):
+        build_audio_cpp_cli_arguments(
+            family="omnivoice",
+            payload={
+                "text": "Привет",
+                "model_id": "audio-cpp/omnivoice-q8_0",
+                "voice": None,
+                "language": "ru",
+                "instruction": "female",
+                "text_chunk_size": 420,
+                "seed": 1,
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+            },
+            model_paths={"omnivoice": empty_directory},
+            output_directory=tmp_path / "output",
+        )
+
+
+def test_model_directory_with_multiple_gguf_artifacts_fails_closed(tmp_path: Path):
+    model_directory = tmp_path / "models" / "ambiguous"
+    model_directory.mkdir(parents=True)
+    (model_directory / "a.gguf").write_bytes(b"a")
+    (model_directory / "b.gguf").write_bytes(b"b")
+
+    with pytest.raises(RuntimeTransportError, match="exactly one GGUF artifact"):
+        build_audio_cpp_cli_arguments(
+            family="omnivoice",
+            payload={
+                "text": "Hello",
+                "voice": None,
+                "language": "ru",
+                "instruction": "instruction",
+                "text_chunk_size": 420,
+                "seed": 1,
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+            },
+            model_paths={"omnivoice": model_directory},
+            output_directory=tmp_path / "output",
+        )
+
+
+def test_transport_accepts_model_directory_packages(monkeypatch, tmp_path: Path):
+    from voiceover_pipeline.local_runtime.transports import audio_cpp_cli
+
+    executable, _runtime_dll = _package(tmp_path)
+    model_directory = tmp_path / "models" / "omnivoice"
+    model_directory.mkdir(parents=True)
+    model_file = model_directory / "omnivoice-q8_0.gguf"
+    model_file.write_bytes(b"model")
+    transport = AudioCppNativeCLITransport(
+        executable_path=executable,
+        model_paths={"omnivoice": model_directory},
+        host_platform="win32",
+        timeout_seconds=2,
+    )
+    captured: dict[str, Any] = {}
+
+    class CompletedProcess:
+        returncode = 0
+        pid = 99
+
+        def poll(self) -> int:
+            return self.returncode
+
+        def communicate(self, *, timeout: float) -> tuple[str, str]:
+            return "", ""
+
+        def wait(self, *, timeout: float) -> int:
+            return self.returncode
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = tuple(command)
+        captured["kwargs"] = kwargs
+        _write_wav(Path(command[command.index("--out") + 1]))
+        return CompletedProcess()
+
+    monkeypatch.setattr(audio_cpp_cli.subprocess, "Popen", fake_popen)
+
+    response = transport.invoke(
+        "voice-1",
+        {
+            "schema_version": 1,
+            "operation": "tts",
+            "family": "omnivoice",
+            "provider_id": "omnivoice-local",
+            "payload": {
+                "text": "Привет",
+                "model_id": "audio-cpp/omnivoice-q8_0",
+                "voice": None,
+                "language": "ru",
+                "instruction": "female",
+                "text_chunk_size": 420,
+                "seed": 1,
+                "num_inference_steps": 2,
+                "guidance_scale": 1.0,
+            },
+        },
+    )
+
+    assert captured["command"][captured["command"].index("--model") + 1] == str(
+        model_file.resolve()
+    )
+    assert response["ok"] is True
 
 
 def test_linux_container_launchers_fail_closed_on_windows(monkeypatch, tmp_path: Path):

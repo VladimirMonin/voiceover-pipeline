@@ -7,6 +7,8 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Final, Literal, Mapping
 
+from voiceover_pipeline.audio_cpp.inventory import PINNED_AUDIO_CPP_REVISION
+
 NATIVE_AUDIO_CPP_CLOSURE_MANIFEST: Final = "audio_cpp_dependency_closure.json"
 NATIVE_AUDIO_CPP_BUILD_RECEIPT: Final = "build_receipt.json"
 _STREAMING_HASH_CHUNK_BYTES: Final = 1 << 20
@@ -14,6 +16,7 @@ _RECEIPT_FIELDS: Final = frozenset(
     {
         "schema_version",
         "source_revision",
+        "backend",
         "compiler",
         "cmake_version",
         "cuda_toolkit_version",
@@ -24,7 +27,8 @@ _RECEIPT_FIELDS: Final = frozenset(
     }
 )
 _HEX_DIGEST_RE: Final = re.compile(r"^[0-9a-f]{64}$")
-_ABSOLUTE_TOKEN_RE: Final = re.compile(r"(^|[/\\\s=])([A-Za-z]:[\\/]|/)")
+_ACCEPTED_ARCHITECTURES: Final = frozenset({"x86_64", "amd64"})
+_ABSOLUTE_TOKEN_RE: Final = re.compile(r"(^|[/\\\s=])([A-Za-z]:[\\/]|[\\/]{2})|\.\.[\\/]|:\\")
 
 NativeRejectionCode = Literal[
     "malformed_manifest",
@@ -47,6 +51,10 @@ class NativeAudioCppInstall:
     executable_path: Path
     closure_manifest_path: Path
     files: Mapping[str, str]
+    source_revision: str
+    backend: str
+    architecture: str
+    model_families: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,8 @@ class AudioCppPackageReceipt:
     """Structural facts from the build receipt that the package checker needs."""
 
     source_revision: str
+    backend: str
+    architecture: str
     binary_sha256: str
     model_families: tuple[str, ...]
 
@@ -180,14 +190,28 @@ def _validate_receipt(executable: Path) -> AudioCppPackageReceipt:
     if unknown or document.get("schema_version") != 1:
         _reject("invalid_receipt", "audio.cpp native build receipt is invalid")
     source_revision = document.get("source_revision")
+    backend = document.get("backend")
+    architecture = document.get("architecture")
     compiler = document.get("compiler")
+    cmake_version = document.get("cmake_version")
+    cuda_toolkit_version = document.get("cuda_toolkit_version")
+    build_flags = document.get("build_flags")
     binary_sha256 = document.get("binary_sha256")
     model_families = document.get("model_families")
     if (
-        not isinstance(source_revision, str)
-        or not source_revision.strip()
+        source_revision != PINNED_AUDIO_CPP_REVISION
+        or not isinstance(backend, str)
+        or not backend.strip()
+        or not isinstance(architecture, str)
+        or architecture.casefold() not in _ACCEPTED_ARCHITECTURES
         or not isinstance(compiler, str)
         or not compiler.strip()
+        or not isinstance(cmake_version, str)
+        or not cmake_version.strip()
+        or not isinstance(cuda_toolkit_version, str)
+        or not cuda_toolkit_version.strip()
+        or not isinstance(build_flags, str)
+        or not build_flags.strip()
         or not isinstance(binary_sha256, str)
         or _HEX_DIGEST_RE.fullmatch(binary_sha256.casefold()) is None
         or not isinstance(model_families, list)
@@ -198,6 +222,7 @@ def _validate_receipt(executable: Path) -> AudioCppPackageReceipt:
         _reject("invalid_receipt", "audio.cpp native build receipt is invalid")
     for field in (
         "source_revision",
+        "backend",
         "compiler",
         "cmake_version",
         "cuda_toolkit_version",
@@ -212,6 +237,8 @@ def _validate_receipt(executable: Path) -> AudioCppPackageReceipt:
         _reject("invalid_receipt", "audio.cpp native build receipt checksum did not match")
     return AudioCppPackageReceipt(
         source_revision=source_revision,
+        backend=backend,
+        architecture=architecture,
         binary_sha256=binary_sha256.casefold(),
         model_families=tuple(model_families),
     )
@@ -283,7 +310,7 @@ def admit_audio_cpp_native_package(
     package_root = executable.parent
     files, manifest_path = _load_manifest(executable)
     _validate_manifest_files(executable, files)
-    _validate_receipt(executable)
+    receipt = _validate_receipt(executable)
     model_dirs: list[Path] = []
     for model_path in required_model_paths:
         resolved = _require_inside(package_root, model_path)
@@ -295,4 +322,8 @@ def admit_audio_cpp_native_package(
         executable_path=executable,
         closure_manifest_path=manifest_path,
         files=files,
+        source_revision=receipt.source_revision,
+        backend=receipt.backend,
+        architecture=receipt.architecture,
+        model_families=receipt.model_families,
     )

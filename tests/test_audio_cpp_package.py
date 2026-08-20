@@ -29,6 +29,7 @@ def _write_receipt(
     document = {
         "schema_version": 1,
         "source_revision": PINNED_AUDIO_CPP_REVISION,
+        "backend": "cuda",
         "compiler": "cl.exe",
         "cmake_version": "3.30.1",
         "cuda_toolkit_version": "12.6.0",
@@ -114,12 +115,34 @@ def test_package_admission_accepts_checksummed_package_and_unicode_space_paths(
     assert install.files["audiocpp_cli.exe"] == _sha256_bytes(b"native executable bytes")
 
 
+def test_admission_exposes_verified_receipt_facts(tmp_path: Path):
+    package, executable = _make_package(tmp_path)
+
+    install = admit_audio_cpp_native_package(executable)
+
+    assert install.source_revision == PINNED_AUDIO_CPP_REVISION
+    assert install.backend == "cuda"
+    assert install.architecture == "x86_64"
+    assert install.model_families == ("qwen3-asr", "omnivoice")
+
+
 def test_discover_native_install_delegates_to_structured_admission(tmp_path: Path):
     _package, executable = _make_package(tmp_path)
 
     install = discover_native_audio_cpp_install(executable)
 
     assert install.executable_path == executable.resolve()
+    assert install.source_revision == PINNED_AUDIO_CPP_REVISION
+    assert install.backend == "cuda"
+    assert install.model_families == ("qwen3-asr", "omnivoice")
+
+
+def test_discover_native_install_requires_the_build_receipt(tmp_path: Path):
+    package, executable = _make_package(tmp_path, receipt=False)
+    _write_closure(package, files=[executable, package / "audio_cpp_runtime.dll"], receipt=False)
+
+    with pytest.raises(ValueError, match="receipt"):
+        discover_native_audio_cpp_install(executable)
 
 
 def test_missing_executable_is_rejected_with_structured_code(tmp_path: Path):
@@ -361,14 +384,28 @@ def test_malformed_build_receipt_is_rejected(tmp_path: Path):
     [
         {"schema_version": 2},
         {"source_revision": ""},
+        {"source_revision": "not-the-pinned-revision"},
+        {"backend": None},
+        {"backend": ""},
+        {"architecture": None},
+        {"architecture": ""},
+        {"architecture": "arm64"},
         {"compiler": None},
+        {"cmake_version": None},
+        {"cmake_version": ""},
+        {"cuda_toolkit_version": None},
+        {"cuda_toolkit_version": ""},
+        {"build_flags": None},
+        {"build_flags": ""},
         {"binary_sha256": "0" * 64},
         {"binary_sha256": "not-a-sha"},
         {"model_families": []},
         {"model_families": ["qwen3-asr", "qwen3-asr"]},
         {"unexpected_field": "boom"},
         {"compiler": "C:\\Users\\builder\\cl.exe"},
-        {"cmake_version": "3.30.1", "build_flags": "-DCMAKE_PREFIX_PATH=/opt/toolchain"},
+        {"cmake_version": "3.30.1", "build_flags": "Release ..\\toolchain"},
+        {"build_flags": "Release C:\\opt\\toolchain"},
+        {"build_flags": "\\\\server\\share\\toolchain"},
     ],
 )
 def test_structural_receipt_defects_are_rejected(tmp_path: Path, override: dict[str, object]):
@@ -378,6 +415,7 @@ def test_structural_receipt_defects_are_rejected(tmp_path: Path, override: dict[
             {
                 "schema_version": 1,
                 "source_revision": PINNED_AUDIO_CPP_REVISION,
+                "backend": "cuda",
                 "compiler": "cl.exe",
                 "cmake_version": "3.30.1",
                 "cuda_toolkit_version": "12.6.0",
@@ -395,6 +433,17 @@ def test_structural_receipt_defects_are_rejected(tmp_path: Path, override: dict[
         admit_audio_cpp_native_package(executable)
 
     assert excinfo.value.code == "invalid_receipt"
+
+
+def test_receipt_with_msvc_build_flags_passes_admission(tmp_path: Path):
+    package, executable = _make_package(tmp_path)
+    _write_receipt(
+        package, binary_bytes=b"native executable bytes", override={"build_flags": "/O2 /fp:fast"}
+    )
+
+    install = admit_audio_cpp_native_package(executable)
+
+    assert install.backend == "cuda"
 
 
 def test_receipt_binary_hash_mismatch_is_rejected(tmp_path: Path):

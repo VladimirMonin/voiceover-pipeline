@@ -20,6 +20,7 @@ PINNED_AUDIO_CPP_REVISION = "502b5b74bd26e9b4aed267d1776ecf131cae7215"
 RECEIPT_FIELDS = {
     "schema_version",
     "source_revision",
+    "backend",
     "compiler",
     "cmake_version",
     "cuda_toolkit_version",
@@ -119,6 +120,7 @@ def test_producer_writes_receipt_and_closure_with_matching_stream_hashes(tmp_pat
 
     assert receipt["schema_version"] == 1
     assert receipt["source_revision"] == PINNED_AUDIO_CPP_REVISION
+    assert receipt["backend"] == "cuda"
     assert receipt["compiler"] == "cl.exe 19.40.33811"
     assert receipt["cmake_version"] == "3.30.1"
     assert receipt["cuda_toolkit_version"] == "12.6.0"
@@ -276,3 +278,43 @@ def test_producer_rejects_model_outside_package_root(tmp_path: Path):
 
     assert completed.returncode != 0
     assert "package" in completed.stderr.casefold()
+
+
+def test_producer_declares_backend_from_an_explicit_override(tmp_path: Path):
+    _package, executable, runtime, model = _package_fixture(tmp_path)
+
+    completed = _run(executable, runtime, model, extra=["--backend", "hip"])
+    assert completed.returncode == 0, completed.stderr
+
+    receipt = json.loads(
+        (executable.parent / NATIVE_AUDIO_CPP_BUILD_RECEIPT).read_text(encoding="utf-8")
+    )
+    assert receipt["backend"] == "hip"
+
+
+def test_producer_writes_receipt_and_closure_atomically_without_tmp_leftovers(tmp_path: Path):
+    package, executable, runtime, model = _package_fixture(tmp_path)
+
+    completed = _run(executable, runtime, model)
+    assert completed.returncode == 0, completed.stderr
+
+    assert (package / NATIVE_AUDIO_CPP_BUILD_RECEIPT).is_file()
+    assert (package / NATIVE_AUDIO_CPP_CLOSURE_MANIFEST).is_file()
+    assert not (package / f"{NATIVE_AUDIO_CPP_BUILD_RECEIPT}.tmp").exists()
+    assert not (package / f"{NATIVE_AUDIO_CPP_CLOSURE_MANIFEST}.tmp").exists()
+
+
+def test_producer_checks_pinned_source_head_and_cleanliness_when_source_given(tmp_path: Path):
+    _package, executable, runtime, model = _package_fixture(tmp_path)
+    source = tmp_path / "source-checkout"
+    source.mkdir()
+
+    completed = _run(
+        executable,
+        runtime,
+        model,
+        extra=["--source", str(source), "--source-revision", PINNED_AUDIO_CPP_REVISION],
+    )
+
+    assert completed.returncode != 0
+    assert "git" in completed.stderr.casefold() or "pinned" in completed.stderr.casefold()

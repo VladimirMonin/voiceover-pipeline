@@ -16,21 +16,15 @@ from threading import RLock
 from typing import Final
 
 from voiceover_pipeline.local_runtime.contracts import RuntimeProtocolError, RuntimeTransportError
-from voiceover_pipeline.local_runtime.transports.audio_cpp_package import stream_sha256
+from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
+    NativeAudioCppInstall,
+    admit_audio_cpp_native_package,
+)
 
 NATIVE_AUDIO_CPP_EXECUTABLE_ENV: Final = "VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE"
-NATIVE_AUDIO_CPP_CLOSURE_MANIFEST: Final = "audio_cpp_dependency_closure.json"
 _PRIVATE_TMP_PREFIX: Final = "voiceover-audio-cpp-"
 _STAGED_AUDIO_RATE_HZ: Final = 16_000
-
-
-@dataclass(frozen=True)
-class NativeAudioCppInstall:
-    """A checked host-native audio.cpp executable and its DLL dependency closure."""
-
-    executable_path: Path
-    closure_manifest_path: Path
-    files: Mapping[str, str]
+_MODEL_ARTIFACT_GLOB: Final = "*.gguf"
 
 
 @dataclass(frozen=True)
@@ -98,62 +92,19 @@ def discover_native_audio_cpp_install(
 ) -> NativeAudioCppInstall:
     """Verify the native executable and every manifest-listed colocated dependency.
 
-    The manifest is intentionally required: a bare ``audiocpp_cli.exe`` does not
-    prove that a Windows package has the DLL closure needed by the selected build.
+    Legacy entry point retained for provider compatibility. It delegates to the
+    single structured admission so that the receipt, DLL closure and model
+    coverage checks never diverge between routes. The manifest is intentionally
+    required: a bare ``audiocpp_cli.exe`` does not prove that a Windows package
+    has the DLL closure needed by the selected build.
     """
 
-    executable = executable_path.expanduser().resolve()
-    if executable.suffix.casefold() != ".exe":
-        raise ValueError("audio.cpp native executable must be an .exe file")
-    if not executable.is_file():
-        raise ValueError("audio.cpp native executable is unavailable")
-    manifest_path = executable.parent / NATIVE_AUDIO_CPP_CLOSURE_MANIFEST
     try:
-        document = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("audio.cpp native dependency closure manifest is unavailable") from exc
-    if not isinstance(document, Mapping) or document.get("schema_version") != 1:
-        raise ValueError("audio.cpp native dependency closure manifest is invalid")
-    raw_files = document.get("files")
-    if not isinstance(raw_files, Mapping) or not raw_files:
-        raise ValueError("audio.cpp native dependency closure manifest has no files")
-    files: dict[str, str] = {}
-    for relative_path, expected_digest in raw_files.items():
-        if not isinstance(relative_path, str) or not isinstance(expected_digest, str):
-            raise ValueError("audio.cpp native dependency closure manifest is invalid")
-        relative = Path(relative_path)
-        if (
-            not relative_path
-            or relative.is_absolute()
-            or ".." in relative.parts
-            or len(expected_digest) != 64
-            or any(character not in "0123456789abcdef" for character in expected_digest.casefold())
-        ):
-            raise ValueError("audio.cpp native dependency closure manifest is invalid")
-        candidate = executable.parent / relative
-        if not candidate.is_file():
-            raise ValueError("audio.cpp native dependency closure is incomplete")
-        actual_digest = stream_sha256(candidate)
-        if actual_digest != expected_digest.casefold():
-            raise ValueError("audio.cpp native dependency closure checksum did not match")
-        files[relative.as_posix()] = actual_digest
-    if executable.name not in files:
-        raise ValueError("audio.cpp native dependency closure does not cover the executable")
-    if not any(relative_path.casefold().endswith(".dll") for relative_path in files):
-        raise ValueError("audio.cpp native dependency closure has no DLL dependencies")
-    for model_path in required_model_paths:
-        model = model_path.expanduser().resolve()
-        try:
-            relative_model_path = model.relative_to(executable.parent).as_posix()
-        except ValueError as exc:
-            raise ValueError("audio.cpp native model is outside the checked package") from exc
-        if relative_model_path not in files:
-            raise ValueError("audio.cpp native dependency closure does not cover a required model")
-    return NativeAudioCppInstall(
-        executable_path=executable,
-        closure_manifest_path=manifest_path,
-        files=files,
-    )
+        return admit_audio_cpp_native_package(
+            executable_path, required_model_paths=required_model_paths
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def decode_audio_cpp_cli_request(payload: Mapping[str, object]) -> dict[str, object]:
@@ -323,6 +274,17 @@ def _build_qwen_tts_arguments(
     return tuple(command)
 
 
+def _gguf_artifacts_in_directory(model_directory: Path) -> tuple[Path, ...]:
+    artifacts = tuple(
+        candidate
+        for candidate in model_directory.glob(_MODEL_ARTIFACT_GLOB)
+        if candidate.is_file() and not candidate.is_symlink()
+    )
+    if not artifacts:
+        return ()
+    return artifacts
+
+
 def build_audio_cpp_cli_arguments(
     *,
     family: str,
@@ -333,22 +295,38 @@ def build_audio_cpp_cli_arguments(
     """Map a decoded request to native ``audiocpp_cli`` argv arguments."""
 
     model_path = model_paths.get(family)
-    if model_path is None or not model_path.is_file():
+    if model_path is None or not model_path.is_file() and not model_path.is_dir():
         raise RuntimeTransportError("audio.cpp native model artifact is unavailable")
+    model_argument = _model_argument_for_cli(model_path, family)
     output_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     forced_aligner: str | None = None
     if family == "qwen3-asr" and payload.get("timestamp_mode") == "word":
         aligner = model_paths.get("qwen3-forced-aligner")
-        if aligner is None or not aligner.is_file():
+        if aligner is None or not aligner.is_file() and not aligner.is_dir():
             raise RuntimeTransportError("audio.cpp native forced aligner artifact is unavailable")
-        forced_aligner = str(aligner.resolve())
+        forced_aligner = _model_argument_for_cli(aligner, "qwen3-forced-aligner")
     return build_audio_cpp_family_arguments(
         family=family,
         payload=payload,
-        model_argument=str(model_path.resolve()),
+        model_argument=model_argument,
         output_directory=output_directory,
         forced_aligner_argument=forced_aligner,
     )
+
+
+def _model_argument_for_cli(model_path: Path, family: str) -> str:
+    if model_path.is_file():
+        return str(model_path.resolve())
+    artifacts = _gguf_artifacts_in_directory(model_path)
+    if not artifacts:
+        raise RuntimeTransportError(
+            f"audio.cpp native {family} model directory contains no GGUF artifact"
+        )
+    if len(artifacts) > 1:
+        raise RuntimeTransportError(
+            f"audio.cpp native {family} model directory must contain exactly one GGUF artifact"
+        )
+    return str(artifacts[0].resolve())
 
 
 def decode_audio_cpp_cli_response(
@@ -440,8 +418,13 @@ class AudioCppNativeCLITransport:
         if timeout_seconds <= 0:
             raise ValueError("audio.cpp native timeout must be positive")
         resolved_models = {name: path.expanduser().resolve() for name, path in model_paths.items()}
-        if not resolved_models or any(not path.is_file() for path in resolved_models.values()):
+        if not resolved_models or any(
+            not path.is_file() and not path.is_dir() for path in resolved_models.values()
+        ):
             raise ValueError("audio.cpp native model artifacts are unavailable")
+        for model_path in resolved_models.values():
+            if model_path.is_dir() and not _gguf_artifacts_in_directory(model_path):
+                raise ValueError("audio.cpp native model directory is unavailable")
         self._executable_path = executable
         self._model_paths = resolved_models
         self._timeout_seconds = timeout_seconds
