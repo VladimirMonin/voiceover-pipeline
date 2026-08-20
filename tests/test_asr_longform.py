@@ -25,10 +25,11 @@ def _result(
     *,
     measurements: dict[str, float] | None = None,
     alignment_origin: str = "forced",
+    provider_id: str = "qwen-local",
 ) -> ASRResult:
     return ASRResult(
         transcript="".join(word.text for word in words),
-        provider_id="qwen-local",
+        provider_id=provider_id,
         model_id="fixture-model",
         language="ru",
         words=words,
@@ -270,6 +271,7 @@ def test_long_form_nemotron_native_words_apply_chunk_offset_exactly_once(
                 ),
                 measurements={"wall_s": 0.5},
                 alignment_origin="native",
+                provider_id="nemotron-local",
             ),
             _result(
                 (
@@ -278,6 +280,7 @@ def test_long_form_nemotron_native_words_apply_chunk_offset_exactly_once(
                 ),
                 measurements={"wall_s": 0.5},
                 alignment_origin="native",
+                provider_id="nemotron-local",
             ),
         ]
     )
@@ -285,12 +288,149 @@ def test_long_form_nemotron_native_words_apply_chunk_offset_exactly_once(
 
     result = longform.transcribe_prerecorded_long_form(provider, _request(source))
 
+    assert result.provider_id == "nemotron-local"
     assert result.alignment_origin == "native"
     assert result.transcript == "opening boundary unique"
     assert [word.start_s for word in result.words] == pytest.approx([0.1, 108.9, 109.5])
     assert [word.end_s for word in result.words] == pytest.approx([0.4, 109.4, 109.8])
     assert result.execution.long_form is not None
     assert result.execution.long_form["deduplicated_word_count"] == 1
+
+
+def test_long_form_nemotron_reconciles_mismatched_boundary_words_by_absolute_time(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "mismatched-boundary.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (
+                    ASRWordSpan(text="alpha ", start_s=108.16, end_s=109.6),
+                    ASRWordSpan(text="beta", start_s=109.6, end_s=110.0),
+                ),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (
+                    ASRWordSpan(text="gamma ", start_s=0.32, end_s=0.56),
+                    ASRWordSpan(text="delta", start_s=0.64, end_s=2.64),
+                ),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert result.provider_id == "nemotron-local"
+    assert result.alignment_origin == "native"
+    assert [word.start_s for word in result.words] == pytest.approx([108.16, 109.64])
+    assert [word.end_s for word in result.words] == pytest.approx([109.6, 111.64])
+    assert [word.text for word in result.words] == ["alpha ", "delta"]
+    assert result.transcript == "alpha delta"
+    assert result.execution.long_form is not None
+    assert result.execution.long_form["deduplicated_word_count"] == 2
+    assert [(segment.text, segment.start_s, segment.end_s) for segment in result.segments] == [
+        ("alpha delta", 0.0, 110.0),
+        ("", 110.0, 120.001),
+    ]
+
+
+def test_long_form_overlap_keeps_identical_text_at_distinct_nonoverlapping_positions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "repeated-words.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (
+                    ASRWordSpan(text="lead ", start_s=108.0, end_s=108.4),
+                    ASRWordSpan(text="repeat ", start_s=109.0, end_s=109.1),
+                ),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (
+                    ASRWordSpan(text="repeat ", start_s=0.8, end_s=0.9),
+                    ASRWordSpan(text="tail", start_s=2.4, end_s=2.8),
+                ),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert [word.text for word in result.words] == ["lead ", "repeat ", "repeat ", "tail"]
+    assert [word.start_s for word in result.words] == pytest.approx([108.0, 109.0, 109.8, 111.4])
+    assert result.execution.long_form is not None
+    assert result.execution.long_form["deduplicated_word_count"] == 0
+
+
+def test_long_form_overlap_reconciliation_never_emits_sub_epsilon_word_overlap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "sub-epsilon-overlap.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (ASRWordSpan(text="tail ", start_s=109.5, end_s=110.0),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (ASRWordSpan(text="head", start_s=0.99, end_s=1.2),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert [(word.start_s, word.end_s) for word in result.words] == pytest.approx([(109.99, 110.2)])
+    assert result.transcript == "head"
+    assert result.execution.long_form is not None
+    assert result.execution.long_form["deduplicated_word_count"] == 1
+
+
+def test_long_form_overlap_reconciliation_fails_when_only_splice_would_discard_pre_overlap_word(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "unspliceable-seam.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (ASRWordSpan(text="longword ", start_s=108.0, end_s=110.0),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+            _result(
+                (ASRWordSpan(text="crossing", start_s=0.9, end_s=2.0),),
+                alignment_origin="native",
+                provider_id="nemotron-local",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    with pytest.raises(longform.LongFormASRError, match="pre-overlap content"):
+        longform.transcribe_prerecorded_long_form(provider, _request(source))
 
 
 def test_long_form_fails_closed_when_a_provider_reports_token_limit_truncation(

@@ -386,6 +386,7 @@ def _merge_chunk_results(
     merged_words: list[ASRWordSpan] = []
     transcript_parts: list[str] = []
     segments: list[ASRSegment] = []
+    word_segment_indices: list[int] = []
     evidence_chunks: list[dict[str, object]] = []
     alignment_origins: set[str] = set()
     previous_plan: ASRChunkPlan | None = None
@@ -413,7 +414,7 @@ def _merge_chunk_results(
                     "word-timed ASR chunks need a native or forced alignment origin"
                 )
             alignment_origins.add(result.alignment_origin)
-            retained_words, removed_words = _deduplicate_overlap_words(
+            retained_words, removed_words, trimmed_existing = _deduplicate_overlap_words(
                 merged_words,
                 offset_words,
                 previous_input_end_s=previous_plan.input_end_s if previous_plan else None,
@@ -421,8 +422,15 @@ def _merge_chunk_results(
             )
             retained_words = _with_word_boundary_space(merged_words, retained_words)
             merged_words.extend(retained_words)
-            deduplicated_word_count += removed_words
-            segment_text = "".join(word.text for word in retained_words).strip()
+            deduplicated_word_count += removed_words + trimmed_existing
+            word_segment_indices.append(len(segments))
+            segments.append(
+                ASRSegment(
+                    text="",
+                    start_s=plan.coverage_start_s,
+                    end_s=plan.coverage_end_s,
+                )
+            )
         else:
             merged_text, removed_tokens = _merge_text_without_word_timestamps(
                 transcript_parts,
@@ -433,15 +441,13 @@ def _merge_chunk_results(
             if merged_text:
                 transcript_parts.append(merged_text)
             deduplicated_text_token_count += removed_tokens
-            segment_text = merged_text
-
-        segments.append(
-            ASRSegment(
-                text=segment_text,
-                start_s=plan.coverage_start_s,
-                end_s=plan.coverage_end_s,
+            segments.append(
+                ASRSegment(
+                    text=merged_text,
+                    start_s=plan.coverage_start_s,
+                    end_s=plan.coverage_end_s,
+                )
             )
-        )
         evidence_chunks.append(
             {
                 "index": plan.index,
@@ -461,6 +467,23 @@ def _merge_chunk_results(
             }
         )
         previous_plan = plan
+
+    if merged_words:
+        for segment_index in word_segment_indices:
+            segment = segments[segment_index]
+            if segment.start_s is None:
+                continue
+            segment_start_s = segment.start_s
+            next_start_s = (
+                segments[segment_index + 1].start_s if segment_index + 1 < len(segments) else None
+            )
+            assigned_text = "".join(
+                word.text
+                for word in merged_words
+                if word.start_s >= segment_start_s
+                and (next_start_s is None or word.start_s < next_start_s)
+            ).strip()
+            segments[segment_index] = replace(segment, text=assigned_text)
 
     if len(alignment_origins) > 1:
         raise LongFormASRError("long-form chunks returned inconsistent word-timestamp origins")
@@ -545,9 +568,29 @@ def _deduplicate_overlap_words(
     *,
     previous_input_end_s: float | None,
     incoming_input_start_s: float,
-) -> tuple[tuple[ASRWordSpan, ...], int]:
-    if previous_input_end_s is None or incoming_input_start_s >= previous_input_end_s - _EPSILON_S:
-        return incoming_words, 0
+) -> tuple[tuple[ASRWordSpan, ...], int, int]:
+    """Reconcile the chunk seam without inventing timestamps.
+
+    Returns ``(retained_incoming, removed_incoming, trimmed_existing)``.
+    ``retained_incoming`` is appended after the merged tail, ``removed_incoming``
+    counts incoming duplicate-window words that were dropped, and
+    ``trimmed_existing`` counts merged-tail words that had to be removed to make
+    the seam strictly monotonic; trimmed words are popped in place.
+
+    Independent ASR runs may disagree on the exact words inside the shared
+    overlap, so exact text matching is used only when the paired spans overlap
+    temporally and the resulting seam is strictly monotonic. Otherwise a bounded
+    temporal splice drops incoming words wholly inside the previous chunk input,
+    retains incoming words that cross beyond it, and trims the minimum number of
+    existing tail words that intersect the overlap window. A residual overlap is
+    never accepted, even when smaller than ``_EPSILON_S``; if a valid splice
+    would require discarding pre-overlap content, the seam fails closed.
+    """
+    if previous_input_end_s is None or not incoming_words or not existing_words:
+        return incoming_words, 0, 0
+    if incoming_words[0].start_s >= existing_words[-1].end_s:
+        return incoming_words, 0, 0
+
     overlap_existing = [
         word for word in existing_words if word.end_s > incoming_input_start_s + _EPSILON_S
     ]
@@ -556,12 +599,38 @@ def _deduplicate_overlap_words(
         candidate_words = incoming_words[:count]
         if candidate_words[-1].end_s > previous_input_end_s + _EPSILON_S:
             continue
-        if all(
-            _word_key(existing.text) == _word_key(incoming.text)
-            for existing, incoming in zip(overlap_existing[-count:], candidate_words, strict=True)
+        paired = list(zip(overlap_existing[-count:], candidate_words, strict=True))
+        if not all(
+            _word_key(existing.text) == _word_key(incoming.text) for existing, incoming in paired
         ):
-            return incoming_words[count:], count
-    return incoming_words, 0
+            continue
+        if not all(_spans_overlap(existing, incoming) for existing, incoming in paired):
+            continue
+        retained_words = incoming_words[count:]
+        if retained_words and retained_words[0].start_s < existing_words[-1].end_s:
+            continue
+        return retained_words, count, 0
+
+    retained_incoming = tuple(word for word in incoming_words if word.end_s > previous_input_end_s)
+    removed_incoming = len(incoming_words) - len(retained_incoming)
+    if not retained_incoming:
+        return (), removed_incoming, 0
+    trimmed_existing = 0
+    while retained_incoming[0].start_s < existing_words[-1].end_s:
+        word = existing_words[-1]
+        if word.start_s < incoming_input_start_s:
+            raise LongFormASRError(
+                "cannot reconcile long-form chunk seam without discarding pre-overlap content"
+            )
+        existing_words.pop()
+        trimmed_existing += 1
+        if not existing_words:
+            break
+    return retained_incoming, removed_incoming, trimmed_existing
+
+
+def _spans_overlap(first: ASRWordSpan, second: ASRWordSpan) -> bool:
+    return first.start_s < second.end_s and second.start_s < first.end_s
 
 
 def _with_word_boundary_space(
