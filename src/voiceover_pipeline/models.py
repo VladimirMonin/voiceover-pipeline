@@ -86,6 +86,7 @@ class TimingResult:
 ASRAlignmentOrigin = Literal["native", "forced", "chunked"]
 ASRPhraseStrength = Literal["mild", "normal", "strong"]
 ASRTimestampMode = Literal["none", "word"]
+ASRRuntimeChoice = Literal["auto", "python", "audio-cpp"]
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,25 @@ class ASRContextHints:
     def __post_init__(self) -> None:
         object.__setattr__(self, "phrase_hints", tuple(self.phrase_hints))
 
+    def validate_for_runtime(self, runtime_choice: ASRRuntimeChoice) -> None:
+        """Reject prompt fields that a native runtime cannot carry safely."""
+        if runtime_choice not in ("auto", "python", "audio-cpp"):
+            raise ValueError("ASR runtime choice must be auto, python, or audio-cpp")
+        if runtime_choice != "audio-cpp":
+            return
+        unsupported: list[str] = []
+        if self.glossary is not None:
+            unsupported.append("glossary")
+        if self.phrase_hints:
+            unsupported.append("phrase_hints")
+        if self.initial_prompt is not None and self.initial_prompt.strip():
+            unsupported.append("initial_prompt")
+        if unsupported:
+            raise ValueError(
+                "ASR audio-cpp runtime does not support non-empty prompt fields: "
+                + ", ".join(unsupported)
+            )
+
 
 @dataclass(frozen=True)
 class ASRRequest:
@@ -134,6 +154,7 @@ class ASRRequest:
     compute: str = "auto"
     hints: ASRContextHints = field(default_factory=ASRContextHints)
     timestamp_mode: ASRTimestampMode = "none"
+    runtime_choice: ASRRuntimeChoice = "auto"
 
     def __post_init__(self) -> None:
         if not str(self.audio_path):
@@ -144,6 +165,9 @@ class ASRRequest:
             raise ValueError("ASR compute must not be blank")
         if self.timestamp_mode not in ("none", "word"):
             raise ValueError("ASR timestamp mode must be none or word")
+        if self.runtime_choice not in ("auto", "python", "audio-cpp"):
+            raise ValueError("ASR runtime choice must be auto, python, or audio-cpp")
+        self.hints.validate_for_runtime(self.runtime_choice)
 
 
 @dataclass(frozen=True)

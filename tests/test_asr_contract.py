@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import MutableMapping, cast
+from typing import MutableMapping, cast, get_args
 
 import pytest
 
@@ -12,6 +12,7 @@ from voiceover_pipeline.models import (
     ASRPhraseStrength,
     ASRRequest,
     ASRResult,
+    ASRRuntimeChoice,
     ASRSegment,
     ASRTimestampMode,
     ASRWordSpan,
@@ -123,6 +124,45 @@ def test_context_glossary_and_phrase_hints_are_typed_without_generic_prompt():
     assert request.hints.glossary.profile_id == "ops-v1"
     assert request.hints.phrase_hints[0].strength == "strong"
     assert not hasattr(request, "prompt")
+
+
+def test_asr_runtime_choice_is_closed_and_native_prompt_validation_is_explicit():
+    assert get_args(ASRRuntimeChoice) == ("auto", "python", "audio-cpp")
+
+    request = ASRRequest(audio_path=Path("fixture.wav"), runtime_choice="audio-cpp")
+
+    assert request.runtime_choice == "audio-cpp"
+    with pytest.raises(ValueError, match="runtime choice"):
+        ASRRequest(
+            audio_path=Path("fixture.wav"),
+            runtime_choice=cast(ASRRuntimeChoice, "native"),
+        )
+    with pytest.raises(ValueError, match="runtime choice"):
+        ASRContextHints().validate_for_runtime(cast(ASRRuntimeChoice, "native"))
+
+
+@pytest.mark.parametrize(
+    "hints",
+    (
+        ASRContextHints(glossary=ASRGlossaryHint(profile_id="ops-v1", digest="sha256:fixture")),
+        ASRContextHints(phrase_hints=(ASRPhraseHint("PostgreSQL"),)),
+        ASRContextHints(initial_prompt="native prompt"),
+    ),
+)
+def test_native_asr_prompt_validation_rejects_unsupported_non_empty_fields(hints):
+    with pytest.raises(ValueError, match="audio-cpp"):
+        hints.validate_for_runtime("audio-cpp")
+    with pytest.raises(ValueError, match="audio-cpp"):
+        ASRRequest(audio_path=Path("fixture.wav"), hints=hints, runtime_choice="audio-cpp")
+
+
+def test_native_asr_prompt_validation_allows_empty_values_and_context_text():
+    hints = ASRContextHints(context_text="", initial_prompt="", phrase_hints=())
+
+    hints.validate_for_runtime("audio-cpp")
+    request = ASRRequest(audio_path=Path("fixture.wav"), hints=hints, runtime_choice="audio-cpp")
+
+    assert request.hints.context_text == ""
 
 
 def test_timestamp_mode_is_an_explicit_closed_request_intent_with_text_only_default():

@@ -23,7 +23,7 @@ def test_list_asr_providers_reads_registry_listing(monkeypatch, capsys):
     spec = ASRProviderSpec(
         provider_id="fixture-local",
         description="Offline fixture provider",
-        factory=lambda: None,
+        factory=FixtureASRProvider,
         models=({"id": "fixture-model"},),
         capabilities=ASRCapabilities(
             batch_audio=True, device_modes=("cpu",), compute_modes=("float32",)
@@ -79,6 +79,27 @@ def test_transcribe_parser_has_finite_audio_controls_but_no_generic_prompt_flags
         )
 
 
+def test_transcribe_parser_exposes_context_sources_and_runtime_choice():
+    from voiceover_pipeline.cli import build_parser
+
+    parser = build_parser()
+    parsed = parser.parse_args(
+        "transcribe --audio audio.wav --provider fixture-local --context terms --runtime python".split()
+    )
+
+    assert parsed.context == "terms"
+    assert parsed.context_file is None
+    assert parsed.runtime == "python"
+    assert (
+        parser.parse_args("transcribe --audio audio.wav --provider fixture-local".split()).runtime
+        == "auto"
+    )
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            "transcribe --audio audio.wav --provider fixture-local --context terms --context-file context.txt".split()
+        )
+
+
 def _fixture_spec(*, available=True):
     return ASRProviderSpec(
         provider_id="fixture-local",
@@ -96,6 +117,138 @@ def _fixture_spec(*, available=True):
             remediation="Install the approved optional ASR runtime.",
         ),
     )
+
+
+@pytest.mark.parametrize("context_kind", ["missing", "unreadable", "blank"])
+def test_transcribe_context_file_is_validated_before_provider_probe(
+    monkeypatch, tmp_path, context_kind
+):
+    import voiceover_pipeline.cli as cli
+
+    context_path = tmp_path / "context.txt"
+    if context_kind == "unreadable":
+        context_path.mkdir()
+    elif context_kind == "blank":
+        context_path.write_text(" \n\t", encoding="utf-8")
+
+    monkeypatch.setattr(
+        cli,
+        "get_asr_provider_spec",
+        lambda _provider_id: pytest.fail("provider lookup must follow context-file validation"),
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--context-file",
+            str(context_path),
+        ]
+    )
+
+    with pytest.raises(cli.CliError, match="blank|read") as error:
+        cli.transcribe_cmd(args)
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize("context_source", ["inline", "file"])
+def test_transcribe_context_and_runtime_reach_request_without_public_context(
+    monkeypatch, capsys, tmp_path, context_source
+):
+    import voiceover_pipeline.cli as cli
+
+    context = "private context that must not be public"
+    context_path = tmp_path / "context.txt"
+    context_path.write_text(context, encoding="utf-8")
+    requests: list[ASRRequest] = []
+    original_transcribe = FixtureASRProvider.transcribe
+
+    def capture_request(provider, request):
+        requests.append(request)
+        return original_transcribe(provider, request)
+
+    monkeypatch.setattr(FixtureASRProvider, "transcribe", capture_request)
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec())
+    context_args = (
+        ["--context", context]
+        if context_source == "inline"
+        else ["--context-file", str(context_path)]
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--language",
+            "ru",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            *context_args,
+            "--runtime",
+            "python",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.transcribe_cmd(args)
+
+    output = capsys.readouterr().out
+    assert exit_info.value.code == 0
+    assert requests[0].hints.context_text == context
+    assert requests[0].runtime_choice == "python"
+    assert context not in output
+
+
+def test_transcribe_explicit_audio_cpp_fails_closed_before_probe_or_factory(monkeypatch):
+    import voiceover_pipeline.cli as cli
+
+    calls: list[str] = []
+
+    def probe():
+        calls.append("probe")
+        return ASRDependencyHealth(available=True, remediation="")
+
+    def factory():
+        calls.append("factory")
+        return FixtureASRProvider()
+
+    spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=factory,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            device_modes=("cpu",),
+            compute_modes=("float32",),
+        ),
+        dependency_probe=probe,
+    )
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--runtime",
+            "audio-cpp",
+        ]
+    )
+
+    with pytest.raises(cli.CliError, match="audio-cpp") as error:
+        cli.transcribe_cmd(args)
+
+    assert error.value.code == 2
+    assert calls == []
 
 
 class FixtureASRProvider(ASRProvider):

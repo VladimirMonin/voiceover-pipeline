@@ -71,6 +71,7 @@ from .gemini_dialogue import (
 from .gemini_dialogue import (
     chunks_from_validation as gemini_chunks_from_validation,
 )
+from .local_runtime.contracts import OmniVoiceRequest
 from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
 from .media import (
     check_media_tools,
@@ -80,7 +81,7 @@ from .media import (
     trim_final_silence,
     write_audio_as_mp3,
 )
-from .models import ASRRequest, ChunkArtifact, ScriptChunk
+from .models import ASRContextHints, ASRRequest, ChunkArtifact, ScriptChunk
 from .pricing import (
     cost_from_generation,
     fetch_openrouter_generation_detail,
@@ -169,7 +170,12 @@ def _find_default_script() -> Path:
 
 def main() -> None:
     parser = build_parser()
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        if exc.code == _EXIT_ARGS and "--json" in sys.argv[1:]:
+            _json_error("Invalid command-line arguments", _EXIT_ARGS)
+        raise
 
     try:
         if args.command == "generate":
@@ -297,7 +303,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-run speaking style instruction for qwen-local preset or design mode.",
     )
     qwen.add_argument("--sample", type=str, default=None)
-    qwen.add_argument("--sample-text", type=str, default="")
+    qwen.add_argument("--sample-text", type=str, default=None)
+
+    omnivoice = gen.add_argument_group("omnivoice-local options")
+    omnivoice.add_argument("--reference-audio", type=Path, default=None)
+    omnivoice.add_argument("--reference-text", type=str, default=None)
+    omnivoice.add_argument("--design-instruction", type=str, default=None)
 
     tim = gen.add_argument_group("Whisper timing (optional)")
     tim.add_argument("--with-timings", action="store_true")
@@ -353,6 +364,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--word-timestamps",
         action="store_true",
         help="Require validated word timestamps from the selected ASR provider.",
+    )
+    context_group = asr.add_mutually_exclusive_group()
+    context_group.add_argument("--context", default=None, help="Optional ASR context text.")
+    context_group.add_argument(
+        "--context-file",
+        type=Path,
+        default=None,
+        help="Read optional ASR context text from a file.",
+    )
+    asr.add_argument(
+        "--runtime",
+        choices=["auto", "python", "audio-cpp"],
+        default="auto",
+        help="Requested ASR runtime route.",
     )
     asr.add_argument("--json", dest="json_output", action="store_true")
 
@@ -624,24 +649,128 @@ def _resolve_provider_style_prompt(args: argparse.Namespace) -> str | None:
 
 
 def _validate_omnivoice_options(args: argparse.Namespace) -> None:
-    if args.provider != "omnivoice-local":
+    if getattr(args, "provider", None) != "omnivoice-local":
         return
-    if (
-        args.mode != "preset"
-        or args.sample is not None
-        or args.sample_text
-        or args.qwen_instruct
-        or args.style_prompt is not None
-        or args.style_prompt_file is not None
-        or args.voice not in (None, DEFAULT_OMNIVOICE_VOICE)
+
+    mode = getattr(args, "mode", "preset")
+    if mode not in ("preset", "clone", "design"):
+        fail("omnivoice-local mode must be preset, clone, or design", _EXIT_ARGS)
+
+    reference_audio = getattr(args, "reference_audio", None)
+    reference_text = getattr(args, "reference_text", None)
+    design_instruction = getattr(args, "design_instruction", None)
+    unsupported: list[str] = []
+    if getattr(args, "sample", None) is not None:
+        unsupported.append("--sample")
+    if getattr(args, "sample_text", None) is not None:
+        unsupported.append("--sample-text")
+    if getattr(args, "qwen_instruct", None) is not None:
+        unsupported.append("--qwen-instruct")
+    if getattr(args, "style_prompt", None) is not None:
+        unsupported.append("--style-prompt")
+    if getattr(args, "style_prompt_file", None) is not None:
+        unsupported.append("--style-prompt-file")
+    if getattr(args, "no_style_prompt", False):
+        unsupported.append("--no-style-prompt")
+    voice = getattr(args, "voice", None)
+    if (mode == "preset" and voice not in (None, DEFAULT_OMNIVOICE_VOICE)) or (
+        mode != "preset" and voice is not None
     ):
+        unsupported.append("--voice")
+    if getattr(args, "fallback_voice", DEFAULT_FALLBACK_VOICE) != DEFAULT_FALLBACK_VOICE:
+        unsupported.append("--fallback-voice")
+    if getattr(args, "speaker_voice", []):
+        unsupported.append("--speaker-voice")
+    if unsupported:
         fail(
-            "omnivoice-local uses one fixed built-in female style condition; named voices, cloning, design, Qwen options, and style controls are unavailable.",
+            "omnivoice-local rejects unsupported Qwen options, voice controls, and style controls: "
+            + ", ".join(unsupported),
             _EXIT_ARGS,
         )
 
+    if mode == "preset":
+        fields = [
+            flag
+            for flag, value in (
+                ("--reference-audio", reference_audio),
+                ("--reference-text", reference_text),
+                ("--design-instruction", design_instruction),
+            )
+            if value is not None
+        ]
+        if fields:
+            fail(
+                "omnivoice-local preset/fixed-style rejects clone/design fields: "
+                + ", ".join(fields),
+                _EXIT_ARGS,
+            )
+        try:
+            OmniVoiceRequest(mode="fixed-style", style_condition=OMNIVOICE_STYLE_CONDITION)
+        except ValueError as exc:
+            fail(str(exc), _EXIT_ARGS)
+        return
+
+    if mode == "clone":
+        if reference_audio is None or reference_text is None or not reference_text.strip():
+            fail(
+                "omnivoice-local clone mode requires a readable reference audio file via "
+                "--reference-audio and non-empty --reference-text; the fixed female style "
+                "condition route cannot clone voices.",
+                _EXIT_ARGS,
+            )
+        if design_instruction is not None:
+            fail("omnivoice-local clone mode rejects --design-instruction", _EXIT_ARGS)
+        reference_audio_path = Path(reference_audio)
+        if not reference_audio_path.is_file():
+            fail(
+                f"OmniVoice reference audio is not a readable file: {reference_audio_path}",
+                _EXIT_ARGS,
+            )
+        try:
+            with reference_audio_path.open("rb"):
+                pass
+        except (OSError, ValueError):
+            fail(
+                f"OmniVoice reference audio is not a readable file: {reference_audio_path}",
+                _EXIT_ARGS,
+            )
+        try:
+            OmniVoiceRequest(
+                mode="clone",
+                reference_audio_path=reference_audio_path,
+                reference_text=reference_text,
+            )
+        except ValueError as exc:
+            fail(str(exc), _EXIT_ARGS)
+        fail(
+            "omnivoice-local clone mode is not implemented by the current provider path; "
+            "refusing to use the fixed female style condition provider.",
+            _EXIT_ARGS,
+        )
+
+    if reference_audio is not None or reference_text is not None:
+        fail(
+            "omnivoice-local design mode rejects --reference-audio and --reference-text",
+            _EXIT_ARGS,
+        )
+    if design_instruction is None or not design_instruction.strip():
+        fail(
+            "omnivoice-local design mode requires non-empty --design-instruction",
+            _EXIT_ARGS,
+        )
+    try:
+        OmniVoiceRequest(mode="design", instruction=design_instruction)
+    except ValueError as exc:
+        fail(str(exc), _EXIT_ARGS)
+    fail(
+        "omnivoice-local design mode is not implemented by the current provider path; "
+        "refusing to use the fixed female style condition provider.",
+        _EXIT_ARGS,
+    )
+
 
 def generate(args: argparse.Namespace) -> None:
+    _validate_omnivoice_options(args)
     try:
         ffmpeg_path, ffprobe_path = check_media_tools()
     except RuntimeError as e:
@@ -1153,6 +1282,15 @@ def split_cmd(args: argparse.Namespace) -> None:
 
 
 def _validate_asr_request_options(args: argparse.Namespace, spec) -> None:
+    runtime = getattr(args, "runtime", "auto")
+    if runtime not in ("auto", "python", "audio-cpp"):
+        fail(f"ASR runtime choice is not supported: {runtime}", _EXIT_ARGS)
+    if runtime == "audio-cpp":
+        fail(
+            f"ASR provider {spec.provider_id} does not support explicit runtime=audio-cpp; "
+            "refusing to fall back to another runtime",
+            _EXIT_ARGS,
+        )
     capabilities = spec.capabilities
     if not capabilities.batch_audio:
         fail(
@@ -1228,10 +1366,25 @@ def _asr_result_payload(result, source_audio: Path) -> dict:
     }
 
 
+def _resolve_asr_context(args: argparse.Namespace) -> ASRContextHints:
+    context_text = getattr(args, "context", None)
+    context_file = getattr(args, "context_file", None)
+    if context_file is not None:
+        context_path = Path(context_file)
+        try:
+            context_text = context_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            fail(f"Unable to read ASR context file: {context_path}", _EXIT_ARGS)
+    if context_text is not None and not context_text.strip():
+        fail("ASR context must not be blank", _EXIT_ARGS)
+    return ASRContextHints(context_text=context_text)
+
+
 def transcribe_cmd(args: argparse.Namespace) -> None:
     audio_path = _resolve_audio(args.audio)
     if not audio_path.exists():
         fail(f"Audio file not found: {audio_path}", _EXIT_ARGS)
+    hints = _resolve_asr_context(args)
     try:
         spec = get_asr_provider_spec(args.provider)
     except ASRProviderNotFoundError as exc:
@@ -1251,7 +1404,9 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
         language=args.language,
         device=args.device,
         compute=args.compute,
+        hints=hints,
         timestamp_mode="word" if args.word_timestamps else "none",
+        runtime_choice=getattr(args, "runtime", "auto"),
     )
     provider = spec.factory()
     try:
@@ -2351,7 +2506,7 @@ def build_provider(
             "voice": None if args.mode == "design" else args.voice,
             "instruct": QWEN_INSTRUCT if instruct is None else instruct,
             "sample_path": args.sample,
-            "sample_text": args.sample_text,
+            "sample_text": getattr(args, "sample_text", None) or "",
         }
         runtime = os.environ.get("VOICEOVER_QWEN_TTS_RUNTIME", "python").strip()
         if runtime == "audio-cpp":

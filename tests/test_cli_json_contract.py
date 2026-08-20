@@ -1,5 +1,6 @@
 import json
 
+import pytest
 from conftest import cli_json, fixture_path
 
 
@@ -322,3 +323,122 @@ def test_timings_asr_provider_is_explicit_and_faster_whisper_remains_default():
         ).compute
         == "bfloat16"
     )
+
+
+def test_transcribe_mutually_exclusive_context_sources_are_json_errors(tmp_path):
+    context_path = tmp_path / "context.txt"
+    context_path.write_text("context", encoding="utf-8")
+    from conftest import run_cli
+
+    proc = run_cli(
+        "transcribe",
+        "--audio",
+        str(fixture_path("smoke_test.md")),
+        "--provider",
+        "qwen-local",
+        "--context",
+        "inline",
+        "--context-file",
+        str(context_path),
+        "--json",
+    )
+
+    assert proc.returncode == 2
+    data = json.loads(proc.stdout)
+    assert data == {"status": "error", "error": "Invalid command-line arguments", "code": 2}
+    assert len([line for line in proc.stdout.splitlines() if line.strip().startswith("{")]) == 1
+
+
+@pytest.mark.parametrize("context_kind", ["missing", "unreadable", "blank"])
+def test_transcribe_context_file_errors_are_json_and_do_not_leak_content(tmp_path, context_kind):
+    context_path = tmp_path / "context.txt"
+    secret = "private-context-value"
+    if context_kind == "unreadable":
+        context_path.mkdir()
+    elif context_kind == "blank":
+        context_path.write_text(" \n", encoding="utf-8")
+
+    code, data = cli_json(
+        "transcribe",
+        "--audio",
+        str(fixture_path("smoke_test.md")),
+        "--provider",
+        "qwen-local",
+        "--context-file",
+        str(context_path),
+        "--json",
+    )
+
+    assert code == 2
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert secret not in json.dumps(data)
+    if context_kind == "blank":
+        assert "blank" in data["error"]
+    else:
+        assert "read" in data["error"]
+
+
+def test_transcribe_blank_inline_context_is_an_argument_error():
+    code, data = cli_json(
+        "transcribe",
+        "--audio",
+        str(fixture_path("smoke_test.md")),
+        "--provider",
+        "qwen-local",
+        "--context",
+        " \t",
+        "--json",
+    )
+
+    assert code == 2
+    assert data == {"status": "error", "error": "ASR context must not be blank", "code": 2}
+
+
+def test_transcribe_explicit_audio_cpp_is_structured_fail_closed_error():
+    code, data = cli_json(
+        "transcribe",
+        "--audio",
+        str(fixture_path("smoke_test.md")),
+        "--provider",
+        "qwen-local",
+        "--runtime",
+        "audio-cpp",
+        "--json",
+    )
+
+    assert code == 2
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert "audio-cpp" in data["error"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "mode_args"),
+    [
+        ("clone", ("--reference-audio", "{reference_audio}", "--reference-text", "reference")),
+        ("design", ("--design-instruction", "warm and clear")),
+    ],
+)
+def test_omnivoice_clone_and_design_fail_closed_as_single_json_error(tmp_path, mode, mode_args):
+    reference_audio = tmp_path / "reference.wav"
+    reference_audio.write_bytes(b"fixture")
+    resolved_mode_args = [value.format(reference_audio=reference_audio) for value in mode_args]
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--mode",
+        mode,
+        *resolved_mode_args,
+        "--json",
+    )
+
+    assert code == 2
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert "not implemented" in data["error"]
+    assert len(data) == 3

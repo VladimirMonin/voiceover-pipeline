@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import get_args
 
 import pytest
 
@@ -11,6 +12,8 @@ from voiceover_pipeline.local_runtime.contracts import (
     LocalRuntimeResponse,
     LocalTTSRequest,
     LocalTTSResponse,
+    OmniVoiceMode,
+    OmniVoiceRequest,
     RuntimeDriverHealth,
     RuntimeProtocolError,
     RuntimeUnavailableError,
@@ -117,6 +120,59 @@ def test_local_asr_and_tts_typed_conversions_accept_valid_payloads_and_reject_ma
         LocalTTSResponse.from_runtime_response(
             LocalRuntimeResponse(request_id="tts-request", payload={"audio_path": ""})
         )
+
+
+def test_typed_asr_runtime_choice_is_routing_only_and_explicit_audio_cpp_does_not_fallback():
+    request = LocalASRRequest(
+        request_id="asr-request",
+        family="qwen3-asr",
+        provider_id="qwen-local",
+        audio_path="fixture.wav",
+        model_id="Qwen/Qwen3-ASR-0.6B",
+        runtime_choice="audio-cpp",
+    )
+    python = FixtureDriver("python")
+    audio_cpp = FixtureDriver("audio-cpp", available=False)
+    runtime = LocalAudioRuntime(LocalRuntimeRegistry((python, audio_cpp)))
+
+    assert request.runtime_choice == "audio-cpp"
+    assert "runtime_choice" not in request.to_runtime_request().payload
+    with pytest.raises(RuntimeUnavailableError, match="audio-cpp"):
+        runtime.execute(request.to_runtime_request(), runtime_choice=request.runtime_choice)
+
+    assert python.requests == []
+    assert audio_cpp.requests == []
+
+
+def test_omnivoice_mode_contract_is_family_safe_and_mode_specific():
+    assert get_args(OmniVoiceMode) == ("fixed-style", "clone", "design")
+    fixed = OmniVoiceRequest(mode="fixed-style", style_condition="female")
+    clone = OmniVoiceRequest(
+        mode="clone", reference_audio_path="fixture.wav", reference_text="reference transcript"
+    )
+    design = OmniVoiceRequest(mode="design", instruction="warm and clear")
+
+    assert fixed.mode == "fixed-style"
+    assert clone.reference_text == "reference transcript"
+    assert design.instruction == "warm and clear"
+    with pytest.raises(ValueError, match="OmniVoice mode"):
+        OmniVoiceRequest(mode="voice-clone")
+
+
+@pytest.mark.parametrize(
+    ("mode", "kwargs", "message"),
+    (
+        ("clone", {}, "reference audio"),
+        ("clone", {"reference_audio_path": "fixture.wav"}, "reference text"),
+        ("design", {}, "instruction"),
+        ("fixed-style", {"reference_audio_path": "fixture.wav"}, "fixed-style"),
+        ("fixed-style", {"reference_text": "reference transcript"}, "fixed-style"),
+        ("fixed-style", {"instruction": "design instruction"}, "fixed-style"),
+    ),
+)
+def test_omnivoice_mode_contract_rejects_missing_or_cross_mode_fields(mode, kwargs, message):
+    with pytest.raises(ValueError, match=message):
+        OmniVoiceRequest(mode=mode, **kwargs)
 
 
 def test_auto_selection_preserves_python_rollback_until_family_promotion():

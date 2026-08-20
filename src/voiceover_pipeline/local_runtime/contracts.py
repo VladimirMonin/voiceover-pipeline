@@ -5,8 +5,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping, Protocol
 
+from voiceover_pipeline.models import ASRRuntimeChoice
+
 RuntimeOperation = Literal["asr", "tts"]
-RuntimeChoice = Literal["python", "audio-cpp", "auto"]
+RuntimeChoice = ASRRuntimeChoice
+OmniVoiceMode = Literal["fixed-style", "clone", "design"]
 
 
 class RuntimeErrorBase(RuntimeError):
@@ -102,8 +105,11 @@ class LocalASRRequest:
     timestamp_mode: Literal["none", "word"] = "none"
     context_text: str | None = None
     provider_options: Mapping[str, object] = field(default_factory=dict)
+    runtime_choice: RuntimeChoice = "auto"
 
     def __post_init__(self) -> None:
+        if self.runtime_choice not in ("auto", "python", "audio-cpp"):
+            raise ValueError("Local ASR runtime choice must be auto, python, or audio-cpp")
         object.__setattr__(self, "provider_options", MappingProxyType(dict(self.provider_options)))
 
     def to_runtime_request(self) -> LocalRuntimeRequest:
@@ -139,6 +145,45 @@ class LocalASRResponse:
         if not isinstance(language, str):
             raise RuntimeProtocolError("Local ASR response language must be a string")
         return cls(transcript=transcript, language=language, payload=response.payload)
+
+
+@dataclass(frozen=True)
+class OmniVoiceRequest:
+    """Mode-only contract kept separate from Qwen's runtime mode vocabulary."""
+
+    mode: OmniVoiceMode = "fixed-style"
+    style_condition: str | None = None
+    instruction: str | None = None
+    reference_audio_path: Path | str | None = None
+    reference_text: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in ("fixed-style", "clone", "design"):
+            raise ValueError("OmniVoice mode must be fixed-style, clone, or design")
+
+        has_style_condition = self.style_condition is not None and self.style_condition.strip()
+        has_instruction = self.instruction is not None and self.instruction.strip()
+        has_reference_audio = (
+            self.reference_audio_path is not None and str(self.reference_audio_path).strip()
+        )
+        has_reference_text = self.reference_text is not None and self.reference_text.strip()
+
+        if self.mode == "clone":
+            if not has_reference_audio:
+                raise ValueError("OmniVoice clone mode requires reference audio")
+            if not has_reference_text:
+                raise ValueError("OmniVoice clone mode requires non-empty reference text")
+            if has_style_condition or has_instruction:
+                raise ValueError("OmniVoice clone mode does not accept style or design fields")
+        elif self.mode == "design":
+            if not has_instruction:
+                raise ValueError("OmniVoice design mode requires non-empty instruction")
+            if has_style_condition or has_reference_audio or has_reference_text:
+                raise ValueError(
+                    "OmniVoice design mode does not accept fixed-style or clone fields"
+                )
+        elif has_reference_audio or has_reference_text or has_instruction:
+            raise ValueError("OmniVoice fixed-style mode does not accept clone/design-only fields")
 
 
 @dataclass(frozen=True)

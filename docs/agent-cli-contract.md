@@ -45,6 +45,11 @@
 
 При `--json` в stdout никогда не должно быть не-JSON строк.
 
+Ошибки парсинга argparse при `--json` (например, конфликт mutually exclusive
+flags) превращаются в единственный JSON error
+`{"status": "error", "error": "Invalid command-line arguments", "code": 2}`
+с exit code `2`.
+
 ## JSON Output Contract
 
 ### Success
@@ -164,8 +169,28 @@ VOP не скачивает модель; до provider/runtime он поток�
 явный file/config boundary и GPU probe, но не загружает модель и не доказывает
 реальный container inference.
 
-Named `--voice`, `--mode clone`, `--sample`, `--sample-text` и `--qwen-instruct` для этого
-provider fail closed: named preset, cloning, design, streaming и Qwen options не входят в
+Распознаются глобальный `--mode preset|clone|design` (default `preset`) и
+флаги `--reference-audio <path>`, `--reference-text <text>`,
+`--design-instruction <text>`:
+
+- `--mode preset` (fixed-style) — поведение не изменилось: названные
+  `--voice`, `--sample`, `--sample-text`, `--qwen-instruct`, `--style-prompt`,
+  `--style-prompt-file`, `--no-style-prompt`, `--fallback-voice`,
+  `--speaker-voice`, а также `--reference-audio`/`--reference-text`/
+  `--design-instruction` fail closed с exit code `2` (invalid args).
+- `--mode clone` требует читаемый файл через `--reference-audio` и непустой
+  `--reference-text`; `--design-instruction` запрещён. После валидации режим
+  fail closed с exit code `2` («not implemented»): текущий fixed-style provider
+  путь не реализует клонирование, и CLI отказывается использовать его как
+  fallback для клона.
+- `--mode design` требует непустой `--design-instruction`; `--reference-audio`/
+  `--reference-text` запрещены. Аналогично fail closed с exit code `2`
+  («not implemented»): голосовой дизайн не реализован текущим provider путём.
+- Оба режима валидируются до построения provider; constructed provider для
+  них не создаётся. Clone/design — планируемые, а не рабочие capability.
+
+Named `--voice`, Qwen cloning/sample options и style controls для этого
+provider fail closed: named preset, streaming и Qwen options не входят в
 контракт. На Windows Docker/WSL не выбираются: нужен
 `VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE` с рядом лежащим
 `audio_cpp_dependency_closure.json`, проверяющим SHA-256 EXE/DLL closure, и
@@ -243,7 +268,20 @@ voiceover transcribe `
 - `--model`, `--language`, `--device` и `--compute` валидируются по capability
   выбранного provider до его factory/runtime. `qwen-local` и `nemotron-local`
   сохраняют свои отдельные family IDs; неизвестный ID по-прежнему fail-closed.
-- Публичных флагов `--prompt`, `--context`, `--glossary` или числового phrase
+- `--context <text>` и `--context-file <path>` — mutually exclusive; заполняют
+  typed `ASRContextHints.context_text`, передаваемый в request до provider
+  probe. Blank/whitespace inline context и missing/unreadable/blank context
+  file — аргументная ошибка (exit code `2`), причём до lookup provider. Значение
+  не попадает в стандартный receipt и в JSON-вывод.
+- `--runtime auto|python|audio-cpp` (default `auto`) — явный запрос маршрута
+  ASR runtime. Explicit `--runtime audio-cpp` для всех зарегистрированных
+  provider-ов сейчас fail closed с exit code `2` до dependency probe и factory:
+  native audio.cpp path ещё не реализован как выбираемый CLI-маршрут, и CLI
+  отказывается от fallback на другой runtime. `auto` и `python` принимаются,
+  но фактический выбор runtime остаётся прежним (env-driven через
+  `VOICEOVER_AUDIO_CPP_BINARY` и т.п.); `--runtime` сам по себе маршрут не
+  переключает.
+- Публичных флагов `--prompt`, `--glossary` или числового phrase
   boost нет. В API typed `ASRContextHints` различает `context_text`, glossary
   profile/digest/selected terms, `ASRPhraseHint` с силой `mild|normal|strong` и
   adapter-specific `initial_prompt`; они не записываются в стандартный receipt.
@@ -326,7 +364,9 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
   как есть, а ISO-коды `de|en|es|ru` преобразуются в `German|English|Spanish|Russian`.
   Context остаётся soft contextual bias, передаваемым в
   `qwen_asr.Qwen3ASRModel.transcribe(..., context=..., language=...)`. Raw
-  `--context`/`--prompt` flags и cloud fallback отсутствуют.
+  `--prompt` flag и cloud fallback отсутствуют; публичные `--context`/
+  `--context-file` заполняют только `context_text` (см. `transcribe` выше).
+  Glossary и phrase hints публичными флагами не выбираются.
 - Capability допускает request `--device cpu|cuda` и `--compute
   auto|bfloat16|float32`; `auto` выбирает `float32` для CPU и `bfloat16` для
   opt-in CUDA. Python route допускается только с уже размещёнными official
@@ -387,7 +427,9 @@ voiceover doctor --with-asr --asr-provider nemotron-local --asr-device cpu --asr
   confidence остаётся `null`. Raw entries сохраняются в receipt до такого
   слияния. Python fallback остаётся text-only.
 - `context_text`, glossary, `phrase_hints` и `initial_prompt` fail closed в
-  audio.cpp route. Пиннутый offline wire contract не доказывает phrase boosting:
+  audio.cpp route. Публичный `--context`/`--context-file` для Python fallback
+  не влияет на transcribe: fallback не передаёт context в модель.
+  Пиннутый offline wire contract не доказывает phrase boosting:
   hotword/term extension остаётся capability-unavailable, пока не появятся
   decoder and live term evidence. В long-form public CLI Nemotron также
   использует external bounded orchestration: Python text-only fallback получает
@@ -527,5 +569,6 @@ voiceover generate `
 - Cloud prices are snapshots из API на момент прогона, не гарантия
 - Qwen-local и omnivoice-local требуют CUDA GPU
 - OmniVoice local uses the Linux container route or a statically checked native-Windows factory; native Windows inference/readiness is not claimed
+- OmniVoice local `--mode clone|design` и ASR explicit `--runtime audio-cpp` проходят валидацию, но fail closed (exit code `2`) как not implemented — планируются, не являются рабочими capability
 - Первый Whisper запуск скачивает модель (~486 MB) из HuggingFace
 - При `--with-timings` ошибка Whisper — hard failure (code 40), но MP3 уже сохранён
