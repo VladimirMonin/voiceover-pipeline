@@ -407,7 +407,7 @@ def test_long_form_overlap_reconciliation_never_emits_sub_epsilon_word_overlap(
     assert result.execution.long_form["deduplicated_word_count"] == 1
 
 
-def test_long_form_overlap_reconciliation_fails_when_only_splice_would_discard_pre_overlap_word(
+def test_long_form_overlap_reconciliation_drops_crossing_hypothesis_instead_of_pre_overlap_word(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "unspliceable-seam.wav"
@@ -429,8 +429,12 @@ def test_long_form_overlap_reconciliation_fails_when_only_splice_would_discard_p
     )
     provider.provider_id = "nemotron-local"
 
-    with pytest.raises(longform.LongFormASRError, match="pre-overlap content"):
-        longform.transcribe_prerecorded_long_form(provider, _request(source))
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert [word.text for word in result.words] == ["longword "]
+    assert result.transcript == "longword"
+    assert result.execution.long_form is not None
+    assert result.execution.long_form["deduplicated_word_count"] == 1
 
 
 def test_long_form_fails_closed_when_a_provider_reports_token_limit_truncation(

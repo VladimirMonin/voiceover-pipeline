@@ -582,9 +582,11 @@ def _deduplicate_overlap_words(
     temporally and the resulting seam is strictly monotonic. Otherwise a bounded
     temporal splice drops incoming words wholly inside the previous chunk input,
     retains incoming words that cross beyond it, and trims the minimum number of
-    existing tail words that intersect the overlap window. A residual overlap is
-    never accepted, even when smaller than ``_EPSILON_S``; if a valid splice
-    would require discarding pre-overlap content, the seam fails closed.
+    existing tail words that intersect the overlap window. Pre-overlap existing
+    content is never discarded: an incoming crossing hypothesis that conflicts
+    with an existing word starting before the overlap window is dropped instead
+    of corrupting the seam. A residual overlap is never accepted, even when
+    smaller than ``_EPSILON_S``.
     """
     if previous_input_end_s is None or not incoming_words or not existing_words:
         return incoming_words, 0, 0
@@ -611,22 +613,20 @@ def _deduplicate_overlap_words(
             continue
         return retained_words, count, 0
 
-    retained_incoming = tuple(word for word in incoming_words if word.end_s > previous_input_end_s)
+    retained_incoming = list(word for word in incoming_words if word.end_s > previous_input_end_s)
     removed_incoming = len(incoming_words) - len(retained_incoming)
-    if not retained_incoming:
-        return (), removed_incoming, 0
     trimmed_existing = 0
-    while retained_incoming[0].start_s < existing_words[-1].end_s:
+    while retained_incoming and retained_incoming[0].start_s < existing_words[-1].end_s:
         word = existing_words[-1]
-        if word.start_s < incoming_input_start_s:
-            raise LongFormASRError(
-                "cannot reconcile long-form chunk seam without discarding pre-overlap content"
-            )
-        existing_words.pop()
-        trimmed_existing += 1
-        if not existing_words:
-            break
-    return retained_incoming, removed_incoming, trimmed_existing
+        if word.start_s >= incoming_input_start_s:
+            existing_words.pop()
+            trimmed_existing += 1
+            if not existing_words:
+                break
+        else:
+            removed_incoming += 1
+            retained_incoming.pop(0)
+    return tuple(retained_incoming), removed_incoming, trimmed_existing
 
 
 def _spans_overlap(first: ASRWordSpan, second: ASRWordSpan) -> bool:

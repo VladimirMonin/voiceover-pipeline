@@ -51,7 +51,7 @@ NEMOTRON_ASR_FAMILY = "nemotron-3.5-asr"
 NEMOTRON_AUDIO_CPP_MODEL_ENV = "VOICEOVER_AUDIO_CPP_NEMOTRON_MODEL"
 NEMOTRON_AUDIO_CPP_MIN_FREE_VRAM_MB = 4096
 NEMOTRON_AUDIO_CPP_MAX_GPU_UTILIZATION_PERCENT = 90
-NEMOTRON_AUDIO_CPP_TRAILING_CLAMP_TOLERANCE_S = 0.1
+NEMOTRON_AUDIO_CPP_TRAILING_CLAMP_TOLERANCE_S = 0.2
 AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION = "audio.cpp Nemotron ASR runtime is unavailable. Set VOICEOVER_AUDIO_CPP_BINARY to the pinned JSON driver before retrying."
 
 
@@ -223,12 +223,14 @@ def _clamp_words_to_duration(
     The native Nemotron runtime may emit a trailing RNN-T token a few frames
     beyond the actual audio length; entries within a bounded trailing tolerance
     are clamped (not rejected) so the strict ASR bounds validation treats them
-    as a tolerance at the audio boundary. Clamping preserves ``end >= start``
-    and word monotonicity because ``min(value, duration)`` is monotone. A word
-    whose entire span lies beyond the duration collapses to a zero-length span
-    at the boundary instead of being dropped, keeping transcript correspondence
-    intact. Entries beyond the tolerance are rejected instead of silently
-    normalized, so a wrong timebase or severe decoder failure is not hidden.
+    as a tolerance at the audio boundary. Live evidence shows trailing
+    overshoots of 0.08-0.12s, so the tolerance is set to 0.2s with headroom.
+    Clamping preserves ``end >= start`` and word monotonicity because
+    ``min(value, duration)`` is monotone. A word whose entire span lies beyond
+    the duration collapses to a zero-length span at the boundary instead of
+    being dropped, keeping transcript correspondence intact. Entries beyond the
+    tolerance are rejected instead of silently normalized, so a wrong timebase
+    or severe decoder failure is not hidden.
     """
     if duration_s is None or duration_s <= 0 or not words:
         return words
