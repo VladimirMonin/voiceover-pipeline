@@ -8,7 +8,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 from .artifacts import (
     build_chunks_manifest,
@@ -72,6 +72,7 @@ from .gemini_dialogue import (
     chunks_from_validation as gemini_chunks_from_validation,
 )
 from .local_runtime.contracts import OmniVoiceRequest
+from .local_runtime.transports.audio_cpp_cli import NATIVE_AUDIO_CPP_EXECUTABLE_ENV
 from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
 from .media import (
     check_media_tools,
@@ -81,7 +82,7 @@ from .media import (
     trim_final_silence,
     write_audio_as_mp3,
 )
-from .models import ASRContextHints, ASRRequest, ChunkArtifact, ScriptChunk
+from .models import ASRContextHints, ASRRequest, ASRRuntimeChoice, ChunkArtifact, ScriptChunk
 from .pricing import (
     cost_from_generation,
     fetch_openrouter_generation_detail,
@@ -1281,14 +1282,26 @@ def split_cmd(args: argparse.Namespace) -> None:
             print(f"{chunk.id}: {len(chunk.text)} chars")
 
 
-def _validate_asr_request_options(args: argparse.Namespace, spec) -> None:
+def _validate_asr_request_options(
+    args: argparse.Namespace, spec, hints: ASRContextHints | None = None
+) -> None:
     runtime = getattr(args, "runtime", "auto")
     if runtime not in ("auto", "python", "audio-cpp"):
         fail(f"ASR runtime choice is not supported: {runtime}", _EXIT_ARGS)
-    if runtime == "audio-cpp":
+    if runtime == "audio-cpp" and args.device != "cuda":
         fail(
-            f"ASR provider {spec.provider_id} does not support explicit runtime=audio-cpp; "
-            "refusing to fall back to another runtime",
+            f"ASR provider {spec.provider_id} requires device=cuda for runtime=audio-cpp; "
+            "the native route is CUDA-only",
+            _EXIT_ARGS,
+        )
+    if (
+        spec.provider_id == "nemotron-local"
+        and hints is not None
+        and hints.context_text is not None
+    ):
+        fail(
+            f"ASR provider {spec.provider_id} does not support context text; "
+            "only its model-owned language prompt selection is supported",
             _EXIT_ARGS,
         )
     capabilities = spec.capabilities
@@ -1390,8 +1403,34 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
     except ASRProviderNotFoundError as exc:
         fail(str(exc), _EXIT_ARGS)
 
-    _validate_asr_request_options(args, spec)
-    health = spec.dependency_probe()
+    _validate_asr_request_options(args, spec, hints)
+    runtime = cast(ASRRuntimeChoice, getattr(args, "runtime", "auto"))
+    if spec.provider_id == "nemotron-local" and runtime == "audio-cpp":
+        from .providers.audio_cpp_nemotron_asr import audio_cpp_nemotron_asr_dependency_probe
+        from .providers.nemotron_asr_local import nemotron_asr_audio_cpp_provider_factory
+
+        health = audio_cpp_nemotron_asr_dependency_probe()
+        provider_factory = nemotron_asr_audio_cpp_provider_factory
+    elif spec.provider_id == "nemotron-local" and runtime == "python":
+        from .providers.nemotron_asr_local import (
+            nemotron_asr_python_dependency_probe,
+            nemotron_asr_python_provider_factory,
+        )
+
+        health = nemotron_asr_python_dependency_probe()
+        provider_factory = nemotron_asr_python_provider_factory
+    elif runtime == "audio-cpp":
+        if not os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip():
+            fail(
+                f"ASR provider {spec.provider_id} does not support runtime=audio-cpp "
+                "without a native audio.cpp package",
+                _EXIT_MISSING_DEP,
+            )
+        health = spec.dependency_probe()
+        provider_factory = spec.factory
+    else:
+        health = spec.dependency_probe()
+        provider_factory = spec.factory
     if not health.available:
         fail(health.remediation, _EXIT_MISSING_DEP)
 
@@ -1406,9 +1445,9 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
         compute=args.compute,
         hints=hints,
         timestamp_mode="word" if args.word_timestamps else "none",
-        runtime_choice=getattr(args, "runtime", "auto"),
+        runtime_choice=runtime,
     )
-    provider = spec.factory()
+    provider = provider_factory()
     try:
         raw_result = (
             transcribe_prerecorded_long_form(provider, request)

@@ -251,6 +251,241 @@ def test_transcribe_explicit_audio_cpp_fails_closed_before_probe_or_factory(monk
     assert calls == []
 
 
+@pytest.mark.parametrize("runtime", ["audio-cpp", "python", "auto"])
+def test_transcribe_nemotron_runtime_choice_selects_the_matching_route(
+    monkeypatch, capsys, runtime
+):
+    import voiceover_pipeline.cli as cli
+
+    class NemotronFixtureProvider(ASRProvider):
+        provider_id = "nemotron-local"
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            return ASRResult(
+                transcript="fixture transcript",
+                provider_id=self.provider_id,
+                model_id="fixture-model",
+                language="ru",
+                execution=ASRExecutionReceipt(
+                    runtime="fixture-runtime",
+                    runtime_version="1.0",
+                    resolved_device=request.device,
+                    resolved_compute=request.compute,
+                ),
+            )
+
+    selected: list[str] = []
+
+    def probe():
+        selected.append("probe")
+        return ASRDependencyHealth(available=True, remediation="")
+
+    def factory():
+        selected.append("factory")
+        return NemotronFixtureProvider()
+
+    spec = ASRProviderSpec(
+        provider_id="nemotron-local",
+        description="Offline fixture provider",
+        factory=factory,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            forced_language=True,
+            word_timestamps=True,
+            device_modes=("cpu", "cuda"),
+            compute_modes=("auto", "float32"),
+        ),
+        dependency_probe=probe,
+    )
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    if runtime == "audio-cpp":
+        from voiceover_pipeline.providers import audio_cpp_nemotron_asr, nemotron_asr_local
+
+        monkeypatch.setattr(
+            audio_cpp_nemotron_asr,
+            "audio_cpp_nemotron_asr_dependency_probe",
+            lambda: selected.append("probe") or ASRDependencyHealth(available=True, remediation=""),
+        )
+        monkeypatch.setattr(
+            nemotron_asr_local,
+            "nemotron_asr_audio_cpp_provider_factory",
+            lambda: selected.append("factory") or NemotronFixtureProvider(),
+        )
+    elif runtime == "python":
+        from voiceover_pipeline.providers import nemotron_asr_local
+
+        monkeypatch.setattr(
+            nemotron_asr_local,
+            "nemotron_asr_python_dependency_probe",
+            lambda: selected.append("probe") or ASRDependencyHealth(available=True, remediation=""),
+        )
+        monkeypatch.setattr(
+            nemotron_asr_local,
+            "nemotron_asr_python_provider_factory",
+            lambda: selected.append("factory") or NemotronFixtureProvider(),
+        )
+    monkeypatch.setattr(
+        cli,
+        "transcribe_prerecorded_long_form",
+        lambda provider, request: provider.transcribe(request),
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "nemotron-local",
+            "--language",
+            "ru",
+            "--device",
+            "cuda" if runtime == "audio-cpp" else "cpu",
+            "--compute",
+            "float32",
+            "--runtime",
+            runtime,
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.transcribe_cmd(args)
+
+    assert exit_info.value.code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["transcript"] == "fixture transcript"
+    assert selected == ["probe", "factory"]
+
+
+def _qwen_audio_cpp_spec(probe, factory):
+    return ASRProviderSpec(
+        provider_id="qwen-local",
+        description="Offline fixture provider",
+        factory=factory,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            forced_language=True,
+            word_timestamps=True,
+            device_modes=("cpu", "cuda"),
+            compute_modes=("auto", "bfloat16", "float32"),
+        ),
+        dependency_probe=probe,
+    )
+
+
+def test_transcribe_qwen_audio_cpp_cuda_without_native_package_fails_closed(
+    monkeypatch,
+):
+    import voiceover_pipeline.cli as cli
+
+    calls: list[str] = []
+
+    def probe():
+        calls.append("probe")
+        pytest.fail("dependency probe must not run without a native audio.cpp package")
+
+    def factory():
+        calls.append("factory")
+        pytest.fail("provider factory must not run without a native audio.cpp package")
+
+    monkeypatch.delenv("VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE", raising=False)
+    monkeypatch.setattr(
+        cli, "get_asr_provider_spec", lambda _provider_id: _qwen_audio_cpp_spec(probe, factory)
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "qwen-local",
+            "--device",
+            "cuda",
+            "--compute",
+            "float32",
+            "--runtime",
+            "audio-cpp",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(cli.CliError, match="does not support runtime=audio-cpp") as error:
+        cli.transcribe_cmd(args)
+
+    assert error.value.code == 10
+    assert calls == []
+
+
+def test_transcribe_qwen_audio_cpp_cuda_with_native_package_selects_audio_cpp_route(
+    monkeypatch, capsys
+):
+    import voiceover_pipeline.cli as cli
+
+    class QwenAudioCppFixtureProvider(ASRProvider):
+        provider_id = "qwen-local"
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            return ASRResult(
+                transcript="fixture transcript",
+                provider_id=self.provider_id,
+                model_id="fixture-model",
+                language="ru",
+                execution=ASRExecutionReceipt(
+                    runtime="audio-cpp",
+                    runtime_version="1.0",
+                    resolved_device=request.device,
+                    resolved_compute=request.compute,
+                ),
+            )
+
+    selected: list[str] = []
+
+    def probe():
+        selected.append("probe")
+        return ASRDependencyHealth(available=True, remediation="")
+
+    def factory():
+        selected.append("factory")
+        return QwenAudioCppFixtureProvider()
+
+    monkeypatch.setenv("VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE", "fixture-native-executable")
+    monkeypatch.setattr(
+        cli, "get_asr_provider_spec", lambda _provider_id: _qwen_audio_cpp_spec(probe, factory)
+    )
+    monkeypatch.setattr(
+        cli,
+        "transcribe_prerecorded_long_form",
+        lambda provider, request: provider.transcribe(request),
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "qwen-local",
+            "--device",
+            "cuda",
+            "--compute",
+            "float32",
+            "--runtime",
+            "audio-cpp",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.transcribe_cmd(args)
+
+    assert exit_info.value.code == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["transcript"] == "fixture transcript"
+    assert data["execution"]["runtime"] == "audio-cpp"
+    assert selected == ["probe", "factory"]
+
+
 class FixtureASRProvider(ASRProvider):
     provider_id = "fixture-local"
 

@@ -24,6 +24,7 @@ def _result(
     words: tuple[ASRWordSpan, ...],
     *,
     measurements: dict[str, float] | None = None,
+    alignment_origin: str = "forced",
 ) -> ASRResult:
     return ASRResult(
         transcript="".join(word.text for word in words),
@@ -31,7 +32,7 @@ def _result(
         model_id="fixture-model",
         language="ru",
         words=words,
-        alignment_origin="forced",
+        alignment_origin=alignment_origin,
         execution=ASRExecutionReceipt(
             runtime="fixture-asr",
             runtime_version="1.0",
@@ -252,6 +253,44 @@ def test_long_form_forced_word_merge_preserves_readable_spacing_and_punctuation(
     assert "".join(word.text for word in result.words) == result.transcript
     assert [word.start_s for word in result.words] == pytest.approx([0.1, 109.0, 109.4])
     assert result.alignment_origin == "forced"
+
+
+def test_long_form_nemotron_native_words_apply_chunk_offset_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "nemotron-long.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (
+                    ASRWordSpan(text="opening ", start_s=0.1, end_s=0.4),
+                    ASRWordSpan(text="boundary", start_s=108.9, end_s=109.4),
+                ),
+                measurements={"wall_s": 0.5},
+                alignment_origin="native",
+            ),
+            _result(
+                (
+                    ASRWordSpan(text="boundary ", start_s=0.0, end_s=0.2),
+                    ASRWordSpan(text="unique", start_s=0.5, end_s=0.8),
+                ),
+                measurements={"wall_s": 0.5},
+                alignment_origin="native",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert result.alignment_origin == "native"
+    assert result.transcript == "opening boundary unique"
+    assert [word.start_s for word in result.words] == pytest.approx([0.1, 108.9, 109.5])
+    assert [word.end_s for word in result.words] == pytest.approx([0.4, 109.4, 109.8])
+    assert result.execution.long_form is not None
+    assert result.execution.long_form["deduplicated_word_count"] == 1
 
 
 def test_long_form_fails_closed_when_a_provider_reports_token_limit_truncation(

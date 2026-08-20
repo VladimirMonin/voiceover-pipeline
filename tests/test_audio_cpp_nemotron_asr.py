@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator
 
 import pytest
 
@@ -165,6 +168,14 @@ def test_audio_cpp_nemotron_environment_route_cancels_and_releases_gpu_lease(mon
     import voiceover_pipeline.providers.audio_cpp_nemotron_asr as audio_cpp_nemotron_asr
     from voiceover_pipeline.local_runtime.lifecycle import GPUSnapshot
 
+    monkeypatch.setattr(audio_cpp_nemotron_asr.sys, "platform", "linux")
+    import voiceover_pipeline.local_runtime.gpu_lease as gpu_lease
+
+    @contextmanager
+    def _noop_lock(_lock_path: Path) -> Iterator[None]:
+        yield
+
+    monkeypatch.setattr(gpu_lease, "_default_lock_backend", lambda: _noop_lock)
     created: list[BlockingDriver] = []
 
     class BlockingDriver:
@@ -242,6 +253,7 @@ def test_audio_cpp_nemotron_dependency_probe_checks_the_configured_binary(tmp_pa
         audio_cpp_nemotron_asr_dependency_probe,
     )
 
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_nemotron_asr.sys.platform", "linux")
     missing = tmp_path / "missing-audio-cpp"
     monkeypatch.setenv("VOICEOVER_AUDIO_CPP_BINARY", str(missing))
 
@@ -262,3 +274,174 @@ def test_audio_cpp_nemotron_dependency_probe_checks_the_configured_binary(tmp_pa
     assert audio_cpp_nemotron_asr_dependency_probe() == ASRDependencyHealth(
         available=True, remediation=""
     )
+
+
+def _native_package(tmp_path: Path) -> tuple[Path, Path]:
+    import hashlib
+    import json
+
+    package = tmp_path / "nemotron package"
+    package.mkdir()
+    executable = package / "audiocpp_cli.exe"
+    executable.write_bytes(b"native executable")
+    runtime_dll = package / "audiocpp_runtime.dll"
+    runtime_dll.write_bytes(b"runtime dll")
+    model = package / "models" / "nemotron" / "nemotron.gguf"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"model")
+    manifest = package / "audio_cpp_dependency_closure.json"
+    files = {
+        path.relative_to(package).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in package.rglob("*")
+        if path.is_file() and path != manifest
+    }
+    manifest.write_text(
+        json.dumps({"schema_version": 1, "files": files}, sort_keys=True), encoding="utf-8"
+    )
+    receipt = {
+        "schema_version": 1,
+        "source_revision": "502b5b74bd26e9b4aed267d1776ecf131cae7215",
+        "backend": "cuda",
+        "compiler": "cl.exe",
+        "cmake_version": "3.30.1",
+        "cuda_toolkit_version": "12.6.0",
+        "architecture": "x86_64",
+        "build_flags": "Release",
+        "binary_sha256": hashlib.sha256(executable.read_bytes()).hexdigest(),
+        "model_families": ["nemotron-3.5-asr"],
+    }
+    (package / "build_receipt.json").write_text(
+        json.dumps(receipt, sort_keys=True), encoding="utf-8"
+    )
+    return executable, model
+
+
+def test_windows_from_environment_admits_native_package_and_builds_native_transport(
+    monkeypatch, tmp_path
+):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
+        AudioCppNativeCLITransport,
+    )
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import (
+        NEMOTRON_AUDIO_CPP_MODEL_ENV,
+        AudioCppNemotronASRProvider,
+    )
+
+    executable, model = _native_package(tmp_path)
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_nemotron_asr.sys.platform", "win32")
+    monkeypatch.setenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, str(executable))
+    monkeypatch.setenv(NEMOTRON_AUDIO_CPP_MODEL_ENV, str(model))
+
+    provider = AudioCppNemotronASRProvider.from_environment()
+
+    assert provider._runtime is not None
+    driver = next(iter(provider._runtime._registry._drivers.values()))
+    assert isinstance(driver._transport, AudioCppNativeCLITransport)
+    assert driver._transport_name == "native-cli"
+    assert driver._build_hash is not None
+
+
+def test_windows_from_environment_fails_closed_without_native_executable_or_model(
+    monkeypatch, tmp_path
+):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
+    )
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import (
+        NEMOTRON_AUDIO_CPP_MODEL_ENV,
+        AudioCppNemotronASRProvider,
+    )
+
+    executable, model = _native_package(tmp_path)
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_nemotron_asr.sys.platform", "win32")
+    monkeypatch.setenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, str(executable))
+    monkeypatch.delenv(NEMOTRON_AUDIO_CPP_MODEL_ENV, raising=False)
+
+    assert AudioCppNemotronASRProvider.from_environment()._runtime is None
+
+    monkeypatch.setenv(NEMOTRON_AUDIO_CPP_MODEL_ENV, str(model))
+    monkeypatch.delenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, raising=False)
+
+    assert AudioCppNemotronASRProvider.from_environment()._runtime is None
+
+
+def test_windows_from_environment_fails_closed_on_invalid_package(monkeypatch, tmp_path):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
+    )
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import (
+        NEMOTRON_AUDIO_CPP_MODEL_ENV,
+        AudioCppNemotronASRProvider,
+    )
+
+    executable, model = _native_package(tmp_path)
+    (executable.parent / "audiocpp_runtime.dll").write_bytes(b"tampered")
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_nemotron_asr.sys.platform", "win32")
+    monkeypatch.setenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, str(executable))
+    monkeypatch.setenv(NEMOTRON_AUDIO_CPP_MODEL_ENV, str(model))
+
+    assert AudioCppNemotronASRProvider.from_environment()._runtime is None
+
+
+def test_windows_dependency_probe_reports_structured_reason_codes(monkeypatch, tmp_path):
+    from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+        NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
+    )
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import (
+        NEMOTRON_AUDIO_CPP_MODEL_ENV,
+        audio_cpp_nemotron_asr_dependency_probe,
+    )
+
+    executable, model = _native_package(tmp_path)
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_nemotron_asr.sys.platform", "win32")
+    monkeypatch.delenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, raising=False)
+    monkeypatch.delenv(NEMOTRON_AUDIO_CPP_MODEL_ENV, raising=False)
+
+    missing = audio_cpp_nemotron_asr_dependency_probe()
+    assert missing.available is False
+    assert missing.reason_code == "missing_native_executable"
+
+    monkeypatch.setenv(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, str(executable))
+    missing_model = audio_cpp_nemotron_asr_dependency_probe()
+    assert missing_model.available is False
+    assert missing_model.reason_code == "missing_model_artifact"
+
+    monkeypatch.setenv(NEMOTRON_AUDIO_CPP_MODEL_ENV, str(model))
+    healthy = audio_cpp_nemotron_asr_dependency_probe()
+    assert healthy.available is True
+    assert healthy.reason_code is None
+
+    (executable.parent / "audiocpp_runtime.dll").write_bytes(b"tampered")
+    invalid = audio_cpp_nemotron_asr_dependency_probe()
+    assert invalid.available is False
+    assert invalid.reason_code == "modified_bytes"
+
+
+def test_execution_receipt_distinguishes_runtime_revision_from_model_revision():
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import _execution_receipt
+
+    receipt = RuntimeExecutionReceipt(
+        driver_id="audio-cpp",
+        transport="native-cli",
+        source_revision="502b5b74bd26e9b4aed267d1776ecf131cae7215",
+    )
+    execution = _execution_receipt(
+        receipt,
+        ASRRequest(audio_path="fixture.wav", device="cuda", compute="auto"),
+        (),
+    )
+
+    assert execution.runtime == "audio-cpp"
+    assert execution.runtime_version == "502b5b74bd26e9b4aed267d1776ecf131cae7215"
+    assert execution.model_revision is None
+    assert execution.resolved_device == "cuda"
+    assert execution.resolved_compute == "auto"
+
+
+def test_transcribe_uses_staged_wav_duration_from_payload():
+    provider = _provider({"transcript": "Checked", "duration_s": 3.5})
+
+    result = provider.transcribe(ASRRequest(audio_path="fixture.wav"))
+
+    assert result.duration_s == 3.5

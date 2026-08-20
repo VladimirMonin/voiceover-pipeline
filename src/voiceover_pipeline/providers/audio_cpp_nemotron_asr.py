@@ -24,6 +24,14 @@ from voiceover_pipeline.local_runtime.gpu_lease import GPULeaseManager
 from voiceover_pipeline.local_runtime.lifecycle import GPULifecycleOwner, probe_local_gpu_state
 from voiceover_pipeline.local_runtime.manager import LocalAudioRuntime
 from voiceover_pipeline.local_runtime.registry import LocalRuntimeRegistry
+from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+    NATIVE_AUDIO_CPP_EXECUTABLE_ENV,
+    AudioCppNativeCLITransport,
+)
+from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
+    AudioCppPackageError,
+    admit_audio_cpp_native_package,
+)
 from voiceover_pipeline.models import ASRContextHints, ASRExecutionReceipt, ASRRequest, ASRResult
 from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth
 from voiceover_pipeline.providers.base import ASRProvider, validate_asr_response
@@ -33,6 +41,7 @@ from voiceover_pipeline.providers.nemotron_asr_local import (
 )
 
 NEMOTRON_ASR_FAMILY = "nemotron-3.5-asr"
+NEMOTRON_AUDIO_CPP_MODEL_ENV = "VOICEOVER_AUDIO_CPP_NEMOTRON_MODEL"
 NEMOTRON_AUDIO_CPP_MIN_FREE_VRAM_MB = 4096
 NEMOTRON_AUDIO_CPP_MAX_GPU_UTILIZATION_PERCENT = 90
 AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION = "audio.cpp Nemotron ASR runtime is unavailable. Set VOICEOVER_AUDIO_CPP_BINARY to the pinned JSON driver before retrying."
@@ -49,7 +58,9 @@ class AudioCppNemotronASRProvider(ASRProvider):
     @classmethod
     def from_environment(cls) -> "AudioCppNemotronASRProvider":
         binary = os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip()
-        if not binary or sys.platform.startswith("win"):
+        if sys.platform.startswith("win"):
+            return cls(_native_windows_runtime_from_environment())
+        if not binary:
             return cls()
         driver = AudioCppRuntimeDriver(
             binary_path=Path(binary),
@@ -132,6 +143,48 @@ def _reject_unsupported_prompt_context(hints: ASRContextHints) -> None:
         )
 
 
+def _admitted_nemotron_model_from_environment() -> Path | None:
+    model_path = os.environ.get(NEMOTRON_AUDIO_CPP_MODEL_ENV, "").strip()
+    if not model_path:
+        return None
+    return Path(model_path)
+
+
+def _native_windows_runtime_from_environment() -> LocalAudioRuntime | None:
+    """Admit the native Windows package and build the CUDA-only Nemotron runtime.
+
+    Fail closed: a missing native executable, model, or invalid package returns
+    ``None`` so the provider stays unavailable instead of falling back to the
+    Python route when the caller explicitly selected the native runtime.
+    """
+    native_executable = os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip()
+    model_path = _admitted_nemotron_model_from_environment()
+    if not native_executable or model_path is None:
+        return None
+    try:
+        install = admit_audio_cpp_native_package(
+            Path(native_executable), required_model_paths=(model_path,)
+        )
+        transport = AudioCppNativeCLITransport(
+            executable_path=install.executable_path,
+            model_paths={NEMOTRON_ASR_FAMILY: model_path},
+        )
+    except (AudioCppPackageError, ValueError):
+        return None
+    driver = AudioCppRuntimeDriver(
+        binary_path=install.executable_path,
+        source_revision=PINNED_AUDIO_CPP_REVISION,
+        transport=transport,
+        build_hash=install.files[install.executable_path.name],
+        transport_name="native-cli",
+    )
+    return LocalAudioRuntime(
+        LocalRuntimeRegistry((driver,)),
+        promoted_families=(NEMOTRON_ASR_FAMILY,),
+        lifecycle=_audio_cpp_gpu_lifecycle(),
+    )
+
+
 def _raw_timestamp_entries(
     payload: Mapping[str, object], *, required: bool
 ) -> tuple[Mapping[str, object], ...]:
@@ -180,7 +233,7 @@ def _execution_receipt(
     return ASRExecutionReceipt(
         runtime=receipt.driver_id if receipt is not None else "audio-cpp",
         runtime_version=receipt.source_revision if receipt is not None else None,
-        model_revision=receipt.source_revision if receipt is not None else None,
+        model_revision=None,
         resolved_device=request.device,
         resolved_compute=request.compute,
         raw_timestamp_entries=raw_timestamp_entries,
@@ -188,8 +241,10 @@ def _execution_receipt(
 
 
 def audio_cpp_nemotron_asr_dependency_probe() -> ASRDependencyHealth:
+    if sys.platform.startswith("win"):
+        return _native_windows_dependency_probe()
     binary = os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip()
-    if not binary or sys.platform.startswith("win"):
+    if not binary:
         return ASRDependencyHealth(
             available=False,
             remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION,
@@ -204,5 +259,37 @@ def audio_cpp_nemotron_asr_dependency_probe() -> ASRDependencyHealth:
         return ASRDependencyHealth(
             available=False,
             remediation=f"{AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION} {health.remediation}".strip(),
+        )
+    return ASRDependencyHealth(available=True, remediation="")
+
+
+def _native_windows_dependency_probe() -> ASRDependencyHealth:
+    native_executable = os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip()
+    if not native_executable:
+        return ASRDependencyHealth(
+            available=False,
+            remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION,
+            reason_code="missing_native_executable",
+        )
+    model_path = _admitted_nemotron_model_from_environment()
+    if model_path is None:
+        return ASRDependencyHealth(
+            available=False,
+            remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION,
+            reason_code="missing_model_artifact",
+        )
+    try:
+        admit_audio_cpp_native_package(Path(native_executable), required_model_paths=(model_path,))
+    except AudioCppPackageError as exc:
+        return ASRDependencyHealth(
+            available=False,
+            remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION,
+            reason_code=exc.code,
+        )
+    except ValueError:
+        return ASRDependencyHealth(
+            available=False,
+            remediation=AUDIO_CPP_NEMOTRON_INSTALL_REMEDIATION,
+            reason_code="invalid_native_package",
         )
     return ASRDependencyHealth(available=True, remediation="")

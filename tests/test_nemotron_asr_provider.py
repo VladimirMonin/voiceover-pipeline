@@ -328,3 +328,85 @@ def test_nemotron_asr_doctor_uses_selected_dependency_probe(monkeypatch, capsys)
         "Nemotron ASR runtime is unavailable. Install an approved Hugging Face Transformers runtime before retrying."
         in data["warnings"]
     )
+
+
+def test_nemotron_runtime_factories_select_explicit_routes(monkeypatch):
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import AudioCppNemotronASRProvider
+    from voiceover_pipeline.providers.nemotron_asr_local import (
+        NemotronLocalASRProvider,
+        nemotron_asr_audio_cpp_provider_factory,
+        nemotron_asr_provider_factory,
+        nemotron_asr_python_provider_factory,
+    )
+
+    monkeypatch.delenv("VOICEOVER_AUDIO_CPP_BINARY", raising=False)
+
+    assert isinstance(nemotron_asr_python_provider_factory(), NemotronLocalASRProvider)
+    assert isinstance(nemotron_asr_provider_factory(), NemotronLocalASRProvider)
+
+    monkeypatch.setenv("VOICEOVER_AUDIO_CPP_BINARY", "fixture-audio-cpp")
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_nemotron_asr.sys.platform", "linux")
+    assert isinstance(nemotron_asr_audio_cpp_provider_factory(), AudioCppNemotronASRProvider)
+    assert isinstance(nemotron_asr_provider_factory(), AudioCppNemotronASRProvider)
+
+
+def test_nemotron_cli_rejects_audio_cpp_runtime_without_cuda(monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.providers.nemotron_asr_local import NEMOTRON_ASR_PROVIDER_SPEC
+
+    monkeypatch.setattr(
+        cli, "get_asr_provider_spec", lambda _provider_id: NEMOTRON_ASR_PROVIDER_SPEC
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "nemotron-local",
+            "--runtime",
+            "audio-cpp",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    with pytest.raises(cli.CliError, match="device=cuda") as error:
+        cli.transcribe_cmd(args)
+
+    assert error.value.code == 2
+
+
+def test_nemotron_cli_rejects_context_text_before_probe_or_factory(monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.providers.nemotron_asr_local import NEMOTRON_ASR_PROVIDER_SPEC
+
+    calls: list[str] = []
+
+    def probe():
+        calls.append("probe")
+        return asr_registry.ASRDependencyHealth(available=True, remediation="")
+
+    def factory():
+        calls.append("factory")
+        return object()
+
+    spec = replace(NEMOTRON_ASR_PROVIDER_SPEC, dependency_probe=probe, factory=factory)
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "nemotron-local",
+            "--context",
+            "PostgreSQL",
+        ]
+    )
+
+    with pytest.raises(cli.CliError, match="does not support context text") as error:
+        cli.transcribe_cmd(args)
+
+    assert error.value.code == 2
+    assert calls == []

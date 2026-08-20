@@ -35,6 +35,19 @@ def nemotron_asr_dependency_probe() -> ASRDependencyHealth:
     return ASRDependencyHealth(available=True, remediation="")
 
 
+def nemotron_asr_python_dependency_probe() -> ASRDependencyHealth:
+    """Probe only the Python Transformers route, never the native package."""
+    try:
+        transformers = importlib.import_module("transformers")
+        importlib.import_module("accelerate")
+        importlib.import_module("librosa")
+    except ImportError:
+        return ASRDependencyHealth(available=False, remediation=NEMOTRON_ASR_INSTALL_REMEDIATION)
+    if not all(hasattr(transformers, name) for name in ("AutoModelForRNNT", "AutoProcessor")):
+        return ASRDependencyHealth(available=False, remediation=NEMOTRON_ASR_INSTALL_REMEDIATION)
+    return ASRDependencyHealth(available=True, remediation="")
+
+
 def _nemotron_language_locale(language: str | None) -> str:
     if not language:
         return "auto"
@@ -122,6 +135,18 @@ def nemotron_asr_provider_factory() -> ASRProvider:
         from voiceover_pipeline.providers.audio_cpp_nemotron_asr import AudioCppNemotronASRProvider
 
         return AudioCppNemotronASRProvider.from_environment()
+    return NemotronLocalASRProvider()
+
+
+def nemotron_asr_audio_cpp_provider_factory() -> ASRProvider:
+    """Explicit native route; never falls back to the Python Transformers route."""
+    from voiceover_pipeline.providers.audio_cpp_nemotron_asr import AudioCppNemotronASRProvider
+
+    return AudioCppNemotronASRProvider.from_environment()
+
+
+def nemotron_asr_python_provider_factory() -> ASRProvider:
+    """Explicit Python Transformers route; never selects the native package."""
     return NemotronLocalASRProvider()
 
 
