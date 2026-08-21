@@ -27,7 +27,7 @@ description: >
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Детали в docs/ — одна тема на файл, читай по необходимости.
 > Запись файлов ТОЛЬКО через инструменты редактирования, не через shell.
-| **Совместимость:** voiceover-pipeline 0.5.1, skill revision 2026-08-17.
+| **Совместимость:** voiceover-pipeline 0.6.0, skill revision 2026-08-21.
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Назначение
@@ -50,6 +50,7 @@ description: >
 | **C: Timings only** | Готовый MP3/Opus, нужны SRT/тайминги | timings --audio --timing-provider → .timings.json + .srt |
 | **D: Troubleshoot** | Что-то сломалось | doctor --json → exit code → recovery |
 | **E: Local hybrid** | Нужны локальные ASR/TTS через `audio.cpp` | inventory → doctor → explicit runtime → receipt → cleanup |
+| **F: Two-speaker podcast** | «подкаст», «диалог», «два ведущих», «вопрос-ответ» | author script → validate → doctor → approval → generate → artifacts |
 
 ## Когда навык должен срабатывать
 
@@ -60,6 +61,9 @@ description: >
 - «нужно получить SRT из MP3»
 - «поставь voiceover-pipeline и проверь что работает»
 - «сделай подкаст из сценария»
+- «сделай подкаст с двумя ведущими» (→ режим F, gemini-dialogue)
+- «озвучь диалог мужчины и женщины» (→ режим F, gemini-dialogue)
+- «сделай Q&A / вопрос-ответ двух спикеров» (→ режим F, gemini-dialogue)
 - «voiceover generate с таймингами»
 - «какие есть провайдеры/модели/голоса для TTS»
 - «какие есть провайдеры для распознавания речи»
@@ -70,7 +74,7 @@ description: >
 
 **Не должен:**
 - «объясни как работает git tag»
-- «напиши сценарий для ролика» (это творческая задача)
+- «напиши сценарий для ролика, но не озвучивай» (только сценарий без артефакта — творческая задача)
 - «сделай Mermaid-диаграмму»
 - «отрендери Remotion-видео целиком»
 - «установи Python» (если нет привязки к voiceover)
@@ -94,7 +98,7 @@ description: >
 | По ситуации | [docs/10-evaluation.md](docs/10-evaluation.md) | Проверить качество навыка |
 | По ситуации | [docs/11-gemini-prompting.md](docs/11-gemini-prompting.md) | Нужна режиссура Gemini TTS, audio tags, эмоции, chunk limits |
 | По ситуации | [docs/12-gemini-prompting-templates.md](docs/12-gemini-prompting-templates.md) | Нужны project-native Gemini examples, prompt templates, QA checklist |
-| Примеры | [examples/](examples/) | Нужен образец сценария, .env.example, Remotion-поток |
+| Примеры | [examples/](examples/) | Нужен образец сценария, .env.example, Remotion-поток или двухголосый подкаст |
 
 ## Обязательный быстрый алгоритм
 
@@ -118,8 +122,10 @@ description: >
    ID, пути, хэши и машинные десятичные дроби не отправляй модели как речь.
 6. **Генерация аудио.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --json --resume`.
    Не используй `--overwrite` для платной генерации; если run оборвался — продолжай через `--resume`.
-7. **Тайминги отдельно.** `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --run-id "prod" --json --overwrite`.
-   Для облачной транскрипции: `--timing-provider groq-whisper --model whisper-large-v3-turbo` (таймкоды) или `--timing-provider xai-stt --model grok-stt` (слова + confidence).
+7. **Тайминги.** Предпочитай `generate --with-timings` в том же безопасном прогоне.
+   Если тайминги нужны отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
+   не перезаписывай папку платного прогона:
+   `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --output-dir "out" --run-id "prod-timings" --json`.
 8. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
 
 ## Security-first правила
@@ -146,12 +152,32 @@ description: >
 | Устанавливает voiceover-pipeline + пререквизиты (Python/UV/FFmpeg), если среда позволяет | Устанавливает CUDA-драйверы, чинит системный PATH, делает низкоуровневый ремонт ОС |
 | Создаёт .env.example, .gitignore, script.md, out/ — все болванки проекта | Читает .env или значения ключей |
 | Проверяет окружение через doctor | Конфигурирует системный PATH |
-| Валидирует Markdown-сценарий | Пишет сценарий за пользователя |
-| Генерирует озвучку через любой из 4 провайдеров с retry, safe rerun и manifest/log | Рендерит Remotion-видео |
+| Валидирует Markdown-сценарий | Выдумывает несвязанный творческий контент |
+| Генерирует озвучку через любой из 5 провайдеров с retry, safe rerun и manifest/log | Рендерит Remotion-видео |
 | Извлекает тайминги через локальный faster-whisper ИЛИ облачные OpenRouter/Groq/xAI Whisper | Правит исходники voiceover-pipeline |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
 | Объясняет провайдеров, модели, голоса, цены (7 TTS + 6 STT моделей) | Гарантирует будущие цены провайдеров |
 | Диагностирует ошибки по exit codes | Правит исходники voiceover-pipeline |
+
+## Режим F: Two-speaker podcast (gemini-dialogue)
+
+Когда пользователь просит «подкаст», «диалог», «два ведущих» или
+«вопрос-ответ» — маршрутизируй на `format: gemini-dialogue` (провайдер
+`openrouter-tts`, модель `google/gemini-3.1-flash-tts-preview`), если
+пользователь явно не требует локальный результат.
+
+- Агент — автор сценария: когда пользователь просит готовый подкаст или
+  озвучку, агент может написать структурированный диалоговый скрипт
+  (`podcast.md`) из темы и состава ведущих пользователя. Это не
+  «выдумывание контента»: сценарий нужен для производства запрошенного
+  артефакта.
+- Ровно два различных спикера, два различных голоса из Gemini voice list.
+- Выбор провайдера остаётся явным и подтверждается пользователем до
+  платного вызова.
+- Локальный OmniVoice в 0.6.0 — один голос на прогон; двухголосый подкаст
+  локально не поддерживается.
+- Полный workflow: `docs/08-workflows.md` → «Agent Podcast Workflow»;
+  формат: `docs/04-input-format.md`; пример: `examples/gemini-dialogue-podcast.md`.
 
 ## Чеклист готового навыка
 

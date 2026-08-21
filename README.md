@@ -3,6 +3,8 @@
 Standalone CLI для генерации озвучки + Whisper timing из Markdown-сценариев.
 
 Четыре TTS-провайдера: Polza GPT Audio, Polza TTS, OpenRouter TTS, Qwen3-TTS (GPU).
+Плюс локальный OmniVoice (auto / voice-bank preset / clone / design) и
+двухголосый `gemini-dialogue` подкаст через OpenRouter Gemini TTS.
 Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
 Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
 Сценарии могут быть plain Markdown или Markdown с frontmatter metadata для provider/model/voice.
@@ -80,6 +82,23 @@ max_chunk_chars: 2000
 
 Для Gemini 3.1 Flash TTS podcasts доступен `format: gemini-dialogue` с двумя
 спикерами, voice map и inline tags вроде `[laughs]`, `[serious]`, `[short pause]`.
+
+### Agent-first podcast (два спикера)
+
+```powershell
+# 1. Валидация без платного запроса
+voiceover validate --script "podcast.md" --format gemini-dialogue --agent --json
+
+# 2. Проверка окружения (не читая .env)
+voiceover doctor --provider openrouter-tts --json
+
+# 3. Генерация (после явного одобрения платного вызова)
+voiceover generate --script "podcast.md" --run-id "podcast-prod" --json --resume
+```
+
+Provider/model/каст/направление берутся из frontmatter скрипта. Resume
+защищён каноническим identity: смена голоса/модели/style prompt отклоняется
+(exit 30) до платного запроса.
 
 ### Gemini prompting quick guide
 
@@ -164,6 +183,7 @@ out/<run-id>/
 | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
 | OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041/мин |
 | Qwen3-TTS | CustomVoice (preset/clone) | Бесплатно (GPU) |
+| OmniVoice | `audio-cpp/omnivoice-q8_0` (auto/preset/clone/design) | Бесплатно (GPU, локально) |
 
 ## Тестирование
 

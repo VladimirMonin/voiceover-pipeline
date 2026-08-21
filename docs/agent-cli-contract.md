@@ -205,6 +205,81 @@ controls для этого provider fail closed. На Windows Docker/WSL не в
 fallback к container нет. Полный pinned receipt и ограничения
 лицензии: [OmniVoice Local TTS](omnivoice-local-tts.md).
 
+## Gemini Dialogue (machine-facing)
+
+`format: gemini-dialogue` — двухголосый диалог через OpenRouter Gemini TTS.
+Этот раздел фиксирует машинный контракт; режиссура и prompting живут в
+skill tree (`docs/skills/voiceover-pipeline/`).
+
+### Frontmatter schema
+
+```yaml
+format: gemini-dialogue
+language: ru
+model: google/gemini-3.1-flash-tts-preview
+speakers:
+  <Alias1>:
+    display_name: <строка>
+    voice: <Gemini voice>
+    profile: <строка>
+  <Alias2>:
+    display_name: <строка>
+    voice: <Gemini voice>
+    profile: <строка>
+vibe: <строка>
+allowed_tags:
+  - <tag>
+max_chunk_bytes: 3500
+```
+
+- `speakers` — ровно два алиаса; алиасы alphanumeric без пробелов.
+- `voice` — из allowlist `GEMINI_TTS_VOICES`; два голоса обязаны быть
+  различными.
+- `allowed_tags` — опционально; по умолчанию полный safe-tag set.
+- `max_chunk_bytes` — опционально; default `3500`, hard limit `4000`.
+- `vibe` + speaker `profile` собираются в style prompt; его UTF-8 размер
+  ограничен `4000` байт (`STYLE_PROMPT_TOO_LARGE`).
+
+### Ограничения
+
+- Провайдер: только `openrouter-tts`; модель: только
+  `google/gemini-3.1-flash-tts-preview`. Другая модель — `MODEL_NOT_GEMINI_TTS`.
+- Top-level `--voice` — производная совместимость: равен голосу первого
+  спикера из карты. Явный конфликтующий `--voice` отклоняется (exit `2`)
+  до создания провайдера.
+- `--speaker-voice <Alias>=<Voice>` (repeat) переопределяет голос спикера;
+  после overrides действуют те же правила (ровно два, различны, из allowlist).
+
+### JSON и exit codes
+
+- `validate --format gemini-dialogue --agent --json` — один JSON-объект
+  отчёта (поля `status`, `valid`, `speaker_voice_map`, `chunk_reports`,
+  `errors`, `warnings`), exit `0` даже при `valid: false`.
+- Невалидный диалог при `generate --json` — один объект
+  `{"status": "error", "error": "<первая ошибка>", "code": 2, "details": <отчёт>}`,
+  exit `2`, до провайдера и платного запроса.
+- `--json` + `--json-events` — несовместимы, отклоняются (exit `2`).
+- Fallback-диагностика style prompt (OpenRouter) пишется в stderr, не в stdout.
+
+### Resume identity
+
+Канонический hash: SHA-256 от UTF-8 JSON
+`{format, provider, model, speaker_voice_map (sorted), style_prompt_sha256, prompt_mode}`
+с sorted keys. Хранится в `run_state.json` как `voice_identity`.
+
+- Изменение голоса спикера, модели, style prompt (vibe/profile) или prompt
+  mode при `--resume` — exit `30` до генерации.
+- Старое состояние без `voice_identity` — fail closed (exit `30`), без
+  смешивания артефактов.
+
+### Артефакты
+
+- `chunks.json`: `script_format: "gemini-dialogue"` и `speaker_voice_map`
+  (алиас → голос).
+- `run_state.json`: `voice_identity` (диалоговый hash) и `script_format`.
+- Текущее ограничение: per-turn WAV и per-turn timing metadata не
+  производятся; чанк — это смысловой блок диалога, а не отдельная реплика.
+
 ## `generate --json` (output)
 
 ```json

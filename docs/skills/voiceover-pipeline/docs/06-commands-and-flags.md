@@ -63,7 +63,7 @@
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
-| `--provider` | choice | `polza-chat-audio` | `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local` |
+| `--provider` | choice | `polza-chat-audio` | `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local`, `omnivoice-local` |
 | `--model` | str | `openai/gpt-audio-mini` | ID модели |
 | `--script` | path | `in/script.md` | Путь к Markdown-сценарию |
 | `--delimiter` | str | `******` | Разделитель чанков |
@@ -72,7 +72,7 @@
 | `--voice` | str | зависит от провайдера | Голос |
 | `--format` | choice | `markdown` | `markdown`, `voiceover` или `gemini-dialogue` |
 | `--max-chunk-chars` | int | `2000` | Validation limit для `voiceover` metadata scripts |
-| `--speaker-voice` | repeat | — | Override для Gemini dialogue: `Speaker1=Puck` |
+| `--speaker-voice` | repeat | — | Override для Gemini dialogue: `Speaker1=Puck` (можно повторять, по одному на спикера) |
 | `--fallback-voice` | str | `onyx` | Запасной голос для Polza Chat Audio |
 | `--style-prompt` | str | дефолтный | Стиль подачи для TTS (OpenRouter Gemini) |
 | `--style-prompt-file` | path | — | Читать prompt из файла |
@@ -95,10 +95,32 @@
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
-| `--mode` | choice | `preset` | `preset` (готовый голос) или `clone` (клонирование) |
+| `--mode` | choice | `preset` | `preset` (готовый голос), `auto`, `clone` (клонирование) или `design` (голос по инструкции) |
 | `--qwen-instruct` | str | `QWEN_INSTRUCT` | Индивидуальная инструкция по стилю для текущего `qwen-local` прогона |
 | `--sample` | str | — | Путь к референс-аудио для clone |
 | `--sample-text` | str | `""` | Текст референса для clone (точнее) |
+
+### OmniVoice-local опции (локальный, один голос на прогон)
+
+`omnivoice-local` — явный offline-only провайдер, модель
+`audio-cpp/omnivoice-q8_0`. В 0.6.0 — один голос на прогон; двухголосый
+подкаст локально не поддерживается. Режимы:
+
+| Флаг | Тип | Default | Назначение |
+|---|---|---|---|
+| `--mode` | choice | `preset` | `auto`, `preset` (bank), `clone`, `design` |
+| `--voice-bank` | path | — | Путь к `catalog.json` voice bank для `--mode preset` (обязателен в preset) |
+| `--reference-audio` | path | — | Референс-аудио для `--mode clone` |
+| `--reference-text` | str | — | Текст референса для `--mode clone` |
+| `--design-instruction` | str | — | Инструкция по голосу для `--mode design` |
+
+- `--mode auto` — модель без voice guidance; `--voice` и reference/design флаги запрещены.
+- `--mode preset` — голос из voice bank: `--voice-bank <catalog.json>` +
+  опционально `--voice <profile-id>` (без `--voice` берётся `default_voice` каталога).
+- `--mode clone` — ad-hoc клонирование: `--reference-audio` + `--reference-text`.
+- `--mode design` — голос по инструкции: `--design-instruction`.
+- `--voice` вне preset+bank, Qwen-опции и style-флаги для этого провайдера fail closed.
+- `list voices --provider omnivoice-local --voice-bank <catalog.json>` показывает профили банка.
 
 ### Whisper timing опции (generate + timings)
 
@@ -125,6 +147,18 @@
 
 `voiceover` и `gemini-dialogue` валидаторы возвращают все ошибки за один прогон.
 Генерация с metadata-форматом блокируется, если `valid: false`.
+
+### Gemini dialogue: локальные и платные флаги
+
+- Платный путь: `--provider openrouter-tts` + `--format gemini-dialogue`
+  (модель `google/gemini-3.1-flash-tts-preview`). Top-level `--voice` для
+  dialogue — производная совместимость от первого спикера; явный
+  конфликтующий `--voice` отклоняется до создания провайдера.
+- Локальный путь: `--provider omnivoice-local` (один голос на прогон) или
+  `--provider qwen-local`. `--format gemini-dialogue` с локальным провайдером
+  не поддерживается.
+- `--speaker-voice` (repeat) переопределяет голос спикера: `Host=Kore`,
+  `Guest=Puck`. Оба спикера должны остаться с различными голосами.
 
 ## Команда `timings` — флаги
 

@@ -11,7 +11,7 @@
 | Qwen Forced Aligner | уточнение границ | внутренний Qwen route | отдельная модель |
 | Nemotron 3.5 ASR | быстрое локальное распознавание | `nemotron-local` | Python rollback; explicit `audio.cpp` |
 | Qwen3-TTS | preset, cloning, voice design | `qwen-local` | Python default; explicit `audio.cpp` |
-| OmniVoice | offline built-in female style condition | `omnivoice-local` | explicit `audio.cpp` |
+| OmniVoice | локальный TTS, один голос на прогон | `omnivoice-local` | explicit `audio.cpp` |
 
 Faster-Whisper остаётся отдельным runtime. Облачные провайдеры не подменяются
 локальными. Выбор `audio.cpp` должен быть явным и fail-closed.
@@ -88,6 +88,31 @@ Qwen `audio.cpp` route использует отдельный Forced Aligner. N
 сохраняет model-native timing data и нормализует tokens-to-words. Заявлять
 таймкоды принятыми можно только после live evidence конкретного route, а не по
 наличию кода или static tests.
+
+## OmniVoice: режимы и граница приёмки (0.6.0)
+
+OmniVoice — локальный TTS через `audio.cpp` (модель `audio-cpp/omnivoice-q8_0`).
+В 0.6.0 — **один голос на прогон**: двухголосый диалог локально не
+поддерживается; для двух спикеров используй платный `gemini-dialogue`.
+
+| Режим | Флаги | Голос |
+|---|---|---|
+| `auto` | `--mode auto` | модель без voice guidance |
+| bank `preset` | `--mode preset --voice-bank <catalog.json>` (+ опц. `--voice <profile-id>`) | профиль из voice bank |
+| ad-hoc `clone` | `--mode clone --reference-audio <wav> --reference-text <text>` | клонирование по референсу |
+| `design` | `--mode design --design-instruction <text>` | голос по инструкции |
+
+Voice bank живёт вне репозитория (например,
+`C:\audio-cpp-work\voice-bank\approved\catalog.json`, schema v1, профили —
+mono WAV + SHA-256). Каталог читается только через CLI
+(`--voice-bank`, `list voices --provider omnivoice-local`); агент не читает
+его файлы напрямую.
+
+Native Windows приёмка: `audiocpp_cli.exe` + colocated checksummed
+DLL/package closure, SHA-256 EXE/DLL, Windows process-group cancellation.
+Docker/WSL/Wine не являются native Windows evidence. Static tests
+подтверждают код, но не реальный Windows run; live acceptance требует
+настоящий Windows host с NVIDIA GPU и native package.
 
 ## Скорость синтеза речи
 

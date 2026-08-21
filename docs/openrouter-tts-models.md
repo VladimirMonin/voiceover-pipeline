@@ -178,6 +178,52 @@ POST https://openrouter.ai/api/v1/audio/speech
 
 Style prompt не добавляется. Пайплайн конвертирует PCM в MP3 через FFmpeg.
 
+## Multi-speaker (Gemini dialogue)
+
+Для `format: gemini-dialogue` к телу запроса добавляется
+`multi_speaker_voice_config` с ровно двумя `speaker_voice_configs`:
+
+```
+POST https://openrouter.ai/api/v1/audio/speech
+{
+  "model": "google/gemini-3.1-flash-tts-preview",
+  "input": "<текст чанка диалога>",
+  "prompt": "<style prompt>",
+  "voice": "<голос первого спикера>",
+  "response_format": "pcm",
+  "multi_speaker_voice_config": {
+    "speaker_voice_configs": [
+      {
+        "speaker": "Host",
+        "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
+      },
+      {
+        "speaker": "Guest",
+        "voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}
+      }
+    ]
+  }
+}
+```
+
+- `speaker` совпадает с алиасом из frontmatter; `voice_name` — из
+  `GEMINI_TTS_VOICES`.
+- Top-level `voice` остаётся обязательным полем запроса и равен голосу
+  первого спикера (совместимость, не третий голос).
+- Имя спикера в конфигурации должно совпадать с именем спикера в тексте
+  диалога.
+
+### Граница доказательств
+
+- **Offline/mocked contract proof:** сериализация запроса покрыта mocked
+  тестами (ровно два `speaker_voice_configs`, имена и голоса совпадают с
+  валидированной картой). Это не доказывает приёмку провайдером.
+- **Live provider acceptance:** требует отдельного явно одобренного платного
+  smoke-прогона; до него multi-speaker приёмка не заявлена.
+- **Volatile facts:** доступность модели, цены и точная схема запроса могут
+  меняться у провайдера; не переноси цены/доступность из исторических
+  примеров в новые обещания.
+
 ## Цены
 
 Цены с реальных smoke-прогонов (2 чанка, тестовый сценарий):

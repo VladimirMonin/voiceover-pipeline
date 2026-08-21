@@ -166,6 +166,108 @@ voiceover generate `
   --resume
 ```
 
+## Agent Podcast Workflow (gemini-dialogue, платный)
+
+Канонический путь для «сделай подкаст с двумя ведущими»:
+
+1. **Автор сценарий.** Из темы и состава ведущих пользователя напиши
+   `podcast.md` в формате `gemini-dialogue` (см. `docs/04-input-format.md`,
+   пример `examples/gemini-dialogue-podcast.md`). Ровно два спикера, два
+   различных голоса.
+2. **Валидация без платного запроса:**
+   ```powershell
+   voiceover validate --script "podcast.md" --format gemini-dialogue --agent --json
+   ```
+3. **Проверка окружения** (не читая `.env`):
+   ```powershell
+   voiceover doctor --provider openrouter-tts --json
+   ```
+4. **Спроси разрешение** на платную генерацию, если оно ещё не дано.
+5. **Генерация:**
+   ```powershell
+   voiceover generate --script "podcast.md" --run-id "podcast-prod" --json --resume
+   ```
+   Provider/model/каст/направление берутся из frontmatter; явные флаги
+   допустимы, но самодостаточный скрипт предпочтителен.
+6. **Прочитай артефакты:** `manifest.json` (entry-point), `run_state.json`,
+   `generation.log`.
+7. **Тайминги:** если нужны — предпочитай `generate --with-timings` в том же
+   безопасном прогоне. Отдельный `voiceover timings` — только с ДРУГИМ
+   `--output-dir`/`--run-id`, никогда с `--overwrite` по папке платного прогона.
+
+## OmniVoice Local Workflows (бесплатно, GPU, один голос на прогон)
+
+Требуется NVIDIA GPU + CUDA + native audio.cpp package
+(см. `docs/14-local-audio-cpp-models.md`). В 0.6.0 OmniVoice — один голос
+на прогон.
+
+Дефолтный preset из voice bank (без `--voice` берётся `default_voice` каталога):
+
+```powershell
+voiceover doctor --provider omnivoice-local --json
+voiceover generate `
+  --provider omnivoice-local `
+  --mode preset `
+  --voice-bank "C:\audio-cpp-work\voice-bank\approved\catalog.json" `
+  --script "script.md" `
+  --run-id "omni-bank" `
+  --json `
+  --resume
+```
+
+Именованный профиль банка:
+
+```powershell
+voiceover generate `
+  --provider omnivoice-local `
+  --mode preset `
+  --voice-bank "C:\audio-cpp-work\voice-bank\approved\catalog.json" `
+  --voice "omni-male-neutral-01" `
+  --script "script.md" `
+  --run-id "omni-male" `
+  --json `
+  --resume
+```
+
+Ad-hoc clone:
+
+```powershell
+voiceover generate `
+  --provider omnivoice-local `
+  --mode clone `
+  --reference-audio "my_voice.wav" `
+  --reference-text "Текст референса." `
+  --script "script.md" `
+  --run-id "omni-clone" `
+  --json `
+  --resume
+```
+
+Design-инструкция:
+
+```powershell
+voiceover generate `
+  --provider omnivoice-local `
+  --mode design `
+  --design-instruction "female, young adult, moderate pitch" `
+  --script "script.md" `
+  --run-id "omni-design" `
+  --json `
+  --resume
+```
+
+Auto-голос (без voice guidance):
+
+```powershell
+voiceover generate `
+  --provider omnivoice-local `
+  --mode auto `
+  --script "script.md" `
+  --run-id "omni-auto" `
+  --json `
+  --resume
+```
+
 ## Timings из готового MP3
 
 Когда MP3 уже есть, а нужны только тайминги:
@@ -205,8 +307,8 @@ voiceover generate ... --overwrite --confirm-delete-paid-audio  # удалить
 3. Генерация аудио:
    voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini" --script "script.md" --run-id "production" --json --resume
 
-4. Тайминги:
-   voiceover timings --audio "out/production/production-voiceover-openai-gpt-audio-mini.mp3" --run-id "production" --word-timestamps --json --overwrite
+4. Тайминги (отдельный run-id, без перезаписи папки прогона):
+   voiceover timings --audio "out/production/production-voiceover-openai-gpt-audio-mini.mp3" --output-dir "out" --run-id "production-timings" --word-timestamps --json
 
 5. Чтение артефактов:
    manifest = json.load(open("out/production/manifest.json"))
