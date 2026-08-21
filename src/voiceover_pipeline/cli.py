@@ -819,6 +819,11 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
 
 
 def generate(args: argparse.Namespace) -> None:
+    if getattr(args, "json_output", False) and getattr(args, "json_events", False):
+        fail(
+            "--json and --json-events are mutually exclusive; use one machine output mode.",
+            _EXIT_ARGS,
+        )
     _validate_omnivoice_options(args)
     try:
         ffmpeg_path, ffprobe_path = check_media_tools()
@@ -849,12 +854,31 @@ def generate(args: argparse.Namespace) -> None:
         )
         if not gemini_report["valid"]:
             if args.json_output:
-                print(json.dumps(gemini_report, ensure_ascii=False))
+                first = gemini_report["errors"][0] if gemini_report["errors"] else {}
+                message = first.get("message", "Gemini dialogue validation failed.")
+                print(
+                    json.dumps(
+                        {
+                            "status": "error",
+                            "error": message,
+                            "code": _EXIT_ARGS,
+                            "details": gemini_report,
+                        },
+                        ensure_ascii=False,
+                    )
+                )
                 sys.exit(_EXIT_ARGS)
             for item in gemini_report["errors"]:
                 print(f"ERROR {item['code']}: {item['message']}", file=sys.stderr)
             sys.exit(_EXIT_ARGS)
         chunks = gemini_chunks_from_validation(gemini_report)
+        if args.voice is not None:
+            derived_voice = next(iter(gemini_report["speaker_voice_map"].values()))
+            if args.voice != derived_voice:
+                fail(
+                    "Explicit --voice conflicts with the dialogue cast; remove --voice or align it with the first speaker voice.",
+                    _EXIT_ARGS,
+                )
     elif script_format == VOICEOVER_FORMAT:
         voiceover_report = validate_voiceover_file(
             args.script,
@@ -987,7 +1011,6 @@ def generate(args: argparse.Namespace) -> None:
 
     _ensure_run_dirs(paths)
 
-    api_key = read_api_key(args)
     requested_voice = args.voice
     if gemini_report:
         args.speaker_voice_map = gemini_report["speaker_voice_map"]
@@ -995,6 +1018,8 @@ def generate(args: argparse.Namespace) -> None:
     else:
         args.speaker_voice_map = {}
         args.voice = requested_voice or _default_voice(args)
+
+    api_key = read_api_key(args)
     style_prompt = _resolve_provider_style_prompt(args)
     if (
         gemini_report
@@ -1048,12 +1073,21 @@ def _generate_step(
 
     current_hash = script_hash(chunks)
     current_voice_identity = _omnivoice_voice_identity(args)
+    dialogue_identity = _gemini_dialogue_identity(args, style_prompt, prompt_mode)
+    if current_voice_identity is None:
+        current_voice_identity = dialogue_identity
     state = load_state(state_path)
     if state and args.resume:
         if state.get("script_hash") != current_hash:
             logger.event("error", "resume_rejected", reason="script_hash_mismatch")
             fail(
                 "Cannot resume: script chunks do not match the previous run_state.json.",
+                _EXIT_PROVIDER,
+            )
+        if dialogue_identity is not None and "voice_identity" not in state:
+            logger.event("error", "resume_rejected", reason="voice_identity_missing")
+            fail(
+                "Cannot resume: run state predates dialogue identity; start a fresh run instead of mixing artifacts.",
                 _EXIT_PROVIDER,
             )
         if "voice_identity" in state and current_voice_identity is not None:
@@ -2544,6 +2578,26 @@ def _omnivoice_voice_identity(args: argparse.Namespace) -> str | None:
             return None
         return f"design:{_sha256_text(design_instruction)}"
     return "auto"
+
+
+def _gemini_dialogue_identity(
+    args: argparse.Namespace, style_prompt: str | None, prompt_mode: str
+) -> str | None:
+    if getattr(args, "provider", None) != "openrouter-tts":
+        return None
+    if getattr(args, "format", None) != GEMINI_DIALOGUE_FORMAT:
+        return None
+    speaker_voice_map = getattr(args, "speaker_voice_map", None) or {}
+    payload = {
+        "format": GEMINI_DIALOGUE_FORMAT,
+        "provider": "openrouter-tts",
+        "model": args.model,
+        "speaker_voice_map": dict(sorted(speaker_voice_map.items())),
+        "style_prompt_sha256": _sha256_text(style_prompt or ""),
+        "prompt_mode": prompt_mode,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _sha256_text(text: str) -> str:

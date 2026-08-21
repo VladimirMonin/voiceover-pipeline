@@ -1,3 +1,5 @@
+import sys
+
 import requests
 
 from voiceover_pipeline.config import (
@@ -58,7 +60,8 @@ class OpenRouterTTSProvider(TTSProvider):
             if "No successful provider responses" not in str(error):
                 raise
             print(
-                f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt."
+                f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.",
+                file=sys.stderr,
             )
             return self._request_audio(text=text, style_prompt=self.fallback_style_prompt)
 

@@ -9,6 +9,7 @@ GEMINI_DIALOGUE_FORMAT = "gemini-dialogue"
 GEMINI_TTS_MODEL = "google/gemini-3.1-flash-tts-preview"
 DEFAULT_MAX_CHUNK_BYTES = 3500
 HARD_MAX_CHUNK_BYTES = 4000
+STYLE_PROMPT_MAX_BYTES = 4000
 DEFAULT_ALLOWED_TAGS = {
     "amazed",
     "calmly",
@@ -109,6 +110,17 @@ def validate_gemini_dialogue_file(
         total_bytes += report["utf8_bytes"]
 
     style_prompt = build_style_prompt(meta, speaker_voice_map)
+    style_prompt_bytes = len(style_prompt.encode("utf-8"))
+    if style_prompt_bytes > STYLE_PROMPT_MAX_BYTES:
+        errors.append(
+            error(
+                "STYLE_PROMPT_TOO_LARGE",
+                f"Style prompt is {style_prompt_bytes} UTF-8 bytes, limit is {STYLE_PROMPT_MAX_BYTES}.",
+                actual=style_prompt_bytes,
+                limit=STYLE_PROMPT_MAX_BYTES,
+                suggested_fix="Shorten vibe and speaker profiles in frontmatter.",
+            )
+        )
     valid = not errors
     return {
         "status": "success" if valid else "error",
@@ -327,13 +339,22 @@ def apply_speaker_voice_overrides(
 
 
 def validate_speakers(speaker_voice_map: dict[str, str], errors: list[dict[str, Any]]) -> None:
-    if len(speaker_voice_map) > 2:
+    if len(speaker_voice_map) != 2:
         errors.append(
             error(
-                "TOO_MANY_SPEAKERS",
-                "Gemini TTS supports at most two speakers.",
+                "SPEAKER_COUNT_INVALID",
+                "Gemini TTS dialogue requires exactly two speakers.",
                 actual=len(speaker_voice_map),
                 limit=2,
+            )
+        )
+    voices = list(speaker_voice_map.values())
+    if len(voices) == 2 and voices[0] == voices[1]:
+        errors.append(
+            error(
+                "DUPLICATE_SPEAKER_VOICE",
+                "Both speakers must use distinct Gemini voices.",
+                actual=voices[0],
             )
         )
     for speaker, voice in speaker_voice_map.items():
