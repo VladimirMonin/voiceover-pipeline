@@ -219,7 +219,22 @@ def build_audio_cpp_family_arguments(
     _append_optional(command, "--language", payload.get("language"))
     if family == "omnivoice":
         mode = payload.get("omnivoice_mode")
-        if mode == "clone":
+        if mode == "auto":
+            command.extend(
+                (
+                    "--text-chunk-size",
+                    str(payload["text_chunk_size"]),
+                    "--mode",
+                    "offline",
+                    "--seed",
+                    str(payload["seed"]),
+                    "--num-inference-steps",
+                    str(payload["num_inference_steps"]),
+                    "--guidance-scale",
+                    str(payload["guidance_scale"]),
+                )
+            )
+        elif mode == "clone":
             if reference_audio_argument is None:
                 raise RuntimeTransportError("audio.cpp clone reference audio is unavailable")
             command.extend(
@@ -374,13 +389,17 @@ def _stage_asr_audio(
         raise RuntimeTransportError("audio.cpp input preparation failed")
 
 
-def _stage_reference_audio(request: Mapping[str, object], workspace: Path) -> Path | None:
+def _stage_reference_audio(
+    request: Mapping[str, object], workspace: Path, timeout_seconds: float
+) -> Path | None:
     """Copy clone reference audio under a neutral name into the private workspace.
 
-    Clone reference audio must be a mono WAV file. Sensitive text (reference
-    transcript, instruction) is passed to the native process via argv flags:
-    the pinned upstream revision exposes no file/stdin transport. Never include
-    such text in exceptions, logs, receipts, or metadata.
+    Clone reference audio is normalized to PCM16 mono 24 kHz: a source that is
+    already PCM16 mono 24 kHz is used as-is, otherwise ffmpeg re-encodes it.
+    Sensitive text (reference transcript, instruction) is passed to the native
+    process via argv flags: the pinned upstream revision exposes no file/stdin
+    transport. Never include such text in exceptions, logs, receipts, or
+    metadata.
     """
     raw_reference = request.get("reference_audio_path")
     if raw_reference is None:
@@ -392,25 +411,66 @@ def _stage_reference_audio(request: Mapping[str, object], workspace: Path) -> Pa
     except (OSError, RuntimeError) as exc:
         raise RuntimeProtocolError("audio.cpp clone reference audio is unavailable") from exc
     if not source.is_file():
-        raise RuntimeProtocolError("audio.cpp clone reference audio must be a regular file")
+        raise RuntimeProtocolError("audio.cpp clone reference audio is unavailable")
     staged = workspace / "reference.wav"
     try:
         shutil.copyfile(source, staged)
         os.chmod(staged, 0o600)
-        with wave.open(str(staged), "rb") as audio:
-            if audio.getnframes() <= 0:
-                raise RuntimeProtocolError(
-                    "audio.cpp clone reference audio contains no audio frames"
-                )
-            if audio.getnchannels() != 1:
-                raise RuntimeProtocolError("audio.cpp clone reference audio must be mono")
-    except RuntimeProtocolError:
-        raise
+        if not _reference_audio_is_normalized(staged):
+            _normalize_reference_audio(staged, workspace, timeout_seconds)
     except (EOFError, OSError, wave.Error) as exc:
         raise RuntimeProtocolError(
             "audio.cpp clone reference audio is not a readable WAV file"
         ) from exc
     return staged
+
+
+def _reference_audio_is_normalized(path: Path) -> bool:
+    with wave.open(str(path), "rb") as audio:
+        return (
+            audio.getsampwidth() == 2
+            and audio.getnchannels() == 1
+            and audio.getframerate() == 24_000
+            and audio.getnframes() > 0
+        )
+
+
+def _normalize_reference_audio(path: Path, workspace: Path, timeout_seconds: float) -> None:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeProtocolError("audio.cpp clone reference audio is not a readable WAV file")
+    normalized = workspace / "reference-normalized.wav"
+    try:
+        completed = subprocess.run(
+            [
+                ffmpeg,
+                "-nostdin",
+                "-y",
+                "-i",
+                str(path),
+                "-ac",
+                "1",
+                "-ar",
+                "24000",
+                "-c:a",
+                "pcm_s16le",
+                str(normalized),
+            ],
+            check=False,
+            cwd=workspace,
+            env=_windows_child_environment(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeProtocolError(
+            "audio.cpp clone reference audio is not a readable WAV file"
+        ) from exc
+    if completed.returncode != 0:
+        raise RuntimeProtocolError("audio.cpp clone reference audio is not a readable WAV file")
+    os.replace(normalized, path)
+    os.chmod(path, 0o600)
 
 
 def _staged_audio_duration_s(staged_audio_path: Path) -> float:
@@ -621,7 +681,9 @@ class AudioCppNativeCLITransport:
                     )
                     staged_duration_s = _staged_audio_duration_s(staged_audio_path)
                 else:
-                    staged_reference_path = _stage_reference_audio(request, workspace)
+                    staged_reference_path = _stage_reference_audio(
+                        request, workspace, timeout_seconds=self._timeout_seconds
+                    )
                     if staged_reference_path is not None:
                         staged_audio_path = staged_reference_path
                 with self._lock:
@@ -857,8 +919,19 @@ def _validate_tts_request(family: str, payload: Mapping[str, object]) -> None:
                     "OmniVoice fixed-style request does not accept design fields"
                 )
             return
-        if mode not in ("fixed-style", "clone", "design"):
+        if mode not in ("auto", "fixed-style", "clone", "design"):
             raise RuntimeProtocolError("OmniVoice request has an unsupported mode")
+        if mode == "auto":
+            if payload.get("style_condition") is not None:
+                raise RuntimeProtocolError("OmniVoice auto mode does not accept style fields")
+            if payload.get("design_instruction") is not None:
+                raise RuntimeProtocolError("OmniVoice auto mode does not accept design fields")
+            if (
+                payload.get("reference_audio_path") is not None
+                or payload.get("reference_text") is not None
+            ):
+                raise RuntimeProtocolError("OmniVoice auto mode does not accept clone fields")
+            return
         if mode == "fixed-style":
             _required_string(payload, "style_condition", "OmniVoice style condition")
             if (

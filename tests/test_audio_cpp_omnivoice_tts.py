@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, cast
 
 import pytest
@@ -27,6 +28,11 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_omnivoice import (
 )
 from voiceover_pipeline.local_tts_text import merge_omnivoice_session_fragments
 from voiceover_pipeline.models import ScriptChunk
+from voiceover_pipeline.omnivoice_voice_bank import (
+    VoiceProfile,
+    load_voice_bank,
+    resolve_bank_profile,
+)
 from voiceover_pipeline.providers import audio_cpp_omnivoice_tts
 from voiceover_pipeline.providers.audio_cpp_omnivoice_tts import OmniVoiceLocalTTSProvider
 
@@ -54,6 +60,50 @@ def _admitted_model(monkeypatch, tmp_path):
         "VOICEOVER_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE", "accept-cc-by-nc-4.0-local-use"
     )
     return admit_omnivoice_model(model_path=model, model_id=OMNIVOICE_LOCAL_MODEL_ID)
+
+
+def _write_reference_wav(path, *, rate=24_000):
+    import wave
+
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(rate)
+        audio.writeframes((b"\x00\x00" * 4000) + (b"\xff\x7f" * 4000))
+
+
+def _bank_profile(tmp_path) -> tuple[VoiceProfile, Path]:
+    import hashlib
+    import json
+
+    bank_root = tmp_path / "bank"
+    (bank_root / "voices").mkdir(parents=True)
+    reference = bank_root / "voices" / "main.wav"
+    _write_reference_wav(reference)
+    digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    (bank_root / "catalog.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "default_voice": "main",
+                "voices": [
+                    {
+                        "id": "main",
+                        "display_name": "Main Narrator",
+                        "description": "Primary narration voice",
+                        "language": "ru",
+                        "reference_audio": "voices/main.wav",
+                        "reference_text": "Эталонная фраза.",
+                        "reference_sha256": digest,
+                        "origin": {"mode": "owner-reference", "instruction": None, "seed": 7},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    catalog = load_voice_bank(bank_root / "catalog.json")
+    return resolve_bank_profile(catalog, "main")
 
 
 def test_typed_tts_contract_carries_omnivoice_controls_and_receipt():
@@ -188,6 +238,37 @@ def test_provider_fails_closed_when_an_injected_runtime_has_no_admitted_model():
         provider.synthesize_chunk("Привет, мир!", "chunk_01")
 
 
+def test_provider_auto_mode_uses_native_auto_voice_fields_and_metadata(monkeypatch, tmp_path):
+    runtime = _Runtime(
+        LocalTTSResponse(
+            audio_bytes=b"RIFFfixtureWAVE",
+            audio_format="wav",
+            payload={"sample_rate_hz": 24_000, "channels": 1, "duration_s": 0.01},
+        )
+    )
+    provider = OmniVoiceLocalTTSProvider(
+        cast(Any, runtime),
+        admitted_model=_admitted_model(monkeypatch, tmp_path),
+        mode="auto",
+    )
+
+    result = provider.synthesize_chunk("Привет, мир!", "chunk_01")
+
+    assert runtime.request is not None
+    assert runtime.request.omnivoice_mode == "auto"
+    assert runtime.request.style_condition is None
+    assert runtime.request.design_instruction is None
+    assert runtime.request.reference_audio_path is None
+    assert runtime.request.reference_text is None
+    assert result.raw_metadata["voice_selection"] == {
+        "kind": "auto-voice",
+        "named_preset": False,
+        "voice_cloning": False,
+        "voice_design": False,
+    }
+    assert result.raw_metadata["voice_session"]["strategy"] == "auto-voice-native-session"
+
+
 def test_provider_clone_mode_stages_reference_fields_and_metadata(monkeypatch, tmp_path):
     runtime = _Runtime(
         LocalTTSResponse(
@@ -256,6 +337,44 @@ def test_provider_design_mode_passes_instruction_and_metadata(monkeypatch, tmp_p
     }
     assert result.raw_metadata["voice_session"]["strategy"] == ("design-instruction-native-session")
     assert "warm and clear" not in str(result.raw_metadata)
+
+
+def test_provider_preset_mode_with_bank_uses_clone_request_and_safe_metadata(monkeypatch, tmp_path):
+    runtime = _Runtime(
+        LocalTTSResponse(
+            audio_bytes=b"RIFFfixtureWAVE",
+            audio_format="wav",
+            payload={"sample_rate_hz": 24_000, "channels": 1, "duration_s": 0.01},
+        )
+    )
+    profile, reference_path = _bank_profile(tmp_path)
+    provider = OmniVoiceLocalTTSProvider(
+        cast(Any, runtime),
+        admitted_model=_admitted_model(monkeypatch, tmp_path),
+        mode="preset",
+        voice_bank=(profile, reference_path),
+    )
+
+    result = provider.synthesize_chunk("Привет, мир!", "chunk_01")
+
+    assert runtime.request is not None
+    assert runtime.request.omnivoice_mode == "clone"
+    assert runtime.request.reference_audio_path == reference_path
+    assert runtime.request.reference_text == "Эталонная фраза."
+    assert runtime.request.style_condition is None
+    assert runtime.request.design_instruction is None
+    assert result.raw_metadata["voice_selection"] == {
+        "kind": "bank-preset",
+        "voice_id": "main",
+        "voice_fingerprint": profile.reference_sha256,
+    }
+    assert result.raw_metadata["voice_session"]["strategy"] == "bank-preset-native-session"
+    metadata_text = str(result.raw_metadata)
+    assert "Эталонная фраза" not in metadata_text
+    assert "display_name" not in metadata_text
+    assert "description" not in metadata_text
+    assert str(reference_path) not in metadata_text
+    assert str(tmp_path) not in metadata_text
 
 
 def test_provider_rejects_a_caller_model_id_that_differs_from_admission(monkeypatch, tmp_path):

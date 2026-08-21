@@ -119,25 +119,25 @@ def test_omnivoice_parser_keeps_global_mode_vocabulary_and_specific_fields(tmp_p
 
 
 @pytest.mark.parametrize(
-    "option",
+    ("option", "message"),
     [
-        ("--sample", "sample.wav"),
-        ("--sample-text", "reference text"),
-        ("--sample-text", ""),
-        ("--qwen-instruct", "calm"),
-        ("--style-prompt", "calm"),
-        ("--style-prompt-file", "style.txt"),
-        ("--no-style-prompt",),
-        ("--voice", "ash"),
-        ("--fallback-voice", "onyx-custom"),
+        (("--sample", "sample.wav"), "options|controls"),
+        (("--sample-text", "reference text"), "options|controls"),
+        (("--sample-text", ""), "options|controls"),
+        (("--qwen-instruct", "calm"), "options|controls"),
+        (("--style-prompt", "calm"), "options|controls"),
+        (("--style-prompt-file", "style.txt"), "options|controls"),
+        (("--no-style-prompt",), "options|controls"),
+        (("--voice", "ash"), "voice-bank"),
+        (("--fallback-voice", "onyx-custom"), "options|controls"),
     ],
 )
-def test_omnivoice_rejects_qwen_and_unsupported_voice_style_controls(option):
+def test_omnivoice_rejects_qwen_and_unsupported_voice_style_controls(option, message):
     from voiceover_pipeline.cli import CliError, _validate_omnivoice_options, build_parser
 
     args = build_parser().parse_args(["generate", "--provider", "omnivoice-local", *option])
 
-    with pytest.raises(CliError, match="options|controls") as error:
+    with pytest.raises(CliError, match=message) as error:
         _validate_omnivoice_options(args)
     assert error.value.code == 2
 
@@ -236,7 +236,7 @@ def test_valid_omnivoice_clone_and_design_reach_provider_construction(monkeypatc
             ["--reference-audio", str(reference_audio), "--reference-text", "reference"]
         )
     else:
-        arguments.extend(["--design-instruction", "warm and clear"])
+        arguments.extend(["--design-instruction", "female, young adult, moderate pitch"])
     args = cli.build_parser().parse_args(arguments)
     constructed: dict[str, object] = {}
 
@@ -255,14 +255,232 @@ def test_valid_omnivoice_clone_and_design_reach_provider_construction(monkeypatc
         assert constructed["reference_text"] == "reference"
     else:
         assert constructed["mode"] == "design"
-        assert constructed["design_instruction"] == "warm and clear"
+        assert constructed["design_instruction"] == "female, young adult, moderate pitch"
 
 
-def test_omnivoice_fixed_preset_validation_remains_available():
+@pytest.mark.parametrize(
+    "design_instruction",
+    [
+        "warm and clear",
+        "dramatic",
+        "male, female",
+        "child, elderly",
+        "low pitch, high pitch",
+        "河南话, american accent",
+        "female, female",
+        " ",
+    ],
+)
+def test_omnivoice_design_instruction_rejects_invalid_vocabulary(design_instruction):
+    from voiceover_pipeline.cli import CliError, _validate_omnivoice_options, build_parser
+
+    args = build_parser().parse_args(
+        [
+            "generate",
+            "--provider",
+            "omnivoice-local",
+            "--mode",
+            "design",
+            "--design-instruction",
+            design_instruction,
+        ]
+    )
+
+    with pytest.raises(
+        CliError, match="unsupported|conflicting|duplicate|cannot mix|non-empty"
+    ) as error:
+        _validate_omnivoice_options(args)
+    assert error.value.code == 2
+
+
+@pytest.mark.parametrize(
+    ("design_instruction", "expected"),
+    [
+        ("female", "female"),
+        ("female, young adult, moderate pitch", "female, young adult, moderate pitch"),
+        (" male, middle-aged, low pitch, whisper ", "male, middle-aged, low pitch, whisper"),
+        ("Female, Young Adult", "female, young adult"),
+        ("female，young adult", "female, young adult"),
+    ],
+)
+def test_omnivoice_design_instruction_valid_vocabulary_passes_validation(
+    design_instruction, expected
+):
     from voiceover_pipeline.cli import _validate_omnivoice_options, build_parser
 
-    args = build_parser().parse_args(["generate", "--provider", "omnivoice-local"])
+    args = build_parser().parse_args(
+        [
+            "generate",
+            "--provider",
+            "omnivoice-local",
+            "--mode",
+            "design",
+            "--design-instruction",
+            design_instruction,
+        ]
+    )
     _validate_omnivoice_options(args)
+
+
+def _write_reference_wav(path, *, rate=24_000):
+    import wave
+
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(rate)
+        audio.writeframes((b"\x00\x00" * 4000) + (b"\xff\x7f" * 4000))
+
+
+def build_voice_bank(tmp_path):
+    import hashlib
+    import json
+
+    bank_root = tmp_path / "bank"
+    (bank_root / "voices").mkdir(parents=True)
+    reference = bank_root / "voices" / "main.wav"
+    _write_reference_wav(reference)
+    digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    catalog_path = bank_root / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "default_voice": "main",
+                "voices": [
+                    {
+                        "id": "main",
+                        "display_name": "Main Narrator",
+                        "description": "Primary narration voice",
+                        "language": "ru",
+                        "reference_audio": "voices/main.wav",
+                        "reference_text": "Эталонная фраза.",
+                        "reference_sha256": digest,
+                        "origin": {"mode": "owner-reference", "instruction": None, "seed": 7},
+                    },
+                    {
+                        "id": "alt",
+                        "display_name": "Alt Narrator",
+                        "description": "",
+                        "language": "ru",
+                        "reference_audio": "voices/main.wav",
+                        "reference_text": "Эталонная фраза.",
+                        "reference_sha256": digest,
+                        "origin": {"mode": "design", "instruction": "warm", "seed": 3},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return catalog_path
+
+
+def test_omnivoice_fixed_preset_validation_remains_available(tmp_path):
+    from voiceover_pipeline.cli import _validate_omnivoice_options, build_parser
+
+    catalog_path = build_voice_bank(tmp_path)
+    args = build_parser().parse_args(
+        [
+            "generate",
+            "--provider",
+            "omnivoice-local",
+            "--voice-bank",
+            str(catalog_path),
+        ]
+    )
+    _validate_omnivoice_options(args)
+
+
+def test_omnivoice_preset_missing_voice_bank_fails():
+    from voiceover_pipeline.cli import CliError, _validate_omnivoice_options, build_parser
+
+    args = build_parser().parse_args(["generate", "--provider", "omnivoice-local"])
+
+    with pytest.raises(CliError, match="--voice-bank") as error:
+        _validate_omnivoice_options(args)
+    assert error.value.code == 2
+
+
+def test_omnivoice_preset_with_bank_and_explicit_voice_defaults(tmp_path):
+    from voiceover_pipeline.cli import _validate_omnivoice_options, build_parser
+
+    catalog_path = build_voice_bank(tmp_path)
+    args = build_parser().parse_args(
+        [
+            "generate",
+            "--provider",
+            "omnivoice-local",
+            "--voice-bank",
+            str(catalog_path),
+            "--voice",
+            "alt",
+        ]
+    )
+    _validate_omnivoice_options(args)
+    assert args.voice_bank_profile.id == "alt"
+
+
+def test_omnivoice_preset_unknown_voice_id_fails(tmp_path):
+    from voiceover_pipeline.cli import CliError, _validate_omnivoice_options, build_parser
+
+    catalog_path = build_voice_bank(tmp_path)
+    args = build_parser().parse_args(
+        [
+            "generate",
+            "--provider",
+            "omnivoice-local",
+            "--voice-bank",
+            str(catalog_path),
+            "--voice",
+            "ghost",
+        ]
+    )
+
+    with pytest.raises(CliError, match="not found in the voice bank") as error:
+        _validate_omnivoice_options(args)
+    assert error.value.code == 2
+
+
+def test_omnivoice_auto_mode_passes_validation_without_voice_fields():
+    from voiceover_pipeline.cli import _validate_omnivoice_options, build_parser
+
+    args = build_parser().parse_args(
+        ["generate", "--provider", "omnivoice-local", "--mode", "auto"]
+    )
+    _validate_omnivoice_options(args)
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (("--reference-audio", "x.wav"), "auto"),
+        (("--reference-text", "reference"), "auto"),
+        (("--design-instruction", "female"), "auto"),
+    ],
+)
+def test_omnivoice_auto_mode_rejects_clone_and_design_fields(extra, message):
+    from voiceover_pipeline.cli import CliError, _validate_omnivoice_options, build_parser
+
+    args = build_parser().parse_args(
+        ["generate", "--provider", "omnivoice-local", "--mode", "auto", *extra]
+    )
+
+    with pytest.raises(CliError, match=message) as error:
+        _validate_omnivoice_options(args)
+    assert error.value.code == 2
+
+
+def test_omnivoice_auto_mode_rejects_voice_controls():
+    from voiceover_pipeline.cli import CliError, _validate_omnivoice_options, build_parser
+
+    args = build_parser().parse_args(
+        ["generate", "--provider", "omnivoice-local", "--mode", "auto", "--voice", "ash"]
+    )
+
+    with pytest.raises(CliError, match="voice controls") as error:
+        _validate_omnivoice_options(args)
+    assert error.value.code == 2
 
 
 class TestStylePromptFlags:

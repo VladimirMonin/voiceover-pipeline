@@ -413,11 +413,64 @@ def test_transcribe_explicit_audio_cpp_is_structured_fail_closed_error():
     assert "audio-cpp" in data["error"]
 
 
+def test_list_omnivoice_providers_expose_auto_mode():
+    code, data = cli_json("list", "providers", "--json")
+
+    assert code == 0
+    omnivoice = next(p for p in data["providers"] if p["id"] == "omnivoice-local")
+    assert "auto" in omnivoice["modes"]
+
+
+def test_omnivoice_auto_mode_dry_run_reports_sentence_packed_inference_chunks(tmp_path):
+    script = tmp_path / "auto-report.md"
+    script.write_text(
+        " ".join(
+            f"Предложение номер словами содержит достаточно полезного текста {word}."
+            for word in (
+                "первое",
+                "второе",
+                "третье",
+                "четвёртое",
+                "пятое",
+                "шестое",
+                "седьмое",
+                "восьмое",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--mode",
+        "auto",
+        "--model",
+        "audio-cpp/omnivoice-q8_0",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "auto-dry-run",
+        "--dry-run-cost",
+        "--json",
+    )
+
+    assert code == 0
+    assert data["dry_run"] is True
+    assert isinstance(data["chunks"], int)
+    assert data["chunks"] > 1
+    assert data["original_chunks"] == data["chunks"]
+    assert not (tmp_path / "out" / "auto-dry-run").exists()
+
+
 @pytest.mark.parametrize(
     ("mode", "mode_args"),
     [
         ("clone", ("--reference-audio", "{reference_audio}", "--reference-text", "reference")),
-        ("design", ("--design-instruction", "warm and clear")),
+        ("design", ("--design-instruction", "female, young adult, moderate pitch")),
     ],
 )
 def test_omnivoice_clone_and_design_reach_provider_fail_as_single_json_error(
@@ -483,3 +536,130 @@ def test_omnivoice_invalid_clone_and_design_keep_exit_two_contract(
     assert data["code"] == 2
     assert message in data["error"]
     assert len(data) == 3
+
+
+def test_omnivoice_design_instruction_invalid_vocabulary_exits_two():
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--mode",
+        "design",
+        "--design-instruction",
+        "warm and clear",
+        "--json",
+    )
+
+    assert code == 2
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert "unsupported" in data["error"]
+    assert len(data) == 3
+
+
+def _write_reference_wav(path, *, rate=24_000):
+    import wave
+
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(rate)
+        audio.writeframes((b"\x00\x00" * 4000) + (b"\xff\x7f" * 4000))
+
+
+def _build_voice_bank(tmp_path):
+    import hashlib
+
+    bank_root = tmp_path / "bank"
+    (bank_root / "voices").mkdir(parents=True)
+    reference = bank_root / "voices" / "main.wav"
+    _write_reference_wav(reference)
+    digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    catalog_path = bank_root / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "default_voice": "main",
+                "voices": [
+                    {
+                        "id": "main",
+                        "display_name": "Main Narrator",
+                        "description": "Primary narration voice",
+                        "language": "ru",
+                        "reference_audio": "voices/main.wav",
+                        "reference_text": "Эталонная фраза.",
+                        "reference_sha256": digest,
+                        "origin": {"mode": "owner-reference", "instruction": None, "seed": 7},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return catalog_path
+
+
+def test_omnivoice_preset_bank_dry_run_reports_success(tmp_path):
+    catalog_path = _build_voice_bank(tmp_path)
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "omnivoice-local",
+        "--mode",
+        "preset",
+        "--model",
+        "audio-cpp/omnivoice-q8_0",
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "bank-dry-run",
+        "--voice-bank",
+        str(catalog_path),
+        "--voice",
+        "main",
+        "--dry-run-cost",
+        "--json",
+    )
+
+    assert code == 0
+    assert data["dry_run"] is True
+    assert data["provider"] == "omnivoice-local"
+    assert not (tmp_path / "out" / "bank-dry-run").exists()
+
+
+def test_list_omnivoice_voices_with_bank_returns_profiles(tmp_path):
+    catalog_path = _build_voice_bank(tmp_path)
+
+    code, data = cli_json(
+        "list",
+        "voices",
+        "--provider",
+        "omnivoice-local",
+        "--voice-bank",
+        str(catalog_path),
+        "--json",
+    )
+
+    assert code == 0
+    assert data["voices"] == ["main"]
+    assert data["profiles"] == [
+        {
+            "id": "main",
+            "display_name": "Main Narrator",
+            "description": "Primary narration voice",
+            "language": "ru",
+        }
+    ]
+    assert data["voice_selection"] == {
+        "kind": "built-in-style-condition",
+        "condition": "female",
+        "named_preset": False,
+        "voice_cloning": False,
+        "voice_design": False,
+    }

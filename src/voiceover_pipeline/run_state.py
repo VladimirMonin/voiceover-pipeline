@@ -49,9 +49,10 @@ def initial_state(
     script_format: str,
     run_id: str,
     limited_to_chunks: int | None = None,
+    voice_identity: str | None = None,
 ) -> dict[str, Any]:
     now = utc_now()
-    return {
+    state: dict[str, Any] = {
         "artifact_type": "voiceover-run-state",
         "status": "running",
         "run_id": run_id,
@@ -69,6 +70,9 @@ def initial_state(
         "chunks": [],
         "errors": [],
     }
+    if voice_identity is not None:
+        state["voice_identity"] = voice_identity
+    return state
 
 
 def completed_numbers(state: dict[str, Any] | None) -> set[int]:

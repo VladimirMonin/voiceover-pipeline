@@ -1,5 +1,6 @@
 import argparse
 import glob as glob_mod
+import hashlib
 import importlib.util
 import json
 import os
@@ -31,7 +32,6 @@ from .config import (
     DEFAULT_ELEVENLABS_VOICE,
     DEFAULT_FALLBACK_VOICE,
     DEFAULT_MODEL,
-    DEFAULT_OMNIVOICE_VOICE,
     DEFAULT_OPENAI_TTS_VOICE,
     DEFAULT_OPENROUTER_TTS_VOICE,
     DEFAULT_OUTPUT_DIR,
@@ -83,6 +83,13 @@ from .media import (
     write_audio_as_mp3,
 )
 from .models import ASRContextHints, ASRRequest, ASRRuntimeChoice, ChunkArtifact, ScriptChunk
+from .omnivoice_design import normalize_omnivoice_design_instruction
+from .omnivoice_voice_bank import (
+    VoiceBankCatalog,
+    VoiceBankError,
+    load_voice_bank,
+    resolve_bank_profile,
+)
 from .pricing import (
     cost_from_generation,
     fetch_openrouter_generation_detail,
@@ -297,7 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     qwen = gen.add_argument_group("qwen-local options")
-    qwen.add_argument("--mode", choices=["preset", "clone", "design"], default="preset")
+    qwen.add_argument("--mode", choices=["preset", "auto", "clone", "design"], default="preset")
     qwen.add_argument(
         "--qwen-instruct",
         default=None,
@@ -310,6 +317,12 @@ def build_parser() -> argparse.ArgumentParser:
     omnivoice.add_argument("--reference-audio", type=Path, default=None)
     omnivoice.add_argument("--reference-text", type=str, default=None)
     omnivoice.add_argument("--design-instruction", type=str, default=None)
+    omnivoice.add_argument(
+        "--voice-bank",
+        type=Path,
+        default=None,
+        help="Path to voice bank catalog.json for omnivoice-local --mode preset.",
+    )
 
     tim = gen.add_argument_group("Whisper timing (optional)")
     tim.add_argument("--with-timings", action="store_true")
@@ -516,6 +529,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["providers", "voices", "timing-models", "timing-providers", "asr-providers"],
     )
     lst.add_argument("--provider", default=None, help="Filter voices by provider.")
+    lst.add_argument(
+        "--voice-bank",
+        type=Path,
+        default=None,
+        help="Path to voice bank catalog.json for omnivoice-local voice listing.",
+    )
     lst.add_argument("--json", dest="json_output", action="store_true")
 
     return parser
@@ -640,6 +659,33 @@ def _resolve_style_prompt(args: argparse.Namespace) -> str | None:
     return PODCAST_NARRATION_PROMPT
 
 
+def _validate_omnivoice_voice_bank(args: argparse.Namespace) -> VoiceBankCatalog:
+    """Load the preset-mode voice bank and resolve the requested profile.
+
+    Attaches the resolved catalog and profile to ``args`` so later CLI
+    stages reuse the same identity without re-reading the bank.
+    """
+    voice_bank_arg = getattr(args, "voice_bank", None)
+    if voice_bank_arg is None:
+        fail(
+            "omnivoice-local preset mode requires --voice-bank catalog.json",
+            _EXIT_ARGS,
+        )
+    catalog_path = Path(voice_bank_arg)
+    try:
+        catalog = load_voice_bank(catalog_path)
+    except VoiceBankError as exc:
+        fail(str(exc), _EXIT_ARGS)
+    requested_voice = getattr(args, "voice", None)
+    voice_id = requested_voice if requested_voice is not None else catalog.default_voice
+    profile = next((item for item in catalog.profiles if item.id == voice_id), None)
+    if profile is None:
+        fail(f"voice '{voice_id}' not found in the voice bank", _EXIT_ARGS)
+    args.voice_bank_catalog = catalog
+    args.voice_bank_profile = profile
+    return catalog
+
+
 def _resolve_provider_style_prompt(args: argparse.Namespace) -> str | None:
     if getattr(args, "provider", None) == "omnivoice-local":
         return None
@@ -654,8 +700,8 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
         return
 
     mode = getattr(args, "mode", "preset")
-    if mode not in ("preset", "clone", "design"):
-        fail("omnivoice-local mode must be preset, clone, or design", _EXIT_ARGS)
+    if mode not in ("preset", "auto", "clone", "design"):
+        fail("omnivoice-local mode must be preset, auto, clone, or design", _EXIT_ARGS)
 
     reference_audio = getattr(args, "reference_audio", None)
     reference_text = getattr(args, "reference_text", None)
@@ -674,9 +720,7 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
     if getattr(args, "no_style_prompt", False):
         unsupported.append("--no-style-prompt")
     voice = getattr(args, "voice", None)
-    if (mode == "preset" and voice not in (None, DEFAULT_OMNIVOICE_VOICE)) or (
-        mode != "preset" and voice is not None
-    ):
+    if mode != "preset" and voice is not None:
         unsupported.append("--voice")
     if getattr(args, "fallback_voice", DEFAULT_FALLBACK_VOICE) != DEFAULT_FALLBACK_VOICE:
         unsupported.append("--fallback-voice")
@@ -689,7 +733,7 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
             _EXIT_ARGS,
         )
 
-    if mode == "preset":
+    if mode in ("preset", "auto"):
         fields = [
             flag
             for flag, value in (
@@ -700,13 +744,23 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
             if value is not None
         ]
         if fields:
+            label = "auto" if mode == "auto" else "preset/fixed-style"
             fail(
-                "omnivoice-local preset/fixed-style rejects clone/design fields: "
-                + ", ".join(fields),
+                f"omnivoice-local {label} rejects clone/design fields: " + ", ".join(fields),
                 _EXIT_ARGS,
             )
+        if mode == "preset":
+            _validate_omnivoice_voice_bank(args)
+            try:
+                OmniVoiceRequest(mode="fixed-style", style_condition=OMNIVOICE_STYLE_CONDITION)
+            except ValueError as exc:
+                fail(str(exc), _EXIT_ARGS)
+            return
         try:
-            OmniVoiceRequest(mode="fixed-style", style_condition=OMNIVOICE_STYLE_CONDITION)
+            if mode == "auto":
+                OmniVoiceRequest(mode="auto")
+            else:
+                OmniVoiceRequest(mode="fixed-style", style_condition=OMNIVOICE_STYLE_CONDITION)
         except ValueError as exc:
             fail(str(exc), _EXIT_ARGS)
         return
@@ -754,6 +808,10 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
             "omnivoice-local design mode requires non-empty --design-instruction",
             _EXIT_ARGS,
         )
+    try:
+        normalize_omnivoice_design_instruction(design_instruction)
+    except ValueError as exc:
+        fail(str(exc), _EXIT_ARGS)
     try:
         OmniVoiceRequest(mode="design", instruction=design_instruction)
     except ValueError as exc:
@@ -849,13 +907,28 @@ def generate(args: argparse.Namespace) -> None:
         chunks = chunks[: args.limit_chunks]
     requested_fragment_count = len(chunks)
     if args.provider == "omnivoice-local" and args.model == OMNIVOICE_LOCAL_MODEL_ID:
-        chunks = merge_omnivoice_session_fragments(
-            chunks,
-            mode=getattr(args, "mode", "preset"),
-            reference_audio_path=getattr(args, "reference_audio", None),
-            reference_text=getattr(args, "reference_text", None),
-            design_instruction=getattr(args, "design_instruction", None),
-        )
+        bank_profile = getattr(args, "voice_bank_profile", None)
+        bank_catalog = getattr(args, "voice_bank_catalog", None)
+        if getattr(args, "mode", "preset") == "preset" and bank_profile is not None:
+            reference_audio_path = (
+                str(bank_catalog.root / bank_profile.reference_audio)
+                if bank_catalog is not None
+                else str(Path(bank_profile.reference_audio))
+            )
+            chunks = merge_omnivoice_session_fragments(
+                chunks,
+                mode="clone",
+                reference_audio_path=reference_audio_path,
+                reference_text=bank_profile.reference_text,
+            )
+        else:
+            chunks = merge_omnivoice_session_fragments(
+                chunks,
+                mode=getattr(args, "mode", "preset"),
+                reference_audio_path=getattr(args, "reference_audio", None),
+                reference_text=getattr(args, "reference_text", None),
+                design_instruction=getattr(args, "design_instruction", None),
+            )
     runtime_session_count = len(chunks)
     if args.run_id:
         _validate_run_id(args.run_id)
@@ -974,6 +1047,7 @@ def _generate_step(
     _emit_json_event(args, "run_started", run_id=paths.prefix, chunks=len(chunks))
 
     current_hash = script_hash(chunks)
+    current_voice_identity = _omnivoice_voice_identity(args)
     state = load_state(state_path)
     if state and args.resume:
         if state.get("script_hash") != current_hash:
@@ -982,6 +1056,10 @@ def _generate_step(
                 "Cannot resume: script chunks do not match the previous run_state.json.",
                 _EXIT_PROVIDER,
             )
+        if "voice_identity" in state and current_voice_identity is not None:
+            if state.get("voice_identity") != current_voice_identity:
+                logger.event("error", "resume_rejected", reason="voice_identity_mismatch")
+                fail("Cannot resume: voice identity changed.", _EXIT_PROVIDER)
         logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
     elif state and not args.resume:
         logger.event("info", "state_replaced", reason="fresh_run")
@@ -994,6 +1072,7 @@ def _generate_step(
             script_format=getattr(args, "format", "markdown"),
             run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
+            voice_identity=current_voice_identity,
         )
     elif args.resume:
         state = initial_state(
@@ -1005,6 +1084,7 @@ def _generate_step(
             script_format=getattr(args, "format", "markdown"),
             run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
+            voice_identity=current_voice_identity,
         )
         _recover_existing_chunks(
             state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice
@@ -1020,6 +1100,7 @@ def _generate_step(
             script_format=getattr(args, "format", "markdown"),
             run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
+            voice_identity=current_voice_identity,
         )
     atomic_write_json(state_path, state)
 
@@ -1958,7 +2039,7 @@ def list_cmd(args: argparse.Namespace) -> None:
                 {
                     "id": "omnivoice-local",
                     "models": [OMNIVOICE_LOCAL_MODEL_ID],
-                    "modes": ["built-in-style-condition"],
+                    "modes": ["auto", "preset", "clone", "design"],
                     "license": "CC-BY-NC-4.0 upstream weights; local noncommercial research only",
                 },
             ]
@@ -1995,6 +2076,22 @@ def list_cmd(args: argparse.Namespace) -> None:
         }
         data = {"provider": provider, "voices": voices_flat.get(provider, [])}
         if provider == "omnivoice-local":
+            bank_arg = getattr(args, "voice_bank", None)
+            if bank_arg is not None:
+                try:
+                    catalog = load_voice_bank(Path(bank_arg))
+                except VoiceBankError as exc:
+                    fail(str(exc), _EXIT_ARGS)
+                data["voices"] = [profile.id for profile in catalog.profiles]
+                data["profiles"] = [
+                    {
+                        "id": profile.id,
+                        "display_name": profile.display_name,
+                        "description": profile.description,
+                        "language": profile.language,
+                    }
+                    for profile in catalog.profiles
+                ]
             data["voice_selection"] = {
                 "kind": "built-in-style-condition",
                 "condition": OMNIVOICE_STYLE_CONDITION,
@@ -2425,6 +2522,42 @@ def _validate_model_for_provider(provider: str, model: str) -> None:
         )
 
 
+def _omnivoice_voice_identity(args: argparse.Namespace) -> str | None:
+    if getattr(args, "provider", None) != "omnivoice-local":
+        return None
+    mode = getattr(args, "mode", "preset")
+    if mode == "preset":
+        profile = getattr(args, "voice_bank_profile", None)
+        catalog = getattr(args, "voice_bank_catalog", None)
+        if profile is None or catalog is None:
+            return None
+        return f"preset:{profile.id}:{profile.reference_sha256}"
+    if mode == "clone":
+        reference_audio_path = getattr(args, "reference_audio", None)
+        reference_text = getattr(args, "reference_text", None)
+        if reference_audio_path is None or reference_text is None:
+            return None
+        return f"clone:{_sha256_file(Path(reference_audio_path))}:{_sha256_text(reference_text)}"
+    if mode == "design":
+        design_instruction = getattr(args, "design_instruction", None)
+        if design_instruction is None:
+            return None
+        return f"design:{_sha256_text(design_instruction)}"
+    return "auto"
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def _direct_cost_kwargs(provider: str, result) -> dict:
     if provider != "polza-tts":
         return {}
@@ -2464,6 +2597,32 @@ def _public_voice_selection(result) -> dict[str, object] | None:
     if not isinstance(selection, dict):
         raise RuntimeError("Local TTS provider returned an invalid public voice selection")
     kind = selection.get("kind")
+    if kind == "auto-voice":
+        expected = {
+            "kind": "auto-voice",
+            "named_preset": False,
+            "voice_cloning": False,
+            "voice_design": False,
+        }
+        if selection != expected:
+            raise RuntimeError("Local TTS provider returned an invalid public voice selection")
+        return dict(expected)
+    if kind == "bank-preset":
+        expected = {
+            "kind": "bank-preset",
+            "voice_id": selection.get("voice_id"),
+            "voice_fingerprint": selection.get("voice_fingerprint"),
+        }
+        if (
+            not isinstance(expected["voice_id"], str)
+            or not expected["voice_id"]
+            or not isinstance(expected["voice_fingerprint"], str)
+            or len(expected["voice_fingerprint"]) != 64
+        ):
+            raise RuntimeError("Local TTS provider returned an invalid public voice selection")
+        if selection != expected:
+            raise RuntimeError("Local TTS provider returned an invalid public voice selection")
+        return dict(expected)
     if kind == "built-in-style-condition":
         expected = {
             "kind": "built-in-style-condition",
@@ -2497,6 +2656,8 @@ def _public_voice_session(result) -> dict[str, object] | None:
         or set(session) != {"strategy", "seed", "internal_text_chunk_size"}
         or session.get("strategy")
         not in {
+            "auto-voice-native-session",
+            "bank-preset-native-session",
             "single-native-invocation-internal-text-chunking",
             "reference-isolated-native-session",
             "design-instruction-native-session",
@@ -2510,7 +2671,7 @@ def _public_voice_session(result) -> dict[str, object] | None:
     return dict(session)
 
 
-def _default_voice(args: argparse.Namespace) -> str:
+def _default_voice(args: argparse.Namespace) -> str | None:
     if args.provider == "polza-tts":
         if args.model and args.model.startswith("elevenlabs/"):
             return DEFAULT_ELEVENLABS_VOICE
@@ -2522,7 +2683,7 @@ def _default_voice(args: argparse.Namespace) -> str:
     if args.provider == "qwen-local":
         return DEFAULT_QWEN_VOICE
     if args.provider == "omnivoice-local":
-        return DEFAULT_OMNIVOICE_VOICE
+        return None
     return DEFAULT_VOICE
 
 
@@ -2586,7 +2747,24 @@ def build_provider(
         _validate_omnivoice_options(args)
         omni_kwargs: dict[str, Any] = {}
         mode = getattr(args, "mode", "preset")
-        if mode == "clone":
+        if mode == "auto":
+            omni_kwargs.update({"mode": "auto"})
+        elif mode == "preset":
+            catalog = getattr(args, "voice_bank_catalog", None)
+            profile = getattr(args, "voice_bank_profile", None)
+            if catalog is None or profile is None:
+                fail(
+                    "omnivoice-local preset mode requires --voice-bank catalog.json",
+                    _EXIT_ARGS,
+                )
+            reference_path = resolve_bank_profile(catalog, profile.id)[1]
+            omni_kwargs.update(
+                {
+                    "mode": "preset",
+                    "voice_bank": (profile, reference_path),
+                }
+            )
+        elif mode == "clone":
             omni_kwargs.update(
                 {
                     "mode": "clone",

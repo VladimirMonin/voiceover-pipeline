@@ -69,6 +69,45 @@ def patch_generation_io(monkeypatch):
     )
 
 
+def build_voice_bank(tmp_path):
+    import hashlib
+    import json
+    import wave
+
+    bank_root = tmp_path / "bank"
+    (bank_root / "voices").mkdir(parents=True)
+    reference = bank_root / "voices" / "main.wav"
+    with wave.open(str(reference), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(24_000)
+        audio.writeframes(b"\x00\x00" * 4000)
+    digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    catalog_path = bank_root / "catalog.json"
+    catalog_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "default_voice": "main",
+                "voices": [
+                    {
+                        "id": "main",
+                        "display_name": "Main Narrator",
+                        "description": "",
+                        "language": "ru",
+                        "reference_audio": "voices/main.wav",
+                        "reference_text": "Эталонная фраза.",
+                        "reference_sha256": digest,
+                        "origin": {"mode": "owner-reference", "instruction": None, "seed": 7},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return catalog_path
+
+
 def test_generate_step_writes_state_and_log_after_each_chunk(tmp_path, monkeypatch):
     import voiceover_pipeline.cli as cli
     from voiceover_pipeline.artifacts import build_run_paths
@@ -243,6 +282,86 @@ def test_resume_does_not_regenerate_completed_chunks(tmp_path, monkeypatch):
     assert provider.calls == ["chunk_02"]
 
 
+def test_clone_voice_identity_is_deterministic_across_processes(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+
+    import voiceover_pipeline.cli as cli
+
+    reference = tmp_path / "ref.wav"
+    reference.write_bytes(b"not-a-real-wav-but-fine")
+    args = argparse.Namespace(
+        provider="omnivoice-local",
+        mode="clone",
+        reference_audio=str(reference),
+        reference_text="Всем привет. Это образец голоса.",
+    )
+    expected = cli._omnivoice_voice_identity(args)
+    assert expected is not None
+    assert "hash(" not in expected and "0x" not in expected
+
+    script = (
+        "import sys, types\n"
+        "import voiceover_pipeline.cli as cli\n"
+        "ref = r'%s'\n"
+        "args = types.SimpleNamespace(provider='omnivoice-local', mode='clone',"
+        " reference_audio=ref, reference_text='Всем привет. Это образец голоса.')\n"
+        "print(cli._omnivoice_voice_identity(args))\n" % (str(reference),)
+    )
+    for seed in ("1", "987654"):
+        env = dict(monkeypatch.__dict__.get("env", {}))
+        env["PYTHONHASHSEED"] = seed
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == expected
+
+
+def test_resume_rejects_changed_voice_identity(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import atomic_write_json, initial_state
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="voice-identity", resume=True)
+    args.provider = "omnivoice-local"
+    args.model = "audio-cpp/omnivoice-q8_0"
+    args.voice = "main"
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+        voice_identity="preset:main:" + "1" * 64,
+    )
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    args.voice_bank_catalog = object()
+    args.voice_bank_profile = type(
+        "Profile",
+        (),
+        {"id": "main", "reference_sha256": "2" * 64},
+    )()
+
+    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "none"
+        )
+
+    assert error.value.code == 30
+
+
 def test_overwrite_refuses_to_delete_existing_paid_chunks_without_confirmation(tmp_path):
     run_dir = tmp_path / "out" / "paid-run"
     chunks_dir = run_dir / "chunks"
@@ -327,6 +446,8 @@ def test_local_tts_dry_run_reports_sentence_packed_inference_chunks(tmp_path):
         str(tmp_path / "out"),
         "--run-id",
         "local-dry-run",
+        "--voice-bank",
+        str(build_voice_bank(tmp_path)),
         "--dry-run-cost",
         "--json",
     )
@@ -355,6 +476,8 @@ def test_local_tts_cli_rejects_raw_digits_before_runtime(tmp_path):
         str(tmp_path / "out"),
         "--run-id",
         "digits",
+        "--voice-bank",
+        str(build_voice_bank(tmp_path)),
         "--dry-run-cost",
         "--json",
     )

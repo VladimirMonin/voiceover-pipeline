@@ -196,6 +196,60 @@ def _design_payload() -> dict[str, object]:
     }
 
 
+def _auto_payload() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation": "tts",
+        "family": "omnivoice",
+        "provider_id": "omnivoice-local",
+        "payload": {
+            "text": "Привет",
+            "model_id": OMNIVOICE_LOCAL_MODEL_ID,
+            "voice": None,
+            "language": "ru",
+            "omnivoice_mode": "auto",
+            "text_chunk_size": 420,
+            "seed": 1234,
+            "num_inference_steps": 32,
+            "guidance_scale": 2.0,
+        },
+    }
+
+
+def test_container_transport_auto_mode_omits_instruct_and_reference_flags(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(audio_cpp_omnivoice.sys, "platform", "linux")
+    transport = _transport(monkeypatch, tmp_path)
+    captured: dict[str, Any] = {}
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = tuple(command)
+        captured["kwargs"] = kwargs
+        output_mount = next(
+            command[index + 1]
+            for index, item in enumerate(command)
+            if item == "--mount" and "dst=/output" in command[index + 1]
+        )
+        output_directory = Path(output_mount.split("src=", 1)[1].split(",", 1)[0])
+        _write_wav(output_directory / "omnivoice.wav")
+        return _CompletedProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    response = cast(dict[str, Any], transport.invoke("auto-1", _auto_payload()))
+
+    command = cast(tuple[str, ...], captured["command"])
+    assert "--instruct" not in command
+    assert "--voice-ref" not in command
+    assert "--reference-text" not in command
+    assert "--text-chunk-size" in command and "420" in command
+    assert "--seed" in command and "1234" in command
+    assert "--num-inference-steps" in command and "32" in command
+    assert "--guidance-scale" in command and "2.0" in command
+    assert response["response"]["audio_format"] == "wav"
+
+
 def test_container_transport_clone_fails_closed_without_staged_reference(
     monkeypatch, tmp_path: Path
 ):

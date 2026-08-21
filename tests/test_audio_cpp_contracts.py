@@ -145,13 +145,19 @@ def test_typed_asr_runtime_choice_is_routing_only_and_explicit_audio_cpp_does_no
 
 
 def test_omnivoice_mode_contract_is_family_safe_and_mode_specific():
-    assert get_args(OmniVoiceMode) == ("fixed-style", "clone", "design")
+    assert get_args(OmniVoiceMode) == ("auto", "fixed-style", "clone", "design")
+    auto = OmniVoiceRequest(mode="auto")
     fixed = OmniVoiceRequest(mode="fixed-style", style_condition="female")
     clone = OmniVoiceRequest(
         mode="clone", reference_audio_path="fixture.wav", reference_text="reference transcript"
     )
     design = OmniVoiceRequest(mode="design", instruction="warm and clear")
 
+    assert auto.mode == "auto"
+    assert auto.style_condition is None
+    assert auto.instruction is None
+    assert auto.reference_audio_path is None
+    assert auto.reference_text is None
     assert fixed.mode == "fixed-style"
     assert clone.reference_text == "reference transcript"
     assert design.instruction == "warm and clear"
@@ -168,6 +174,9 @@ def test_omnivoice_mode_contract_is_family_safe_and_mode_specific():
         ("fixed-style", {"reference_audio_path": "fixture.wav"}, "fixed-style"),
         ("fixed-style", {"reference_text": "reference transcript"}, "fixed-style"),
         ("fixed-style", {"instruction": "design instruction"}, "fixed-style"),
+        ("auto", {"reference_audio_path": "fixture.wav"}, "auto"),
+        ("auto", {"instruction": "warm"}, "auto"),
+        ("auto", {"style_condition": "female"}, "auto"),
     ),
 )
 def test_omnivoice_mode_contract_rejects_missing_or_cross_mode_fields(mode, kwargs, message):
@@ -193,6 +202,7 @@ def _omnivoice_tts_request(**overrides) -> LocalTTSRequest:
 
 
 def test_local_tts_request_carries_omnivoice_mode_fields_without_qwen_mode_collision():
+    auto = _omnivoice_tts_request(omnivoice_mode="auto")
     fixed = _omnivoice_tts_request(omnivoice_mode="fixed-style", style_condition="female")
     clone = _omnivoice_tts_request(
         omnivoice_mode="clone",
@@ -201,6 +211,13 @@ def test_local_tts_request_carries_omnivoice_mode_fields_without_qwen_mode_colli
     )
     design = _omnivoice_tts_request(omnivoice_mode="design", design_instruction="warm and clear")
 
+    auto_payload = auto.to_runtime_request().payload
+    assert auto_payload["omnivoice_mode"] == "auto"
+    assert "style_condition" not in auto_payload
+    assert "design_instruction" not in auto_payload
+    assert "reference_audio_path" not in auto_payload
+    assert "reference_text" not in auto_payload
+    assert "mode" not in auto_payload
     assert fixed.to_runtime_request().payload["omnivoice_mode"] == "fixed-style"
     assert fixed.to_runtime_request().payload["style_condition"] == "female"
     assert "mode" not in fixed.to_runtime_request().payload
@@ -277,6 +294,10 @@ def test_local_tts_request_hides_sensitive_omnivoice_fields_from_repr():
             },
             "Qwen instruction",
         ),
+        ({"omnivoice_mode": "auto", "style_condition": "female"}, "auto"),
+        ({"omnivoice_mode": "auto", "design_instruction": "warm"}, "auto"),
+        ({"omnivoice_mode": "auto", "reference_audio_path": "fixture.wav"}, "auto"),
+        ({"omnivoice_mode": "auto", "reference_text": "reference transcript"}, "auto"),
     ),
 )
 def test_local_tts_request_rejects_missing_or_cross_mode_omnivoice_fields(kwargs, message):

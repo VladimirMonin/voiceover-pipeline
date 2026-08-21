@@ -45,6 +45,7 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_package import (
     admit_audio_cpp_native_package,
 )
 from voiceover_pipeline.models import SynthesisResult
+from voiceover_pipeline.omnivoice_voice_bank import VoiceProfile
 from voiceover_pipeline.providers.base import TTSProvider
 
 OMNIVOICE_FAMILY = "omnivoice"
@@ -169,6 +170,7 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
         reference_audio_path: Path | str | None = None,
         reference_text: str | None = None,
         design_instruction: str | None = None,
+        voice_bank: tuple[VoiceProfile, Path] | None = None,
     ) -> None:
         self._runtime = runtime
         self._admitted_model = _re_admit_omnivoice_model(admitted_model)
@@ -185,6 +187,7 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
         self._reference_audio_path = reference_audio_path
         self._reference_text = reference_text
         self._design_instruction = design_instruction
+        self._voice_bank = voice_bank
 
     @classmethod
     def from_environment(cls, **kwargs: Any) -> "OmniVoiceLocalTTSProvider":
@@ -293,6 +296,11 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
     def _mode_request_fields(
         self,
     ) -> tuple[OmniVoiceMode, str | None, str | None, Path | str | None, str | None]:
+        if self._mode == "auto":
+            return ("auto", None, None, None, None)
+        if self._mode == "preset" and self._voice_bank is not None:
+            _profile, reference_path = self._voice_bank
+            return ("clone", None, None, reference_path, _profile.reference_text)
         if self._mode == "clone":
             return (
                 "clone",
@@ -306,6 +314,20 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
         return ("fixed-style", OMNIVOICE_STYLE_CONDITION, None, None, None)
 
     def _voice_selection_metadata(self) -> dict[str, Any]:
+        if self._mode == "auto":
+            return {
+                "kind": "auto-voice",
+                "named_preset": False,
+                "voice_cloning": False,
+                "voice_design": False,
+            }
+        if self._mode == "preset" and self._voice_bank is not None:
+            profile, _reference_path = self._voice_bank
+            return {
+                "kind": "bank-preset",
+                "voice_id": profile.id,
+                "voice_fingerprint": profile.reference_sha256,
+            }
         if self._mode == "clone":
             return {
                 "kind": "reference-clone",
@@ -329,7 +351,11 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
         }
 
     def _voice_session_metadata(self) -> dict[str, Any]:
-        if self._mode == "clone":
+        if self._mode == "preset" and self._voice_bank is not None:
+            strategy = "bank-preset-native-session"
+        elif self._mode == "auto":
+            strategy = "auto-voice-native-session"
+        elif self._mode == "clone":
             strategy = "reference-isolated-native-session"
         elif self._mode == "design":
             strategy = "design-instruction-native-session"
