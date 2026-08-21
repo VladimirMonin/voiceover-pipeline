@@ -156,48 +156,53 @@ container command; default — `["docker"]`, shell-like строка недоп�
 окружение для выбора модели. Любое другое значение
 `VOICEOVER_QWEN_TTS_RUNTIME` — invalid args (exit code `2`).
 
-### `omnivoice-local`: fixed offline female style condition
+### `omnivoice-local`: offline OmniVoice with auto / preset / clone / design
 
 `omnivoice-local` — явный offline-only provider с единственной моделью
 `audio-cpp/omnivoice-q8_0`. На Linux он использует pinned audio.cpp CUDA
-container, встроенное условие `female`, fixed seed и internal text chunks по 420 символов. Это не AutoVoice и не named preset/voice ID. VOP объединяет подготовленные fragments в один запрос, поэтому audio.cpp обрабатывает их в одной container/model session. Перед `generate` требуется задать
-`VOICEOVER_OMNIVOICE_MODEL` на локальный Q8_0 GGUF и явно подтвердить local-only
-noncommercial use: `VOICEOVER_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE=accept-cc-by-nc-4.0-local-use`.
-VOP не скачивает модель; до provider/runtime он потоково проверяет SHA-256 exact artifact.
-Опциональный `VOICEOVER_OMNIVOICE_CONTAINER_COMMAND_JSON` — JSON argv для
-локального Docker command (default `["docker"]`). `doctor` проверяет этот
-явный file/config boundary и GPU probe, но не загружает модель и не доказывает
-реальный container inference.
+container; на Windows — native `audiocpp_cli.exe` factory. Fixed seed `1234`
+и internal text chunks по 420 символов. VOP объединяет подготовленные
+fragments в один запрос, поэтому audio.cpp обрабатывает их в одной
+model session (голос постоянен на весь script). Перед `generate` требуется
+задать `VOICEOVER_OMNIVOICE_MODEL` на локальный Q8_0 GGUF и явно подтвердить
+local-only noncommercial use:
+`VOICEOVER_OMNIVOICE_NONCOMMERCIAL_LOCAL_USE=accept-cc-by-nc-4.0-local-use`.
+VOP не скачивает модель; до provider/runtime он потоково проверяет SHA-256
+exact artifact. Опциональный `VOICEOVER_OMNIVOICE_CONTAINER_COMMAND_JSON` —
+JSON argv для локального Docker command (default `["docker"]`). `doctor`
+проверяет этот явный file/config boundary и GPU probe, но не загружает модель
+и не доказывает реальный container inference.
 
-Распознаются глобальный `--mode preset|clone|design` (default `preset`) и
-флаги `--reference-audio <path>`, `--reference-text <text>`,
-`--design-instruction <text>`:
+Распознаются глобальный `--mode auto|preset|clone|design` (default `preset`)
+и флаги `--reference-audio <path>`, `--reference-text <text>`,
+`--design-instruction <text>`, `--voice-bank <catalog.json>`:
 
-- `--mode preset` (fixed-style) — поведение не изменилось: названные
-  `--voice`, `--sample`, `--sample-text`, `--qwen-instruct`, `--style-prompt`,
-  `--style-prompt-file`, `--no-style-prompt`, `--fallback-voice`,
-  `--speaker-voice`, а также `--reference-audio`/`--reference-text`/
-  `--design-instruction` fail closed с exit code `2` (invalid args).
+- `--mode auto` — модель без voice guidance; `--voice` и reference/design
+  флаги запрещены (exit code `2`).
+- `--mode preset` — требует `--voice <id>` и `--voice-bank <catalog.json>`.
+  Резолвит profile из каталога (пути строго внутри bank root, SHA-256
+  сверяется с файлом, reference — mono WAV) и выполняет нативный clone по
+  reference. Неизвестный `--voice`, невалидный каталог, несовпадение
+  digest дают exit code `2`; при `--resume` с изменённым fingerprint — exit
+  code `30`. Public metadata: kind `bank-preset` + `voice_id` +
+  `voice_fingerprint` (sha256). Reference path/transcript не публикуются.
 - `--mode clone` требует читаемый файл через `--reference-audio` и непустой
-  `--reference-text`; `--design-instruction` запрещён. После валидации режим
-  fail closed с exit code `2` («not implemented»): текущий fixed-style provider
-  путь не реализует клонирование, и CLI отказывается использовать его как
-  fallback для клона.
-- `--mode design` требует непустой `--design-instruction`; `--reference-audio`/
-  `--reference-text` запрещены. Аналогично fail closed с exit code `2`
-  («not implemented»): голосовой дизайн не реализован текущим provider путём.
-- Оба режима валидируются до построения provider; constructed provider для
-  них не создаётся. Clone/design — планируемые, а не рабочие capability.
+  `--reference-text`; `--design-instruction` и `--voice` запрещены.
+  Reference нормализуется до PCM16 mono 24 kHz при staging. Public kind:
+  `reference-clone`. Resume-identity детерминирована (sha256), изменённый
+  fingerprint отклоняется с exit code `30`.
+- `--mode design` требует непустой `--design-instruction` из allowlist
+  (gender/age/pitch/style/accent); `--reference-audio`/`--reference-text`/
+  `--voice` запрещены. Неизвестный токен fail closed с exit code `2`.
+  Public kind: `design-instruction`.
 
-Named `--voice`, Qwen cloning/sample options и style controls для этого
-provider fail closed: named preset, streaming и Qwen options не входят в
-контракт. На Windows Docker/WSL не выбираются: нужен
-`VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE` с рядом лежащим
+Named `--voice` (вне preset+bank), Qwen cloning/sample options и style
+controls для этого provider fail closed. На Windows Docker/WSL не выбираются:
+нужен `VOICEOVER_AUDIO_CPP_NATIVE_EXECUTABLE` с рядом лежащим
 `audio_cpp_dependency_closure.json`, проверяющим SHA-256 EXE/DLL closure, и
-`VOICEOVER_OMNIVOICE_MODEL` и тот же noncommercial-use acknowledgment. Отсутствующий,
-несовпавший SHA-256 или closure даёт unavailable route; fallback к container нет. Это
-статически проверенный factory/package route, а не claim о Windows inference/readiness.
-Полный pinned receipt и ограничения
+`VOICEOVER_OMNIVOICE_MODEL` и тот же noncommercial-use acknowledgment.
+Отсутствующий, несовпавший SHA-256 или closure даёт unavailable route;
+fallback к container нет. Полный pinned receipt и ограничения
 лицензии: [OmniVoice Local TTS](omnivoice-local-tts.md).
 
 ## `generate --json` (output)
@@ -568,7 +573,7 @@ voiceover generate `
 - `--word-timestamps` подходит для visual highlights, но не гарантирует семантически точных границ слов
 - Cloud prices are snapshots из API на момент прогона, не гарантия
 - Qwen-local и omnivoice-local требуют CUDA GPU
-- OmniVoice local uses the Linux container route or a statically checked native-Windows factory; native Windows inference/readiness is not claimed
-- OmniVoice local `--mode clone|design` и ASR explicit `--runtime audio-cpp` проходят валидацию, но fail closed (exit code `2`) как not implemented — планируются, не являются рабочими capability
+- OmniVoice local uses the Linux container route or the native-Windows factory; native Windows clone/design/bank paths are accepted (см. `docs/reports/2026-08-21-native-windows-omnivoice-voice-bank-acceptance.md`)
+- OmniVoice local ASR explicit `--runtime audio-cpp` проходит валидацию, но fail closed (exit code `2`) как not implemented — планируется, не является рабочей capability
 - Первый Whisper запуск скачивает модель (~486 MB) из HuggingFace
 - При `--with-timings` ошибка Whisper — hard failure (code 40), но MP3 уже сохранён
