@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.6.0
+
+### OmniVoice Local Voice Bank
+
+- Added `--voice-provider omnivoice-local` with four local modes: `auto` (default preset), bank preset (named OmniVoice voices), `clone` (voice from a reference audio), and `design` (build a synthetic voice from properties).
+- OmniVoice is single-speaker per run; local multi-speaker dialogue is not first-class in this release.
+
+### Native Windows Acceptance
+
+- Native Windows launcher paths for local audio.cpp models are accepted as first-class (Qwen3-TTS, OmniVoice, Qwen3-ASR, Nemotron), alongside the existing Linux routes.
+
+### Hardened Gemini Dialogue Workflow
+
+- Dialogue validation now enforces exactly two distinct speakers and rejects duplicate speaker voices.
+- Style prompt is capped with a strict byte limit to catch oversized prompts before paid generation.
+- Top-level Gemini `voice` is derived from the speaker map with conflict rejection instead of trusting a manual override.
+- Hardened `--json`/`--json-events` handling: JSON error envelope for failures and rejection of `--json` combined with `--json-events`.
+- Canonical dialogue resume identity (`--resume`) with fail-closed behavior (exit code 30) when the run cannot be safely resumed.
+
+### Agent Skill Reconciliation
+
+- Skill updated: Two-speaker podcast branch, OmniVoice workflows (auto/bank/clone/design), and safe timings guidance.
+
+### Tests
+
+- Added mocked end-to-end Gemini dialogue generation test (no live provider calls).
+
 ## 0.5.1
 
 ### Documentation & Skill Update
