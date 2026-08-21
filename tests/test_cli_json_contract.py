@@ -559,6 +559,200 @@ def test_omnivoice_design_instruction_invalid_vocabulary_exits_two():
     assert len(data) == 3
 
 
+def _write_gemini_dialogue(tmp_path, body, extra_meta="", speakers=None):
+    if speakers is None:
+        speakers = "\n".join(
+            [
+                "  Speaker1:",
+                "    display_name: Первый диктор",
+                "    voice: Puck",
+                "    profile: calm host",
+                "  Speaker2:",
+                "    display_name: Второй диктор",
+                "    voice: Kore",
+                "    profile: energetic co-host",
+            ]
+        )
+    script = tmp_path / "dialogue.md"
+    script.write_text(
+        "\n".join(
+            [
+                "---",
+                "format: gemini-dialogue",
+                "language: ru",
+                "model: google/gemini-3.1-flash-tts-preview",
+                "speakers:",
+                speakers,
+                "allowed_tags:",
+                "  - warmly",
+                "  - calmly",
+                "  - curious",
+                "max_chunk_bytes: 3500",
+                extra_meta.rstrip(),
+                "---",
+                body,
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return script
+
+
+def test_gemini_dialogue_validate_agent_json_is_one_object(tmp_path):
+    from conftest import run_cli
+
+    script = _write_gemini_dialogue(
+        tmp_path,
+        "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
+    )
+    proc = run_cli(
+        "validate", "--script", str(script), "--format", "gemini-dialogue", "--agent", "--json"
+    )
+    assert proc.returncode == 0
+    data = json.loads(proc.stdout)
+    assert data["valid"] is True
+    assert data["status"] == "success"
+    assert data["format"] == "gemini-dialogue"
+    assert data["speaker_voice_map"] == {"Speaker1": "Puck", "Speaker2": "Kore"}
+    json_lines = [line for line in proc.stdout.splitlines() if line.strip().startswith("{")]
+    assert len(json_lines) == 1
+    assert proc.stderr.strip() == ""
+
+
+def test_invalid_gemini_dialogue_generate_json_is_single_error_object(tmp_path):
+    from conftest import run_cli
+
+    script = _write_gemini_dialogue(
+        tmp_path,
+        "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+        speakers="  Speaker1:\n    voice: Puck\n  Speaker2:\n    voice: Puck",
+    )
+    proc = run_cli(
+        "generate",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "bad-dialogue",
+        "--json",
+    )
+    assert proc.returncode == 2
+    data = json.loads(proc.stdout)
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert "DUPLICATE_SPEAKER_VOICE" in data["error"] or "distinct" in data["error"]
+    assert "details" in data
+    assert data["details"]["valid"] is False
+    codes = {item["code"] for item in data["details"]["errors"]}
+    assert "DUPLICATE_SPEAKER_VOICE" in codes
+    json_lines = [line for line in proc.stdout.splitlines() if line.strip().startswith("{")]
+    assert len(json_lines) == 1
+    assert proc.stderr.strip() == ""
+
+
+def test_gemini_dialogue_style_fallback_diagnostic_stays_off_stdout(tmp_path, monkeypatch, capsys):
+    import sys
+
+    script = _write_gemini_dialogue(
+        tmp_path,
+        "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
+    )
+
+    def failing_synthesize_chunk(self, text, chunk_id):
+        from voiceover_pipeline.models import SynthesisResult
+
+        if getattr(self, "_fallback_done", False):
+            return SynthesisResult(
+                audio_bytes=b"audio",
+                audio_format="mp3",
+                transcript=text,
+                generation_id=f"gen-{chunk_id}",
+                client_path="fake",
+            )
+        self._fallback_done = True
+        print(
+            f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.",
+            file=sys.stderr,
+        )
+        return SynthesisResult(
+            audio_bytes=b"audio",
+            audio_format="mp3",
+            transcript=text,
+            generation_id=f"gen-{chunk_id}",
+            client_path="fake",
+        )
+
+    import voiceover_pipeline.cli as cli
+
+    monkeypatch.setattr(
+        cli, "write_audio_as_mp3", lambda _ffmpeg, _audio, _fmt, path: path.write_bytes(b"mp3")
+    )
+    monkeypatch.setattr(cli, "trim_final_silence", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "mp3_duration_ms", lambda *_args, **_kwargs: 1000)
+    monkeypatch.setattr(
+        cli,
+        "concat_mp3_chunks",
+        lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"),
+    )
+    monkeypatch.setattr(cli, "attach_costs", lambda *args, **kwargs: args[-1])
+    monkeypatch.setattr(cli, "fetch_pricing_snapshot", lambda _provider, _api_key, _model: None)
+    monkeypatch.setattr(cli.OpenRouterTTSProvider, "synthesize_chunk", failing_synthesize_chunk)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test-only-placeholder")
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover",
+            "generate",
+            "--script",
+            str(script),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--run-id",
+            "fallback-stdout",
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "success"
+    assert data["run_id"] == "fallback-stdout"
+    json_lines = [line for line in captured.out.splitlines() if line.strip().startswith("{")]
+    assert len(json_lines) == 1
+    assert "Style prompt failed" not in captured.out
+    assert "Style prompt failed" in captured.err
+
+
+def test_gemini_dialogue_json_and_json_events_rejected(tmp_path):
+    script = _write_gemini_dialogue(
+        tmp_path,
+        "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
+    )
+    code, data = cli_json(
+        "generate",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "json-events-conflict",
+        "--json",
+        "--json-events",
+    )
+    assert code == 2
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert "mutually exclusive" in data["error"]
+    assert not (tmp_path / "out" / "json-events-conflict").exists()
+
+
 def _write_reference_wav(path, *, rate=24_000):
     import wave
 

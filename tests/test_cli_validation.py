@@ -542,7 +542,20 @@ class TestStylePromptFlags:
         assert _resolve_style_prompt(ns) == PODCAST_NARRATION_PROMPT
 
 
-def write_gemini_dialogue(tmp_path, body, extra_meta=""):
+def write_gemini_dialogue(tmp_path, body, extra_meta="", speakers=None):
+    if speakers is None:
+        speakers = "\n".join(
+            [
+                "  Speaker1:",
+                "    display_name: Первый диктор",
+                "    voice: Puck",
+                "    profile: calm host",
+                "  Speaker2:",
+                "    display_name: Второй диктор",
+                "    voice: Kore",
+                "    profile: energetic co-host",
+            ]
+        )
     script = tmp_path / "dialogue.md"
     script.write_text(
         "\n".join(
@@ -552,14 +565,7 @@ def write_gemini_dialogue(tmp_path, body, extra_meta=""):
                 "language: ru",
                 "model: google/gemini-3.1-flash-tts-preview",
                 "speakers:",
-                "  Speaker1:",
-                "    display_name: Первый диктор",
-                "    voice: Puck",
-                "    profile: calm host",
-                "  Speaker2:",
-                "    display_name: Второй диктор",
-                "    voice: Kore",
-                "    profile: energetic co-host",
+                speakers,
                 "allowed_tags:",
                 "  - warmly",
                 "  - calmly",
@@ -650,6 +656,229 @@ class TestGeminiDialogueValidation:
         assert code == 0
         assert data["valid"] is False
         assert any(item["code"] == "PROMPT_SKELETON_IN_DIALOGUE_BODY" for item in data["errors"])
+
+    def test_gemini_dialogue_zero_speakers_reports_count_invalid(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            speakers="",
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        count_error = next(
+            (item for item in data["errors"] if item["code"] == "SPEAKER_COUNT_INVALID"), None
+        )
+        assert count_error is not None
+        assert count_error["actual"] == 0
+        assert count_error["limit"] == 2
+
+    def test_gemini_dialogue_one_speaker_reports_count_invalid(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            speakers="  Speaker1:\n    display_name: Первый диктор\n    voice: Puck",
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        count_error = next(
+            (item for item in data["errors"] if item["code"] == "SPEAKER_COUNT_INVALID"), None
+        )
+        assert count_error is not None
+        assert count_error["actual"] == 1
+        assert count_error["limit"] == 2
+
+    def test_gemini_dialogue_three_speakers_reports_count_invalid(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            speakers="\n".join(
+                [
+                    "  Speaker1:",
+                    "    voice: Puck",
+                    "  Speaker2:",
+                    "    voice: Kore",
+                    "  Speaker3:",
+                    "    voice: Charon",
+                ]
+            ),
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        count_error = next(
+            (item for item in data["errors"] if item["code"] == "SPEAKER_COUNT_INVALID"), None
+        )
+        assert count_error is not None
+        assert count_error["actual"] == 3
+        assert count_error["limit"] == 2
+
+    def test_gemini_dialogue_exactly_two_speakers_passes(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is True
+        assert data["speaker_voice_map"] == {"Speaker1": "Puck", "Speaker2": "Kore"}
+        assert not any(item["code"] == "SPEAKER_COUNT_INVALID" for item in data["errors"])
+
+    def test_gemini_dialogue_duplicate_voice_reports_error(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            speakers="\n".join(
+                [
+                    "  Speaker1:",
+                    "    voice: Puck",
+                    "  Speaker2:",
+                    "    voice: Puck",
+                ]
+            ),
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        duplicate_error = next(
+            (item for item in data["errors"] if item["code"] == "DUPLICATE_SPEAKER_VOICE"), None
+        )
+        assert duplicate_error is not None
+        assert duplicate_error["actual"] == "Puck"
+
+    def test_gemini_dialogue_invalid_alias_regression(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            speakers="\n".join(
+                [
+                    "  Speaker One:",
+                    "    voice: Puck",
+                    "  Speaker2:",
+                    "    voice: Kore",
+                ]
+            ),
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        assert any(item["code"] == "INVALID_SPEAKER_ALIAS" for item in data["errors"])
+
+    def test_gemini_dialogue_invalid_voice_regression(self, tmp_path):
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            speakers="\n".join(
+                [
+                    "  Speaker1:",
+                    "    voice: Puck",
+                    "  Speaker2:",
+                    "    voice: ghost",
+                ]
+            ),
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        assert any(item["code"] == "INVALID_VOICE" for item in data["errors"])
+
+    def test_gemini_dialogue_style_prompt_over_limit_fails(self, tmp_path):
+        from voiceover_pipeline.gemini_dialogue import STYLE_PROMPT_MAX_BYTES
+
+        long_vibe = "длинное направление для стиля подкаста. " * (STYLE_PROMPT_MAX_BYTES // 40 + 1)
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            extra_meta=f"vibe: >\n  {long_vibe}",
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        style_error = next(
+            (item for item in data["errors"] if item["code"] == "STYLE_PROMPT_TOO_LARGE"), None
+        )
+        assert style_error is not None
+        assert style_error["actual"] > STYLE_PROMPT_MAX_BYTES
+        assert style_error["limit"] == STYLE_PROMPT_MAX_BYTES
+
+    def test_gemini_dialogue_style_prompt_near_limit_passes(self, tmp_path):
+        from voiceover_pipeline.gemini_dialogue import STYLE_PROMPT_MAX_BYTES
+
+        unit = "спокойный подкаст. "
+        unit_bytes = len(unit.encode("utf-8"))
+        repeats = STYLE_PROMPT_MAX_BYTES // unit_bytes - 30
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем.",
+            extra_meta=f"vibe: >\n  {unit * repeats}",
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is True
+        style_bytes = len(data["style_prompt"].encode("utf-8"))
+        assert style_bytes <= STYLE_PROMPT_MAX_BYTES
+        assert style_bytes > STYLE_PROMPT_MAX_BYTES - 2000
+
+    def test_gemini_dialogue_chunk_exceeds_hard_limit(self, tmp_path):
+        long_text = "очень длинный текст " * 330
+        script = write_gemini_dialogue(
+            tmp_path,
+            "Speaker1: Короткий первый чанк.\n******\nSpeaker2: " + long_text,
+        )
+        code, data = cli_json(
+            "validate", "--script", str(script), "--format", "gemini-dialogue", "--json"
+        )
+        assert code == 0
+        assert data["valid"] is False
+        hard_errors = [
+            item for item in data["errors"] if item["code"] == "CHUNK_EXCEEDS_HARD_LIMIT"
+        ]
+        assert hard_errors
+        assert hard_errors[0]["chunk"] == 2
+        assert hard_errors[0]["limit"] == 4000
+
+
+def test_gemini_dialogue_conflicting_top_level_voice_fails_before_generation(tmp_path):
+    script = write_gemini_dialogue(
+        tmp_path,
+        "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
+    )
+    code, data = cli_json(
+        "generate",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "voice-conflict",
+        "--voice",
+        "Kore",
+        "--json",
+    )
+    assert code == 2
+    assert data["status"] == "error"
+    assert data["code"] == 2
+    assert "conflict" in data["error"]
+    assert not (tmp_path / "out" / "voice-conflict").exists()
 
 
 def write_voiceover_script(tmp_path, meta_lines, body="Первый чанк.\n******\nВторой чанк."):

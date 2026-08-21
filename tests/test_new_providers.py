@@ -1,3 +1,4 @@
+import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -385,6 +386,117 @@ class TestPromptModeResolution:
     def test_unknown_provider_model_resolves_to_none(self):
         mode = resolve_prompt_mode("polza-tts", "elevenlabs/some-model")
         assert mode == TTS_PROMPT_MODE_NONE
+
+
+class TestGeminiMultiSpeakerRequestShape:
+    def _write_validated_dialogue(self, tmp_path):
+        from voiceover_pipeline.gemini_dialogue import validate_gemini_dialogue_file
+
+        script = tmp_path / "podcast.md"
+        script.write_text(
+            "\n".join(
+                [
+                    "---",
+                    "format: gemini-dialogue",
+                    "language: ru",
+                    "model: google/gemini-3.1-flash-tts-preview",
+                    "speakers:",
+                    "  Host:",
+                    "    display_name: Ведущая",
+                    "    voice: Kore",
+                    "    profile: warm host",
+                    "  Guest:",
+                    "    display_name: Гость",
+                    "    voice: Puck",
+                    "    profile: calm expert",
+                    "vibe: >",
+                    "  Russian technical podcast. Natural question-and-answer conversation.",
+                    "allowed_tags:",
+                    "  - warmly",
+                    "  - curious",
+                    "max_chunk_bytes: 3500",
+                    "---",
+                    "Host: [warmly] Что умеет утилита?",
+                    "Guest: Она создаёт озвучку и субтитры.",
+                    "******",
+                    "Host: [curious] Можно работать локально?",
+                    "Guest: Да, для одноголосой озвучки есть OmniVoice.",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        report = validate_gemini_dialogue_file(script)
+        assert report["valid"] is True
+        return report
+
+    def _request_body(self, tmp_path, report):
+        from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio-gemini"
+        mock_response.headers = {"X-Generation-Id": "gen-gemini-multi"}
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
+            provider = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice=next(iter(report["speaker_voice_map"].values())),
+                style_prompt=report["style_prompt"],
+                speaker_voice_map=report["speaker_voice_map"],
+            )
+            provider.synthesize_chunk(
+                "Host: Что умеет утилита?\nGuest: Она создаёт озвучку.", "chunk_01"
+            )
+        return mock_post.call_args[1]["json"]
+
+    def test_request_has_exactly_two_speaker_configs(self, tmp_path):
+        report = self._write_validated_dialogue(tmp_path)
+        body = self._request_body(tmp_path, report)
+        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
+        assert len(configs) == 2
+
+    def test_speaker_names_match_validated_aliases(self, tmp_path):
+        report = self._write_validated_dialogue(tmp_path)
+        body = self._request_body(tmp_path, report)
+        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
+        assert {config["speaker"] for config in configs} == set(report["speaker_voice_map"])
+
+    def test_voice_names_match_validated_map(self, tmp_path):
+        report = self._write_validated_dialogue(tmp_path)
+        body = self._request_body(tmp_path, report)
+        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
+        for config in configs:
+            assert (
+                config["voice_config"]["prebuilt_voice_config"]["voice_name"]
+                == report["speaker_voice_map"][config["speaker"]]
+            )
+
+    def test_top_level_compatibility_voice_equals_first_validated_voice(self, tmp_path):
+        report = self._write_validated_dialogue(tmp_path)
+        body = self._request_body(tmp_path, report)
+        first_voice = next(iter(report["speaker_voice_map"].values()))
+        assert body["voice"] == first_voice
+
+    def test_no_third_speaker_or_raw_frontmatter_in_request(self, tmp_path):
+        report = self._write_validated_dialogue(tmp_path)
+        body = self._request_body(tmp_path, report)
+        assert len(body["multi_speaker_voice_config"]["speaker_voice_configs"]) == 2
+        serialized = json.dumps(body, ensure_ascii=False)
+        assert "max_chunk_bytes" not in serialized
+        assert "allowed_tags" not in serialized
+        assert "vibe" not in serialized
+        assert "display_name" not in serialized
+
+    def test_single_speaker_map_is_rejected_at_validation(self, tmp_path):
+        from voiceover_pipeline.gemini_dialogue import validate_speakers
+
+        errors: list[dict] = []
+        validate_speakers({"Host": "Kore"}, errors)
+        codes = [item["code"] for item in errors]
+        assert "SPEAKER_COUNT_INVALID" in codes
+        assert "DUPLICATE_SPEAKER_VOICE" not in codes
 
 
 class TestBuildRequestBody:

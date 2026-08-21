@@ -362,6 +362,277 @@ def test_resume_rejects_changed_voice_identity(tmp_path, monkeypatch):
     assert error.value.code == 30
 
 
+def _write_dialogue_fixture(tmp_path):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.gemini_dialogue import validate_gemini_dialogue_file
+
+    script = tmp_path / "podcast.md"
+    script.write_text(
+        "\n".join(
+            [
+                "---",
+                "format: gemini-dialogue",
+                "language: ru",
+                "model: google/gemini-3.1-flash-tts-preview",
+                "speakers:",
+                "  Host:",
+                "    display_name: Ведущая",
+                "    voice: Kore",
+                "    profile: warm host",
+                "  Guest:",
+                "    display_name: Гость",
+                "    voice: Puck",
+                "    profile: calm expert",
+                "vibe: >",
+                "  Russian technical podcast. Natural question-and-answer conversation.",
+                "allowed_tags:",
+                "  - warmly",
+                "  - curious",
+                "max_chunk_bytes: 3500",
+                "---",
+                "Host: [warmly] Что умеет утилита?",
+                "Guest: Она создаёт озвучку и субтитры.",
+                "******",
+                "Host: [curious] Можно работать локально?",
+                "Guest: Да, для одноголосой озвучки есть OmniVoice.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    report = validate_gemini_dialogue_file(script)
+    assert report["valid"] is True
+    return script, report, cli.gemini_chunks_from_validation(report)
+
+
+def make_dialogue_args(tmp_path, script, speaker_voice_map, run_id="dialogue-run", resume=False):
+    return argparse.Namespace(
+        provider="openrouter-tts",
+        model="google/gemini-3.1-flash-tts-preview",
+        voice=next(iter(speaker_voice_map.values())),
+        script=script,
+        output_dir=tmp_path / "out",
+        run_id=run_id,
+        format="gemini-dialogue",
+        limit_chunks=None,
+        retries=3,
+        retry_delay=0,
+        retry_max_delay=0,
+        no_retry=False,
+        no_trim=True,
+        json_output=True,
+        json_events=False,
+        resume=resume,
+        with_timings=False,
+        speaker_voice_map=speaker_voice_map,
+    )
+
+
+def _dialogue_state(paths, args, chunks, style_prompt, identity):
+    from voiceover_pipeline.run_state import initial_state
+
+    return initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="gemini-dialogue",
+        run_id=args.run_id,
+        voice_identity=identity,
+    )
+
+
+def test_dialogue_resume_same_cast_skips_completed_chunks(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.models import ChunkArtifact
+    from voiceover_pipeline.run_state import atomic_write_json, upsert_completed_chunk
+
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    style_prompt = report["style_prompt"]
+    prompt_mode = "native"
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+    identity = cli._gemini_dialogue_identity(args, style_prompt, prompt_mode)
+    assert identity is not None
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    (paths.chunks_dir / "chunk_01.mp3").write_bytes(b"existing")
+    state = _dialogue_state(paths, args, chunks, style_prompt, identity)
+    upsert_completed_chunk(
+        state,
+        artifact=ChunkArtifact(
+            number=1,
+            id="chunk_01",
+            file="chunk_01.mp3",
+            duration_ms=1000,
+            duration_sec=1.0,
+            start_ms=0,
+            end_ms=1000,
+            text_characters=len(chunks[0].text),
+            transcript=None,
+            client_path="fake",
+            generation_id="old-gen",
+        ),
+        model=args.model,
+        voice=args.voice,
+        text=chunks[0].text,
+    )
+    atomic_write_json(paths.output_root / "run_state.json", state)
+    provider = FakeProvider()
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, style_prompt, "native"
+        )
+
+    assert exit_info.value.code == 0
+    assert provider.calls == ["chunk_02"]
+    final_state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+    assert final_state["voice_identity"] == identity
+
+
+def test_dialogue_resume_rejects_changed_speaker_voice(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import atomic_write_json
+
+    patch_generation_io(monkeypatch)
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    style_prompt = report["style_prompt"]
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+    identity = cli._gemini_dialogue_identity(args, style_prompt, "native")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    state = _dialogue_state(paths, args, chunks, style_prompt, identity)
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    changed_map = dict(report["speaker_voice_map"])
+    changed_map["Guest"] = "Charon"
+    changed_args = make_dialogue_args(
+        tmp_path, script, changed_map, run_id="dialogue-run", resume=True
+    )
+
+    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+        cli._generate_step(
+            changed_args,
+            FakeProvider(),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "key",
+            None,
+            paths,
+            style_prompt,
+            "native",
+        )
+
+    assert error.value.code == 30
+
+
+def test_dialogue_resume_rejects_changed_model(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import atomic_write_json
+
+    patch_generation_io(monkeypatch)
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    style_prompt = report["style_prompt"]
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+    identity = cli._gemini_dialogue_identity(args, style_prompt, "native")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    state = _dialogue_state(paths, args, chunks, style_prompt, identity)
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    changed_args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+    changed_args.model = "google/gemini-3.1-flash-tts-preview-2"
+
+    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+        cli._generate_step(
+            changed_args,
+            FakeProvider(),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "none",
+            None,
+            paths,
+            style_prompt,
+            "native",
+        )
+
+    assert error.value.code == 30
+
+
+def test_dialogue_resume_rejects_changed_style_prompt(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import atomic_write_json
+
+    patch_generation_io(monkeypatch)
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    style_prompt = report["style_prompt"]
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+    identity = cli._gemini_dialogue_identity(args, style_prompt, "native")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    state = _dialogue_state(paths, args, chunks, style_prompt, identity)
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    changed_style = style_prompt + " Тон должен быть другим."
+    changed_args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+
+    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+        cli._generate_step(
+            changed_args,
+            FakeProvider(),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "none",
+            None,
+            paths,
+            changed_style,
+            "native",
+        )
+
+    assert error.value.code == 30
+
+
+def test_dialogue_resume_old_state_without_identity_fails_closed(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import atomic_write_json
+
+    patch_generation_io(monkeypatch)
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    style_prompt = report["style_prompt"]
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    state = _dialogue_state(paths, args, chunks, style_prompt, None)
+    assert "voice_identity" not in state
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    with pytest.raises(cli.CliError, match="predates dialogue identity") as error:
+        cli._generate_step(
+            args,
+            FakeProvider(),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "none",
+            None,
+            paths,
+            style_prompt,
+            "native",
+        )
+
+    assert error.value.code == 30
+
+
 def test_overwrite_refuses_to_delete_existing_paid_chunks_without_confirmation(tmp_path):
     run_dir = tmp_path / "out" / "paid-run"
     chunks_dir = run_dir / "chunks"
