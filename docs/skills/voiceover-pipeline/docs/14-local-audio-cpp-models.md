@@ -93,7 +93,10 @@ Qwen `audio.cpp` route использует отдельный Forced Aligner. N
 
 OmniVoice — локальный TTS через `audio.cpp` (модель `audio-cpp/omnivoice-q8_0`).
 В 0.6.0 — **один голос на прогон**: двухголосый диалог локально не
-поддерживается; для двух спикеров используй платный `gemini-dialogue`.
+поддерживается. Платный `gemini-dialogue` двухголосым тоже пока НЕ является
+(2026-08-22): OpenRouter игнорирует `multi_speaker_voice_config`; двухголосый
+результат ожидается после фикса по плану
+`docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`.
 
 | Режим | Флаги | Голос |
 |---|---|---|

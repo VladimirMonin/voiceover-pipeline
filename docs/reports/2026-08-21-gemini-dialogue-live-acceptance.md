@@ -2,8 +2,14 @@
 
 Date: 2026-08-21
 
-Status: PASS по всем автоматическим проверкам; один открытый пункт —
-аудируемость голосов (требуется прослушивание человеком).
+> **Status: FAILED/BLOCKED — 0.6.0 must not be tagged/published until two
+> distinct voices are proven audibly.**
+>
+> Обновлено 2026-08-22 после прослушивания: audible cast assignment FAILED.
+> OpenRouter проигнорировал недокументированное поле
+> `multi_speaker_voice_config` и синтезировал весь диалог с одним голосом —
+> женским `Kore` — для обоих спикеров. Транспорт и генерация аудио PASS;
+> план фикса: [docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](../plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).
 
 Scope: одобренный платный live-прогон двухспикерного сценария
 `gemini-dialogue` через OpenRouter: генерация, resume без смены каста,
@@ -50,14 +56,14 @@ Scope: одобренный платный live-прогон двухспике�
 | 1 | Оффлайн-валидация сценария | PASS | exit 0, valid=true, chunks=2, пустые errors/warnings |
 | 2 | Doctor: обязательные проверки | PASS | required_ok=true, workflow_ok=true; CUDA — optional-предупреждение |
 | 3 | Платная генерация | PASS | exit 0, run_id `smoke-20260821-225042`, длительность 14.16 s (подтверждено ffprobe) |
-| 4 | Назначение голосов спикерам | PASS | `speaker_voice_map` + стилевой промпт переданы по каждому запросу (request path) |
-| 5 | Отсутствие подмены ролей | PASS | Host→Kore, Guest→Puck во всех запросах, без свапа |
+| 4 | Назначение голосов спикерам | PASS (transport) | `speaker_voice_map` + стилевой промпт переданы по каждому запросу (request path) |
+| 5 | Отсутствие подмены ролей | PASS (transport) | Host→Kore, Guest→Puck во всех запросах, без свапа |
 | 6 | MP3 и манифесты существуют | PASS | full + 2 чанка MP3, run/manifest/chunks/run_state JSON — хеши ниже |
 | 7 | `--json` — один объект | PASS | во всех трёх прогонах (validate / generate / resume) |
 | 8 | Resume без смены каста | PASS | exit 0, resume_detected completed=2, chunk_skipped_resume ×2, без provider-вызовов; хеши артефактов идентичны |
 | 9 | Resume после смены каста | PASS | exit 30, `{"status":"error","error":"Cannot resume: voice identity changed.","code":30}`; log `resume_rejected reason=voice_identity_mismatch`; платный запрос не выполнялся |
 | 10 | Секреты в логах/артефактах | PASS | regex-скан всех текстовых артефактов чист: нет ключей и ссылок на `.env` |
-| 11 | Аудируемость голосов | OPEN | требует прослушивания человеком — единственный открытый пункт перед финальным release-заявлением |
+| 11 | Аудируемость голосов (прослушивание) | **FAIL** | пользователь услышал один женский голос (`Kore`) для обоих спикеров; OpenRouter игнорирует `multi_speaker_voice_config` и применяет один top-level `voice` |
 
 Дополнительно зафиксировано:
 
@@ -89,14 +95,23 @@ Scope: одобренный платный live-прогон двухспике�
 
 ## Открытые пункты
 
-- Аудируемость голосов: оба голоса корректно назначены по request path,
-  но факт слышимости и качества требует человеческого прослушивания. До
-  этого финальный release-claim по качеству аудио не заявляется.
+- Аудируемость голосов: **FAILED** — пользователь прослушал результат и
+  услышал один женский голос (`Kore`) для обоих спикеров. Причина:
+  OpenRouter `/api/v1/audio/speech` поддерживает только один top-level
+  `voice` на запрос; поле `multi_speaker_voice_config` не документировано,
+  провайдер его игнорирует. Транспорт (два запроса, карта голосов, resume
+  identity) работал, но audible cast assignment не произошёл.
 
 ## Заключение
 
-Live-приёмка Gemini dialogue пройдена: платная генерация успешна,
-resume без смены каста работает без регенерации, resume после смены каста
-отклоняется до платного запроса, секреты не обнаружены. Единственный
-открытый пункт — аудируемость голосов (прослушивание человеком) — отмечен
-выше и должен быть закрыт до финального release-заявления.
+**Итоговый статус: FAILED/BLOCKED.** Транспорт и генерация аудио прошли
+(PASS): платная генерация успешна (run_id `smoke-20260821-225042`, 2 чанка,
+14.16 s, USD 0.007142), resume без смены каста не регенерирует, resume после
+смены каста отклоняется до платного запроса, секреты не обнаружены. Но
+**audible cast assignment FAILED**: пользователь услышал один женский голос
+(Kore) для обоих спикеров, поскольку OpenRouter игнорирует недокументированный
+`multi_speaker_voice_config`. Два различных голоса не доказаны на слух, поэтому
+0.6.0 **не должен быть tagged/published** до тех пор, пока не будет
+прослушана и принята по audibility двухголосая версия. План фикса (по одному
+запросу на реплику с одним документированным top-level `voice`):
+[docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](../plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).

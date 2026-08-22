@@ -207,9 +207,30 @@ fallback к container нет. Полный pinned receipt и ограничен�
 
 ## Gemini Dialogue (machine-facing)
 
-`format: gemini-dialogue` — двухголосый диалог через OpenRouter Gemini TTS.
-Этот раздел фиксирует машинный контракт; режиссура и prompting живут в
-skill tree (`docs/skills/voiceover-pipeline/`).
+`format: gemini-dialogue` — двухголосый диалог. Каноническое имя формата
+идёт вперёд: **`dialogue`** (provider-independent); `gemini-dialogue`
+сохраняется как compatibility alias, идентичный по плану. State/manifests
+пишут `format: dialogue`. Режиссура и prompting живут в skill tree
+(`docs/skills/voiceover-pipeline/`).
+
+### Статус: BROKEN, не заявлять как рабочий
+
+- OpenRouter `/api/v1/audio/speech` поддерживает **один голос на запрос**
+  (одно top-level `voice`); поле `multi_speaker_voice_config` не
+  документировано, провайдер его игнорирует.
+- Live-приёмка 2026-08-21 отмечена **FAILED/BLOCKED** (2026-08-22): весь
+  диалог озвучен одним голосом `Kore`; audible cast assignment не
+  произошёл. См. `docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md`.
+- Гибридный payload (top-level `voice` + `multi_speaker_voice_config`)
+  **rejected/blocked**: как только фикс внедрён, такой запрос отклоняется
+  до provider-вызова. Это не рабочий transport.
+- Исполнение планируется как **turn-by-turn**: один запрос на реплику (turn)
+  с одним документированным top-level `voice` (`model`, `input`, `voice`,
+  `response_format`). Фикс по плану:
+  `docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`.
+- Двухголосый результат **недоступен**, пока фикс не внедрён и человек не
+  прослушал и не подтвердил два различных голоса. Не обещать два голоса и
+  не использовать `multi_speaker_voice_config`.
 
 ### Frontmatter schema
 
@@ -249,6 +270,9 @@ max_chunk_bytes: 3500
   до создания провайдера.
 - `--speaker-voice <Alias>=<Voice>` (repeat) переопределяет голос спикера;
   после overrides действуют те же правила (ровно два, различны, из allowlist).
+- **Недокументированный `multi_speaker_voice_config` в payload не
+  отправляется и не поддерживается.** Один запрос — одна реплика (turn) —
+  один top-level документированный `voice` (в рамках плана turn-by-turn).
 
 ### JSON и exit codes
 
@@ -274,11 +298,13 @@ max_chunk_bytes: 3500
 
 ### Артефакты
 
-- `chunks.json`: `script_format: "gemini-dialogue"` и `speaker_voice_map`
-  (алиас → голос).
+- `chunks.json`: `script_format` (`dialogue` / alias `gemini-dialogue`) и
+  `speaker_voice_map` (алиас → голос).
 - `run_state.json`: `voice_identity` (диалоговый hash) и `script_format`.
 - Текущее ограничение: per-turn WAV и per-turn timing metadata не
   производятся; чанк — это смысловой блок диалога, а не отдельная реплика.
+- Планируется per-turn артефакты и новый resume-identity `synthesis_identity`
+  (по `docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`).
 
 ## `generate --json` (output)
 

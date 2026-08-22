@@ -180,46 +180,33 @@ Style prompt не добавляется. Пайплайн конвертиру�
 
 ## Multi-speaker (Gemini dialogue)
 
-Для `format: gemini-dialogue` к телу запроса добавляется
-`multi_speaker_voice_config` с ровно двумя `speaker_voice_configs`:
+**OpenRouter `/api/v1/audio/speech` поддерживает только ОДИН голос на запрос
+(одно top-level поле `voice`).** Поле `multi_speaker_voice_config` НЕ
+является частью этого endpoint и НЕ поддерживается — OpenRouter игнорирует
+его и синтезирует весь input одним голосом. Подтверждено live-прослушиванием
+2026-08-22 (см. `docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md`):
+весь диалог был озвучен одним женским голосом `Kore`.
 
-```
-POST https://openrouter.ai/api/v1/audio/speech
-{
-  "model": "google/gemini-3.1-flash-tts-preview",
-  "input": "<текст чанка диалога>",
-  "prompt": "<style prompt>",
-  "voice": "<голос первого спикера>",
-  "response_format": "pcm",
-  "multi_speaker_voice_config": {
-    "speaker_voice_configs": [
-      {
-        "speaker": "Host",
-        "voice_config": {"prebuilt_voice_config": {"voice_name": "Kore"}}
-      },
-      {
-        "speaker": "Guest",
-        "voice_config": {"prebuilt_voice_config": {"voice_name": "Puck"}}
-      }
-    ]
-  }
-}
-```
+Гибридный payload (top-level `voice` + `multi_speaker_voice_config`) больше
+не используется и не должен документироваться как рабочий. Двухголосый
+`gemini-dialogue` сейчас BROKEN и перерабатывается; НЕ заявляй, что он
+работает. План: один запрос на реплику (turn) с одним документированным
+top-level `voice`; запланировано в
+[docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).
+Два голоса недоступны, пока фикс не внедрён и человек не прослушал результат.
 
-- `speaker` совпадает с алиасом из frontmatter; `voice_name` — из
-  `GEMINI_TTS_VOICES`.
-- Top-level `voice` остаётся обязательным полем запроса и равен голосу
-  первого спикера (совместимость, не третий голос).
-- Имя спикера в конфигурации должно совпадать с именем спикера в тексте
-  диалога.
+Нативный multi-speaker существует только в прямом Gemini API
+(`generation_config.speech_config` с двумя `{speaker, voice}`), но не через
+OpenRouter.
 
 ### Граница доказательств
 
-- **Offline/mocked contract proof:** сериализация запроса покрыта mocked
-  тестами (ровно два `speaker_voice_configs`, имена и голоса совпадают с
-  валидированной картой). Это не доказывает приёмку провайдером.
-- **Live provider acceptance:** требует отдельного явно одобренного платного
-  smoke-прогона; до него multi-speaker приёмка не заявлена.
+- **Offline/mocked contract proof:** сериализация гибридного payload
+  покрывалась mocked тестами, но это не доказывало, что провайдер применяет
+  два голоса; live-прослуш показал, что провайдер игнорирует
+  `multi_speaker_voice_config`.
+- **Live provider acceptance:** аудируемость двух голосов ещё не принята
+  (2026-08-22) — live-приёмка отмечена FAILED/BLOCKED.
 - **Volatile facts:** доступность модели, цены и точная схема запроса могут
   меняться у провайдера; не переноси цены/доступность из исторических
   примеров в новые обещания.

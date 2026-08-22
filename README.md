@@ -4,7 +4,8 @@ Standalone CLI для генерации озвучки + Whisper timing из Ma
 
 Четыре TTS-провайдера: Polza GPT Audio, Polza TTS, OpenRouter TTS, Qwen3-TTS (GPU).
 Плюс локальный OmniVoice (auto / voice-bank preset / clone / design) и
-двухголосый `gemini-dialogue` подкаст через OpenRouter Gemini TTS.
+формат `gemini-dialogue` для двухспикерного подкаста через OpenRouter Gemini TTS
+(двухголосый результат перерабатывается — см. статус ниже).
 Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
 Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
 Сценарии могут быть plain Markdown или Markdown с frontmatter metadata для provider/model/voice.
@@ -83,6 +84,17 @@ max_chunk_chars: 2000
 Для Gemini 3.1 Flash TTS podcasts доступен `format: gemini-dialogue` с двумя
 спикерами, voice map и inline tags вроде `[laughs]`, `[serious]`, `[short pause]`.
 
+> **Статус (2026-08-22): двухголосый диалог через OpenRouter BROKEN и
+> перерабатывается.** OpenRouter `/api/v1/audio/speech` поддерживает один
+> голос на запрос; недокументированное поле `multi_speaker_voice_config`
+> игнорируется, и live-прослушивание подтвердило один женский голос для
+> обоих спикеров. Два различных голоса недоступны, пока не внедрён план
+> turn-by-turn (один запрос на реплику с одним документированным `voice`)
+> и человек не подтвердил аудируемость:
+> [docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).
+> Live-приёмка отмечена FAILED/BLOCKED:
+> [docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md](docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md).
+
 ### Agent-first podcast (два спикера)
 
 ```powershell
@@ -99,6 +111,13 @@ voiceover generate --script "podcast.md" --run-id "podcast-prod" --json --resume
 Provider/model/каст/направление берутся из frontmatter скрипта. Resume
 защищён каноническим identity: смена голоса/модели/style prompt отклоняется
 (exit 30) до платного запроса.
+
+> **Недоступно до фикса (2026-08-22):** текущий `gemini-dialogue` прогон не
+> производит двух различных голосов — OpenRouter игнорирует
+> `multi_speaker_voice_config`. Не запускать платный двухголосый прогон,
+> пока фикс
+> ([docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md))
+> не внедрён, и не заявлять двухголосый результат.
 
 ### Gemini prompting quick guide
 

@@ -2,6 +2,12 @@
 
 ## 0.6.0
 
+> **0.6.0 held — live acceptance of two-voice dialogue FAILED (OpenRouter
+> applies a single voice); fix in progress per plan 2026-08-22
+> (`docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`).**
+> 0.6.0 must not be tagged/published until two distinct voices are proven
+> audibly.
+
 ### OmniVoice Local Voice Bank
 
 - Added `--voice-provider omnivoice-local` with four local modes: `auto` (default preset), bank preset (named OmniVoice voices), `clone` (voice from a reference audio), and `design` (build a synthetic voice from properties).
@@ -94,7 +100,7 @@
 ### Gemini Dialogue
 
 - Added `format: gemini-dialogue` for OpenRouter Gemini 3.1 Flash TTS with two speakers, per-speaker Gemini voices, shared style prompt, and inline emotion tags.
-- Added OpenRouter Gemini multi-speaker payload support with `multi_speaker_voice_config` while preserving OpenRouter's required top-level `voice` field.
+- Added OpenRouter Gemini multi-speaker payload support with `multi_speaker_voice_config` while preserving OpenRouter's required top-level `voice` field. *(Note 2026-08-22: this payload never worked — OpenRouter ignores `multi_speaker_voice_config` and applies a single voice; the 0.6.0 two-voice release is held.)*
 - Added strict UTF-8 byte validation for Gemini dialogue chunks to catch oversized final chunks before paid generation.
 
 ### Tests

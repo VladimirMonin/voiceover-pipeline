@@ -1,6 +1,14 @@
 # Agent-first release plan: Gemini dialogue and OmniVoice workflows (0.6.0)
 
-> **Status:** approved for planning; implementation has not started.
+> **Status:** SUPERSEDED on 2026-08-22. The assumed OpenRouter
+> `multi_speaker_voice_config` request shape was never supported — OpenRouter
+> `/api/v1/audio/speech` applies a single top-level `voice` (live listening
+> confirmed one female voice for both speakers; live acceptance marked
+> FAILED/BLOCKED). See the replacement plan
+> [2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).
+> This document is retained for history only; do not implement from it.
+>
+> **Status (original):** approved for planning; implementation has not started.
 > This plan targets the smallest safe `0.6.0` release for agent users.
 > It does not authorize a paid provider call, package publication, release tag,
 > or registry upload. Those operations require separate approval at their gates.
@@ -12,15 +20,19 @@ Python orchestration scripts.
 
 The repository already has a first-class two-speaker path:
 
-- script format: `gemini-dialogue`;
+- script format: `gemini-dialogue` (canonical `dialogue` going forward);
 - provider: `openrouter-tts`;
 - model: `google/gemini-3.1-flash-tts-preview` through OpenRouter;
-- request shape: Gemini `multi_speaker_voice_config`;
+- request shape: ~~Gemini `multi_speaker_voice_config`~~ — **invalid; see
+  SUPERSEDED note above; the fix plan moves to one request per turn with a
+  single documented top-level `voice`**;
 - output: normal resumable VOP artifacts.
 
 Official Google GenAI types require exactly two `SpeakerVoiceConfig` entries.
 The speaker name in the configuration must match the speaker name used in the
 prompt. This matches the product shape already present in the repository.
+*(Superseded: this applies to the direct Gemini API only, not to OpenRouter;
+see the SUPERSEDED note above.)*
 
 The agent is the script author. A separate LLM-in-the-CLI feature for turning a
 topic into a podcast is not required: when the user asks for a complete podcast,
@@ -135,7 +147,7 @@ The following product seams already exist and should be extended, not replaced:
 |---|---|
 | Gemini dialogue parsing and validation | `src/voiceover_pipeline/gemini_dialogue.py` |
 | CLI format/provider wiring | `src/voiceover_pipeline/cli.py` |
-| OpenRouter multi-speaker request | `src/voiceover_pipeline/providers/openrouter_tts.py` |
+| OpenRouter multi-speaker request | `src/voiceover_pipeline/providers/openrouter_tts.py` (hybrid payload to be removed per fix plan) |
 | Resume state | `src/voiceover_pipeline/run_state.py` |
 | Artifact manifests | `src/voiceover_pipeline/artifacts.py` |
 | Gemini validation tests | `tests/test_cli_validation.py` |
@@ -153,9 +165,9 @@ The following product seams already exist and should be extended, not replaced:
 
 | ID | Problem | Why it blocks an agent-first release | Minimum resolution |
 |---|---|---|---|
-| GD-01 | Validator accepts one speaker and only rejects more than two | Official Gemini multi-speaker config requires exactly two entries | Require exactly two aliases |
+| GD-01 | Validator accepts one speaker and only rejects more than two | ~~Official Gemini multi-speaker config requires exactly two entries~~ (superseded — OpenRouter supports one voice; see fix plan) | Require exactly two aliases |
 | GD-02 | Two aliases may select the same voice | Product promises two distinct speakers | Require two distinct valid Gemini voices |
-| GD-03 | Explicit top-level `--voice` can conflict with the cast | OpenRouter still needs a top-level voice, but it is compatibility metadata, not a third cast decision | Derive it from the first mapped speaker; reject a conflicting explicit value |
+| GD-03 | Explicit top-level `--voice` can conflict with the cast | OpenRouter still needs a top-level voice, but it is compatibility metadata, not a third cast decision | Derive it from the first mapped speaker; reject a conflicting explicit value (fix plan: per-turn top-level `voice`) |
 | GD-04 | Resume identity does not include cast, model, or style | A resumed paid run can mix audio generated with different voices or direction | Persist and compare a canonical dialogue identity |
 | GD-05 | Some dialogue errors/diagnostics can pollute stdout | Agents require one parseable JSON object | Standard JSON error envelope; diagnostics to stderr |
 | GD-06 | Main agent workflow does not route podcast requests to the existing dialogue path | Agents may bypass VOP and write helper scripts | Add the canonical branch and command |
@@ -164,7 +176,7 @@ The following product seams already exist and should be extended, not replaced:
 | GD-09 | Skill source exists but was not registered in the current agent session | Correct instructions cannot trigger if unavailable | Document and verify installation through the agent platform's existing skill mechanism |
 | GD-10 | Version metadata disagrees (`pyproject.toml` 0.5.1, package `__version__` 0.1.0) | Release and diagnostics report inconsistent versions | Align all version surfaces at 0.6.0 |
 | GD-11 | Skill recommends a destructive standalone timings sequence | An agent can delete an existing generated run with `--overwrite` | Prefer `generate --with-timings`; otherwise require a different run/output location |
-| GD-12 | Multi-speaker behavior has request-shape tests but no durable live acceptance | Serialization alone does not prove the provider accepts the payload | One short approved paid smoke before the release claim |
+| GD-12 | Multi-speaker behavior has request-shape tests but no durable live acceptance | Serialization alone does not prove the provider accepts the payload | One short approved paid smoke before the release claim — **smoke FAILED (one voice), see fix plan** |
 
 ## Wave 0: execution preflight and code intelligence
 
@@ -290,6 +302,7 @@ contract during implementation. It is defined once and tested at the boundary.
 - Two aliases with two valid voices pass.
 - A conflicting explicit `--voice` fails before provider construction.
 - A valid cast produces the existing OpenRouter multi-speaker payload.
+  *(Superseded — the hybrid payload is invalid; see SUPERSEDED note.)*
 
 ## Wave 2: cast-safe resume and machine-safe JSON
 
@@ -381,7 +394,9 @@ Add deterministic cases for:
 
 ### `tests/test_new_providers.py`
 
-Retain the request-shape regression and assert:
+Retain the request-shape regression and assert (superseded: these assertions
+described the invalid hybrid payload; the fix plan asserts instead that
+`multi_speaker_voice_config` is absent and one turn = one documented voice):
 
 - exactly two `speaker_voice_configs` entries;
 - speaker names match the dialogue aliases;
@@ -415,7 +430,7 @@ Add one test that exercises:
 1. Frontmatter auto-detection.
 2. Dialogue validation.
 3. OpenRouter provider construction.
-4. Multi-speaker payload serialization.
+4. ~~Multi-speaker payload serialization~~ (superseded — invalid hybrid payload; see SUPERSEDED note).
 5. Fake audio response conversion.
 6. `chunks.json` with `script_format` and `speaker_voice_map`.
 7. `run_state.json` with dialogue identity.
@@ -688,7 +703,7 @@ successful implementation push does not authorize a tag or registry publish.
 Stop and report rather than expanding scope when:
 
 - required code-intelligence tools are unavailable;
-- the exact OpenRouter multi-speaker schema cannot be confirmed;
+- the exact OpenRouter multi-speaker schema cannot be confirmed; *(confirmed: it does not exist — single top-level `voice` only; see SUPERSEDED note)*
 - dialogue resume cannot be made cast-safe without a state migration larger
   than this release;
 - machine JSON cannot remain one-object compatible;
@@ -706,7 +721,9 @@ Stop and report rather than expanding scope when:
 - Any count other than two fails before provider construction.
 - Duplicate voice assignment fails before provider construction.
 - A conflicting top-level voice fails before provider construction.
-- The OpenRouter request contains exactly two speaker configs.
+- The OpenRouter request contains exactly two speaker configs. (Superseded —
+  see SUPERSEDED note; the fix plan instead requires `voice=[A,B,A]` with no
+  `multi_speaker_voice_config`.)
 - Dialogue identity covers model, cast, style direction, and prompt mode.
 - Resume rejects cast/model/style changes before a paid call.
 - `--json` produces one object for success and failure.
