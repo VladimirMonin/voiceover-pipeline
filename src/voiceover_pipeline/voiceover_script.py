@@ -268,7 +268,7 @@ def default_voice(provider: str, model: str) -> str:
 
 
 def supports_style_prompt(provider: str, model: str) -> bool:
-    return provider == "openrouter-tts" and model.startswith("google/")
+    return False
 
 
 def split_body_chunks(body: str, body_start_line: int, delimiter: str) -> list[dict[str, Any]]:

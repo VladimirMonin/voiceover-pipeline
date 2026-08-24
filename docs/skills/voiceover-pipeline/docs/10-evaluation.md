@@ -163,18 +163,18 @@
 
 ### Кейс 10: Gemini with documented OpenRouter speech payload
 
-**Контекст:** пользователь хочет Gemini TTS с expressive prompt.
+**Контекст:** пользователь хочет Gemini TTS через OpenRouter без посторонней речи.
 
 **Ожидание:**
-- Gemini использует prefix prompt mode: style prompt входит в `input`
-- `--style-prompt-file` читает prompt из файла
-- `--no-style-prompt` отправляет исходный `input` без префикса
+- `input` byte-equals текущему произносимому тексту
+- style/profile/vibe/labels/соседний turn не входят в request
+- OpenRouter dialogue требует явный per-turn ASR quality provider до concat
 - request body содержит `model`, `input`, `voice`, `response_format="pcm"`; ответ — raw audio
 
 **Assertions:**
 1. В request body нет недокументированного `prompt`; `response_format="pcm"` присутствует
-2. `--style-prompt-file` корректно читает файл
-3. `--no-style-prompt` убирает стилевой префикс из `input`
+2. Явный `--style-prompt` отклоняется до платного запроса
+3. Вставка соседней реплики и повтор последней дают exit `60` до concat
 4. Пустой, JSON/data URI/SSE ответ отклоняется без повторного платного запроса
 
 ## Заметки качественного обзора

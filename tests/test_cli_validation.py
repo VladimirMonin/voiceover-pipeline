@@ -928,7 +928,7 @@ class TestVoiceoverMetadataValidation:
         code, data = cli_json("validate", "--script", str(script), "--json")
         assert code == 0
         assert data["valid"] is True
-        assert data["warnings"] == []
+        assert [warning["code"] for warning in data["warnings"]] == ["STYLE_PROMPT_IGNORED"]
         assert (
             data["effective_config"]["style_prompt"]
             == "Speak as a calm technical podcast narrator."

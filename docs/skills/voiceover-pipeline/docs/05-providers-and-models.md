@@ -121,7 +121,7 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 | Модель | ID | Цена/мин | Style prompt | Голоса |
 |---|---|---|---|---|
-| Gemini TTS | `google/gemini-3.1-flash-tts-preview` | **~$0.030** | Да | Google (30) |
+| Gemini TTS | `google/gemini-3.1-flash-tts-preview` | **~$0.030** | Нет | Google (30) |
 
 ### Голоса Gemini TTS (30 имён)
 
@@ -129,32 +129,14 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 `Puck`, `Charon`, `Fenrir`, `Orus`, `Aoede`, `Kore`, `Zephyr`, `Leda`, `Callirrhoe`, `Autonoe`, `Enceladus`, `Iapetus`, `Umbriel`, `Algieba`, `Despina`, `Erinome`, `Algenib`, `Rasalgethi`, `Laomedeia`, `Achernar`, `Alnilam`, `Schedar`, `Gacrux`, `Pulcherrima`, `Achird`, `Zubenelgenubi`, `Vindemiatrix`, `Sadachbia`, `Sadaltager`, `Sulafat`.
 
-### Style prompt (Gemini)
+### Verbatim input (Gemini)
 
-Управление подачей через `--style-prompt`. Для Gemini 3.1 Flash TTS через
-OpenRouter prompt добавляется префиксом к `input`; отдельное поле `prompt` этот
-model-specific `/audio/speech` endpoint не документирует.
+OpenRouter `/audio/speech` получает только точный произносимый текст текущей
+реплики. `style_prompt`, `vibe`, speaker `profile`, labels и соседние реплики
+не добавляются к `input`; отдельное поле `prompt` также не отправляется.
+Подача выбирается только top-level полем `voice`. CLI отклоняет явные
+`--style-prompt` и `--style-prompt-file` до платного запроса.
 
-```powershell
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --style-prompt "Энергичный голос ведущего: громкий, быстрый, чёткий."
-
-# Prompt из файла (удобно для длинных промптов)
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --style-prompt-file "prompts/expressive.txt"
-
-# Без prompt (чистый TTS)
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --no-style-prompt
-```
-
-Дефолт: «Голос технического подкаста: спокойный, вдумчивый, живой и уверенный.»
 OpenRouter делает ровно один платный synthesis-запрос на turn; автоматического
 generation retry или fallback-запроса с другим prompt нет.
 
@@ -162,6 +144,8 @@ generation retry или fallback-запроса с другим prompt нет.
 
 - Gemini-запрос содержит `model`, `input`, `voice`, `response_format="pcm"`;
   ответ — raw audio body. JSON, data URI, base64 field и SSE отклоняются.
+- OpenRouter dialogue требует явный `--tts-quality-provider`: каждый turn
+  транскрибируется и строго сверяется до final concat; receipt не хранит текст.
 - Отсутствующий в текущем speech-каталоге model ID отклоняется до billing.
 - `openai/gpt-audio-mini` и `openai/gpt-audio` используют chat-audio контракт,
   а не `/audio/speech`, поэтому не добавляются как ложная замена.

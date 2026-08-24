@@ -65,7 +65,7 @@ voiceover generate --with-timings        ← TTS + Whisper
 - `elevenlabs/*` → `POST /api/v1/media` (async task → poll `GET /media/{id}` → download URL)
 
 **OpenRouter TTS** — текущий speech-каталог поддерживает Gemini:
-- Gemini: style_prompt работает, голоса Google (30 имён)
+- Gemini: `input` строго verbatim, подача выбирается только голосом Google (30 имён)
 - исторический OpenAI Mini TTS ID больше не допускается до запроса
 
 ## Семь протестированных моделей

@@ -81,7 +81,7 @@ TTS_PROMPT_MODE_PREFIX = "prefix"
 TTS_PROMPT_MODE_NATIVE = "native"
 
 PROMPTABLE_TTS_MODELS: dict[str, str] = {
-    "google/gemini-3.1-flash-tts-preview": "prefix",
+    "google/gemini-3.1-flash-tts-preview": "none",
 }
 
 POLZA_PROMPTABLE_TTS_MODELS: dict[str, str] = {}

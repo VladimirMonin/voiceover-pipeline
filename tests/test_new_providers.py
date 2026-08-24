@@ -196,7 +196,7 @@ class TestOpenRouterTTSProviderOpenAI:
         json_body = mock_post.call_args[1]["json"]
         assert json_body == {
             "model": "google/gemini-3.1-flash-tts-preview",
-            "input": "podcast narration style\n\nHello gemini",
+            "input": "Hello gemini",
             "voice": "Puck",
             "response_format": "pcm",
         }
@@ -251,7 +251,7 @@ class TestOpenRouterTTSProviderOpenAI:
 
 
 class TestGeminiExplicitPromptModes:
-    def test_prefix_mode_falls_back_to_old_concatenation(self):
+    def test_prefix_mode_cannot_change_openrouter_synthesis_input(self):
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.content = b"fake-audio"
@@ -270,11 +270,17 @@ class TestGeminiExplicitPromptModes:
             p.synthesize_chunk("Hello", "chunk_01")
 
         json_body = mock_post.call_args[1]["json"]
-        assert json_body["input"] == "podcast style\n\nHello"
+        assert json_body["input"] == "Hello"
         assert "prompt" not in json_body
 
-    def test_native_explicit_mode_fails_before_billing(self):
-        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post") as mock_post:
+    def test_native_explicit_mode_cannot_add_prompt_field(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-audio"
+        mock_response.headers = {"X-Generation-Id": "gen-native"}
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -282,10 +288,14 @@ class TestGeminiExplicitPromptModes:
                 style_prompt="podcast style",
                 prompt_mode="native",
             )
-            with pytest.raises(ValueError, match="does not document a separate prompt field"):
-                p.synthesize_chunk("Hello", "chunk_01")
+            p.synthesize_chunk("Hello", "chunk_01")
 
-        mock_post.assert_not_called()
+        assert mock_post.call_args.kwargs["json"] == {
+            "model": "google/gemini-3.1-flash-tts-preview",
+            "input": "Hello",
+            "voice": "Puck",
+            "response_format": "pcm",
+        }
 
     def test_none_mode_sends_no_prompt_field(self):
         mock_response = MagicMock()
@@ -325,9 +335,9 @@ class TestUnknownGoogleModelFallback:
 
 
 class TestPromptModeResolution:
-    def test_gemini_flash_tts_resolves_to_prefix(self):
+    def test_gemini_flash_tts_resolves_to_none(self):
         mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
-        assert mode == TTS_PROMPT_MODE_PREFIX
+        assert mode == TTS_PROMPT_MODE_NONE
 
     def test_unknown_google_resolves_to_native(self):
         mode = resolve_prompt_mode("openrouter-tts", "google/gemini-2.5-pro-tts")

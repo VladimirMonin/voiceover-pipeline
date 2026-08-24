@@ -511,6 +511,46 @@ def test_dialogue_resume_same_cast_skips_completed_chunks(tmp_path, monkeypatch)
     assert final_state["synthesis_identity"] == identity
 
 
+def test_dialogue_quality_failure_prevents_final_concat(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"])
+    args.tts_quality_provider = "fixture-asr"
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+
+    def fail_quality(*_args, **_kwargs):
+        raise cli.CliError("quality gate failed", 60)
+
+    monkeypatch.setattr(cli, "_verify_dialogue_turns_before_concat", fail_quality)
+
+    def unexpected_concat(*_args, **_kwargs):
+        raise AssertionError("final concat must not run after quality failure")
+
+    monkeypatch.setattr(cli, "concat_dialogue_turns", unexpected_concat)
+
+    with pytest.raises(cli.CliError, match="quality gate failed") as error:
+        cli._generate_step(
+            args,
+            FakeProvider(),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "key",
+            None,
+            paths,
+            None,
+            "none",
+        )
+
+    assert error.value.code == 60
+    assert not paths.full_mp3.exists()
+
+
 def test_dialogue_resume_rejects_changed_speaker_voice(tmp_path, monkeypatch):
     import voiceover_pipeline.cli as cli
     from voiceover_pipeline.artifacts import build_run_paths

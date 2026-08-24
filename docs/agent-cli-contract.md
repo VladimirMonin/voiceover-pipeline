@@ -138,6 +138,11 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
 
 Приоритет: `--no-style-prompt` > `--style-prompt-file` > `--style-prompt` > дефолт из config.py.
 
+Для `openrouter-tts` style prompt не является synthesis capability:
+`input` всегда равен точному произносимому тексту, `prompt_mode=none`, отдельного
+`prompt` нет. Явные `--style-prompt`/`--style-prompt-file` отклоняются до billing;
+frontmatter `style_prompt` получает `STYLE_PROMPT_IGNORED`.
+
 Для `qwen-local` используется отдельный `--qwen-instruct`. Он передаётся в
 `generate_custom_voice(..., instruct=...)` только для текущего прогона. Если
 флаг не указан, сохраняется прежний дефолт `QWEN_INSTRUCT` из `config.py`.
@@ -298,7 +303,8 @@ State/manifests всегда пишут `format: dialogue`. Режиссура �
   документировано и никогда не отправляется.
 - Исполнение `turn-by-turn-v1`: один request на реплику, с одним
   документированным `voice` и только `model`, `input`, `voice`,
-  `response_format`. `Alias:` не входит в spoken text.
+  `response_format`. `input` byte-equals текущему turn text; `Alias:`, vibe,
+  profiles, cast map и соседние turns отсутствуют.
 - Для OmniVoice admission/runtime происходит один раз; turn вызывает bound
   bank profile. Два разных profile ID с одинаковым `reference_sha256`
   отклоняются до native call.
@@ -332,8 +338,9 @@ max_chunk_bytes: 3500
   различными.
 - `allowed_tags` — опционально; по умолчанию полный safe-tag set.
 - `max_chunk_bytes` — опционально; default `3500`, hard limit `4000`.
-- `vibe` + speaker `profile` собираются в style prompt; его UTF-8 размер
-  ограничен `4000` байт (`STYLE_PROMPT_TOO_LARGE`).
+- `vibe` + speaker `profile` остаются validation/planning metadata с лимитом
+  `4000` UTF-8 bytes (`STYLE_PROMPT_TOO_LARGE`), но OpenRouter synthesis input
+  не меняют.
 
 ### Ограничения
 
@@ -361,7 +368,8 @@ max_chunk_bytes: 3500
   `{"status": "error", "error": "<первая ошибка>", "code": 2, "details": <отчёт>}`,
   exit `2`, до провайдера и платного запроса.
 - `--json` + `--json-events` — несовместимы, отклоняются (exit `2`).
-- Fallback-диагностика style prompt (OpenRouter) пишется в stderr, не в stdout.
+- OpenRouter dialogue без явного `--tts-quality-provider` отклоняется exit `2`
+  до платного запроса.
 
 ### Resume identity
 
@@ -380,8 +388,11 @@ orphan dialogue MP3 без trusted state, fail closed.
   `audio_sha256`, `start_ms`, `end_ms`, `pause_after_ms`, speaker/voice и
   доступный fingerprint. Transcript, reference paths/text и voice-bank private
   data отсутствуют.
-- `run_state.json` хранит тот же trusted receipt без private dialogue text.
-  Final concat использует turn files строго в плане и после speech trim
+- `tts_quality.json` и поле `tts_quality` manifest хранят per-turn audio/text
+  hashes, counts, strict similarity/repetition metrics и ASR identity без
+  transcript/expected text. FAIL сохраняет receipt и даёт exit `60` до concat.
+- `run_state.json` хранит trusted synthesis receipt без private dialogue text.
+  Final concat использует только quality-PASS turn files строго в плане и после speech trim
   материализует локальную PCM тишину: 250/600/0 ms.
 
 ## `generate --json` (output)

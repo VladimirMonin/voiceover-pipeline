@@ -155,12 +155,12 @@ Failed to synthesize turn_0001: OpenRouter TTS request failed with HTTP 502.
 ```
 
 OpenRouter generation не ретраится автоматически: один turn делает ровно один
-платный запрос. Исправьте prompt/voice или продолжите подтверждённый partial run
+платный запрос. Проверьте verbatim text/voice или продолжите подтверждённый partial run
 через `--resume`; уже сохранённые turns повторно не генерируются.
 
 ## Unsupported prompt mode
 
 Если модель не поддерживает выбранный `prompt_mode`, пайплайн использует model-aware режим:
 - `openai/*` → `none` (prompt игнорируется)
-- текущий OpenRouter Gemini TTS → `prefix` (prompt включается в `input`)
+- текущий OpenRouter Gemini TTS → `none` (`input` строго равен произносимому тексту)
 - остальные → `none`

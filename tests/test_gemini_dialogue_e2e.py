@@ -56,6 +56,18 @@ def _patch_generation_io(monkeypatch):
     )
     monkeypatch.setattr(cli, "attach_costs", lambda *args, **kwargs: args[-1])
     monkeypatch.setattr(cli, "fetch_pricing_snapshot", lambda _provider, _api_key, _model: None)
+    monkeypatch.setattr(cli, "_preflight_tts_quality_provider", lambda _args: None)
+    monkeypatch.setattr(
+        cli,
+        "_verify_dialogue_turns_before_concat",
+        lambda *_args, **_kwargs: {
+            "artifact_type": "voiceover-dialogue-tts-quality-receipt",
+            "status": "success",
+            "passed": True,
+            "turns": [],
+            "human_listening_required": True,
+        },
+    )
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
 
@@ -83,6 +95,8 @@ def test_gemini_dialogue_e2e_mocked_generation(tmp_path, monkeypatch, capsys):
             str(tmp_path / "out"),
             "--run-id",
             "e2e-dialogue",
+            "--tts-quality-provider",
+            "fixture-asr",
             "--json",
         ],
     )
@@ -118,7 +132,7 @@ def test_gemini_dialogue_e2e_mocked_generation(tmp_path, monkeypatch, capsys):
     ):
         assert body["model"] == "google/gemini-3.1-flash-tts-preview"
         assert body["voice"] == voice
-        assert body["input"].endswith(f"\n\n{text}")
+        assert body["input"] == text
         assert set(body) == {"model", "input", "voice", "response_format"}
         assert body["response_format"] == "pcm"
         assert "multi_speaker_voice_config" not in body
@@ -180,6 +194,8 @@ def test_openrouter_dialogue_failure_makes_one_request_and_stops(
         str(tmp_path / "out"),
         "--run-id",
         "failed-dialogue",
+        "--tts-quality-provider",
+        "fixture-asr",
         "--json",
     ]
     if no_retry:

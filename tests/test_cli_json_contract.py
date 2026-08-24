@@ -352,11 +352,11 @@ def test_direct_cost_kwargs_none_for_other_providers():
     assert _direct_cost_kwargs("polza-chat-audio", result) == {}
 
 
-def test_gemini_prompt_mode_in_manifest_is_prefix():
+def test_gemini_prompt_mode_in_manifest_is_none():
     from voiceover_pipeline.tts_prompting import resolve_prompt_mode
 
     mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
-    assert mode == "prefix"
+    assert mode == "none"
 
 
 def test_qwen_instruct_flag_reaches_local_provider():

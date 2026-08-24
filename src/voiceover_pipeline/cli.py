@@ -387,6 +387,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Include word-level timestamps (faster-whisper + groq-whisper; openrouter-whisper ignores with a warning).",
     )
 
+    quality = gen.add_argument_group("Dialogue TTS quality gate")
+    quality.add_argument(
+        "--tts-quality-provider",
+        default=None,
+        help="Explicit ASR provider used to verify every dialogue turn before concat.",
+    )
+    quality.add_argument("--tts-quality-model", default=None)
+    quality.add_argument("--tts-quality-language", default=None)
+    quality.add_argument("--tts-quality-device", default=DEFAULT_ASR_DEVICE)
+    quality.add_argument("--tts-quality-compute", default=DEFAULT_ASR_COMPUTE)
+    quality.add_argument(
+        "--tts-quality-runtime", choices=["auto", "python", "audio-cpp"], default="auto"
+    )
+
     # --------------- split ---------------
     spl = subparsers.add_parser("split", help="Print chunk ids and character counts.")
     spl.add_argument("--script", type=Path, default=_find_default_script())
@@ -742,6 +756,8 @@ def _validate_omnivoice_voice_bank(args: argparse.Namespace) -> VoiceBankCatalog
 
 
 def _resolve_provider_style_prompt(args: argparse.Namespace) -> str | None:
+    if getattr(args, "provider", None) == "openrouter-tts":
+        return None
     if getattr(args, "provider", None) == "omnivoice-local":
         return None
     if getattr(args, "provider", None) == "qwen-local":
@@ -1029,6 +1045,15 @@ def generate(args: argparse.Namespace) -> None:
     _resolve_qwen_mode_identity(args)
     _validate_model_for_provider(args.provider, args.model)
     _validate_omnivoice_options(args)
+    if args.provider == "openrouter-tts" and (
+        getattr(args, "style_prompt", None) is not None
+        or getattr(args, "style_prompt_file", None) is not None
+    ):
+        fail(
+            "OpenRouter /audio/speech does not support style prompts in synthesis input; "
+            "remove --style-prompt/--style-prompt-file and select delivery with --voice only.",
+            _EXIT_ARGS,
+        )
     if not is_dialogue_format(script_format):
         try:
             chunks = prepare_local_tts_chunks(chunks, args.provider, args.model)
@@ -1094,6 +1119,20 @@ def generate(args: argparse.Namespace) -> None:
             }
         )
 
+    if (
+        is_dialogue_format(script_format)
+        and args.provider == "openrouter-tts"
+        and not getattr(args, "tts_quality_provider", None)
+    ):
+        fail(
+            "OpenRouter dialogue requires --tts-quality-provider so every paid turn is "
+            "transcribed and checked before concat.",
+            _EXIT_ARGS,
+        )
+
+    if is_dialogue_format(script_format) and getattr(args, "tts_quality_provider", None):
+        _preflight_tts_quality_provider(args)
+
     if getattr(args, "with_timings", False):
         _preflight_timing_dependency(
             getattr(args, "timing_provider", "faster-whisper"),
@@ -1141,6 +1180,7 @@ def generate(args: argparse.Namespace) -> None:
     style_prompt = _resolve_provider_style_prompt(args)
     if (
         gemini_report
+        and args.provider != "openrouter-tts"
         and not args.no_style_prompt
         and args.style_prompt is None
         and args.style_prompt_file is None
@@ -1492,6 +1532,12 @@ def _generate_step(
         args.provider, chunk_artifacts
     )
 
+    tts_quality_receipt = (
+        _verify_dialogue_turns_before_concat(args, chunks, chunk_artifacts, paths)
+        if dialogue_run
+        else None
+    )
+
     chunks_manifest = build_chunks_manifest(
         provider=args.provider,
         model=args.model,
@@ -1512,6 +1558,7 @@ def _generate_step(
         script_format=getattr(args, "format", "markdown"),
         speaker_voice_map=getattr(args, "speaker_voice_map", None) or None,
         execution_source=state.get("execution_source"),
+        tts_quality_receipt=tts_quality_receipt,
     )
     try:
         write_json(paths.chunks_json, chunks_manifest)
@@ -1879,6 +1926,135 @@ def verify_tts_cmd(args: argparse.Namespace) -> None:
     else:
         print("TTS quality PASS" if quality.passed else "TTS quality FAIL")
     sys.exit(_EXIT_OK if quality.passed else _EXIT_QUALITY)
+
+
+def _preflight_tts_quality_provider(args: argparse.Namespace) -> None:
+    """Validate the selected ASR route before any paid dialogue request."""
+    provider_id = args.tts_quality_provider
+    if provider_id == "xai-stt":
+        read_xai_key()
+        return
+    try:
+        spec = get_asr_provider_spec(provider_id)
+    except ASRProviderNotFoundError as exc:
+        fail(str(exc), _EXIT_ARGS)
+    health = spec.dependency_probe()
+    if not health.available:
+        fail(health.remediation, _EXIT_MISSING_DEP)
+
+
+def _transcribe_dialogue_quality_audio(
+    args: argparse.Namespace, audio_path: Path
+) -> tuple[str, str, str | None, str, str | None]:
+    """Return transcript plus content-free ASR identity for a quality check."""
+    provider_id = args.tts_quality_provider
+    if provider_id == "xai-stt":
+        from .providers.xai_stt import XAISttProvider
+
+        provider = XAISttProvider(model=args.tts_quality_model or "grok-stt")
+        timing = provider.transcribe(
+            audio_path=audio_path,
+            language=args.tts_quality_language or "ru",
+            word_timestamps=False,
+            quiet=True,
+        )
+        transcript = " ".join(segment.text for segment in timing.segments).strip()
+        return transcript, provider_id, provider.model, "cloud-api", None
+
+    transcribe_args = argparse.Namespace(
+        audio=audio_path,
+        provider=provider_id,
+        model=getattr(args, "tts_quality_model", None),
+        language=getattr(args, "tts_quality_language", None),
+        device=getattr(args, "tts_quality_device", DEFAULT_ASR_DEVICE),
+        compute=getattr(args, "tts_quality_compute", DEFAULT_ASR_COMPUTE),
+        runtime=getattr(args, "tts_quality_runtime", "auto"),
+        context=None,
+        context_file=None,
+        word_timestamps=False,
+    )
+    result, _ = _transcribe_result(transcribe_args)
+    return (
+        result.transcript,
+        result.provider_id,
+        result.model_id,
+        result.execution.runtime,
+        result.execution.model_revision,
+    )
+
+
+def _verify_dialogue_turns_before_concat(
+    args: argparse.Namespace,
+    chunks: list[ScriptChunk],
+    chunk_artifacts: list[ChunkArtifact],
+    paths,
+) -> dict[str, Any] | None:
+    """Transcribe and strictly verify every dialogue turn before final concat."""
+    provider_id = getattr(args, "tts_quality_provider", None)
+    if provider_id is None:
+        return None
+
+    artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
+    receipt_path = paths.output_root / "tts_quality.json"
+    aggregate: dict[str, Any] = {
+        "artifact_type": "voiceover-dialogue-tts-quality-receipt",
+        "status": "running",
+        "passed": False,
+        "provider": provider_id,
+        "model": getattr(args, "tts_quality_model", None),
+        "turn_count": len(chunks),
+        "turns": [],
+        "human_listening_required": True,
+    }
+    atomic_write_json(receipt_path, aggregate)
+
+    for chunk in chunks:
+        artifact = artifacts_by_number.get(chunk.number)
+        if artifact is None:
+            aggregate["status"] = "quality_failed"
+            aggregate["failure_reason"] = "missing_turn_artifact"
+            atomic_write_json(receipt_path, aggregate)
+            fail(
+                f"Dialogue TTS quality gate failed: turn {chunk.number} has no audio artifact.",
+                _EXIT_QUALITY,
+                details=aggregate,
+            )
+        audio_path = paths.chunks_dir / artifact.file
+        transcript, asr_provider, asr_model, asr_runtime, asr_revision = (
+            _transcribe_dialogue_quality_audio(args, audio_path)
+        )
+        quality = evaluate_tts_transcript(
+            expected_text=chunk.text,
+            actual_transcript=transcript,
+            minimum_similarity=1.0,
+            maximum_missing_ratio=0.0,
+            maximum_unexpected_ratio=0.0,
+            maximum_repeated_ngram_excess=0,
+        )
+        turn_receipt = quality.public_receipt(
+            audio_sha256=_sha256_file(audio_path),
+            asr_provider=asr_provider,
+            asr_model=asr_model,
+            asr_runtime=asr_runtime,
+            asr_model_revision=asr_revision,
+        )
+        turn_receipt["turn_index"] = chunk.number
+        aggregate["turns"].append(turn_receipt)
+        if not quality.passed:
+            aggregate["status"] = "quality_failed"
+            aggregate["failed_turn"] = chunk.number
+            atomic_write_json(receipt_path, aggregate)
+            fail(
+                f"Dialogue TTS quality gate failed for turn {chunk.number}; final concat was not created.",
+                _EXIT_QUALITY,
+                details=aggregate,
+            )
+        atomic_write_json(receipt_path, aggregate)
+
+    aggregate["status"] = "success"
+    aggregate["passed"] = True
+    atomic_write_json(receipt_path, aggregate)
+    return aggregate
 
 
 def run_timings(args: argparse.Namespace) -> None:

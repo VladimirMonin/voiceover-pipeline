@@ -65,6 +65,7 @@ def build_chunks_manifest(
     script_format: str = "markdown",
     speaker_voice_map: dict[str, str] | None = None,
     execution_source: dict[str, Any] | None = None,
+    tts_quality_receipt: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     total_duration_ms = chunk_artifacts[-1].end_ms if chunk_artifacts else 0
     return drop_none(
@@ -78,6 +79,7 @@ def build_chunks_manifest(
             "script_format": script_format,
             "speaker_voice_map": speaker_voice_map,
             "execution_source": execution_source,
+            "tts_quality": tts_quality_receipt,
             "format": "mp3",
             "script": str(script.resolve()),
             "chunks_dir": str(chunks_dir),

@@ -67,44 +67,14 @@
 > - [openrouter-gemini-tts-chunk-01.ogg](openrouter-gemini-tts-chunk-01.ogg) — Gemini, голос `Puck`, ~$0.030/мин
 > - [openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg](openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg) — исторический GPT-4o Mini TTS smoke; модель больше не предлагается текущим speech-каталогом
 
-## Style prompt (Gemini)
+## Verbatim input (Gemini)
 
-Gemini поддерживает стилевое управление через текст запроса. Для актуального
-OpenRouter `/audio/speech` style prompt добавляется префиксом к `input`: отдельное
-поле `prompt` этим model-specific endpoint не документировано.
-
-```powershell
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --voice "Kore" `
-  --style-prompt "Энергичный голос ведущего новостей: громкий, быстрый."
-```
-
-### Флаги для style-prompt
-
-| Флаг | Поведение |
-|---|---|
-| `--style-prompt "..."` | Строка из CLI |
-| `--style-prompt-file path.txt` | Читать prompt из файла |
-| `--no-style-prompt` | Отключить prompt (чистый TTS) |
-| (ничего) | Дефолтный prompt из config.py |
-
-### Prompt mode
-
-- **Prefix** (Gemini по умолчанию): style prompt и текст объединяются в `input`.
-- **None**: отправляется только исходный текст.
-- **Native**: для Gemini 3.1 Flash TTS через OpenRouter отклоняется до запроса,
-  потому что отдельное поле `prompt` отсутствует в официальном примере endpoint.
+Для актуального OpenRouter `/audio/speech` поле `input` равно только точному
+произносимому тексту. Style prompt, profile, vibe, speaker labels и соседние
+реплики не отправляются ни префиксом, ни отдельным полем. Подача выбирается
+top-level `voice`; явные `--style-prompt`/`--style-prompt-file` отклоняются.
 
 Gemini 3.1 Flash TTS поддерживает inline audio tags: `[whispers]`, `[laughs]`, `[excited]` и другие.
-
-**Дефолтный style prompt (только Gemini):**
-
-```text
-Голос технического подкаста: спокойный, вдумчивый, живой и уверенный.
-Тёплый мужской тембр, средний темп, ясная артикуляция, без театральности.
-```
 
 ## Запуск
 

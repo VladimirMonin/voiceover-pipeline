@@ -116,7 +116,9 @@ compatibility alias, но planner, manifest и run state используют т
 
 > OpenRouter поддерживает один top-level `voice` на запрос. Диалоговый
 > маршрут делает один запрос на реплику с голосом её alias, не отправляет
-> `multi_speaker_voice_config` и не озвучивает `Alias:`.
+> `multi_speaker_voice_config` и не озвучивает `Alias:`. Поле `input` равно
+> точному тексту текущей реплики: `vibe`, profiles, labels и соседние turns
+> никогда не отправляются модели.
 
 ```markdown
 ---
@@ -183,6 +185,8 @@ voiceover generate `
   --format dialogue `
   --script "script.md" `
   --run-id "podcast-prod" `
+  --tts-quality-provider xai-stt `
+  --tts-quality-language ru `
   --json `
   --resume
 ```
@@ -220,7 +224,8 @@ max_chunk_chars: 2000
 - `model` — модель выбранного провайдера.
 - `voice` — голос, если провайдер его поддерживает.
 - `fallback_voice` — только для `polza-chat-audio`.
-- `style_prompt` или `prompt` — работает для OpenRouter Gemini TTS, для остальных режимов валидатор даст warning.
+- `style_prompt` или `prompt` — не поддерживается OpenRouter `/audio/speech`;
+  валидатор возвращает `STYLE_PROMPT_IGNORED`, а generate не отправляет его модели.
 - `max_chunk_chars` — настроенный лимит символов на чанк; для `omnivoice-local` с его штатной моделью валидатор показывает локальный лимит 420, если CLI-лимит не задан.
 
 JSON-отчёт также содержит `spoken_text` с политикой raw digits и информационной статистикой состава текста: количеством Latin-символов и Latin-слов, смешанных по алфавиту слов, всех букв и долей Latin. Для OmniVoice raw digits блокируют валидацию; для остальных маршрутов это warning.

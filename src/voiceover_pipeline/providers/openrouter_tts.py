@@ -3,8 +3,6 @@ import requests
 from voiceover_pipeline.config import (
     OPENROUTER_BASE_URL,
     OPENROUTER_TTS_MODELS,
-    PODCAST_NARRATION_PROMPT,
-    TTS_PROMPT_MODE_NATIVE,
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
@@ -45,7 +43,7 @@ class OpenRouterTTSProvider(TTSProvider):
         api_key: str,
         model: str,
         voice: str,
-        style_prompt: str | None = PODCAST_NARRATION_PROMPT,
+        style_prompt: str | None = None,
         prompt_mode: str = "auto",
         speaker_voice_map: dict[str, str] | None = None,
         base_url: str = OPENROUTER_BASE_URL,
@@ -60,10 +58,10 @@ class OpenRouterTTSProvider(TTSProvider):
         self.api_key = api_key
         self.model = model
         self.voice = voice
-        self.style_prompt = style_prompt
+        self.style_prompt = None
 
         self._raw_prompt_mode = prompt_mode
-        self.prompt_mode = resolve_prompt_mode(self.provider_id, model, prompt_mode)
+        self.prompt_mode = resolve_prompt_mode(self.provider_id, model, "none")
         self.base_url = base_url.rstrip("/")
         self.response_format = response_format
         self.timeout_seconds = timeout_seconds
@@ -80,18 +78,7 @@ class OpenRouterTTSProvider(TTSProvider):
         self, text: str, chunk_id: str, voice: str | None = None
     ) -> SynthesisResult:
         active_voice = voice or self.voice
-        if self._is_openai_model:
-            return self._request_audio(text=text, style_prompt=None, voice=active_voice)
-        if (
-            self._uses_documented_gemini_speech_contract
-            and self.prompt_mode == TTS_PROMPT_MODE_NATIVE
-        ):
-            raise ValueError(
-                "OpenRouter Gemini 3.1 Flash TTS does not document a separate prompt field; "
-                "use prompt_mode=auto, prefix, or none."
-            )
-
-        return self._request_audio(text=text, style_prompt=self.style_prompt, voice=active_voice)
+        return self._request_audio(text=text, style_prompt=None, voice=active_voice)
 
     def _request_audio(
         self, text: str, style_prompt: str | None, voice: str | None = None

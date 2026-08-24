@@ -76,9 +76,9 @@
 | `--max-chunk-chars` | int | `2000` | Validation limit для `voiceover` metadata scripts |
 | `--speaker-voice` | repeat | — | Override для Gemini dialogue: `Speaker1=Puck` (можно повторять, по одному на спикера) |
 | `--fallback-voice` | str | `onyx` | Запасной голос для Polza Chat Audio |
-| `--style-prompt` | str | дефолтный | Стиль подачи для TTS (OpenRouter Gemini) |
-| `--style-prompt-file` | path | — | Читать prompt из файла |
-| `--no-style-prompt` | flag | false | Отключить prompt полностью |
+| `--style-prompt` | str | — | Не поддерживается OpenRouter `/audio/speech`; явное значение отклоняется |
+| `--style-prompt-file` | path | — | Не поддерживается OpenRouter `/audio/speech`; явное значение отклоняется |
+| `--no-style-prompt` | flag | false | Совместимый no-op: OpenRouter всегда отправляет verbatim `input` |
 | `--no-trim` | flag | false | Не обрезать финальную тишину |
 | `--json` | flag | false | JSON-вывод в stdout |
 | `--json-events` | flag | false | NDJSON progress events: `chunk_started`, `chunk_saved`, `chunk_failed`, `run_complete` |
@@ -92,6 +92,12 @@
 | `--no-retry` | flag | false | Отключить retry |
 | `--limit-chunks` | int | — | Сгенерировать только первые N chunks для теста |
 | `--dry-run-cost` | flag | false | Посчитать chunks/chars без TTS-запросов |
+| `--tts-quality-provider` | str | — | ASR для строгой сверки каждого dialogue turn до concat; обязателен для OpenRouter dialogue |
+| `--tts-quality-model` | str | provider default | ASR model для quality gate |
+| `--tts-quality-language` | str | — | Явный язык ASR quality gate |
+| `--tts-quality-device` | str | `cpu` | ASR device |
+| `--tts-quality-compute` | str | `auto` | ASR compute mode |
+| `--tts-quality-runtime` | choice | `auto` | `auto`, `python`, `audio-cpp` |
 
 ### Qwen-local опции
 
