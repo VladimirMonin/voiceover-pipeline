@@ -7,6 +7,7 @@ import os
 import shutil
 import sys
 import time
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn, cast
@@ -47,6 +48,9 @@ from .config import (
     DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
     GEMINI_TTS_VOICES,
+    OMNIVOICE_DEFAULT_GUIDANCE_SCALE,
+    OMNIVOICE_DEFAULT_SEED,
+    OMNIVOICE_DEFAULT_STEPS,
     OMNIVOICE_LOCAL_MODEL_ID,
     OMNIVOICE_STYLE_CONDITION,
     OPENAI_TTS_VOICES,
@@ -65,11 +69,12 @@ from .config import (
     read_xai_key,
 )
 from .gemini_dialogue import (
+    DIALOGUE_FORMAT,
     GEMINI_DIALOGUE_FORMAT,
+    chunks_from_validation,
+    dialogue_turns_from_validation,
+    is_dialogue_format,
     validate_gemini_dialogue_file,
-)
-from .gemini_dialogue import (
-    chunks_from_validation as gemini_chunks_from_validation,
 )
 from .local_runtime.contracts import OmniVoiceRequest
 from .local_runtime.transports.audio_cpp_cli import NATIVE_AUDIO_CPP_EXECUTABLE_ENV
@@ -77,6 +82,7 @@ from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts
 from .media import (
     check_media_tools,
     concat_audio_files,
+    concat_dialogue_turns,
     concat_mp3_chunks,
     mp3_duration_ms,
     trim_final_silence,
@@ -154,6 +160,11 @@ class CliError(RuntimeError):
     def __init__(self, message: str, code: int):
         super().__init__(message)
         self.code = code
+
+
+def gemini_chunks_from_validation(report: dict[str, Any]) -> list[ScriptChunk]:
+    """Compatibility alias for callers that still inspect section chunks."""
+    return chunks_from_validation(report)
 
 
 def fail(message: str, code: int) -> NoReturn:
@@ -245,13 +256,13 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--voice", default=None)
     gen.add_argument(
         "--format",
-        choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT],
+        choices=["markdown", VOICEOVER_FORMAT, DIALOGUE_FORMAT, GEMINI_DIALOGUE_FORMAT],
         default="markdown",
     )
     gen.add_argument(
         "--max-chunk-chars",
         type=int,
-        default=2000,
+        default=None,
         help="Validation limit for voiceover metadata scripts.",
     )
     gen.add_argument(
@@ -494,7 +505,7 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument("--delimiter", default="******")
     val.add_argument(
         "--format",
-        choices=["markdown", VOICEOVER_FORMAT, GEMINI_DIALOGUE_FORMAT],
+        choices=["markdown", VOICEOVER_FORMAT, DIALOGUE_FORMAT, GEMINI_DIALOGUE_FORMAT],
         default="markdown",
     )
     val.add_argument(
@@ -519,7 +530,7 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument(
         "--agent", action="store_true", help="Include agent-oriented snippets and suggested fixes."
     )
-    val.add_argument("--max-chunk-chars", type=int, default=2000)
+    val.add_argument("--max-chunk-chars", type=int, default=None)
     val.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- list ---------------
@@ -724,7 +735,8 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
         unsupported.append("--voice")
     if getattr(args, "fallback_voice", DEFAULT_FALLBACK_VOICE) != DEFAULT_FALLBACK_VOICE:
         unsupported.append("--fallback-voice")
-    if getattr(args, "speaker_voice", []):
+    dialogue_format = is_dialogue_format(getattr(args, "format", "markdown"))
+    if getattr(args, "speaker_voice", []) and not dialogue_format:
         unsupported.append("--speaker-voice")
     if unsupported:
         fail(
@@ -750,7 +762,19 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
                 _EXIT_ARGS,
             )
         if mode == "preset":
-            _validate_omnivoice_voice_bank(args)
+            if dialogue_format:
+                voice_bank_arg = getattr(args, "voice_bank", None)
+                if voice_bank_arg is None:
+                    fail(
+                        "omnivoice-local dialogue preset mode requires --voice-bank catalog.json",
+                        _EXIT_ARGS,
+                    )
+                try:
+                    args.voice_bank_catalog = load_voice_bank(Path(voice_bank_arg))
+                except VoiceBankError as exc:
+                    fail(str(exc), _EXIT_ARGS)
+            else:
+                _validate_omnivoice_voice_bank(args)
             try:
                 OmniVoiceRequest(mode="fixed-style", style_condition=OMNIVOICE_STYLE_CONDITION)
             except ValueError as exc:
@@ -818,39 +842,53 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
         fail(str(exc), _EXIT_ARGS)
 
 
+def _resolve_script_format(script_path: Path, requested_format: str) -> str:
+    detected_format = detect_frontmatter_format(script_path)
+    script_format = requested_format
+    if (
+        detected_format is not None
+        and script_format == "markdown"
+        and (detected_format == VOICEOVER_FORMAT or is_dialogue_format(detected_format))
+    ):
+        script_format = detected_format
+    if script_format is None:
+        return "markdown"
+    return DIALOGUE_FORMAT if is_dialogue_format(script_format) else script_format
+
+
 def generate(args: argparse.Namespace) -> None:
     if getattr(args, "json_output", False) and getattr(args, "json_events", False):
         fail(
             "--json and --json-events are mutually exclusive; use one machine output mode.",
             _EXIT_ARGS,
         )
+    script_format = _resolve_script_format(args.script, args.format)
+    args.format = script_format
     _validate_omnivoice_options(args)
     try:
         ffmpeg_path, ffprobe_path = check_media_tools()
     except RuntimeError as e:
         fail(str(e), _EXIT_NO_FFMPEG)
-    detected_format = detect_frontmatter_format(args.script)
-    script_format = args.format
-    if script_format == "markdown" and detected_format in (
-        VOICEOVER_FORMAT,
-        GEMINI_DIALOGUE_FORMAT,
-    ):
-        script_format = detected_format
-    args.format = script_format
 
     gemini_report = None
     voiceover_report = None
-    if script_format == GEMINI_DIALOGUE_FORMAT:
+    if is_dialogue_format(script_format):
         args.provider = args.provider or "openrouter-tts"
         _resolve_model(args)
-        if args.provider != "openrouter-tts":
-            fail("gemini-dialogue format currently requires provider openrouter-tts.", _EXIT_ARGS)
+        allowed_voices = None
+        if args.provider == "omnivoice-local":
+            catalog = getattr(args, "voice_bank_catalog", None)
+            if catalog is None:
+                fail("omnivoice-local dialogue requires an admitted voice bank", _EXIT_ARGS)
+            allowed_voices = {profile.id for profile in catalog.profiles}
         gemini_report = validate_gemini_dialogue_file(
             args.script,
             delimiter=args.delimiter,
             model=args.model,
             speaker_voice_overrides=args.speaker_voice,
             agent=True,
+            provider=args.provider,
+            allowed_voices=allowed_voices,
         )
         if not gemini_report["valid"]:
             if args.json_output:
@@ -871,8 +909,8 @@ def generate(args: argparse.Namespace) -> None:
             for item in gemini_report["errors"]:
                 print(f"ERROR {item['code']}: {item['message']}", file=sys.stderr)
             sys.exit(_EXIT_ARGS)
-        chunks = gemini_chunks_from_validation(gemini_report)
-        if args.voice is not None:
+        chunks = dialogue_turns_from_validation(gemini_report)
+        if args.voice is not None and args.provider != "omnivoice-local":
             derived_voice = next(iter(gemini_report["speaker_voice_map"].values()))
             if args.voice != derived_voice:
                 fail(
@@ -886,7 +924,7 @@ def generate(args: argparse.Namespace) -> None:
             provider_override=args.provider,
             model_override=getattr(args, "model", None),
             voice_override=args.voice,
-            max_chunk_chars=args.max_chunk_chars if hasattr(args, "max_chunk_chars") else 2000,
+            max_chunk_chars=args.max_chunk_chars,
             agent=True,
         )
         if not voiceover_report["valid"]:
@@ -918,10 +956,11 @@ def generate(args: argparse.Namespace) -> None:
     _resolve_qwen_mode_identity(args)
     _validate_model_for_provider(args.provider, args.model)
     _validate_omnivoice_options(args)
-    try:
-        chunks = prepare_local_tts_chunks(chunks, args.provider, args.model)
-    except ValueError as exc:
-        fail(str(exc), _EXIT_ARGS)
+    if not is_dialogue_format(script_format):
+        try:
+            chunks = prepare_local_tts_chunks(chunks, args.provider, args.model)
+        except ValueError as exc:
+            fail(str(exc), _EXIT_ARGS)
     if not chunks:
         fail("Script produced no chunks. Check delimiter and content.", _EXIT_ARGS)
     original_chunk_count = len(chunks)
@@ -930,7 +969,11 @@ def generate(args: argparse.Namespace) -> None:
             fail("--limit-chunks must be greater than zero", _EXIT_ARGS)
         chunks = chunks[: args.limit_chunks]
     requested_fragment_count = len(chunks)
-    if args.provider == "omnivoice-local" and args.model == OMNIVOICE_LOCAL_MODEL_ID:
+    if (
+        args.provider == "omnivoice-local"
+        and args.model == OMNIVOICE_LOCAL_MODEL_ID
+        and not is_dialogue_format(script_format)
+    ):
         bank_profile = getattr(args, "voice_bank_profile", None)
         bank_catalog = getattr(args, "voice_bank_catalog", None)
         if getattr(args, "mode", "preset") == "preset" and bank_profile is not None:
@@ -1015,11 +1058,12 @@ def generate(args: argparse.Namespace) -> None:
     if gemini_report:
         args.speaker_voice_map = gemini_report["speaker_voice_map"]
         args.voice = requested_voice or next(iter(args.speaker_voice_map.values()))
+        if args.provider == "omnivoice-local":
+            chunks = _bind_omnivoice_dialogue_fingerprints(chunks, args.voice_bank_catalog)
     else:
         args.speaker_voice_map = {}
         args.voice = requested_voice or _default_voice(args)
 
-    api_key = read_api_key(args)
     style_prompt = _resolve_provider_style_prompt(args)
     if (
         gemini_report
@@ -1029,12 +1073,25 @@ def generate(args: argparse.Namespace) -> None:
     ):
         style_prompt = gemini_report["style_prompt"]
     prompt_mode = resolve_prompt_mode(args.provider, args.model)
-    provider = build_provider(args, api_key, style_prompt, prompt_mode)
+    _preflight_dialogue_resume(args, chunks, paths, style_prompt, prompt_mode)
+    api_key = read_api_key(args)
+    provider_for_generation: Any = build_provider(args, api_key, style_prompt, prompt_mode)
+    if args.provider == "omnivoice-local" and gemini_report:
+        catalog = args.voice_bank_catalog
+        if not isinstance(provider_for_generation, OmniVoiceLocalTTSProvider):
+            fail("omnivoice-local dialogue did not build an OmniVoice provider", _EXIT_PROVIDER)
+        providers: dict[str, OmniVoiceLocalTTSProvider] = {}
+        for voice_id in gemini_report["speaker_voice_map"].values():
+            profile, reference_path = resolve_bank_profile(catalog, voice_id)
+            providers[voice_id] = provider_for_generation.for_voice_bank_profile(
+                profile, reference_path
+            )
+        provider_for_generation = providers
     pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
 
     _generate_step(
         args,
-        provider,
+        provider_for_generation,
         ffmpeg_path,
         ffprobe_path,
         chunks,
@@ -1044,6 +1101,38 @@ def generate(args: argparse.Namespace) -> None:
         style_prompt,
         prompt_mode,
     )
+
+
+def _preflight_dialogue_resume(
+    args: argparse.Namespace,
+    chunks: list[ScriptChunk],
+    paths,
+    style_prompt: str | None,
+    prompt_mode: str,
+) -> None:
+    """Reject unsafe dialogue resumes before provider construction or pricing I/O."""
+    if not args.resume or not is_dialogue_format(getattr(args, "format", "markdown")):
+        return
+    state = load_state(paths.output_root / STATE_FILE)
+    if state is None:
+        if any(paths.chunks_dir.glob("*.mp3")):
+            fail(
+                "Cannot resume: orphan dialogue audio exists without trusted run state.",
+                _EXIT_PROVIDER,
+            )
+        return
+    if state.get("script_hash") != script_hash(chunks):
+        fail(
+            "Cannot resume: script chunks do not match the previous run_state.json.", _EXIT_PROVIDER
+        )
+    synthesis_identity = _dialogue_synthesis_identity(args, style_prompt, prompt_mode, chunks)
+    if "synthesis_identity" not in state:
+        fail(
+            "Cannot resume: run state predates dialogue synthesis identity; start a fresh run instead of mixing artifacts.",
+            _EXIT_PROVIDER,
+        )
+    if state.get("synthesis_identity") != synthesis_identity:
+        fail("Cannot resume: dialogue synthesis identity changed.", _EXIT_PROVIDER)
 
 
 def _generate_step(
@@ -1072,10 +1161,13 @@ def _generate_step(
     _emit_json_event(args, "run_started", run_id=paths.prefix, chunks=len(chunks))
 
     current_hash = script_hash(chunks)
-    current_voice_identity = _omnivoice_voice_identity(args)
-    dialogue_identity = _gemini_dialogue_identity(args, style_prompt, prompt_mode)
-    if current_voice_identity is None:
-        current_voice_identity = dialogue_identity
+    dialogue_run = is_dialogue_format(getattr(args, "format", "markdown"))
+    current_voice_identity = None if dialogue_run else _omnivoice_voice_identity(args)
+    synthesis_identity = (
+        _dialogue_synthesis_identity(args, style_prompt, prompt_mode, chunks)
+        if dialogue_run
+        else None
+    )
     state = load_state(state_path)
     if state and args.resume:
         if state.get("script_hash") != current_hash:
@@ -1084,13 +1176,17 @@ def _generate_step(
                 "Cannot resume: script chunks do not match the previous run_state.json.",
                 _EXIT_PROVIDER,
             )
-        if dialogue_identity is not None and "voice_identity" not in state:
-            logger.event("error", "resume_rejected", reason="voice_identity_missing")
-            fail(
-                "Cannot resume: run state predates dialogue identity; start a fresh run instead of mixing artifacts.",
-                _EXIT_PROVIDER,
-            )
-        if "voice_identity" in state and current_voice_identity is not None:
+        if dialogue_run:
+            if "synthesis_identity" not in state:
+                logger.event("error", "resume_rejected", reason="synthesis_identity_missing")
+                fail(
+                    "Cannot resume: run state predates dialogue synthesis identity; start a fresh run instead of mixing artifacts.",
+                    _EXIT_PROVIDER,
+                )
+            if state.get("synthesis_identity") != synthesis_identity:
+                logger.event("error", "resume_rejected", reason="synthesis_identity_mismatch")
+                fail("Cannot resume: dialogue synthesis identity changed.", _EXIT_PROVIDER)
+        elif "voice_identity" in state and current_voice_identity is not None:
             if state.get("voice_identity") != current_voice_identity:
                 logger.event("error", "resume_rejected", reason="voice_identity_mismatch")
                 fail("Cannot resume: voice identity changed.", _EXIT_PROVIDER)
@@ -1107,6 +1203,7 @@ def _generate_step(
             run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
             voice_identity=current_voice_identity,
+            synthesis_identity=synthesis_identity,
         )
     elif args.resume:
         state = initial_state(
@@ -1119,11 +1216,20 @@ def _generate_step(
             run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
             voice_identity=current_voice_identity,
+            synthesis_identity=synthesis_identity,
         )
-        _recover_existing_chunks(
-            state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice
-        )
-        logger.event("info", "resume_recovered", completed=state.get("completed_count", 0))
+        if dialogue_run:
+            if any(paths.chunks_dir.glob("*.mp3")):
+                logger.event("error", "resume_rejected", reason="orphan_dialogue_audio")
+                fail(
+                    "Cannot resume: orphan dialogue audio exists without trusted run state.",
+                    _EXIT_PROVIDER,
+                )
+        else:
+            _recover_existing_chunks(
+                state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice
+            )
+            logger.event("info", "resume_recovered", completed=state.get("completed_count", 0))
     else:
         state = initial_state(
             provider=args.provider,
@@ -1135,6 +1241,7 @@ def _generate_step(
             run_id=paths.prefix,
             limited_to_chunks=getattr(args, "limit_chunks", None),
             voice_identity=current_voice_identity,
+            synthesis_identity=synthesis_identity,
         )
     atomic_write_json(state_path, state)
 
@@ -1144,6 +1251,8 @@ def _generate_step(
     chunk_artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
     completed = completed_numbers(state)
     total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
+    if dialogue_run and chunk_artifacts:
+        total_duration_ms += chunk_artifacts[-1].pause_after_ms
     retry_policy = RetryPolicy(
         attempts=args.retries,
         delay_seconds=args.retry_delay,
@@ -1154,6 +1263,18 @@ def _generate_step(
     for chunk in chunks:
         output_path = paths.chunks_dir / f"{chunk.id}.mp3"
         if chunk.number in completed and output_path.exists():
+            if dialogue_run:
+                completed_artifact = chunk_artifacts_by_number.get(chunk.number)
+                if (
+                    completed_artifact is None
+                    or completed_artifact.audio_sha256 is None
+                    or completed_artifact.audio_sha256 != _sha256_file(output_path)
+                ):
+                    logger.event("error", "resume_rejected", reason="dialogue_audio_hash_mismatch")
+                    fail(
+                        "Cannot resume: dialogue audio does not match the trusted run state.",
+                        _EXIT_PROVIDER,
+                    )
             logger.event(
                 "info",
                 "chunk_skipped_resume",
@@ -1172,9 +1293,22 @@ def _generate_step(
         )
         _emit_json_event(args, "chunk_started", chunk=chunk.number, id=chunk.id)
 
+        def synthesize_current_chunk():
+            selected_provider: Any = provider
+            if isinstance(provider, dict):
+                selected_provider = provider[chunk.voice]
+            if not isinstance(selected_provider, OpenRouterTTSProvider):
+                return selected_provider.synthesize_chunk(chunk.text, chunk.id)
+            try:
+                return selected_provider.synthesize_chunk(chunk.text, chunk.id, voice=chunk.voice)
+            except TypeError as error:
+                if "unexpected keyword argument 'voice'" not in str(error):
+                    raise
+                return selected_provider.synthesize_chunk(chunk.text, chunk.id)
+
         try:
             result = run_with_retry(
-                lambda: provider.synthesize_chunk(chunk.text, chunk.id),
+                synthesize_current_chunk,
                 policy=retry_policy,
                 on_retry=lambda attempt, error, delay: _log_retry(
                     logger, args, chunk, attempt, error, delay
@@ -1220,7 +1354,7 @@ def _generate_step(
         duration_ms = mp3_duration_ms(ffprobe_path, output_path)
         start_ms = total_duration_ms
         end_ms = start_ms + duration_ms
-        total_duration_ms = end_ms
+        total_duration_ms = end_ms + (chunk.pause_after_ms if dialogue_run else 0)
 
         artifact = ChunkArtifact(
             number=chunk.number,
@@ -1231,9 +1365,16 @@ def _generate_step(
             start_ms=start_ms,
             end_ms=end_ms,
             text_characters=len(chunk.text),
-            transcript=result.transcript,
+            transcript=None if dialogue_run else result.transcript,
             client_path=result.client_path,
             generation_id=result.generation_id,
+            speaker=chunk.speaker,
+            voice=chunk.voice or args.voice,
+            voice_fingerprint=chunk.voice_fingerprint,
+            turn_index=chunk.number if dialogue_run else None,
+            speech_duration_ms=duration_ms if dialogue_run else None,
+            audio_sha256=_sha256_file(output_path) if dialogue_run else None,
+            pause_after_ms=chunk.pause_after_ms,
             runtime_receipt=_public_runtime_receipt(result),
             voice_selection=_public_voice_selection(result),
             voice_session=_public_voice_session(result),
@@ -1241,7 +1382,13 @@ def _generate_step(
         )
         chunk_artifacts_by_number[chunk.number] = artifact
         upsert_completed_chunk(
-            state, artifact=artifact, model=args.model, voice=args.voice, text=chunk.text
+            state,
+            artifact=artifact,
+            model=args.model,
+            voice=chunk.voice or args.voice,
+            text=chunk.text,
+            include_text=not dialogue_run,
+            include_transcript=not dialogue_run,
         )
         atomic_write_json(state_path, state)
         logger.event(
@@ -1297,7 +1444,17 @@ def _generate_step(
 
     try:
         logger.event("info", "concat_started", output=paths.full_mp3.name)
-        concat_mp3_chunks(ffmpeg_path, paths.chunks_dir, paths.full_mp3)
+        if dialogue_run:
+            concat_dialogue_turns(
+                ffmpeg_path,
+                [
+                    (paths.chunks_dir / artifact.file, artifact.pause_after_ms)
+                    for artifact in chunk_artifacts
+                ],
+                paths.full_mp3,
+            )
+        else:
+            concat_mp3_chunks(ffmpeg_path, paths.chunks_dir, paths.full_mp3)
     except Exception as e:
         append_error(state, chunk_id=None, message=str(e))
         atomic_write_json(state_path, state)
@@ -1955,15 +2112,9 @@ def validate_cmd(args: argparse.Namespace) -> None:
     if not script.exists():
         fail("Script file not found", _EXIT_ARGS)
 
-    detected_format = detect_frontmatter_format(script)
-    script_format = args.format
-    if script_format == "markdown" and detected_format in (
-        VOICEOVER_FORMAT,
-        GEMINI_DIALOGUE_FORMAT,
-    ):
-        script_format = detected_format
+    script_format = _resolve_script_format(script, args.format)
 
-    if script_format == GEMINI_DIALOGUE_FORMAT:
+    if is_dialogue_format(script_format):
         report = validate_gemini_dialogue_file(
             script,
             delimiter=args.delimiter,
@@ -1975,7 +2126,7 @@ def validate_cmd(args: argparse.Namespace) -> None:
             print(json.dumps(report, ensure_ascii=False))
             sys.exit(_EXIT_OK)
         print(f"Script: {script}")
-        print(f"Format: {GEMINI_DIALOGUE_FORMAT}")
+        print(f"Format: {DIALOGUE_FORMAT}")
         print(f"Chunks: {report['chunks']}, Valid: {report['valid']}")
         for item in report["errors"]:
             loc = f" line {item.get('line') or item.get('line_start', '')}".rstrip()
@@ -2013,14 +2164,15 @@ def validate_cmd(args: argparse.Namespace) -> None:
     parts = [p.strip() for p in text.split(args.delimiter)]
     chunk_list = [(i, p) for i, p in enumerate(parts, start=1) if p]
 
+    max_chunk_chars = 2000 if args.max_chunk_chars is None else args.max_chunk_chars
     issues: list[dict] = []
     total_chars = 0
     for idx, chunk_text in chunk_list:
         chars = len(chunk_text)
         total_chars += chars
-        if chars > args.max_chunk_chars:
+        if chars > max_chunk_chars:
             issues.append(
-                {"chunk": idx, "type": "too_long", "chars": chars, "limit": args.max_chunk_chars}
+                {"chunk": idx, "type": "too_long", "chars": chars, "limit": max_chunk_chars}
             )
 
     warnings = []
@@ -2580,24 +2732,94 @@ def _omnivoice_voice_identity(args: argparse.Namespace) -> str | None:
     return "auto"
 
 
-def _gemini_dialogue_identity(
-    args: argparse.Namespace, style_prompt: str | None, prompt_mode: str
+def _bind_omnivoice_dialogue_fingerprints(
+    chunks: list[ScriptChunk], catalog: VoiceBankCatalog
+) -> list[ScriptChunk]:
+    profiles = {profile.id: profile for profile in catalog.profiles}
+    bound: list[ScriptChunk] = []
+    for chunk in chunks:
+        if chunk.voice is None:
+            fail("OmniVoice dialogue turn is missing a voice-bank profile", _EXIT_ARGS)
+        profile = profiles.get(chunk.voice)
+        if profile is None:
+            fail(f"voice '{chunk.voice}' not found in the voice bank", _EXIT_ARGS)
+        bound.append(replace(chunk, voice_fingerprint=profile.reference_sha256))
+    return bound
+
+
+def _dialogue_synthesis_identity(
+    args: argparse.Namespace,
+    style_prompt: str | None,
+    prompt_mode: str,
+    chunks: list[ScriptChunk] | None = None,
 ) -> str | None:
-    if getattr(args, "provider", None) != "openrouter-tts":
-        return None
-    if getattr(args, "format", None) != GEMINI_DIALOGUE_FORMAT:
+    if not is_dialogue_format(getattr(args, "format", None)):
         return None
     speaker_voice_map = getattr(args, "speaker_voice_map", None) or {}
+    provider = getattr(args, "provider", None)
+    catalog = getattr(args, "voice_bank_catalog", None)
+    profiles = (
+        {profile.id: profile for profile in catalog.profiles}
+        if provider == "omnivoice-local" and isinstance(catalog, VoiceBankCatalog)
+        else {}
+    )
+    if provider == "omnivoice-local" and not profiles:
+        fail("Cannot build dialogue identity without an admitted OmniVoice voice bank.", _EXIT_ARGS)
+    cast: dict[str, dict[str, str | None]] = {}
+    for alias, voice in sorted(speaker_voice_map.items()):
+        profile = profiles.get(voice)
+        if provider == "omnivoice-local" and profile is None:
+            fail(f"voice '{voice}' not found in the voice bank", _EXIT_ARGS)
+        cast[alias] = {
+            "voice": voice,
+            "profile_id": profile.id if profile is not None else None,
+            "voice_fingerprint": profile.reference_sha256 if profile is not None else None,
+        }
     payload = {
-        "format": GEMINI_DIALOGUE_FORMAT,
-        "provider": "openrouter-tts",
+        "format": DIALOGUE_FORMAT,
+        "execution_strategy": "turn-by-turn-v1",
+        "provider": provider,
         "model": args.model,
-        "speaker_voice_map": dict(sorted(speaker_voice_map.items())),
+        "cast": cast,
         "style_prompt_sha256": _sha256_text(style_prompt or ""),
         "prompt_mode": prompt_mode,
+        "trim_speech": not getattr(args, "no_trim", False),
+        "omnivoice": {
+            "mode": getattr(args, "mode", None),
+            "seed": OMNIVOICE_DEFAULT_SEED if provider == "omnivoice-local" else None,
+            "steps": OMNIVOICE_DEFAULT_STEPS if provider == "omnivoice-local" else None,
+            "guidance": OMNIVOICE_DEFAULT_GUIDANCE_SCALE if provider == "omnivoice-local" else None,
+        },
+        "turns": [
+            {
+                "turn_index": chunk.number,
+                "id": chunk.id,
+                "speaker": chunk.speaker,
+                "voice": chunk.voice,
+                "voice_fingerprint": chunk.voice_fingerprint
+                or (profiles[chunk.voice].reference_sha256 if chunk.voice in profiles else None),
+                "text_sha256": _sha256_text(chunk.text),
+                "pause_after_ms": chunk.pause_after_ms,
+            }
+            for chunk in (chunks or [])
+        ]
+        if chunks and any(chunk.speaker is not None for chunk in chunks)
+        else [],
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _gemini_dialogue_identity(
+    args: argparse.Namespace,
+    style_prompt: str | None,
+    prompt_mode: str,
+    chunks: list[ScriptChunk] | None = None,
+) -> str | None:
+    """Compatibility wrapper for callers from the former OpenRouter-only path."""
+    if getattr(args, "provider", None) != "openrouter-tts":
+        return None
+    return _dialogue_synthesis_identity(args, style_prompt, prompt_mode, chunks)
 
 
 def _sha256_text(text: str) -> str:
@@ -2773,7 +2995,6 @@ def build_provider(
             voice=args.voice,
             style_prompt=style_prompt,
             prompt_mode=prompt_mode,
-            speaker_voice_map=getattr(args, "speaker_voice_map", None),
         )
     if args.provider == "qwen-local":
         instruct = getattr(args, "qwen_instruct", None)
@@ -2806,18 +3027,26 @@ def build_provider(
         elif mode == "preset":
             catalog = getattr(args, "voice_bank_catalog", None)
             profile = getattr(args, "voice_bank_profile", None)
-            if catalog is None or profile is None:
+            if catalog is None:
                 fail(
                     "omnivoice-local preset mode requires --voice-bank catalog.json",
                     _EXIT_ARGS,
                 )
-            reference_path = resolve_bank_profile(catalog, profile.id)[1]
-            omni_kwargs.update(
-                {
-                    "mode": "preset",
-                    "voice_bank": (profile, reference_path),
-                }
-            )
+            if profile is None:
+                if not is_dialogue_format(getattr(args, "format", "markdown")):
+                    fail(
+                        "omnivoice-local preset mode requires a resolved voice-bank profile",
+                        _EXIT_ARGS,
+                    )
+                omni_kwargs.update({"mode": "preset"})
+            else:
+                reference_path = resolve_bank_profile(catalog, profile.id)[1]
+                omni_kwargs.update(
+                    {
+                        "mode": "preset",
+                        "voice_bank": (profile, reference_path),
+                    }
+                )
         elif mode == "clone":
             omni_kwargs.update(
                 {

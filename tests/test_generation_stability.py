@@ -1,5 +1,6 @@
 import argparse
 import builtins
+import hashlib
 import json
 
 import pytest
@@ -63,6 +64,11 @@ def patch_generation_io(monkeypatch):
         cli,
         "concat_mp3_chunks",
         lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"),
+    )
+    monkeypatch.setattr(
+        cli,
+        "concat_dialogue_turns",
+        lambda _ffmpeg, _turns, output_path: output_path.write_bytes(b"full"),
     )
     monkeypatch.setattr(
         cli, "attach_costs", lambda _provider, _api_key, _model, _started, chunks: chunks
@@ -363,8 +369,10 @@ def test_resume_rejects_changed_voice_identity(tmp_path, monkeypatch):
 
 
 def _write_dialogue_fixture(tmp_path):
-    import voiceover_pipeline.cli as cli
-    from voiceover_pipeline.gemini_dialogue import validate_gemini_dialogue_file
+    from voiceover_pipeline.gemini_dialogue import (
+        dialogue_turns_from_validation,
+        validate_gemini_dialogue_file,
+    )
 
     script = tmp_path / "podcast.md"
     script.write_text(
@@ -401,7 +409,7 @@ def _write_dialogue_fixture(tmp_path):
     )
     report = validate_gemini_dialogue_file(script)
     assert report["valid"] is True
-    return script, report, cli.gemini_chunks_from_validation(report)
+    return script, report, dialogue_turns_from_validation(report)
 
 
 def make_dialogue_args(tmp_path, script, speaker_voice_map, run_id="dialogue-run", resume=False):
@@ -412,7 +420,7 @@ def make_dialogue_args(tmp_path, script, speaker_voice_map, run_id="dialogue-run
         script=script,
         output_dir=tmp_path / "out",
         run_id=run_id,
-        format="gemini-dialogue",
+        format="dialogue",
         limit_chunks=None,
         retries=3,
         retry_delay=0,
@@ -436,9 +444,9 @@ def _dialogue_state(paths, args, chunks, style_prompt, identity):
         voice=args.voice,
         script_path=args.script,
         chunks=chunks,
-        script_format="gemini-dialogue",
+        script_format="dialogue",
         run_id=args.run_id,
-        voice_identity=identity,
+        synthesis_identity=identity,
     )
 
 
@@ -454,18 +462,19 @@ def test_dialogue_resume_same_cast_skips_completed_chunks(tmp_path, monkeypatch)
     style_prompt = report["style_prompt"]
     prompt_mode = "native"
     args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
-    identity = cli._gemini_dialogue_identity(args, style_prompt, prompt_mode)
+    identity = cli._gemini_dialogue_identity(args, style_prompt, prompt_mode, chunks)
     assert identity is not None
     paths = build_run_paths(args.output_dir, args.model, args.run_id)
     paths.chunks_dir.mkdir(parents=True)
-    (paths.chunks_dir / "chunk_01.mp3").write_bytes(b"existing")
+    first_path = paths.chunks_dir / f"{chunks[0].id}.mp3"
+    first_path.write_bytes(b"existing")
     state = _dialogue_state(paths, args, chunks, style_prompt, identity)
     upsert_completed_chunk(
         state,
         artifact=ChunkArtifact(
-            number=1,
-            id="chunk_01",
-            file="chunk_01.mp3",
+            number=chunks[0].number,
+            id=chunks[0].id,
+            file=first_path.name,
             duration_ms=1000,
             duration_sec=1.0,
             start_ms=0,
@@ -474,10 +483,16 @@ def test_dialogue_resume_same_cast_skips_completed_chunks(tmp_path, monkeypatch)
             transcript=None,
             client_path="fake",
             generation_id="old-gen",
+            turn_index=chunks[0].number,
+            speech_duration_ms=1000,
+            audio_sha256=hashlib.sha256(b"existing").hexdigest(),
+            pause_after_ms=chunks[0].pause_after_ms,
         ),
         model=args.model,
         voice=args.voice,
         text=chunks[0].text,
+        include_text=False,
+        include_transcript=False,
     )
     atomic_write_json(paths.output_root / "run_state.json", state)
     provider = FakeProvider()
@@ -488,9 +503,9 @@ def test_dialogue_resume_same_cast_skips_completed_chunks(tmp_path, monkeypatch)
         )
 
     assert exit_info.value.code == 0
-    assert provider.calls == ["chunk_02"]
+    assert provider.calls == [chunk.id for chunk in chunks[1:]]
     final_state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
-    assert final_state["voice_identity"] == identity
+    assert final_state["synthesis_identity"] == identity
 
 
 def test_dialogue_resume_rejects_changed_speaker_voice(tmp_path, monkeypatch):
@@ -502,7 +517,7 @@ def test_dialogue_resume_rejects_changed_speaker_voice(tmp_path, monkeypatch):
     script, report, chunks = _write_dialogue_fixture(tmp_path)
     style_prompt = report["style_prompt"]
     args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
-    identity = cli._gemini_dialogue_identity(args, style_prompt, "native")
+    identity = cli._gemini_dialogue_identity(args, style_prompt, "native", chunks)
     paths = build_run_paths(args.output_dir, args.model, args.run_id)
     paths.chunks_dir.mkdir(parents=True)
     state = _dialogue_state(paths, args, chunks, style_prompt, identity)
@@ -514,7 +529,7 @@ def test_dialogue_resume_rejects_changed_speaker_voice(tmp_path, monkeypatch):
         tmp_path, script, changed_map, run_id="dialogue-run", resume=True
     )
 
-    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+    with pytest.raises(cli.CliError, match="synthesis identity changed") as error:
         cli._generate_step(
             changed_args,
             FakeProvider(),
@@ -540,7 +555,7 @@ def test_dialogue_resume_rejects_changed_model(tmp_path, monkeypatch):
     script, report, chunks = _write_dialogue_fixture(tmp_path)
     style_prompt = report["style_prompt"]
     args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
-    identity = cli._gemini_dialogue_identity(args, style_prompt, "native")
+    identity = cli._gemini_dialogue_identity(args, style_prompt, "native", chunks)
     paths = build_run_paths(args.output_dir, args.model, args.run_id)
     paths.chunks_dir.mkdir(parents=True)
     state = _dialogue_state(paths, args, chunks, style_prompt, identity)
@@ -549,7 +564,7 @@ def test_dialogue_resume_rejects_changed_model(tmp_path, monkeypatch):
     changed_args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
     changed_args.model = "google/gemini-3.1-flash-tts-preview-2"
 
-    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+    with pytest.raises(cli.CliError, match="synthesis identity changed") as error:
         cli._generate_step(
             changed_args,
             FakeProvider(),
@@ -575,7 +590,7 @@ def test_dialogue_resume_rejects_changed_style_prompt(tmp_path, monkeypatch):
     script, report, chunks = _write_dialogue_fixture(tmp_path)
     style_prompt = report["style_prompt"]
     args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
-    identity = cli._gemini_dialogue_identity(args, style_prompt, "native")
+    identity = cli._gemini_dialogue_identity(args, style_prompt, "native", chunks)
     paths = build_run_paths(args.output_dir, args.model, args.run_id)
     paths.chunks_dir.mkdir(parents=True)
     state = _dialogue_state(paths, args, chunks, style_prompt, identity)
@@ -584,7 +599,7 @@ def test_dialogue_resume_rejects_changed_style_prompt(tmp_path, monkeypatch):
     changed_style = style_prompt + " Тон должен быть другим."
     changed_args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"], resume=True)
 
-    with pytest.raises(cli.CliError, match="voice identity changed") as error:
+    with pytest.raises(cli.CliError, match="synthesis identity changed") as error:
         cli._generate_step(
             changed_args,
             FakeProvider(),
@@ -613,10 +628,10 @@ def test_dialogue_resume_old_state_without_identity_fails_closed(tmp_path, monke
     paths = build_run_paths(args.output_dir, args.model, args.run_id)
     paths.chunks_dir.mkdir(parents=True)
     state = _dialogue_state(paths, args, chunks, style_prompt, None)
-    assert "voice_identity" not in state
+    assert "synthesis_identity" not in state
     atomic_write_json(paths.output_root / "run_state.json", state)
 
-    with pytest.raises(cli.CliError, match="predates dialogue identity") as error:
+    with pytest.raises(cli.CliError, match="predates dialogue synthesis identity") as error:
         cli._generate_step(
             args,
             FakeProvider(),

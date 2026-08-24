@@ -341,6 +341,9 @@ def build_voice_bank(tmp_path):
     reference = bank_root / "voices" / "main.wav"
     _write_reference_wav(reference)
     digest = hashlib.sha256(reference.read_bytes()).hexdigest()
+    alternate = bank_root / "voices" / "alt.wav"
+    _write_reference_wav(alternate, rate=16_000)
+    alternate_digest = hashlib.sha256(alternate.read_bytes()).hexdigest()
     catalog_path = bank_root / "catalog.json"
     catalog_path.write_text(
         json.dumps(
@@ -363,9 +366,9 @@ def build_voice_bank(tmp_path):
                         "display_name": "Alt Narrator",
                         "description": "",
                         "language": "ru",
-                        "reference_audio": "voices/main.wav",
+                        "reference_audio": "voices/alt.wav",
                         "reference_text": "Эталонная фраза.",
-                        "reference_sha256": digest,
+                        "reference_sha256": alternate_digest,
                         "origin": {"mode": "design", "instruction": "warm", "seed": 3},
                     },
                 ],

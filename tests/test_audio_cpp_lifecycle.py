@@ -323,6 +323,7 @@ def test_windows_probe_detects_wvm_image_and_healthy_state(monkeypatch):
     assert snapshot.wvm_active is True
 
 
+@pytest.mark.platform_simulated
 def test_windows_probe_unknown_image_blocks_job(monkeypatch, tmp_path):
     from voiceover_pipeline.local_runtime.gpu_lease import GPULeaseManager
     from voiceover_pipeline.local_runtime.lifecycle import (

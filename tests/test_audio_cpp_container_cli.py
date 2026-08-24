@@ -169,8 +169,24 @@ def test_container_cli_transport_constructs_pinned_isolated_command_and_maps_wor
             "duration_s": 1.0,
             "forced_aligner_available": True,
             "words": [
-                {"text": "Привет", "start_s": 0.1, "end_s": 0.6, "confidence": 0.0},
-                {"text": "мир", "start_s": 0.7, "end_s": 0.9, "confidence": 0.9},
+                {
+                    "word": "Привет",
+                    "start_sample": 1600,
+                    "end_sample": 9600,
+                    "confidence": 0.0,
+                    "text": "Привет",
+                    "start_s": 0.1,
+                    "end_s": 0.6,
+                },
+                {
+                    "word": "мир",
+                    "start_sample": 11200,
+                    "end_sample": 14400,
+                    "confidence": 0.9,
+                    "text": "мир",
+                    "start_s": 0.7,
+                    "end_s": 0.9,
+                },
             ],
         },
     }

@@ -5,7 +5,9 @@ from typing import Any
 from .config import GEMINI_TTS_VOICES
 from .models import ScriptChunk
 
+DIALOGUE_FORMAT = "dialogue"
 GEMINI_DIALOGUE_FORMAT = "gemini-dialogue"
+DIALOGUE_FORMAT_ALIASES = frozenset((DIALOGUE_FORMAT, GEMINI_DIALOGUE_FORMAT))
 GEMINI_TTS_MODEL = "google/gemini-3.1-flash-tts-preview"
 DEFAULT_MAX_CHUNK_BYTES = 3500
 HARD_MAX_CHUNK_BYTES = 4000
@@ -53,12 +55,19 @@ _SPEAKER_RE = re.compile(r"^([A-Za-z0-9]+):\s*(.*)$")
 _TAG_RE = re.compile(r"\[([^\[\]\n]+)\]")
 
 
+def is_dialogue_format(value: object) -> bool:
+    """Return whether a public format spelling selects the dialogue planner."""
+    return isinstance(value, str) and value in DIALOGUE_FORMAT_ALIASES
+
+
 def validate_gemini_dialogue_file(
     script_path: Path,
     delimiter: str = "******",
     model: str | None = None,
     speaker_voice_overrides: list[str] | None = None,
     agent: bool = False,
+    provider: str | None = None,
+    allowed_voices: set[str] | None = None,
 ) -> dict[str, Any]:
     text = script_path.read_text(encoding="utf-8-sig")
     errors: list[dict[str, Any]] = []
@@ -67,17 +76,17 @@ def validate_gemini_dialogue_file(
     meta, body, body_start_line, fm_errors = parse_frontmatter(text)
     errors.extend(fm_errors)
 
-    if meta.get("format") != GEMINI_DIALOGUE_FORMAT:
+    if not is_dialogue_format(meta.get("format")):
         errors.append(
             error(
                 "FORMAT_NOT_GEMINI_DIALOGUE",
-                "Frontmatter must contain format: gemini-dialogue.",
+                "Frontmatter must contain format: dialogue or gemini-dialogue.",
                 line=1,
             )
         )
 
     active_model = model or str(meta.get("model") or "")
-    if active_model != GEMINI_TTS_MODEL:
+    if provider != "omnivoice-local" and active_model != GEMINI_TTS_MODEL:
         errors.append(
             error(
                 "MODEL_NOT_GEMINI_TTS",
@@ -90,7 +99,7 @@ def validate_gemini_dialogue_file(
 
     speaker_voice_map = extract_speaker_voice_map(meta, errors)
     apply_speaker_voice_overrides(speaker_voice_map, speaker_voice_overrides or [], errors)
-    validate_speakers(speaker_voice_map, errors)
+    validate_speakers(speaker_voice_map, errors, allowed_voices=allowed_voices)
 
     allowed_tags = extract_allowed_tags(meta)
     max_chunk_bytes = extract_max_chunk_bytes(meta, warnings)
@@ -125,7 +134,8 @@ def validate_gemini_dialogue_file(
     return {
         "status": "success" if valid else "error",
         "valid": valid,
-        "format": GEMINI_DIALOGUE_FORMAT,
+        "format": DIALOGUE_FORMAT,
+        "input_format": meta.get("format"),
         "model": active_model,
         "script": str(script_path),
         "chunks": len(chunks),
@@ -150,6 +160,41 @@ def chunks_from_validation(report: dict[str, Any]) -> list[ScriptChunk]:
         ScriptChunk(number=item["chunk"], id=f"chunk_{item['chunk']:02d}", text=item["text"])
         for item in report.get("chunk_reports", [])
     ]
+
+
+def dialogue_turns_from_validation(report: dict[str, Any]) -> list[ScriptChunk]:
+    """Return one provider request per validated dialogue turn."""
+    speaker_voice_map = report.get("speaker_voice_map", {})
+    sections = report.get("chunk_reports", [])
+    raw_turns: list[tuple[str, str, bool]] = []
+    for section_index, section in enumerate(sections):
+        lines = [line.strip() for line in str(section.get("text", "")).splitlines() if line.strip()]
+        for line_index, line in enumerate(lines):
+            match = _SPEAKER_RE.match(line)
+            if match:
+                raw_turns.append(
+                    (
+                        match.group(1),
+                        match.group(2).strip(),
+                        section_index < len(sections) - 1 and line_index == len(lines) - 1,
+                    )
+                )
+    turns: list[ScriptChunk] = []
+    for index, (speaker, text, section_end) in enumerate(raw_turns, start=1):
+        pause = 600 if section_end else 250
+        if index == len(raw_turns):
+            pause = 0
+        turns.append(
+            ScriptChunk(
+                number=index,
+                id=f"turn_{index:04d}",
+                text=text,
+                speaker=speaker,
+                voice=speaker_voice_map.get(speaker),
+                pause_after_ms=pause,
+            )
+        )
+    return turns
 
 
 def parse_frontmatter(text: str) -> tuple[dict[str, Any], str, int, list[dict[str, Any]]]:
@@ -338,7 +383,12 @@ def apply_speaker_voice_overrides(
         speaker_voice_map[speaker] = voice
 
 
-def validate_speakers(speaker_voice_map: dict[str, str], errors: list[dict[str, Any]]) -> None:
+def validate_speakers(
+    speaker_voice_map: dict[str, str],
+    errors: list[dict[str, Any]],
+    *,
+    allowed_voices: set[str] | None = None,
+) -> None:
     if len(speaker_voice_map) != 2:
         errors.append(
             error(
@@ -366,11 +416,12 @@ def validate_speakers(speaker_voice_map: dict[str, str], errors: list[dict[str, 
                     actual=speaker,
                 )
             )
-        if voice not in GEMINI_TTS_VOICES:
+        valid_voices = GEMINI_TTS_VOICES if allowed_voices is None else allowed_voices
+        if voice not in valid_voices:
             errors.append(
                 error(
                     "INVALID_VOICE",
-                    f"Voice {voice} is not a Gemini TTS voice.",
+                    f"Voice {voice} is not an admitted voice for this provider.",
                     actual=voice,
                     expected="one of GEMINI_TTS_VOICES",
                 )

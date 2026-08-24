@@ -612,7 +612,7 @@ def test_gemini_dialogue_validate_agent_json_is_one_object(tmp_path):
     data = json.loads(proc.stdout)
     assert data["valid"] is True
     assert data["status"] == "success"
-    assert data["format"] == "gemini-dialogue"
+    assert data["format"] == "dialogue"
     assert data["speaker_voice_map"] == {"Speaker1": "Puck", "Speaker2": "Kore"}
     json_lines = [line for line in proc.stdout.splitlines() if line.strip().startswith("{")]
     assert len(json_lines) == 1
@@ -692,7 +692,7 @@ def test_gemini_dialogue_style_fallback_diagnostic_stays_off_stdout(tmp_path, mo
     monkeypatch.setattr(cli, "mp3_duration_ms", lambda *_args, **_kwargs: 1000)
     monkeypatch.setattr(
         cli,
-        "concat_mp3_chunks",
+        "concat_dialogue_turns",
         lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"),
     )
     monkeypatch.setattr(cli, "attach_costs", lambda *args, **kwargs: args[-1])

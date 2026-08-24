@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ from .config import (
     QWEN_PRESET_SPEAKERS,
 )
 from .gemini_dialogue import error, parse_frontmatter, warning
+from .local_tts_text import get_local_tts_chunk_profile
 from .models import ScriptChunk
 
 VOICEOVER_FORMAT = "voiceover"
@@ -58,6 +60,7 @@ MODELS_BY_PROVIDER = {
     "openrouter-tts": OPENROUTER_TTS_MODELS,
     "omnivoice-local": [OMNIVOICE_LOCAL_MODEL_ID],
 }
+DEFAULT_MAX_CHUNK_CHARS = 2000
 
 
 def detect_frontmatter_format(script_path: Path) -> str | None:
@@ -78,7 +81,7 @@ def validate_voiceover_file(
     provider_override: str | None = None,
     model_override: str | None = None,
     voice_override: str | None = None,
-    max_chunk_chars: int = 2000,
+    max_chunk_chars: int | None = None,
     agent: bool = False,
 ) -> dict[str, Any]:
     text = script_path.read_text(encoding="utf-8-sig")
@@ -118,6 +121,14 @@ def validate_voiceover_file(
     voice = voice_override or str(meta.get("voice") or default_voice(provider, model))
     validate_voice(provider, model, voice, errors)
 
+    profile = get_local_tts_chunk_profile(provider, model)
+    resolved_max_chunk_chars = (
+        profile.target_chars
+        if profile is not None and max_chunk_chars is None
+        else max_chunk_chars or DEFAULT_MAX_CHUNK_CHARS
+    )
+    raw_digit_policy = "reject" if profile is not None and profile.reject_raw_digits else "warn"
+
     fallback_voice = str(meta.get("fallback_voice") or DEFAULT_FALLBACK_VOICE)
     if provider == "polza-chat-audio" and fallback_voice not in POLZA_CHAT_AUDIO_VOICES:
         errors.append(
@@ -156,7 +167,7 @@ def validate_voiceover_file(
     chunk_reports: list[dict[str, Any]] = []
     total_chars = 0
     for chunk in chunks:
-        report = validate_plain_chunk(chunk, max_chunk_chars, agent)
+        report = validate_plain_chunk(chunk, resolved_max_chunk_chars, raw_digit_policy, agent)
         errors.extend(report.pop("errors"))
         warnings.extend(report.pop("warnings"))
         total_chars += report["chars"]
@@ -177,14 +188,16 @@ def validate_voiceover_file(
         },
         "chunks": len(chunks),
         "total_chars": total_chars,
-        "max_chunk_chars": max_chunk_chars,
+        "max_chunk_chars": resolved_max_chunk_chars,
+        "spoken_text": aggregate_spoken_text(chunk_reports, raw_digit_policy),
         "chunk_reports": chunk_reports,
         "errors": errors,
         "warnings": warnings,
         "summary": {
             "error_count": len(errors),
             "warning_count": len(warnings),
-            "max_chunk_chars": max_chunk_chars,
+            "max_chunk_chars": resolved_max_chunk_chars,
+            "spoken_text": aggregate_spoken_text(chunk_reports, raw_digit_policy),
         },
     }
 
@@ -289,7 +302,7 @@ def append_chunk(
 
 
 def validate_plain_chunk(
-    chunk: dict[str, Any], max_chunk_chars: int, agent: bool
+    chunk: dict[str, Any], max_chunk_chars: int, raw_digit_policy: str, agent: bool
 ) -> dict[str, Any]:
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
@@ -310,13 +323,20 @@ def validate_plain_chunk(
             )
         )
     if any(ch.isdigit() for ch in text):
-        warnings.append(
-            warning(
+        issue = (
+            error(
+                "RAW_DIGITS",
+                "Chunk contains raw digits; write numbers, dates, percentages, fractions, and versions in words.",
+                chunk=chunk["chunk"],
+            )
+            if raw_digit_policy == "reject"
+            else warning(
                 "CONTAINS_DIGITS",
                 "Chunk contains digits; TTS pronunciation may be unexpected.",
                 chunk=chunk["chunk"],
             )
         )
+        (errors if raw_digit_policy == "reject" else warnings).append(issue)
     leaked_markers = [marker for marker in PROMPT_SKELETON_MARKERS if marker in text]
     if leaked_markers:
         warnings.append(
@@ -333,6 +353,52 @@ def validate_plain_chunk(
         "line_end": chunk["line_end"],
         "chars": chars,
         "text": text,
+        "spoken_text": spoken_text_metrics(text, raw_digit_policy),
         "errors": errors,
         "warnings": warnings,
+    }
+
+
+def spoken_text_metrics(text: str, raw_digit_policy: str) -> dict[str, Any]:
+    """Return deterministic language composition metrics for spoken text."""
+    letters = [char for char in text if char.isalpha()]
+    latin_alphabet = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz")
+    latin_characters = sum(char in latin_alphabet for char in letters)
+    latin_words = 0
+    mixed_script_words = 0
+    for token in re.findall(r"\S+", text):
+        token_letters = [char for char in token if char.isalpha()]
+        if not token_letters:
+            continue
+        has_latin = any(char in latin_alphabet for char in token_letters)
+        has_non_latin = any(char not in latin_alphabet for char in token_letters)
+        if has_latin and has_non_latin:
+            mixed_script_words += 1
+        elif has_latin:
+            latin_words += 1
+    total_letters = len(letters)
+    return {
+        "raw_digit_policy": raw_digit_policy,
+        "latin_characters": latin_characters,
+        "latin_words": latin_words,
+        "mixed_script_words": mixed_script_words,
+        "total_letters": total_letters,
+        "latin_ratio": latin_characters / total_letters if total_letters else 0.0,
+    }
+
+
+def aggregate_spoken_text(
+    chunk_reports: list[dict[str, Any]], raw_digit_policy: str
+) -> dict[str, Any]:
+    """Aggregate spoken-text metrics while preserving the policy field."""
+    metrics = [report["spoken_text"] for report in chunk_reports]
+    total_letters = sum(item["total_letters"] for item in metrics)
+    latin_characters = sum(item["latin_characters"] for item in metrics)
+    return {
+        "raw_digit_policy": raw_digit_policy,
+        "latin_characters": latin_characters,
+        "latin_words": sum(item["latin_words"] for item in metrics),
+        "mixed_script_words": sum(item["mixed_script_words"] for item in metrics),
+        "total_letters": total_letters,
+        "latin_ratio": latin_characters / total_letters if total_letters else 0.0,
     }

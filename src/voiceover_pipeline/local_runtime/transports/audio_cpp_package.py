@@ -98,7 +98,16 @@ def _reject(code: NativeRejectionCode, message: str) -> None:
 
 def _require_relative_sibling(package_root: Path, relative_path: str) -> Path:
     relative = Path(relative_path)
-    if not relative_path or relative.is_absolute() or ".." in relative.parts:
+    portable_parts = re.split(r"[/\\]", relative_path)
+    if (
+        not relative_path
+        or relative.is_absolute()
+        or relative_path.startswith(("/", "\\"))
+        or re.match(r"^[A-Za-z]:[\\/]", relative_path) is not None
+        or ".." in relative.parts
+        or ".." in portable_parts
+        or "\\" in relative_path
+    ):
         _reject("malformed_manifest", "audio.cpp native dependency closure manifest is invalid")
     candidate = package_root.joinpath(*relative.parts)
     try:

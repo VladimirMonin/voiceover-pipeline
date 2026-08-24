@@ -32,7 +32,7 @@ if sys.platform == "win32":
     _kernel32.CloseHandle.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
 else:
-    _kernel32 = None
+    _kernel32: Any = None
 
 # ctypes.get_last_error() only reports errors for WinDLL handles created with
 # use_last_error=True; the tiny indirection keeps the Windows identity branch

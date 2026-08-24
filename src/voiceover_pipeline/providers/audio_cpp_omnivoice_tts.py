@@ -293,6 +293,22 @@ class OmniVoiceLocalTTSProvider(TTSProvider):
             raw_metadata=metadata,
         )
 
+    def for_voice_bank_profile(
+        self, profile: VoiceProfile, reference_path: Path
+    ) -> "OmniVoiceLocalTTSProvider":
+        """Bind another admitted bank profile while reusing this run's runtime."""
+        return OmniVoiceLocalTTSProvider(
+            self._runtime,
+            admitted_model=self._admitted_model,
+            model_id=self._model_id,
+            language=self._language,
+            seed=self._seed,
+            num_inference_steps=self._num_inference_steps,
+            guidance_scale=self._guidance_scale,
+            mode="preset",
+            voice_bank=(profile, reference_path),
+        )
+
     def _mode_request_fields(
         self,
     ) -> tuple[OmniVoiceMode, str | None, str | None, Path | str | None, str | None]:

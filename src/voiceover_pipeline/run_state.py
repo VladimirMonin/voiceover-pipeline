@@ -50,6 +50,7 @@ def initial_state(
     run_id: str,
     limited_to_chunks: int | None = None,
     voice_identity: str | None = None,
+    synthesis_identity: str | None = None,
 ) -> dict[str, Any]:
     now = utc_now()
     state: dict[str, Any] = {
@@ -72,6 +73,8 @@ def initial_state(
     }
     if voice_identity is not None:
         state["voice_identity"] = voice_identity
+    if synthesis_identity is not None:
+        state["synthesis_identity"] = synthesis_identity
     return state
 
 
@@ -100,6 +103,13 @@ def artifact_from_state(item: dict[str, Any]) -> ChunkArtifact:
         transcript=item.get("transcript"),
         client_path=item.get("client_path"),
         generation_id=item.get("generation_id"),
+        speaker=item.get("speaker"),
+        voice=item.get("voice"),
+        voice_fingerprint=item.get("voice_fingerprint"),
+        turn_index=item.get("turn_index"),
+        speech_duration_ms=item.get("speech_duration_ms"),
+        audio_sha256=item.get("audio_sha256"),
+        pause_after_ms=int(item.get("pause_after_ms", 0)),
         runtime_receipt=item.get("runtime_receipt"),
         voice_selection=item.get("voice_selection"),
         voice_session=item.get("voice_session"),
@@ -138,6 +148,8 @@ def upsert_completed_chunk(
     model: str,
     voice: str,
     text: str,
+    include_text: bool = True,
+    include_transcript: bool = True,
 ) -> None:
     item = {
         "status": "completed",
@@ -150,9 +162,14 @@ def upsert_completed_chunk(
         "start_ms": artifact.start_ms,
         "end_ms": artifact.end_ms,
         "generation_id": artifact.generation_id,
+        "speaker": artifact.speaker,
+        "voice": artifact.voice or voice,
+        "voice_fingerprint": artifact.voice_fingerprint,
+        "turn_index": artifact.turn_index,
+        "speech_duration_ms": artifact.speech_duration_ms,
+        "audio_sha256": artifact.audio_sha256,
+        "pause_after_ms": artifact.pause_after_ms,
         "model": model,
-        "voice": voice,
-        "text": text,
         "text_hash": chunk_text_hash(text),
         "text_characters": artifact.text_characters,
         "transcript": artifact.transcript,
@@ -168,6 +185,10 @@ def upsert_completed_chunk(
         "usage": artifact.usage,
         "generated_at": utc_now(),
     }
+    if include_text:
+        item["text"] = text
+    if not include_transcript:
+        item.pop("transcript", None)
     state["chunks"] = [
         entry for entry in state.get("chunks", []) if entry.get("number") != artifact.number
     ]

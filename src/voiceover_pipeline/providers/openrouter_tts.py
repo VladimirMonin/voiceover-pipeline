@@ -38,7 +38,7 @@ class OpenRouterTTSProvider(TTSProvider):
         self.model = model
         self.voice = voice
         self.style_prompt = style_prompt
-        self.speaker_voice_map = speaker_voice_map or {}
+
         self.fallback_style_prompt = PODCAST_NARRATION_FALLBACK_PROMPT
         self._raw_prompt_mode = prompt_mode
         self.prompt_mode = resolve_prompt_mode(self.provider_id, model, prompt_mode)
@@ -50,12 +50,17 @@ class OpenRouterTTSProvider(TTSProvider):
     def _is_openai_model(self) -> bool:
         return self.model.startswith("openai/")
 
-    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+    def synthesize_chunk(
+        self, text: str, chunk_id: str, voice: str | None = None
+    ) -> SynthesisResult:
+        active_voice = voice or self.voice
         if self._is_openai_model:
-            return self._request_audio(text=text, style_prompt=None)
+            return self._request_audio(text=text, style_prompt=None, voice=active_voice)
 
         try:
-            return self._request_audio(text=text, style_prompt=self.style_prompt)
+            return self._request_audio(
+                text=text, style_prompt=self.style_prompt, voice=active_voice
+            )
         except RuntimeError as error:
             if "No successful provider responses" not in str(error):
                 raise
@@ -63,27 +68,22 @@ class OpenRouterTTSProvider(TTSProvider):
                 f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.",
                 file=sys.stderr,
             )
-            return self._request_audio(text=text, style_prompt=self.fallback_style_prompt)
+            return self._request_audio(
+                text=text, style_prompt=self.fallback_style_prompt, voice=active_voice
+            )
 
-    def _request_audio(self, text: str, style_prompt: str | None) -> SynthesisResult:
+    def _request_audio(
+        self, text: str, style_prompt: str | None, voice: str | None = None
+    ) -> SynthesisResult:
         body = build_request_body(
             model=self.model,
             text=text,
-            voice=self.voice,
+            voice=voice or self.voice,
             response_format=self.response_format,
             style_prompt=style_prompt,
             prompt_mode=self.prompt_mode,
         )
-        if self.speaker_voice_map:
-            body["multi_speaker_voice_config"] = {
-                "speaker_voice_configs": [
-                    {
-                        "speaker": speaker,
-                        "voice_config": {"prebuilt_voice_config": {"voice_name": voice}},
-                    }
-                    for speaker, voice in self.speaker_voice_map.items()
-                ]
-            }
+
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
@@ -108,10 +108,9 @@ class OpenRouterTTSProvider(TTSProvider):
             generation_id=response.headers.get("X-Generation-Id"),
             client_path="requests",
             raw_metadata={
-                "voice": self.voice,
+                "voice": voice or self.voice,
                 "provider": self.provider_id,
                 "style_prompt": style_prompt,
                 "prompt_mode": self.prompt_mode,
-                "speaker_voice_map": self.speaker_voice_map,
             },
         )

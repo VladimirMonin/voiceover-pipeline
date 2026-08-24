@@ -217,9 +217,8 @@ def test_subprocess_transport_rejects_non_file_tts_artifact(tmp_path: Path) -> N
     assert not workspace.exists()
 
 
-@pytest.mark.skipif(
-    sys.platform.startswith("win"), reason="Windows symlink creation needs privileges"
-)
+@pytest.mark.native_linux
+@pytest.mark.skipif(sys.platform == "win32", reason="requires native POSIX symlink behavior")
 def test_subprocess_transport_rejects_tts_artifact_symlink_escape(tmp_path: Path) -> None:
     outside_artifact = tmp_path / "outside.wav"
     outside_artifact.write_bytes(b"outside artifact")

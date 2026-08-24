@@ -105,6 +105,13 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 show_error_codes = true
 
+[tool.pytest.ini_options]
+markers = [
+  "native_linux: requires a real Linux/POSIX host capability",
+  "native_windows: requires a real Windows host capability",
+  "platform_simulated: exercises a platform contract with injected fakes; must stay host-independent",
+]
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/voiceover_pipeline"]
 

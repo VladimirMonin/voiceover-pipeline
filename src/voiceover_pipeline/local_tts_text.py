@@ -20,6 +20,15 @@ class LocalTTSChunkProfile:
     reject_raw_digits: bool
 
 
+@dataclass(frozen=True)
+class OmniVoiceInternalSeam:
+    """One deterministic boundary produced by an OmniVoice internal text split."""
+
+    offset: int
+    splits_word: bool
+    ends_after_sentence: bool
+
+
 LOCAL_TTS_CHUNK_PROFILES = MappingProxyType(
     {
         ("omnivoice-local", OMNIVOICE_LOCAL_MODEL_ID): LocalTTSChunkProfile(
@@ -30,6 +39,15 @@ LOCAL_TTS_CHUNK_PROFILES = MappingProxyType(
 )
 _DIGIT_PATTERN = re.compile(r"[0-9]")
 _SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?…])\s+")
+
+
+def get_local_tts_chunk_profile(
+    provider_id: str, model_id: str | None
+) -> LocalTTSChunkProfile | None:
+    """Return the explicit spoken-text profile for a provider/model pair."""
+    if model_id is None:
+        return None
+    return LOCAL_TTS_CHUNK_PROFILES.get((provider_id, model_id))
 
 
 def prepare_local_tts_chunks(
@@ -43,7 +61,7 @@ def prepare_local_tts_chunks(
     source_chunks = list(chunks)
     if model_id is None:
         return source_chunks
-    profile = LOCAL_TTS_CHUNK_PROFILES.get((provider_id, model_id))
+    profile = get_local_tts_chunk_profile(provider_id, model_id)
     if profile is None:
         return source_chunks
     target_chars = profile.target_chars if max_chars is None else max_chars
@@ -80,30 +98,75 @@ def merge_omnivoice_session_fragments(
     reference_audio_path: Path | str | None = None,
     reference_text: str | None = None,
     design_instruction: str | None = None,
+    max_chars: int = OMNIVOICE_INTERNAL_TEXT_CHUNK_SIZE,
 ) -> list[ScriptChunk]:
-    """Create one OmniVoice request so its internal 420-character chunks share one session.
+    """Create one OmniVoice request with sentence-safe internal text seams.
 
     The session identity is the mode plus the reference/design fields: different
     modes, reference audio, or design instructions belong to different voice
     sessions and are never merged into one request. Within a single generate
     call every fragment shares one identity, so they merge into one session.
+    Long-form prepared fragments are separated by whitespace gutters so every
+    internal boundary follows a sentence-ending fragment instead of cutting a
+    spoken word. Whitespace does not add spoken content.
     """
     prepared = list(fragments)
     if not prepared:
         return []
+    if max_chars <= 0:
+        raise ValueError("OmniVoice internal text chunk size must be greater than zero")
     if mode == "clone":
         if reference_audio_path is None or reference_text is None or not reference_text.strip():
             raise ValueError("OmniVoice clone session requires reference audio and text")
     elif mode == "design":
         if design_instruction is None or not design_instruction.strip():
             raise ValueError("OmniVoice design session requires a non-empty instruction")
+    joined_text = " ".join(fragment.text for fragment in prepared)
+    session_text = joined_text
+    if len(joined_text) > max_chars:
+        pieces: list[str] = []
+        position = 0
+        for index, fragment in enumerate(prepared):
+            text = fragment.text
+            is_last = index == len(prepared) - 1
+            remaining = max_chars - (position % max_chars)
+            if not is_last and len(text) <= remaining:
+                pieces.append(text)
+                pieces.append(" " * (remaining - len(text)))
+                position += remaining
+                continue
+            pieces.append(text)
+            position += len(text)
+            if not is_last:
+                pieces.append(" ")
+                position += 1
+        session_text = "".join(pieces)
     return [
         ScriptChunk(
             number=1,
             id="chunk_01_omnivoice_session",
-            text=" ".join(fragment.text for fragment in prepared),
+            text=session_text,
         )
     ]
+
+
+def inspect_omnivoice_internal_seams(
+    text: str, *, max_chars: int
+) -> tuple[OmniVoiceInternalSeam, ...]:
+    """Report whether fixed-size internal splits preserve spoken-word boundaries."""
+    if max_chars <= 0:
+        raise ValueError("OmniVoice internal text chunk size must be greater than zero")
+    seams: list[OmniVoiceInternalSeam] = []
+    for offset in range(max_chars, len(text), max_chars):
+        left = text[:offset].rstrip()
+        seams.append(
+            OmniVoiceInternalSeam(
+                offset=offset,
+                splits_word=text[offset - 1].isalnum() and text[offset].isalnum(),
+                ends_after_sentence=bool(left and left[-1] in ".!?…"),
+            )
+        )
+    return tuple(seams)
 
 
 def _pack_text(text: str, *, max_chars: int) -> tuple[str, ...]:

@@ -80,6 +80,7 @@ def load_voice_bank(catalog_path: Path) -> VoiceBankCatalog:
     root = catalog_path.parent
     root_resolved = root.resolve()
     seen_ids: set[str] = set()
+    fingerprints_to_ids: dict[str, str] = {}
     profiles: list[VoiceProfile] = []
     for raw_profile in raw_voices:
         profile = _voice_profile(catalog_path, raw_profile)
@@ -89,6 +90,13 @@ def load_voice_bank(catalog_path: Path) -> VoiceBankCatalog:
                 f"'{profile.id}'"
             )
         seen_ids.add(profile.id)
+        previous_id = fingerprints_to_ids.get(profile.reference_sha256)
+        if previous_id is not None:
+            raise VoiceBankError(
+                f"voice bank catalog '{catalog_path.name}' profiles '{previous_id}' and "
+                f"'{profile.id}' share reference_sha256"
+            )
+        fingerprints_to_ids[profile.reference_sha256] = profile.id
         _validate_reference_path(catalog_path, profile, root, root_resolved)
         profiles.append(profile)
 

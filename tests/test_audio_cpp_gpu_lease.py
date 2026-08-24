@@ -241,6 +241,7 @@ def test_windows_liveness_tri_state_alive_dead_unknown(monkeypatch):
     assert _probe_liveness(-7) == "dead"
 
 
+@pytest.mark.platform_simulated
 def test_windows_liveness_unknown_prevents_lease_steal(monkeypatch, tmp_path):
     from voiceover_pipeline.local_runtime.gpu_lease import (
         GPULeaseError,
@@ -297,6 +298,7 @@ def test_posix_liveness_preserves_os_kill_semantics(monkeypatch):
     assert _probe_liveness(777) == "alive"
 
 
+@pytest.mark.platform_simulated
 def test_windows_lock_backend_retries_until_free_and_unlocks(monkeypatch, tmp_path):
     from voiceover_pipeline.local_runtime.gpu_lease import _windows_lock_backend
 
@@ -352,6 +354,8 @@ def test_posix_lock_backend_uses_flock_ex_and_unlock(monkeypatch, tmp_path):
     assert calls[1][1] == 8
 
 
+@pytest.mark.native_windows
+@pytest.mark.skipif(sys.platform != "win32", reason="requires native Windows file locking")
 def test_windows_lock_backend_exclusive_across_processes(tmp_path):
     if sys.platform != "win32":
         pytest.skip("real Windows cross-process lock")

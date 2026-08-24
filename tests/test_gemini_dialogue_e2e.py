@@ -51,7 +51,7 @@ def _patch_generation_io(monkeypatch):
     monkeypatch.setattr(cli, "mp3_duration_ms", lambda *_args, **_kwargs: 1000)
     monkeypatch.setattr(
         cli,
-        "concat_mp3_chunks",
+        "concat_dialogue_turns",
         lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"),
     )
     monkeypatch.setattr(cli, "attach_costs", lambda *args, **kwargs: args[-1])
@@ -104,31 +104,89 @@ def test_gemini_dialogue_e2e_mocked_generation(tmp_path, monkeypatch, capsys):
     assert len(json_lines) == 1
     assert captured.err.strip() == ""
 
-    assert mock_post.call_count == 2
+    assert mock_post.call_count == 4
     bodies = [call[1]["json"] for call in mock_post.call_args_list]
-    for body in bodies:
+    for body, voice, text in zip(
+        bodies,
+        ["Kore", "Puck", "Kore", "Puck"],
+        [
+            "[warmly] Что умеет утилита?",
+            "Она создаёт озвучку и субтитры.",
+            "[curious] Можно работать локально?",
+            "Да, для одноголосой озвучки есть OmniVoice.",
+        ],
+    ):
         assert body["model"] == "google/gemini-3.1-flash-tts-preview"
-        assert body["voice"] == "Kore"
-        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
-        assert len(configs) == 2
-        assert {config["speaker"] for config in configs} == {"Host", "Guest"}
-        for config in configs:
-            assert config["voice_config"]["prebuilt_voice_config"]["voice_name"] in ("Kore", "Puck")
+        assert body["voice"] == voice
+        assert body["input"] == text
+        assert "multi_speaker_voice_config" not in body
 
     run_dir = tmp_path / "out" / "e2e-dialogue"
     chunks_manifest = json.loads((run_dir / "chunks" / "chunks.json").read_text(encoding="utf-8"))
-    assert chunks_manifest["script_format"] == "gemini-dialogue"
+    assert chunks_manifest["script_format"] == "dialogue"
     assert chunks_manifest["speaker_voice_map"] == {"Host": "Kore", "Guest": "Puck"}
-    assert len(chunks_manifest["chunks"]) == 2
+    assert len(chunks_manifest["chunks"]) == 4
+    assert [chunk["turn_index"] for chunk in chunks_manifest["chunks"]] == [1, 2, 3, 4]
+    assert [chunk["speech_duration_ms"] for chunk in chunks_manifest["chunks"]] == [1000] * 4
+    assert [chunk["pause_after_ms"] for chunk in chunks_manifest["chunks"]] == [250, 600, 250, 0]
+    assert [(chunk["start_ms"], chunk["end_ms"]) for chunk in chunks_manifest["chunks"]] == [
+        (0, 1000),
+        (1250, 2250),
+        (2850, 3850),
+        (4100, 5100),
+    ]
+    for chunk in chunks_manifest["chunks"]:
+        assert len(chunk["audio_sha256"]) == 64
+        int(chunk["audio_sha256"], 16)
+        assert "transcript" not in chunk
 
     run_state = json.loads((run_dir / "run_state.json").read_text(encoding="utf-8"))
-    assert run_state["script_format"] == "gemini-dialogue"
-    voice_identity = run_state.get("voice_identity")
-    assert voice_identity is not None
-    assert len(voice_identity) == 64
-    int(voice_identity, 16)
+    assert run_state["script_format"] == "dialogue"
+    synthesis_identity = run_state.get("synthesis_identity")
+    assert synthesis_identity is not None
+    assert len(synthesis_identity) == 64
+    int(synthesis_identity, 16)
+    assert all("text" not in turn and "transcript" not in turn for turn in run_state["chunks"])
 
-    assert (run_dir / "chunks" / "chunk_01.mp3").exists()
-    assert (run_dir / "chunks" / "chunk_02.mp3").exists()
+    assert (run_dir / "chunks" / "turn_0001.mp3").exists()
+    assert (run_dir / "chunks" / "turn_0004.mp3").exists()
     assert (run_dir / "e2e-dialogue-voiceover-google-gemini-3-1-flash-tts-preview.mp3").exists()
     assert (run_dir / "manifest.json").exists()
+
+
+def test_omnivoice_dialogue_validation_accepts_admitted_bank_profiles(tmp_path):
+    from voiceover_pipeline.gemini_dialogue import (
+        dialogue_turns_from_validation,
+        validate_gemini_dialogue_file,
+    )
+
+    script = tmp_path / "omnivoice-dialogue.md"
+    script.write_text(
+        "\n".join(
+            [
+                "---",
+                "format: gemini-dialogue",
+                "speakers:",
+                "  Female:",
+                "    voice: omni-female-neutral-01",
+                "  Male:",
+                "    voice: omni-male-deep-01",
+                "---",
+                "Female: Привет.",
+                "Male: Здравствуйте.",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    report = validate_gemini_dialogue_file(
+        script,
+        provider="omnivoice-local",
+        allowed_voices={"omni-female-neutral-01", "omni-male-deep-01"},
+    )
+
+    assert report["valid"] is True
+    assert [turn.voice for turn in dialogue_turns_from_validation(report)] == [
+        "omni-female-neutral-01",
+        "omni-male-deep-01",
+    ]

@@ -217,7 +217,7 @@ class TestOpenRouterTTSProviderOpenAI:
         assert json_body["voice"] == "Puck"
         assert result.audio_bytes == b"fake-audio-gemini"
 
-    def test_gemini_model_can_send_multispeaker_config(self):
+    def test_gemini_model_ignores_legacy_multispeaker_config(self):
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.content = b"fake-audio-gemini"
@@ -237,11 +237,7 @@ class TestOpenRouterTTSProviderOpenAI:
 
         json_body = mock_post.call_args[1]["json"]
         assert json_body["voice"] == "Puck"
-        configs = json_body["multi_speaker_voice_config"]["speaker_voice_configs"]
-        assert configs[0]["speaker"] == "Speaker1"
-        assert configs[0]["voice_config"]["prebuilt_voice_config"]["voice_name"] == "Puck"
-        assert configs[1]["speaker"] == "Speaker2"
-        assert configs[1]["voice_config"]["prebuilt_voice_config"]["voice_name"] == "Kore"
+        assert "multi_speaker_voice_config" not in json_body
         assert result.audio_bytes == b"fake-audio-gemini"
 
     def test_gemini_no_style_prompt_sends_none_prompt(self):
@@ -451,27 +447,20 @@ class TestGeminiMultiSpeakerRequestShape:
             )
         return mock_post.call_args[1]["json"]
 
-    def test_request_has_exactly_two_speaker_configs(self, tmp_path):
+    def test_request_has_no_undocumented_multispeaker_config(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
         body = self._request_body(tmp_path, report)
-        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
-        assert len(configs) == 2
+        assert "multi_speaker_voice_config" not in body
 
-    def test_speaker_names_match_validated_aliases(self, tmp_path):
+    def test_request_is_single_voice(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
         body = self._request_body(tmp_path, report)
-        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
-        assert {config["speaker"] for config in configs} == set(report["speaker_voice_map"])
+        assert body["voice"] == "Kore"
 
-    def test_voice_names_match_validated_map(self, tmp_path):
+    def test_request_contains_only_documented_fields(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
         body = self._request_body(tmp_path, report)
-        configs = body["multi_speaker_voice_config"]["speaker_voice_configs"]
-        for config in configs:
-            assert (
-                config["voice_config"]["prebuilt_voice_config"]["voice_name"]
-                == report["speaker_voice_map"][config["speaker"]]
-            )
+        assert set(body) <= {"model", "input", "voice", "response_format", "prompt"}
 
     def test_top_level_compatibility_voice_equals_first_validated_voice(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
@@ -482,7 +471,7 @@ class TestGeminiMultiSpeakerRequestShape:
     def test_no_third_speaker_or_raw_frontmatter_in_request(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
         body = self._request_body(tmp_path, report)
-        assert len(body["multi_speaker_voice_config"]["speaker_voice_configs"]) == 2
+        assert "multi_speaker_voice_config" not in body
         serialized = json.dumps(body, ensure_ascii=False)
         assert "max_chunk_bytes" not in serialized
         assert "allowed_tags" not in serialized

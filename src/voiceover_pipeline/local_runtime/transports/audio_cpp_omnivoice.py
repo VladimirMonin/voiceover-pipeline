@@ -8,6 +8,7 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
+from math import ceil
 from pathlib import Path
 from threading import RLock
 from typing import Final
@@ -15,6 +16,7 @@ from typing import Final
 from voiceover_pipeline.audio_cpp.inventory import find_family_inventory
 from voiceover_pipeline.local_runtime.contracts import RuntimeProtocolError, RuntimeTransportError
 from voiceover_pipeline.local_runtime.transports.audio_cpp_cli import (
+    _stage_reference_audio,
     build_audio_cpp_family_arguments,
     decode_audio_cpp_cli_request,
     decode_audio_cpp_cli_response,
@@ -26,6 +28,7 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_container import (
 _PRIVATE_TMP_PREFIX: Final = "voiceover-audio-cpp-"
 _OMNIVOICE_FAMILY: Final = "omnivoice"
 _MOUNTED_MODEL_PATH: Final = "/models/omnivoice-q8_0.gguf"
+_MOUNTED_REFERENCE_PATH: Final = "/input/reference.wav"
 PINNED_AUDIO_CPP_OMNIVOICE_BINARY_SHA256: Final = (
     "d98b99f10355a018ddaec6d17999725ab7bdbcf5f164ab067c1288a15a4f51dd"
 )
@@ -37,6 +40,8 @@ _CHILD_ENVIRONMENT_KEYS: Final = (
     "LC_ALL",
 )
 _MODEL_HASH_CHUNK_BYTES: Final = 1024 * 1024
+_DEFAULT_TIMEOUT_CHARS: Final = 420
+_MAX_TIMEOUT_SECONDS: Final = 1800.0
 
 
 @dataclass(frozen=True)
@@ -142,16 +147,23 @@ class AudioCppOmniVoiceCLITransport:
                 os.chmod(workspace, 0o700)
                 output_directory = workspace / "output"
                 output_directory.mkdir(mode=0o700)
+                reference_path = _stage_reference_audio(
+                    request, workspace, timeout_seconds=self._timeout_seconds
+                )
                 output_path = output_directory / "omnivoice.wav"
                 with self._lock:
                     if request_id in self._cancelled:
                         raise RuntimeTransportError("OmniVoice invocation cancelled")
                     process = self._start_container(
-                        self._build_command(output_directory=output_directory, request=request)
+                        self._build_command(
+                            output_directory=output_directory,
+                            request=request,
+                            reference_path=reference_path,
+                        )
                     )
                     self._processes[request_id] = process
                 try:
-                    process.communicate(timeout=self._timeout_seconds)
+                    process.communicate(timeout=self._timeout_for_request(request))
                 except subprocess.TimeoutExpired as exc:
                     self._terminate_process(process)
                     raise RuntimeTransportError("OmniVoice invocation timed out") from exc
@@ -191,7 +203,11 @@ class AudioCppOmniVoiceCLITransport:
         return request
 
     def _build_command(
-        self, *, output_directory: Path, request: Mapping[str, object]
+        self,
+        *,
+        output_directory: Path,
+        request: Mapping[str, object],
+        reference_path: Path | None,
     ) -> tuple[str, ...]:
         command: list[str] = [
             *self._container_command,
@@ -211,6 +227,10 @@ class AudioCppOmniVoiceCLITransport:
             "--mount",
             f"type=bind,src={output_directory},dst=/output",
         ]
+        if reference_path is not None:
+            command.extend(
+                ("--mount", self._readonly_mount(reference_path, _MOUNTED_REFERENCE_PATH))
+            )
         command.append(self._image)
         command.extend(
             build_audio_cpp_family_arguments(
@@ -218,10 +238,19 @@ class AudioCppOmniVoiceCLITransport:
                 payload=request,
                 model_argument=_MOUNTED_MODEL_PATH,
                 output_directory=Path("/output"),
+                reference_audio_argument=(
+                    _MOUNTED_REFERENCE_PATH if reference_path is not None else None
+                ),
                 wav_filename="omnivoice.wav",
             )
         )
         return tuple(command)
+
+    def _timeout_for_request(self, request: Mapping[str, object]) -> float:
+        text = request.get("text")
+        text_length = len(text) if isinstance(text, str) else 0
+        workload_units = max(1, ceil(text_length / _DEFAULT_TIMEOUT_CHARS))
+        return min(_MAX_TIMEOUT_SECONDS, self._timeout_seconds * workload_units)
 
     @staticmethod
     def _readonly_mount(source: Path, destination: str) -> str:
@@ -277,3 +306,9 @@ class AudioCppOmniVoiceCLITransport:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 return
+            try:
+                process.wait(timeout=1)
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeTransportError(
+                    "OmniVoice container process could not be terminated"
+                ) from exc

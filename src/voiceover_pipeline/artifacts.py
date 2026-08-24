@@ -30,8 +30,14 @@ def write_json(path: Path, data: dict[str, Any]) -> None:
         raise RuntimeError(f"Failed to write {path}: {e}") from e
 
 
-def chunk_artifacts_to_dicts(chunks: list[ChunkArtifact]) -> list[dict[str, Any]]:
-    return [drop_none(asdict(chunk)) for chunk in chunks]
+def chunk_artifacts_to_dicts(
+    chunks: list[ChunkArtifact], *, redact_transcripts: bool = False
+) -> list[dict[str, Any]]:
+    artifacts = [drop_none(asdict(chunk)) for chunk in chunks]
+    if redact_transcripts:
+        for artifact in artifacts:
+            artifact.pop("transcript", None)
+    return artifacts
 
 
 def drop_none(value: dict[str, Any]) -> dict[str, Any]:
@@ -86,7 +92,10 @@ def build_chunks_manifest(
             "duration_source": "ffprobe_after_ffmpeg_final_silence_trim",
             "ffmpeg": ffmpeg_path,
             "ffprobe": ffprobe_path,
-            "chunks": chunk_artifacts_to_dicts(chunk_artifacts),
+            "chunks": chunk_artifacts_to_dicts(
+                chunk_artifacts,
+                redact_transcripts=script_format == "dialogue",
+            ),
         }
     )
 

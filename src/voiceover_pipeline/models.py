@@ -10,6 +10,10 @@ class ScriptChunk:
     number: int
     id: str
     text: str
+    speaker: str | None = None
+    voice: str | None = None
+    voice_fingerprint: str | None = None
+    pause_after_ms: int = 0
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,13 @@ class ChunkArtifact:
     transcript: str | None
     client_path: str | None
     generation_id: str | None
+    speaker: str | None = None
+    voice: str | None = None
+    voice_fingerprint: str | None = None
+    turn_index: int | None = None
+    speech_duration_ms: int | None = None
+    audio_sha256: str | None = None
+    pause_after_ms: int = 0
     runtime_receipt: dict[str, str] | None = None
     voice_selection: dict[str, Any] | None = None
     voice_session: dict[str, Any] | None = None

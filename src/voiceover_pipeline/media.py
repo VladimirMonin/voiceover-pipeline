@@ -193,6 +193,84 @@ def concat_mp3_chunks(ffmpeg_path: str, chunks_dir: Path, output_path: Path) -> 
     concat_audio_files(ffmpeg_path, sorted(chunks_dir.glob("chunk_*.mp3")), output_path)
 
 
+def concat_dialogue_turns(
+    ffmpeg_path: str,
+    turns: list[tuple[Path, int]],
+    output_path: Path,
+) -> None:
+    """Concatenate ordered dialogue turns through one normalized PCM graph.
+
+    ``turns`` is deliberately ordered by the validated dialogue plan rather
+    than by filename. Every provider artifact and generated silence segment is
+    decoded to the same PCM sample rate, channel layout, and sample format
+    before the only final MP3 encode.
+    """
+    if not turns:
+        raise RuntimeError("No dialogue turn files provided for concat")
+
+    input_args: list[str] = []
+    filters: list[str] = []
+    input_count = 0
+    for turn_path, pause_after_ms in turns:
+        if pause_after_ms < 0:
+            raise ValueError("Dialogue pause duration must not be negative")
+
+        input_args.extend(["-i", str(turn_path)])
+        filters.append(
+            f"[{input_count}:a]aresample={SAMPLE_RATE},"
+            f"aformat=sample_fmts=s16:sample_rates={SAMPLE_RATE}:channel_layouts=mono,"
+            f"asetpts=PTS-STARTPTS[a{input_count}]"
+        )
+        input_count += 1
+
+        if pause_after_ms == 0:
+            continue
+        input_args.extend(
+            [
+                "-f",
+                "lavfi",
+                "-t",
+                f"{pause_after_ms / 1000:.3f}",
+                "-i",
+                f"anullsrc=r={SAMPLE_RATE}:cl=mono",
+            ]
+        )
+        filters.append(
+            f"[{input_count}:a]aresample={SAMPLE_RATE},"
+            f"aformat=sample_fmts=s16:sample_rates={SAMPLE_RATE}:channel_layouts=mono,"
+            f"asetpts=PTS-STARTPTS[a{input_count}]"
+        )
+        input_count += 1
+
+    normalized_streams = "".join(f"[a{index}]" for index in range(input_count))
+    if input_count == 1:
+        filters.append(f"{normalized_streams}anull[dialogue]")
+    else:
+        filters.append(f"{normalized_streams}concat=n={input_count}:v=0:a=1[dialogue]")
+
+    result = subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            *input_args,
+            "-filter_complex",
+            ";".join(filters),
+            "-map",
+            "[dialogue]",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            MP3_BITRATE,
+            str(output_path),
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.decode("utf-8", errors="replace"))
+
+
 def concat_audio_files(ffmpeg_path: str, chunk_paths: list[Path], output_path: Path) -> None:
     if not chunk_paths:
         raise RuntimeError("No audio chunk files provided for concat")

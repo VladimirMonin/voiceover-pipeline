@@ -6,6 +6,7 @@ import pytest
 
 from voiceover_pipeline.config import OMNIVOICE_LOCAL_MODEL_ID
 from voiceover_pipeline.local_tts_text import (
+    inspect_omnivoice_internal_seams,
     merge_omnivoice_session_fragments,
     prepare_local_tts_chunks,
 )
@@ -140,6 +141,29 @@ def test_omnivoice_session_merge_preserves_prepared_fragment_order_in_one_reques
             text="Первое предложение. Второе предложение. Третье предложение.",
         )
     ]
+
+
+def test_omnivoice_session_merge_aligns_long_form_internal_seams_after_sentences() -> None:
+    fragments = [
+        ScriptChunk(number=1, id="chunk_01_part_01", text="Первое предложение."),
+        ScriptChunk(number=2, id="chunk_01_part_02", text="Второе предложение."),
+        ScriptChunk(number=3, id="chunk_01_part_03", text="Третье предложение."),
+    ]
+
+    merged = merge_omnivoice_session_fragments(fragments, max_chars=30)
+    seams = inspect_omnivoice_internal_seams(merged[0].text, max_chars=30)
+
+    assert _tokens(merged[0].text) == _tokens(" ".join(fragment.text for fragment in fragments))
+    assert len(seams) == 2
+    assert all(seam.ends_after_sentence and not seam.splits_word for seam in seams)
+
+
+def test_omnivoice_internal_seam_diagnostic_reports_a_hard_word_cut() -> None:
+    seams = inspect_omnivoice_internal_seams("а" * 31, max_chars=30)
+
+    assert seams[0].offset == 30
+    assert seams[0].splits_word is True
+    assert seams[0].ends_after_sentence is False
 
 
 def test_omnivoice_session_merge_requires_clone_reference_identity() -> None:

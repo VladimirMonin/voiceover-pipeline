@@ -24,6 +24,7 @@ else:
     import fcntl
 
     _fcntl = fcntl
+    msvcrt: Any = None
 
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _STILL_ACTIVE = 259
@@ -54,7 +55,7 @@ LockBackend = Callable[[Path], AbstractContextManager[None]]
 
 
 def _default_lock_backend() -> LockBackend:
-    if sys.platform == "win32":
+    if sys.platform == "win32" and msvcrt is not None:
         return _windows_lock_backend
     return _posix_lock_backend
 

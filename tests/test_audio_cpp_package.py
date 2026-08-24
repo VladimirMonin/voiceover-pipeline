@@ -189,6 +189,7 @@ def test_unsupported_manifest_schema_version_is_rejected(tmp_path: Path):
     assert excinfo.value.code == "unsupported_schema_version"
 
 
+@pytest.mark.platform_simulated
 def test_manifest_path_escape_entries_are_rejected(tmp_path: Path):
     package, executable = _make_package(tmp_path)
     for evil in ("..\\..\\evil.dll", "C:/evil/evil.dll", "other\\..\\evil.dll"):
