@@ -218,10 +218,14 @@ listening requirement.
 
 ## Sources
 
-[1] https://github.com/k2-fsa/OmniVoice/blob/master/docs/generation-parameters.md — OmniVoice generation parameters
-[2] https://github.com/k2-fsa/OmniVoice/blob/master/docs/voice-design.md — OmniVoice voice design
-[3] https://github.com/k2-fsa/OmniVoice/issues/116 — OmniVoice issue 116
-[4] https://github.com/k2-fsa/OmniVoice/blob/master/docs/community-projects.md — OmniVoice community projects
-[5] https://github.com/0xShug0/audio.cpp — audio.cpp repository README
-[6] https://github.com/0xShug0/audio.cpp/blob/main/docs/models/omnivoice.md — audio.cpp OmniVoice model documentation
-[7] https://github.com/0xShug0/audio.cpp/blob/main/src/models/omnivoice/session.cpp — audio.cpp OmniVoice session source
+[1] https://github.com/k2-fsa/OmniVoice/blob/08be0b4ccbac3e13e374e86fbfead4b4cac343e2/README.md — Voice Design training-language limitation.
+[2] https://github.com/k2-fsa/OmniVoice/blob/08be0b4ccbac3e13e374e86fbfead4b4cac343e2/docs/generation-parameters.md — long-form and decoding parameters.
+[3] https://github.com/k2-fsa/OmniVoice/issues/186#issuecomment-4703863895 — maintainer on garbage output and data coverage outside Chinese/English.
+[4] https://github.com/k2-fsa/OmniVoice/issues/206#issuecomment-4998772296 — maintainer on voice switching and retraining.
+[5] https://github.com/k2-fsa/OmniVoice/issues/116#issuecomment-4739643480 — maintainer: truncation has no real solution without new training.
+[6] https://github.com/k2-fsa/OmniVoice/issues/245#issuecomment-5213760618 — current truncation report and training-data explanation.
+[7] https://github.com/k2-fsa/OmniVoice/issues/144#issuecomment-4474067675 — Voice Design garbage, sentence chunking, and distribution coverage.
+[8] https://github.com/k2-fsa/OmniVoice/issues/134 — repeated, mixed, and skipped speech reproducer.
+[9] https://github.com/k2-fsa/OmniVoice/issues/253 — random text skipping report.
+[10] https://github.com/0xShug0/audio.cpp/blob/502b5b74bd26e9b4aed267d1776ecf131cae7215/src/models/omnivoice/session.cpp — exact pinned audio.cpp long-form session implementation.
+[11] https://github.com/k2-fsa/OmniVoice/blob/08be0b4ccbac3e13e374e86fbfead4b4cac343e2/docs/community-projects.md — audio.cpp is a community project.

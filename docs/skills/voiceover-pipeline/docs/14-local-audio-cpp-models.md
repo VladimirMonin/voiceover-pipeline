@@ -115,6 +115,19 @@ experimental и требует отдельной приёмки; более д�
 короткие experimental clips или другой TTS provider. Windows clone/preset и
 принятые voice-bank пути этим gate не объявляются сломанными.
 
+Upstream evidence: Voice Design is limited to Chinese/English in the
+[official README](https://github.com/k2-fsa/OmniVoice/blob/08be0b4ccbac3e13e374e86fbfead4b4cac343e2/README.md);
+maintainers tie non-English garbage to
+[training-data coverage](https://github.com/k2-fsa/OmniVoice/issues/186#issuecomment-4703863895),
+voice switching to a condition that
+[requires retraining](https://github.com/k2-fsa/OmniVoice/issues/206#issuecomment-4998772296),
+and truncation to a problem with
+[no complete fix](https://github.com/k2-fsa/OmniVoice/issues/116#issuecomment-4739643480).
+Reports also show [repeated/mixed/skipped speech](https://github.com/k2-fsa/OmniVoice/issues/134)
+and [random skipped text](https://github.com/k2-fsa/OmniVoice/issues/253).
+Long blocks increase exposure; they are not proven to be the sole cause. The
+full evidence ledger is in `docs/reports/2026-08-24-omnivoice-hallucination-research.md`.
+
 Voice bank живёт вне репозитория (например,
 `C:\audio-cpp-work\voice-bank\approved\catalog.json`, schema v1, профили —
 mono WAV + SHA-256). Каталог читается только через CLI

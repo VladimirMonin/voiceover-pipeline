@@ -30,6 +30,27 @@ longer requests fail before provider/model/GPU construction. A syntactically
 valid instruction such as `female, middle-aged, very low pitch` does not make
 long Russian Voice Design reliable.
 
+### Upstream evidence for this restriction
+
+- OmniVoice states that Voice Design was trained only on Chinese and English:
+  [upstream README at the researched revision](https://github.com/k2-fsa/OmniVoice/blob/08be0b4ccbac3e13e374e86fbfead4b4cac343e2/README.md).
+- The maintainer attributes non-Chinese/non-English garbage output to training-data
+  coverage: [issue #186 comment](https://github.com/k2-fsa/OmniVoice/issues/186#issuecomment-4703863895).
+- Upstream reports cover [repeated/mixed/skipped speech](https://github.com/k2-fsa/OmniVoice/issues/134),
+  [random skipped text](https://github.com/k2-fsa/OmniVoice/issues/253), and
+  [voice switching that requires retraining](https://github.com/k2-fsa/OmniVoice/issues/206#issuecomment-4998772296).
+- Maintainers describe truncation as a training-data problem with no complete fix:
+  [issue #116 comment](https://github.com/k2-fsa/OmniVoice/issues/116#issuecomment-4739643480) and
+  [issue #245 comment](https://github.com/k2-fsa/OmniVoice/issues/245#issuecomment-5213760618).
+- Sentence chunking can reduce some Voice Design garbage, but upstream still
+  attributes it to insufficient distribution coverage:
+  [issue #144 comment](https://github.com/k2-fsa/OmniVoice/issues/144#issuecomment-4474067675).
+- The pinned audio.cpp long-form implementation is inspectable at
+  [revision `502b5b74`](https://github.com/0xShug0/audio.cpp/blob/502b5b74bd26e9b4aed267d1776ecf131cae7215/src/models/omnivoice/session.cpp).
+
+Long blocks increase exposure to these failures, but are not proven to be their
+sole cause. No complete upstream fix exists for the current checkpoint.
+
 ## Voice bank
 
 A voice bank is a directory outside the repository with `catalog.json`
