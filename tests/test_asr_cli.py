@@ -544,6 +544,79 @@ def test_transcribe_normalizes_a_fixture_provider_without_timestamps(monkeypatch
     assert data["execution"]["measurements"] == {"wall_s": 0.25}
 
 
+def test_verify_tts_quality_emits_transcript_free_pass_receipt(monkeypatch, capsys):
+    import voiceover_pipeline.cli as cli
+
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec())
+    args = cli.build_parser().parse_args(
+        [
+            "verify-tts",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--expected-text",
+            "fixture transcript",
+            "--provider",
+            "fixture-local",
+            "--model",
+            "fixture-model",
+            "--language",
+            "ru",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.verify_tts_cmd(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 0
+    assert data["passed"] is True
+    assert data["asr"]["provider"] == "fixture-local"
+    assert data["asr"]["runtime"] == "fixture-runtime"
+    assert "transcript" not in data
+    assert "fixture transcript" not in json.dumps(data)
+
+
+def test_verify_tts_quality_fails_closed_on_unexpected_speech(monkeypatch, capsys):
+    import voiceover_pipeline.cli as cli
+
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: _fixture_spec())
+    args = cli.build_parser().parse_args(
+        [
+            "verify-tts",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--expected-text",
+            "completely different expected words that are absent",
+            "--provider",
+            "fixture-local",
+            "--model",
+            "fixture-model",
+            "--language",
+            "ru",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            "--json",
+        ]
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.verify_tts_cmd(args)
+
+    data = json.loads(capsys.readouterr().out)
+    assert exit_info.value.code == 60
+    assert data["status"] == "quality_failed"
+    assert data["passed"] is False
+    assert data["failure_reasons"]
+    assert "fixture transcript" not in json.dumps(data)
+
+
 def test_asr_json_payload_preserves_native_raw_timestamp_entries():
     import voiceover_pipeline.cli as cli
 

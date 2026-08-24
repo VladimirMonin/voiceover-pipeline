@@ -122,11 +122,15 @@ description: >
    ID, пути, хэши и машинные десятичные дроби не отправляй модели как речь.
 6. **Генерация аудио.** `voiceover generate --provider <X> --model <Y> --script "script.md" --run-id "prod" --json --resume`.
    Не используй `--overwrite` для платной генерации; если run оборвался — продолжай через `--resume`.
+   Для длинного/выпускного TTS с доступным локальным ASR затем запусти
+   `voiceover verify-tts --audio <mp3> --expected-file <script> --provider <ASR> --receipt <json> --json`.
+   Exit `60` — quality FAIL; exit `0` всё равно требует человеческого прослушивания.
 7. **Тайминги.** Предпочитай `generate --with-timings` в том же безопасном прогоне.
    Если тайминги нужны отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
    не перезаписывай папку платного прогона:
    `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --output-dir "out" --run-id "prod-timings" --json`.
 8. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
+   В receipt проверь `execution_source`: source kind, revision/dirty и package-tree SHA-256.
 
 ## Security-first правила
 

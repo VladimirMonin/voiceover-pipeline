@@ -16,6 +16,7 @@
 | `generate` | Полная генерация + тайминги | да |
 | `timings --audio` | Тайминги из готового MP3 | да |
 | `transcribe --audio` | Распознать конечный локальный аудиофайл через ASR registry | да |
+| `verify-tts --audio --expected-file` | Fail-closed проверка пропусков, посторонней речи и повторов через локальный ASR | да |
 
 Все команды можно вызвать с `--json` для машинно-читаемого вывода.
 
@@ -31,6 +32,7 @@
 | `30` | provider/run error | API error, папка существует без --overwrite |
 | `40` | whisper error | Whisper timing не удался |
 | `50` | output error | Ошибка записи/удаления файлов |
+| `60` | TTS quality failed | ASR-сверка нашла существенный пропуск, вставку или повтор; аудио и receipt сохранены |
 
 ## Stdout/Stderr Contract
 
@@ -194,7 +196,32 @@ JSON argv для локального Docker command (default `["docker"]`). `do
 - `--mode design` требует непустой `--design-instruction` из allowlist
   (gender/age/pitch/style/accent); `--reference-audio`/`--reference-text`/
   `--voice` запрещены. Неизвестный токен fail closed с exit code `2`.
+  Accent attributes относятся только к English synthesis, Chinese dialect
+  attributes — только к Chinese synthesis. Текущий OmniVoice route фиксирован
+  на русском языке, поэтому обе категории отклоняются до запуска модели.
   Public kind: `design-instruction`.
+
+Каждый новый `run_state.json` и итоговый run receipt содержит content-free
+`execution_source`: package version, `editable-checkout`/`installed-wheel`, Git
+revision и dirty flag для editable checkout, плюс SHA-256 точного package tree.
+Локальные пути и исходный текст туда не входят.
+
+## `verify-tts` — fail-closed quality gate
+
+Команда запускает явно выбранный зарегистрированный ASR route и сравнивает
+нормализованный transcript с `--expected-text` или `--expected-file`. Она
+проверяет similarity, существенные пропуски, неожиданные слова и повторённые
+двух-/трёхсловные последовательности. Transcript и expected text не публикуются:
+stdout/`--receipt` содержат только hashes, counts, ASR identity и audio SHA-256.
+`0` означает technical PASS, `60` — quality FAIL. Недоступный ASR остаётся
+exit `10`/`30`; decode-only PASS не подменяет эту проверку. Даже technical PASS
+содержит `human_listening_required: true`.
+
+```bash
+voiceover verify-tts --audio out/run/full.mp3 --expected-file script.md \
+  --provider qwen-local --model Qwen/Qwen3-ASR-0.6B --language ru \
+  --receipt out/run/tts-quality.json --json
+```
 
 Named `--voice` (вне preset+bank), Qwen cloning/sample options и style
 controls для этого provider fail closed. На Windows Docker/WSL не выбираются:

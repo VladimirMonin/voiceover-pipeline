@@ -205,6 +205,9 @@ def test_generate_step_persists_the_public_omnivoice_runtime_receipt(tmp_path, m
     }
     assert run_manifest["chunks"][0]["voice_selection"] == state["chunks"][0]["voice_selection"]
     assert run_manifest["chunks"][0]["voice_session"] == state["chunks"][0]["voice_session"]
+    assert run_manifest["execution_source"] == state["execution_source"]
+    assert run_manifest["execution_source"]["package_version"] == "0.6.0"
+    assert str(tmp_path) not in json.dumps(run_manifest["execution_source"])
     assert str(tmp_path) not in json.dumps(run_manifest["chunks"][0]["runtime_receipt"])
 
 

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .execution_identity import build_execution_identity
 from .models import ChunkArtifact, ScriptChunk
 
 STATE_FILE = "run_state.json"
@@ -63,6 +64,7 @@ def initial_state(
         "script": str(script_path.resolve()),
         "script_format": script_format,
         "script_hash": script_hash(chunks),
+        "execution_source": build_execution_identity(),
         "chunk_count": len(chunks),
         "limited_to_chunks": limited_to_chunks,
         "completed_count": 0,

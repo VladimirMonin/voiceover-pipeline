@@ -9,7 +9,7 @@
 | `auto` | No voice guidance; model default | `auto-voice` | `auto-voice-native-session` |
 | `preset` (default) | Resolves `--voice` through `--voice-bank` catalog into a reference WAV + transcript, then native clone | `bank-preset` (with `voice_id`, `voice_fingerprint`) | `bank-preset-native-session` |
 | `clone` | Ad-hoc `--reference-audio` + `--reference-text` native clone | `reference-clone` | `reference-isolated-native-session` |
-| `design` | Allowlisted `--design-instruction` (gender, age, pitch, style, accent) | `design-instruction` | `design-instruction-native-session` |
+| `design` | Allowlisted `--design-instruction` (gender, age, pitch, style; accents are English-only) | `design-instruction` | `design-instruction-native-session` |
 | (legacy fallback) | Fixed built-in `female` condition, only when no mode applies | `built-in-style-condition` | `single-native-invocation-internal-text-chunking` |
 
 Deterministic seed `1234`, 32 inference steps, guidance scale `2.0`, and
@@ -19,6 +19,12 @@ internal text chunk size `420` apply to every mode.
 voice bank catalog and rejects unknown voice ids with exit code 30 on resume
 mismatch. Passing Qwen cloning/sample options and `--style-prompt` /
 `--style-prompt-file` to `omnivoice-local` is rejected.
+
+Upstream trains voice design primarily on Chinese and English. Accent attributes
+describe English speech, not the language of synthesis. Because the current VOP
+OmniVoice route is fixed to Russian, accent and Chinese-dialect attributes are
+rejected before runtime admission. For a deep Russian female design use
+`female, middle-aged, very low pitch`; do not add `russian accent`.
 
 ## Voice bank
 
@@ -163,4 +169,4 @@ Always pass `--language ru` for Russian text. Never pipe text through
 
 ## Receipts and safety
 
-The runtime returns only copied WAV bytes and a runtime receipt containing driver ID, transport, pinned source revision, and `audiocpp_cli` build hash. Every generated OmniVoice chunk also preserves a public artifact receipt with model ID, SHA-256, quantization, license, and provenance; its public `voice_selection` records the mode-specific kind, and `voice_session` records the fixed seed and one-session internal chunking strategy. These fields contain no local model or temporary paths. Private temporary output paths and input text are not included in receipts or surfaced in transport errors. Bank references are staged under a neutral filename, normalized to PCM16 mono 24 kHz, and cleaned up in `finally`. GPU leasing and lifecycle release are delegated to `LocalAudioRuntime`.
+The runtime returns only copied WAV bytes and a runtime receipt containing driver ID, transport, pinned source revision, and `audiocpp_cli` build hash. Every generated OmniVoice chunk also preserves a public artifact receipt with model ID, SHA-256, quantization, license, and provenance; its public `voice_selection` records the mode-specific kind, and `voice_session` records the fixed seed and one-session internal chunking strategy. Run receipts additionally carry a path-free `execution_source` with package version, editable/wheel source kind, Git revision/dirty state where available, and exact package-tree SHA-256. Private paths, input text and design instructions are excluded. Use `voiceover verify-tts --audio ... --expected-file ... --provider ... --receipt ... --json` for transcript-free omission/insertion/repetition evidence; technical PASS never replaces human listening. Bank references are staged under a neutral filename, normalized to PCM16 mono 24 kHz, and cleaned up in `finally`. GPU leasing and lifecycle release are delegated to `LocalAudioRuntime`.

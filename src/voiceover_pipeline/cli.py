@@ -49,6 +49,7 @@ from .config import (
     ELEVENLABS_TTS_VOICES,
     GEMINI_TTS_VOICES,
     OMNIVOICE_DEFAULT_GUIDANCE_SCALE,
+    OMNIVOICE_DEFAULT_LANGUAGE,
     OMNIVOICE_DEFAULT_SEED,
     OMNIVOICE_DEFAULT_STEPS,
     OMNIVOICE_LOCAL_MODEL_ID,
@@ -88,7 +89,14 @@ from .media import (
     trim_final_silence,
     write_audio_as_mp3,
 )
-from .models import ASRContextHints, ASRRequest, ASRRuntimeChoice, ChunkArtifact, ScriptChunk
+from .models import (
+    ASRContextHints,
+    ASRRequest,
+    ASRResult,
+    ASRRuntimeChoice,
+    ChunkArtifact,
+    ScriptChunk,
+)
 from .omnivoice_design import normalize_omnivoice_design_instruction
 from .omnivoice_voice_bank import (
     VoiceBankCatalog,
@@ -134,6 +142,7 @@ from .run_state import (
 )
 from .script_splitter import split_markdown_by_delimiter
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
+from .tts_quality import evaluate_tts_transcript
 from .voiceover_script import (
     VOICEOVER_FORMAT,
     chunks_from_voiceover_report,
@@ -149,6 +158,7 @@ _EXIT_NO_KEY = 20
 _EXIT_PROVIDER = 30
 _EXIT_WHISPER = 40
 _EXIT_OUTPUT = 50
+_EXIT_QUALITY = 60
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -203,6 +213,8 @@ def main() -> None:
             split_cmd(args)
         elif args.command == "transcribe":
             transcribe_cmd(args)
+        elif args.command == "verify-tts":
+            verify_tts_cmd(args)
         elif args.command == "timings":
             run_timings(args)
         elif args.command == "status":
@@ -405,6 +417,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Requested ASR runtime route.",
     )
     asr.add_argument("--json", dest="json_output", action="store_true")
+
+    # --------------- verify-tts ---------------
+    verify_tts = subparsers.add_parser(
+        "verify-tts",
+        help="Fail closed on major TTS omissions, unexpected speech, or repetition.",
+    )
+    verify_tts.add_argument("--audio", type=str, required=True)
+    expected_group = verify_tts.add_mutually_exclusive_group(required=True)
+    expected_group.add_argument("--expected-text", default=None)
+    expected_group.add_argument("--expected-file", type=Path, default=None)
+    verify_tts.add_argument("--provider", required=True, help="Registered ASR provider ID.")
+    verify_tts.add_argument("--model", default=None, help="Provider-specific ASR model ID.")
+    verify_tts.add_argument("--language", default=None, help="Optional forced language.")
+    verify_tts.add_argument("--device", default=DEFAULT_ASR_DEVICE)
+    verify_tts.add_argument("--compute", default=DEFAULT_ASR_COMPUTE)
+    verify_tts.add_argument("--runtime", choices=["auto", "python", "audio-cpp"], default="auto")
+    verify_tts.add_argument("--receipt", type=Path, default=None)
+    verify_tts.add_argument("--json", dest="json_output", action="store_true")
 
     # --------------- timings ---------------
     timp = subparsers.add_parser("timings", help="Extract Whisper timings from audio.")
@@ -833,7 +863,9 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
             _EXIT_ARGS,
         )
     try:
-        normalize_omnivoice_design_instruction(design_instruction)
+        normalize_omnivoice_design_instruction(
+            design_instruction, language=OMNIVOICE_DEFAULT_LANGUAGE
+        )
     except ValueError as exc:
         fail(str(exc), _EXIT_ARGS)
     try:
@@ -1436,6 +1468,7 @@ def _generate_step(
         prompt_mode=prompt_mode,
         script_format=getattr(args, "format", "markdown"),
         speaker_voice_map=getattr(args, "speaker_voice_map", None) or None,
+        execution_source=state.get("execution_source"),
     )
     try:
         write_json(paths.chunks_json, chunks_manifest)
@@ -1661,7 +1694,7 @@ def _resolve_asr_context(args: argparse.Namespace) -> ASRContextHints:
     return ASRContextHints(context_text=context_text)
 
 
-def transcribe_cmd(args: argparse.Namespace) -> None:
+def _transcribe_result(args: argparse.Namespace) -> tuple[ASRResult, Path]:
     audio_path = _resolve_audio(args.audio)
     if not audio_path.exists():
         fail(f"Audio file not found: {audio_path}", _EXIT_ARGS)
@@ -1712,7 +1745,7 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
         device=args.device,
         compute=args.compute,
         hints=hints,
-        timestamp_mode="word" if args.word_timestamps else "none",
+        timestamp_mode="word" if getattr(args, "word_timestamps", False) else "none",
         runtime_choice=runtime,
     )
     provider = provider_factory()
@@ -1751,11 +1784,58 @@ def transcribe_cmd(args: argparse.Namespace) -> None:
             f"ASR provider {spec.provider_id} returned undeclared forced alignment", _EXIT_PROVIDER
         )
 
+    return result, audio_path
+
+
+def transcribe_cmd(args: argparse.Namespace) -> None:
+    result, audio_path = _transcribe_result(args)
+
     data = _asr_result_payload(result, audio_path)
     if args.json_output:
         _json_ok(data)
     else:
         print(result.transcript)
+
+
+def _expected_tts_text(args: argparse.Namespace) -> str:
+    expected_text = getattr(args, "expected_text", None)
+    expected_file = getattr(args, "expected_file", None)
+    if expected_file is not None:
+        try:
+            expected_text = Path(expected_file).read_text(encoding="utf-8")
+        except (OSError, UnicodeError, ValueError):
+            fail(f"Unable to read expected TTS text file: {expected_file}", _EXIT_ARGS)
+    if expected_text is None or not expected_text.strip():
+        fail("Expected TTS text must not be blank", _EXIT_ARGS)
+    return expected_text
+
+
+def verify_tts_cmd(args: argparse.Namespace) -> None:
+    args.context = None
+    args.context_file = None
+    args.word_timestamps = False
+    expected_text = _expected_tts_text(args)
+    result, audio_path = _transcribe_result(args)
+    quality = evaluate_tts_transcript(
+        expected_text=expected_text,
+        actual_transcript=result.transcript,
+    )
+    receipt = quality.public_receipt(
+        audio_sha256=hashlib.sha256(audio_path.read_bytes()).hexdigest(),
+        asr_provider=result.provider_id,
+        asr_model=result.model_id,
+        asr_runtime=result.execution.runtime,
+        asr_model_revision=result.execution.model_revision,
+    )
+    receipt["status"] = "success" if quality.passed else "quality_failed"
+    receipt_path = getattr(args, "receipt", None)
+    if receipt_path is not None:
+        atomic_write_json(Path(receipt_path), receipt)
+    if args.json_output:
+        print(json.dumps(receipt, ensure_ascii=False))
+    else:
+        print("TTS quality PASS" if quality.passed else "TTS quality FAIL")
+    sys.exit(_EXIT_OK if quality.passed else _EXIT_QUALITY)
 
 
 def run_timings(args: argparse.Namespace) -> None:

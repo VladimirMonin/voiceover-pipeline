@@ -75,7 +75,7 @@ _EXCLUSIVITY_GROUPS: Final[tuple[frozenset[str], ...]] = (
 _DESIGN_ITEM_SEPARATOR: Final[re.Pattern[str]] = re.compile(r"\s*[,，]\s*")
 
 
-def normalize_omnivoice_design_instruction(instruction: str) -> str:
+def normalize_omnivoice_design_instruction(instruction: str, *, language: str | None = None) -> str:
     """Split, trim, lowercase, and validate an OmniVoice design instruction.
 
     Returns the canonical lowercase comma-joined form. Raises ``ValueError``
@@ -114,6 +114,18 @@ def normalize_omnivoice_design_instruction(instruction: str) -> str:
     if has_dialect and has_accent:
         raise ValueError(
             "OmniVoice design instruction cannot mix Chinese dialect and English accent"
+        )
+
+    normalized_language = (language or "").strip().lower().replace("_", "-")
+    if has_accent and normalized_language and not normalized_language.startswith("en"):
+        raise ValueError(
+            "OmniVoice accent attributes are supported for English speech only; "
+            f"language '{normalized_language}' must omit accent attributes"
+        )
+    if has_dialect and normalized_language and not normalized_language.startswith("zh"):
+        raise ValueError(
+            "OmniVoice dialect attributes are supported for Chinese speech only; "
+            f"language '{normalized_language}' must omit dialect attributes"
         )
 
     return ", ".join(items)

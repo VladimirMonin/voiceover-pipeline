@@ -32,6 +32,7 @@
 | [OpenRouter TTS](openrouter-tts-models.md) | OpenRouter TTS: Google Gemini, OpenAI GPT-4o Mini TTS — голоса, style prompt, цены |
 | [Qwen Local](qwen-local-tts.md) | Qwen3-TTS локально: preset-голоса, клонирование голоса, бесплатно (GPU) |
 | [OmniVoice Local TTS](omnivoice-local-tts.md) | Явный offline встроенный female style condition через pinned Linux CUDA container; Q8_0, provenance и platform boundary |
+| [OmniVoice hallucination research](reports/2026-08-24-omnivoice-hallucination-research.md) | Upstream и exact-run evidence: unsupported Russian accent conditioning, long-form nonclaims и bounded quality gate |
 
 ## Быстрый старт
 

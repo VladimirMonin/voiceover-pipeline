@@ -164,3 +164,24 @@ def test_normalize_accepts_whisper_with_other_single_group_items():
         normalize_omnivoice_design_instruction("whisper, female, young adult")
         == "whisper, female, young adult"
     )
+
+
+def test_normalize_rejects_english_accent_attributes_for_russian_synthesis():
+    with pytest.raises(ValueError, match="English speech only"):
+        normalize_omnivoice_design_instruction(
+            "female, middle-aged, low pitch, russian accent", language="ru"
+        )
+
+
+def test_normalize_accepts_accent_attributes_for_english_synthesis():
+    assert (
+        normalize_omnivoice_design_instruction(
+            "female, middle-aged, low pitch, russian accent", language="en"
+        )
+        == "female, middle-aged, low pitch, russian accent"
+    )
+
+
+def test_normalize_rejects_chinese_dialect_attributes_outside_chinese_synthesis():
+    with pytest.raises(ValueError, match="Chinese speech only"):
+        normalize_omnivoice_design_instruction("female, 东北话", language="ru")

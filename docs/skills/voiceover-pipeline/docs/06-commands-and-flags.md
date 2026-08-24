@@ -16,6 +16,7 @@
 | `split --script` | Разбить сценарий на чанки (без генерации) | Да |
 | `generate` | Полная генерация: TTS + MP3 + опционально тайминги | Да |
 | `timings --audio` | Извлечь Whisper-тайминги из готового MP3 | Да |
+| `verify-tts --audio --expected-file` | Проверить пропуски/вставки/повторы через ASR без публикации transcript | Да |
 | `status --run-id` | Проверить partial/resumable run | Да |
 | `concat --run-id` | Склеить существующие chunks в partial/full файл | Да |
 
@@ -33,6 +34,7 @@
 | 30 | provider/run error | API error, папка существует без --overwrite |
 | 40 | timing blocked / whisper error | openrouter-whisper отклонён (нет таймкодов) или whisper timing упал (но MP3 сохранён!) |
 | 50 | output error | Ошибка записи/удаления файлов |
+| 60 | TTS quality failed | Существенный пропуск, посторонняя речь или повтор; human listening всё ещё обязателен |
 
 ## Stdout/Stderr контракт
 
@@ -120,7 +122,7 @@ session на прогон. `format: dialogue` создаёт один bound bank
 - `--mode preset` — голос из voice bank: `--voice-bank <catalog.json>` +
   опционально `--voice <profile-id>` (без `--voice` берётся `default_voice` каталога).
 - `--mode clone` — ad-hoc клонирование: `--reference-audio` + `--reference-text`.
-- `--mode design` — голос по инструкции: `--design-instruction`.
+- `--mode design` — голос по инструкции: `--design-instruction`; для русского route accent/dialect attributes запрещены как unsupported-language conditioning.
 - `--voice` вне preset+bank, Qwen-опции и style-флаги для этого провайдера fail closed.
 - `list voices --provider omnivoice-local --voice-bank <catalog.json>` показывает профили банка.
 
