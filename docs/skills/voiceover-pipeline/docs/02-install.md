@@ -108,12 +108,13 @@ Console scripts: `voiceover` и `voiceover-pipeline` (работают оба).
 
 | Менеджер | Base | +Whisper | +Qwen GPU | +All extras |
 |---|---|---|---|---|
+| **uv tool** | `uv tool install voiceover-pipeline` | `uv tool install "voiceover-pipeline[timing-whisper]"` | `uv tool install "voiceover-pipeline[voiceover-qwen]"` | `uv tool install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
 | **uvx** | `uvx voiceover-pipeline doctor` | `uvx --from "voiceover-pipeline[timing-whisper]" voiceover-pipeline generate --with-timings ...` | `uvx --from "voiceover-pipeline[voiceover-qwen]" voiceover-pipeline generate --provider qwen-local ...` | `uvx --from "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]" ...` |
 | **pipx** | `pipx install voiceover-pipeline` | `pipx install "voiceover-pipeline[timing-whisper]"` | `pipx install "voiceover-pipeline[voiceover-qwen]"` | `pipx install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
 | **pip** | `pip install voiceover-pipeline` | `pip install "voiceover-pipeline[timing-whisper]"` | `pip install "voiceover-pipeline[voiceover-qwen]"` | `pip install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
 | **uv pip** | `uv pip install voiceover-pipeline` | `uv pip install "voiceover-pipeline[timing-whisper]"` | `uv pip install "voiceover-pipeline[voiceover-qwen]"` | `uv pip install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
 
-Рекомендация: используй `uvx` для разовых запусков, `pipx` для постоянной установки.
+Рекомендация: используй `uvx` для разовых запусков и `uv tool install` для постоянной изолированной установки. `pipx` — только fallback, если `uv tool` недоступен.
 
 ## Проверка установки
 
