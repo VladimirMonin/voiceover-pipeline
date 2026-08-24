@@ -106,6 +106,15 @@ Offline contract не заменяет отдельный human audible PASS.
 | ad-hoc `clone` | `--mode clone --reference-audio <wav> --reference-text <text>` | клонирование по референсу |
 | `design` | `--mode design --design-instruction <text>` | голос по инструкции |
 
+Upstream обучал Voice Design только на Chinese/English. Для текущего русского
+route короткий design до включительно 30 estimated seconds остаётся только
+experimental и требует отдельной приёмки; более длинный fail-closed отклоняется
+до provider/model/GPU admission. Инструкция `female, middle-aged, very low pitch`
+не исправляет long Russian hallucination. Без неявной подмены выбирай
+`clone` с русским reference, принятый `preset` из voice bank, отдельно принятые
+короткие experimental clips или другой TTS provider. Windows clone/preset и
+принятые voice-bank пути этим gate не объявляются сломанными.
+
 Voice bank живёт вне репозитория (например,
 `C:\audio-cpp-work\voice-bank\approved\catalog.json`, schema v1, профили —
 mono WAV + SHA-256). Каталог читается только через CLI

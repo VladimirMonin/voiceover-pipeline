@@ -114,6 +114,87 @@ def test_list_omnivoice_voice_contract_exposes_style_condition_not_a_named_voice
     }
 
 
+def test_long_russian_omnivoice_design_json_rejects_before_provider_construction(
+    monkeypatch, tmp_path, capsys
+):
+    import sys
+
+    from voiceover_pipeline import cli
+
+    script = tmp_path / "long-russian.md"
+    script.write_text(" ".join(["слово"] * 76), encoding="utf-8")
+    constructed = False
+
+    def forbidden_provider_construction(**kwargs):
+        nonlocal constructed
+        constructed = True
+        raise AssertionError(f"provider must not be constructed: {kwargs}")
+
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(
+        cli.OmniVoiceLocalTTSProvider,
+        "from_environment",
+        forbidden_provider_construction,
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            "omnivoice-local",
+            "--mode",
+            "design",
+            "--design-instruction",
+            "female",
+            "--script",
+            str(script),
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+    assert constructed is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "error"
+    assert payload["code"] == 2
+    assert payload["details"]["error_code"] == "OMNIVOICE_DESIGN_UNSUPPORTED_LONG_LANGUAGE"
+    assert len(payload["details"]["alternatives"]) == 4
+    assert "unreliable" in payload["error"]
+
+
+def test_short_russian_omnivoice_design_emits_experimental_warning(capsys):
+    import argparse
+
+    from voiceover_pipeline.cli import _enforce_omnivoice_design_route
+    from voiceover_pipeline.models import ScriptChunk
+
+    args = argparse.Namespace(provider="omnivoice-local", mode="design")
+    _enforce_omnivoice_design_route(
+        args,
+        [ScriptChunk(number=1, id="chunk_01", text="Короткий русский текст.")],
+    )
+
+    warning = capsys.readouterr().err
+    assert "experimental" in warning
+    assert "trained only for Chinese and English" in warning
+
+
+def test_omnivoice_design_help_names_long_russian_limit_and_alternatives():
+    from conftest import run_cli
+
+    proc = run_cli("generate", "--help")
+
+    assert proc.returncode == 0
+    help_text = " ".join(proc.stdout.split())
+    assert "30-second" in help_text
+    assert "clone, preset, short experimental clips, or another provider" in help_text
+
+
 def test_list_polza_tts_providers():
     code, data = cli_json("list", "providers", "--json")
     assert code == 0

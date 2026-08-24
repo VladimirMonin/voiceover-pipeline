@@ -190,12 +190,13 @@ evidence only and does not establish audible causality.
 The evidence-backed product defect is narrower and certain: VOP accepted
 `russian accent` for Russian synthesis even though upstream defines accent
 attributes for English speech and warns that voice design is trained on Chinese
-and English and can be unstable in other languages. VOP now rejects English
-accent attributes outside English and Chinese dialect attributes outside
-Chinese before runtime admission. This prevents the exact unsupported
-historical conditioning without claiming to solve every provider/model
-hallucination. Russian deep-female design remains available as
-`female, middle-aged, very low pitch`, preserving the accepted Windows shape.
+and English and can be unstable in other languages. VOP rejects English accent
+attributes outside English and Chinese dialect attributes outside Chinese before
+provider/runtime construction. The later upstream verdict also makes the
+long-form nonclaim explicit: `female, middle-aged, very low pitch` is only a
+syntactically valid historical instruction, not a solution to long Russian
+hallucination. Long Russian design is an unsupported model regime; accepted
+Windows clone/preset/voice-bank paths remain separate and are not invalidated.
 
 The product also now writes path-free package execution identity to run receipts
 and provides `voiceover verify-tts`: a configured local ASR compares expected

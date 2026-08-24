@@ -8,7 +8,114 @@ allowed; Chinese dialect tokens cannot be mixed with English accent tokens.
 """
 
 import re
-from typing import Final
+from dataclasses import dataclass
+from typing import Final, Literal
+
+OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS: Final = 30.0
+_OMNIVOICE_ESTIMATED_WORDS_PER_SECOND: Final = 2.5
+
+_OMNIVOICE_DESIGN_ALTERNATIVES: Final[tuple[dict[str, object], ...]] = (
+    {
+        "id": "omnivoice-clone",
+        "provider": "omnivoice-local",
+        "mode": "clone",
+        "requires": "Russian reference audio and its transcript",
+        "experimental": False,
+    },
+    {
+        "id": "omnivoice-preset",
+        "provider": "omnivoice-local",
+        "mode": "preset",
+        "requires": "an available accepted voice-bank profile",
+        "experimental": False,
+    },
+    {
+        "id": "short-design-clips",
+        "provider": "omnivoice-local",
+        "mode": "design",
+        "requires": "separate acceptance of every clip at or below thirty estimated seconds",
+        "experimental": True,
+    },
+    {
+        "id": "other-tts-provider",
+        "provider": None,
+        "mode": None,
+        "requires": "explicit selection of another TTS provider",
+        "experimental": False,
+    },
+)
+
+
+@dataclass(frozen=True)
+class OmniVoiceDesignRoutePolicy:
+    """Pre-runtime truth for one OmniVoice mode/language/text combination."""
+
+    status: Literal["allowed", "experimental", "rejected"]
+    language: str
+    mode: str
+    estimated_duration_seconds: float
+    warning: str | None = None
+    alternatives: tuple[dict[str, object], ...] = ()
+
+    def error_details(self) -> dict[str, object]:
+        """Return the stable machine contract for a rejected design request."""
+        if self.status != "rejected":
+            raise ValueError("OmniVoice design error details require a rejected policy")
+        return {
+            "error_code": "OMNIVOICE_DESIGN_UNSUPPORTED_LONG_LANGUAGE",
+            "provider": "omnivoice-local",
+            "mode": self.mode,
+            "language": self.language,
+            "estimated_duration_seconds": self.estimated_duration_seconds,
+            "threshold_seconds": OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS,
+            "alternatives": [dict(item) for item in self.alternatives],
+            "automatic_fallback": False,
+        }
+
+
+def estimate_omnivoice_duration_seconds(text: str) -> float:
+    """Estimate speech duration offline before model or GPU admission.
+
+    Upstream's learned duration estimator is part of the admitted model. VOP
+    therefore uses a deterministic conservative speech-rate estimate at the
+    pre-admission boundary and applies upstream's thirty-second long-form
+    threshold to that estimate.
+    """
+    word_count = len(re.findall(r"\S+", text))
+    return word_count / _OMNIVOICE_ESTIMATED_WORDS_PER_SECOND
+
+
+def evaluate_omnivoice_design_route(
+    text: str, *, language: str, mode: str
+) -> OmniVoiceDesignRoutePolicy:
+    """Classify design support without constructing a provider or runtime."""
+    normalized_language = language.strip().lower().replace("_", "-")
+    estimated_duration = estimate_omnivoice_duration_seconds(text)
+    if mode != "design" or normalized_language.startswith(("en", "zh")):
+        return OmniVoiceDesignRoutePolicy(
+            status="allowed",
+            language=normalized_language,
+            mode=mode,
+            estimated_duration_seconds=estimated_duration,
+        )
+
+    warning = (
+        "OmniVoice Voice Design is trained only for Chinese and English; "
+        f"{normalized_language or 'this language'} design is experimental and requires "
+        "separate acceptance."
+    )
+    status: Literal["experimental", "rejected"] = (
+        "rejected" if estimated_duration > OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS else "experimental"
+    )
+    return OmniVoiceDesignRoutePolicy(
+        status=status,
+        language=normalized_language,
+        mode=mode,
+        estimated_duration_seconds=estimated_duration,
+        warning=warning,
+        alternatives=_OMNIVOICE_DESIGN_ALTERNATIVES,
+    )
+
 
 OMNIVOICE_DESIGN_GENDERS: Final[frozenset[str]] = frozenset({"male", "female"})
 

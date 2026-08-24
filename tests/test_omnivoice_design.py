@@ -8,6 +8,8 @@ from voiceover_pipeline.omnivoice_design import (
     OMNIVOICE_DESIGN_GENDERS,
     OMNIVOICE_DESIGN_PITCHES,
     OMNIVOICE_DESIGN_WHISPER,
+    OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS,
+    evaluate_omnivoice_design_route,
     normalize_omnivoice_design_instruction,
 )
 
@@ -185,3 +187,53 @@ def test_normalize_accepts_accent_attributes_for_english_synthesis():
 def test_normalize_rejects_chinese_dialect_attributes_outside_chinese_synthesis():
     with pytest.raises(ValueError, match="Chinese speech only"):
         normalize_omnivoice_design_instruction("female, 东北话", language="ru")
+
+
+def test_russian_design_threshold_boundary_is_short_experimental_then_rejected():
+    at_threshold = evaluate_omnivoice_design_route(
+        " ".join(["слово"] * 75), language="ru", mode="design"
+    )
+    over_threshold = evaluate_omnivoice_design_route(
+        " ".join(["слово"] * 76), language="ru", mode="design"
+    )
+
+    assert at_threshold.estimated_duration_seconds == OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS
+    assert at_threshold.status == "experimental"
+    assert at_threshold.warning is not None
+    assert "trained only for Chinese and English" in at_threshold.warning
+    assert over_threshold.estimated_duration_seconds > OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS
+    assert over_threshold.status == "rejected"
+
+
+@pytest.mark.parametrize("language", ["en", "en-US", "zh", "zh-CN"])
+def test_long_english_and_chinese_design_remain_allowed(language):
+    policy = evaluate_omnivoice_design_route(
+        " ".join(["supported"] * 200), language=language, mode="design"
+    )
+
+    assert policy.status == "allowed"
+    assert policy.warning is None
+
+
+def test_russian_clone_remains_allowed_at_long_duration():
+    policy = evaluate_omnivoice_design_route(" ".join(["слово"] * 200), language="ru", mode="clone")
+
+    assert policy.status == "allowed"
+    assert policy.alternatives == ()
+
+
+def test_rejected_design_policy_exposes_machine_readable_alternatives():
+    policy = evaluate_omnivoice_design_route(" ".join(["слово"] * 76), language="ru", mode="design")
+    details = policy.error_details()
+
+    assert details["error_code"] == "OMNIVOICE_DESIGN_UNSUPPORTED_LONG_LANGUAGE"
+    assert details["mode"] == "design"
+    assert details["language"] == "ru"
+    assert details["threshold_seconds"] == 30.0
+    assert [item["id"] for item in details["alternatives"]] == [
+        "omnivoice-clone",
+        "omnivoice-preset",
+        "short-design-clips",
+        "other-tts-provider",
+    ]
+    assert details["alternatives"][2]["experimental"] is True

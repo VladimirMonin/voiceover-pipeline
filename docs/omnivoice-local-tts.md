@@ -20,11 +20,15 @@ voice bank catalog and rejects unknown voice ids with exit code 30 on resume
 mismatch. Passing Qwen cloning/sample options and `--style-prompt` /
 `--style-prompt-file` to `omnivoice-local` is rejected.
 
-Upstream trains voice design primarily on Chinese and English. Accent attributes
+Upstream trains Voice Design only on Chinese and English. Accent attributes
 describe English speech, not the language of synthesis. Because the current VOP
 OmniVoice route is fixed to Russian, accent and Chinese-dialect attributes are
-rejected before runtime admission. For a deep Russian female design use
-`female, middle-aged, very low pitch`; do not add `russian accent`.
+rejected before runtime admission. Russian Voice Design is an unsupported model
+regime, not a repaired hallucination route: short requests at or below the
+estimated 30-second threshold remain explicitly experimental with a warning;
+longer requests fail before provider/model/GPU construction. A syntactically
+valid instruction such as `female, middle-aged, very low pitch` does not make
+long Russian Voice Design reliable.
 
 ## Voice bank
 
@@ -56,6 +60,17 @@ Approved local bank: `C:\audio-cpp-work\voice-bank\approved\catalog.json`
 `docs/reports/2026-08-21-native-windows-omnivoice-voice-bank-acceptance.md`).
 
 ## Long-form chunk policy
+
+Before the runtime policy below applies, VOP estimates duration offline at a
+conservative 2.5 words/second. For `design` in languages other than English or
+Chinese, an estimate above the upstream 30-second long-form threshold is rejected
+with exit code 2. JSON errors include `details.error_code`, the estimate and
+threshold, `automatic_fallback: false`, and four explicit alternatives: Russian
+reference cloning, an available accepted voice-bank preset, separately accepted
+short design clips (experimental), or another TTS provider. VOP never silently
+changes mode or voice. Clone, preset/voice-bank and native Windows routes are
+not rejected. The policy permits English/Chinese design, but the current CLI
+route remains fixed to Russian and does not expose a language selector.
 
 The explicit pair `omnivoice-local` + `audio-cpp/omnivoice-q8_0` sentence-packs
 spoken text into atoms of at most 420 characters before synthesis. It preserves

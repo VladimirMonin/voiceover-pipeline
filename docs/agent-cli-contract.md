@@ -199,7 +199,59 @@ JSON argv для локального Docker command (default `["docker"]`). `do
   Accent attributes относятся только к English synthesis, Chinese dialect
   attributes — только к Chinese synthesis. Текущий OmniVoice route фиксирован
   на русском языке, поэтому обе категории отклоняются до запуска модели.
-  Public kind: `design-instruction`.
+  Public kind: `design-instruction`. Upstream обучал Voice Design только на
+  Chinese/English. Поэтому Russian/non-English/non-Chinese design до
+  provider/model/GPU admission получает warning как experimental при оценке не
+  более 30 секунд и отклоняется выше upstream long-form threshold. Оценка
+  выполняется offline по 2.5 words/second. Clone и preset/voice-bank не
+  блокируются; policy допускает English/Chinese design, хотя текущий CLI route
+  остаётся фиксированным на русском. Windows не объявляется сломанным.
+  Автоматической смены mode/voice нет.
+
+Long unsupported design возвращает exit code `2`. В `--json` обычные
+`status`/`error`/`code` дополняются объектом `details`:
+
+```json
+{
+  "error_code": "OMNIVOICE_DESIGN_UNSUPPORTED_LONG_LANGUAGE",
+  "provider": "omnivoice-local",
+  "mode": "design",
+  "language": "ru",
+  "estimated_duration_seconds": 30.4,
+  "threshold_seconds": 30.0,
+  "alternatives": [
+    {
+      "id": "omnivoice-clone",
+      "provider": "omnivoice-local",
+      "mode": "clone",
+      "requires": "Russian reference audio and its transcript",
+      "experimental": false
+    },
+    {
+      "id": "omnivoice-preset",
+      "provider": "omnivoice-local",
+      "mode": "preset",
+      "requires": "an available accepted voice-bank profile",
+      "experimental": false
+    },
+    {
+      "id": "short-design-clips",
+      "provider": "omnivoice-local",
+      "mode": "design",
+      "requires": "separate acceptance of every clip at or below thirty estimated seconds",
+      "experimental": true
+    },
+    {
+      "id": "other-tts-provider",
+      "provider": null,
+      "mode": null,
+      "requires": "explicit selection of another TTS provider",
+      "experimental": false
+    }
+  ],
+  "automatic_fallback": false
+}
+```
 
 Каждый новый `run_state.json` и итоговый run receipt содержит content-free
 `execution_source`: package version, `editable-checkout`/`installed-wheel`, Git

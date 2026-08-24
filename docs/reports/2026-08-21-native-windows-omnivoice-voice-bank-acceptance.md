@@ -109,7 +109,10 @@ exit 0:
 ## Limitations
 
 - CC-BY-NC-4.0 model: local noncommercial research use only.
-- Voice design is most stable for the trained languages; Russian design
-  voices were validated by listening and back-transcription on this seed.
+- Voice design is most stable for the trained languages. The short Russian
+  references captured into this accepted voice bank were validated by listening
+  and back-transcription on this seed; this does not support long Russian Voice
+  Design or claim that hallucination is repaired. Runtime use of these accepted
+  profiles follows the preset/clone path.
 - Direct PowerShell invocations must pass strict UTF-8 text (see
   `docs/omnivoice-local-tts.md`) and `--language ru` for Russian.

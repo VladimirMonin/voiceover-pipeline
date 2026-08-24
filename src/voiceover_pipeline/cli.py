@@ -97,7 +97,11 @@ from .models import (
     ChunkArtifact,
     ScriptChunk,
 )
-from .omnivoice_design import normalize_omnivoice_design_instruction
+from .omnivoice_design import (
+    OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS,
+    evaluate_omnivoice_design_route,
+    normalize_omnivoice_design_instruction,
+)
 from .omnivoice_voice_bank import (
     VoiceBankCatalog,
     VoiceBankError,
@@ -167,9 +171,10 @@ _EXIT_QUALITY = 60
 
 
 class CliError(RuntimeError):
-    def __init__(self, message: str, code: int):
+    def __init__(self, message: str, code: int, *, details: dict[str, object] | None = None):
         super().__init__(message)
         self.code = code
+        self.details = details
 
 
 def gemini_chunks_from_validation(report: dict[str, Any]) -> list[ScriptChunk]:
@@ -177,8 +182,8 @@ def gemini_chunks_from_validation(report: dict[str, Any]) -> list[ScriptChunk]:
     return chunks_from_validation(report)
 
 
-def fail(message: str, code: int) -> NoReturn:
-    raise CliError(message, code)
+def fail(message: str, code: int, *, details: dict[str, object] | None = None) -> NoReturn:
+    raise CliError(message, code, details=details)
 
 
 def _find_default_script() -> Path:
@@ -228,7 +233,7 @@ def main() -> None:
         elif args.command == "list":
             list_cmd(args)
     except CliError as exc:
-        _emit_error(args, str(exc), exc.code)
+        _emit_error(args, str(exc), exc.code, details=exc.details)
     except SystemExit:
         raise
     except Exception as exc:
@@ -339,7 +344,16 @@ def build_parser() -> argparse.ArgumentParser:
     omnivoice = gen.add_argument_group("omnivoice-local options")
     omnivoice.add_argument("--reference-audio", type=Path, default=None)
     omnivoice.add_argument("--reference-text", type=str, default=None)
-    omnivoice.add_argument("--design-instruction", type=str, default=None)
+    omnivoice.add_argument(
+        "--design-instruction",
+        type=str,
+        default=None,
+        help=(
+            "Voice Design instruction. Non-English/non-Chinese speech is experimental up to "
+            "the 30-second threshold and rejected above it; choose clone, preset, short "
+            "experimental clips, or another provider."
+        ),
+    )
     omnivoice.add_argument(
         "--voice-bank",
         type=Path,
@@ -874,6 +888,33 @@ def _validate_omnivoice_options(args: argparse.Namespace) -> None:
         fail(str(exc), _EXIT_ARGS)
 
 
+def _enforce_omnivoice_design_route(args: argparse.Namespace, chunks: list[ScriptChunk]) -> None:
+    """Reject unsupported long design before provider/GPU admission."""
+    if getattr(args, "provider", None) != "omnivoice-local":
+        return
+    policy = evaluate_omnivoice_design_route(
+        " ".join(chunk.text for chunk in chunks),
+        language=OMNIVOICE_DEFAULT_LANGUAGE,
+        mode=getattr(args, "mode", "preset"),
+    )
+    if policy.status == "allowed":
+        return
+    if policy.status == "experimental":
+        assert policy.warning is not None
+        print(f"Warning: {policy.warning}", file=sys.stderr)
+        return
+    fail(
+        "OmniVoice Voice Design is unreliable for long Russian speech: upstream trains "
+        "this mode only on Chinese and English. The text is valid, but this mode is "
+        f"unsupported above the {OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS:g}-second long-form "
+        "threshold. Choose Russian reference cloning, an available accepted preset, "
+        "separately accepted short design clips (experimental), or another TTS provider; "
+        "no mode or voice was changed.",
+        _EXIT_ARGS,
+        details=policy.error_details(),
+    )
+
+
 def _resolve_script_format(script_path: Path, requested_format: str) -> str:
     detected_format = detect_frontmatter_format(script_path)
     script_format = requested_format
@@ -1001,6 +1042,7 @@ def generate(args: argparse.Namespace) -> None:
             fail("--limit-chunks must be greater than zero", _EXIT_ARGS)
         chunks = chunks[: args.limit_chunks]
     requested_fragment_count = len(chunks)
+    _enforce_omnivoice_design_route(args, chunks)
     if (
         args.provider == "omnivoice-local"
         and args.model == OMNIVOICE_LOCAL_MODEL_ID
@@ -2734,14 +2776,23 @@ def _json_ok(data: dict) -> NoReturn:
     sys.exit(_EXIT_OK)
 
 
-def _json_error(message: str, code: int) -> NoReturn:
-    print(json.dumps({"status": "error", "error": message, "code": code}, ensure_ascii=False))
+def _json_error(message: str, code: int, *, details: dict[str, object] | None = None) -> NoReturn:
+    payload: dict[str, object] = {"status": "error", "error": message, "code": code}
+    if details is not None:
+        payload["details"] = details
+    print(json.dumps(payload, ensure_ascii=False))
     sys.exit(code)
 
 
-def _emit_error(args, message: str, code: int) -> NoReturn:
+def _emit_error(
+    args,
+    message: str,
+    code: int,
+    *,
+    details: dict[str, object] | None = None,
+) -> NoReturn:
     if getattr(args, "json_output", True):
-        _json_error(message, code)
+        _json_error(message, code, details=details)
     else:
         print(f"Error: {message}", file=sys.stderr)
         sys.exit(code)
