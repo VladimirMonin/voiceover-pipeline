@@ -154,13 +154,16 @@ class TestPolzaTTSProvider:
 
 
 class TestOpenRouterTTSProviderOpenAI:
-    def test_is_openai_model_true(self):
-        p = OpenRouterTTSProvider(
-            api_key="sk-or",
-            model="openai/gpt-4o-mini-tts-2025-12-15",
-            voice="alloy",
-        )
-        assert p._is_openai_model is True
+    def test_stale_openai_speech_model_fails_before_billing(self):
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post") as mock_post:
+            with pytest.raises(ValueError, match="not in the current OpenRouter speech catalog"):
+                OpenRouterTTSProvider(
+                    api_key="sk-or",
+                    model="openai/gpt-4o-mini-tts-2025-12-15",
+                    voice="alloy",
+                )
+
+        mock_post.assert_not_called()
 
     def test_is_openai_model_false_for_gemini(self):
         p = OpenRouterTTSProvider(
@@ -170,35 +173,14 @@ class TestOpenRouterTTSProviderOpenAI:
         )
         assert p._is_openai_model is False
 
-    def test_openai_model_skips_style_prompt(self):
+    def test_gemini_model_uses_documented_speech_payload(self):
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.content = b"fake-audio"
-        mock_response.headers = {"X-Generation-Id": "gen-or-1"}
-
-        with patch(
-            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
-        ) as mock_post:
-            p = OpenRouterTTSProvider(
-                api_key="sk-or",
-                model="openai/gpt-4o-mini-tts-2025-12-15",
-                voice="alloy",
-                style_prompt="should be ignored",
-            )
-            result = p.synthesize_chunk("Hello openai", "chunk_01")
-
-        json_body = mock_post.call_args[1]["json"]
-        assert json_body["input"] == "Hello openai"
-        assert json_body["voice"] == "alloy"
-        assert result.audio_bytes == b"fake-audio"
-        assert "prompt" not in json_body
-        assert "style_prompt" not in json_body.get("input", "").lower()
-
-    def test_gemini_model_uses_native_prompt(self):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-audio-gemini"
-        mock_response.headers = {"X-Generation-Id": "gen-gemini-1"}
+        mock_response.content = b"ID3fake-audio-gemini"
+        mock_response.headers = {
+            "Content-Type": "audio/mpeg",
+            "X-Generation-Id": "gen-gemini-1",
+        }
 
         with patch(
             "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
@@ -212,10 +194,15 @@ class TestOpenRouterTTSProviderOpenAI:
             result = p.synthesize_chunk("Hello gemini", "chunk_01")
 
         json_body = mock_post.call_args[1]["json"]
-        assert json_body["input"] == "Hello gemini"
-        assert json_body["prompt"] == "podcast narration style"
-        assert json_body["voice"] == "Puck"
-        assert result.audio_bytes == b"fake-audio-gemini"
+        assert json_body == {
+            "model": "google/gemini-3.1-flash-tts-preview",
+            "input": "podcast narration style\n\nHello gemini",
+            "voice": "Puck",
+            "response_format": "pcm",
+        }
+        assert mock_post.call_args[1]["headers"]["X-Title"] == "Voiceover Pipeline"
+        assert result.audio_bytes == b"ID3fake-audio-gemini"
+        assert result.audio_format == "mp3"
 
     def test_gemini_model_ignores_legacy_multispeaker_config(self):
         mock_response = MagicMock()
@@ -286,15 +273,8 @@ class TestGeminiExplicitPromptModes:
         assert json_body["input"] == "podcast style\n\nHello"
         assert "prompt" not in json_body
 
-    def test_native_explicit_mode_sends_separate_prompt(self):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-audio"
-        mock_response.headers = {"X-Generation-Id": "gen-2"}
-
-        with patch(
-            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
-        ) as mock_post:
+    def test_native_explicit_mode_fails_before_billing(self):
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post") as mock_post:
             p = OpenRouterTTSProvider(
                 api_key="sk-or",
                 model="google/gemini-3.1-flash-tts-preview",
@@ -302,11 +282,10 @@ class TestGeminiExplicitPromptModes:
                 style_prompt="podcast style",
                 prompt_mode="native",
             )
-            p.synthesize_chunk("Hello", "chunk_01")
+            with pytest.raises(ValueError, match="does not document a separate prompt field"):
+                p.synthesize_chunk("Hello", "chunk_01")
 
-        json_body = mock_post.call_args[1]["json"]
-        assert json_body["input"] == "Hello"
-        assert json_body["prompt"] == "podcast style"
+        mock_post.assert_not_called()
 
     def test_none_mode_sends_no_prompt_field(self):
         mock_response = MagicMock()
@@ -332,32 +311,23 @@ class TestGeminiExplicitPromptModes:
 
 
 class TestUnknownGoogleModelFallback:
-    def test_unknown_google_model_uses_native(self):
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.content = b"fake-audio"
-        mock_response.headers = {"X-Generation-Id": "gen-future-1"}
+    def test_unknown_google_model_fails_before_billing(self):
+        with patch("voiceover_pipeline.providers.openrouter_tts.requests.post") as mock_post:
+            with pytest.raises(ValueError, match="not in the current OpenRouter speech catalog"):
+                OpenRouterTTSProvider(
+                    api_key="sk-or",
+                    model="google/gemini-2.5-pro-tts",
+                    voice="Puck",
+                    style_prompt="expressive style",
+                )
 
-        with patch(
-            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
-        ) as mock_post:
-            p = OpenRouterTTSProvider(
-                api_key="sk-or",
-                model="google/gemini-2.5-pro-tts",
-                voice="Puck",
-                style_prompt="expressive style",
-            )
-            p.synthesize_chunk("Future model", "chunk_01")
-
-        json_body = mock_post.call_args[1]["json"]
-        assert json_body["input"] == "Future model"
-        assert json_body["prompt"] == "expressive style"
+        mock_post.assert_not_called()
 
 
 class TestPromptModeResolution:
-    def test_gemini_flash_tts_resolves_to_native(self):
+    def test_gemini_flash_tts_resolves_to_prefix(self):
         mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
-        assert mode == TTS_PROMPT_MODE_NATIVE
+        assert mode == TTS_PROMPT_MODE_PREFIX
 
     def test_unknown_google_resolves_to_native(self):
         mode = resolve_prompt_mode("openrouter-tts", "google/gemini-2.5-pro-tts")
@@ -460,7 +430,7 @@ class TestGeminiMultiSpeakerRequestShape:
     def test_request_contains_only_documented_fields(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
         body = self._request_body(tmp_path, report)
-        assert set(body) <= {"model", "input", "voice", "response_format", "prompt"}
+        assert set(body) == {"model", "input", "voice", "response_format"}
 
     def test_top_level_compatibility_voice_equals_first_validated_voice(self, tmp_path):
         report = self._write_validated_dialogue(tmp_path)
@@ -486,6 +456,132 @@ class TestGeminiMultiSpeakerRequestShape:
         codes = [item["code"] for item in errors]
         assert "SPEAKER_COUNT_INVALID" in codes
         assert "DUPLICATE_SPEAKER_VOICE" not in codes
+
+
+class TestOpenRouterDocumentedAudioResponses:
+    @pytest.mark.parametrize(
+        ("content_type", "audio_bytes", "expected_format"),
+        [
+            ("audio/mpeg", b"ID3fixture", "mp3"),
+            ("audio/pcm", b"\x00\x01", "pcm16"),
+        ],
+    )
+    def test_accepts_documented_raw_audio_streams(self, content_type, audio_bytes, expected_format):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = audio_bytes
+        mock_response.headers = {"Content-Type": content_type}
+
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ):
+            provider = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Kore",
+                style_prompt=None,
+            )
+            result = provider.synthesize_chunk("Hello", "turn_0001")
+
+        assert result.audio_bytes == audio_bytes
+        assert result.audio_format == expected_format
+
+    @pytest.mark.parametrize(
+        ("status_code", "content_type", "body", "error_match"),
+        [
+            (502, "application/json", b'{"error":"No successful provider responses"}', "HTTP 502"),
+            (200, "audio/mpeg", b"", "empty audio body"),
+            (200, "application/json", b'{"audio":"ZmFrZQ=="}', "non-audio response"),
+            (200, "text/plain", b"upstream returned prose", "non-audio response"),
+            (200, "audio/wav", b"RIFFfixtureWAVE", "non-audio response"),
+            (200, "audio/L16", b"\x00\x01", "non-audio response"),
+        ],
+    )
+    def test_failed_response_makes_exactly_one_request(
+        self, status_code, content_type, body, error_match
+    ):
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.content = body
+        mock_response.text = body.decode("utf-8")
+        mock_response.headers = {"Content-Type": content_type}
+
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ) as mock_post:
+            provider = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Kore",
+                style_prompt="podcast style",
+            )
+            with pytest.raises(RuntimeError, match=error_match):
+                provider.synthesize_chunk("Hello", "turn_0001")
+
+        assert mock_post.call_count == 1
+
+    @pytest.mark.parametrize(
+        ("content_type", "body"),
+        [
+            ("application/json", b'{"audio":"ZmFrZQ=="}'),
+            ("text/plain", b"data:audio/mpeg;base64,ZmFrZQ=="),
+            ("text/event-stream", b'data: {"choices":[]}\n\n'),
+        ],
+    )
+    def test_rejects_undocumented_wrapped_audio_without_guessing(self, content_type, body):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = body
+        mock_response.headers = {"Content-Type": content_type}
+
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ):
+            provider = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Kore",
+                style_prompt=None,
+            )
+            with pytest.raises(RuntimeError, match="non-audio response"):
+                provider.synthesize_chunk("Hello", "turn_0001")
+
+    def test_rejects_empty_raw_audio_stream(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b""
+        mock_response.headers = {"Content-Type": "audio/mpeg"}
+
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ):
+            provider = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Kore",
+                style_prompt=None,
+            )
+            with pytest.raises(RuntimeError, match="empty audio body"):
+                provider.synthesize_chunk("Hello", "turn_0001")
+
+    def test_gemini_missing_content_type_uses_requested_pcm_format(self):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"\x00\x01"
+        mock_response.headers = {}
+
+        with patch(
+            "voiceover_pipeline.providers.openrouter_tts.requests.post", return_value=mock_response
+        ):
+            provider = OpenRouterTTSProvider(
+                api_key="sk-or",
+                model="google/gemini-3.1-flash-tts-preview",
+                voice="Kore",
+                style_prompt=None,
+            )
+            result = provider.synthesize_chunk("Hello", "turn_0001")
+
+        assert result.audio_format == "pcm16"
 
 
 class TestBuildRequestBody:

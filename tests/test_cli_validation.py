@@ -973,16 +973,16 @@ class TestVoiceoverMetadataValidation:
             "--provider",
             "openrouter-tts",
             "--model",
-            "openai/gpt-4o-mini-tts-2025-12-15",
+            "google/gemini-3.1-flash-tts-preview",
             "--voice",
-            "alloy",
+            "Puck",
             "--json",
         )
         assert code == 0
         assert data["valid"] is True
         assert data["effective_config"]["provider"] == "openrouter-tts"
-        assert data["effective_config"]["model"] == "openai/gpt-4o-mini-tts-2025-12-15"
-        assert data["effective_config"]["voice"] == "alloy"
+        assert data["effective_config"]["model"] == "google/gemini-3.1-flash-tts-preview"
+        assert data["effective_config"]["voice"] == "Puck"
 
     def test_voiceover_metadata_warns_about_prompt_skeleton_in_body(self, tmp_path):
         script = write_voiceover_script(

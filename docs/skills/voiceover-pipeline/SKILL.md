@@ -157,7 +157,7 @@ description: >
 | Создаёт .env.example, .gitignore, script.md, out/ — все болванки проекта | Читает .env или значения ключей |
 | Проверяет окружение через doctor | Конфигурирует системный PATH |
 | Валидирует Markdown-сценарий | Выдумывает несвязанный творческий контент |
-| Генерирует озвучку через любой из 5 провайдеров с retry, safe rerun и manifest/log | Рендерит Remotion-видео |
+| Генерирует озвучку через любой из 5 провайдеров с provider-specific retry, safe rerun и manifest/log | Рендерит Remotion-видео |
 | Извлекает тайминги через локальный faster-whisper ИЛИ облачные OpenRouter/Groq/xAI Whisper | Правит исходники voiceover-pipeline |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
 | Объясняет провайдеров, модели, голоса, цены (7 TTS + 6 STT моделей) | Гарантирует будущие цены провайдеров |

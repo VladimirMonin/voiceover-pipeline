@@ -118,7 +118,9 @@ def test_gemini_dialogue_e2e_mocked_generation(tmp_path, monkeypatch, capsys):
     ):
         assert body["model"] == "google/gemini-3.1-flash-tts-preview"
         assert body["voice"] == voice
-        assert body["input"] == text
+        assert body["input"].endswith(f"\n\n{text}")
+        assert set(body) == {"model", "input", "voice", "response_format"}
+        assert body["response_format"] == "pcm"
         assert "multi_speaker_voice_config" not in body
 
     run_dir = tmp_path / "out" / "e2e-dialogue"
@@ -152,6 +154,56 @@ def test_gemini_dialogue_e2e_mocked_generation(tmp_path, monkeypatch, capsys):
     assert (run_dir / "chunks" / "turn_0004.mp3").exists()
     assert (run_dir / "e2e-dialogue-voiceover-google-gemini-3-1-flash-tts-preview.mp3").exists()
     assert (run_dir / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("no_retry", [False, True])
+def test_openrouter_dialogue_failure_makes_one_request_and_stops(
+    tmp_path, monkeypatch, capsys, no_retry
+):
+    from unittest.mock import MagicMock, patch
+
+    import voiceover_pipeline.cli as cli
+
+    script = _write_dialogue_script(tmp_path)
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.content = b""
+    mock_response.headers = {"Content-Type": "audio/pcm"}
+    _patch_generation_io(monkeypatch)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "«redacted:sk-…»")
+    argv = [
+        "voiceover",
+        "generate",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "failed-dialogue",
+        "--json",
+    ]
+    if no_retry:
+        argv.append("--no-retry")
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with patch(
+        "voiceover_pipeline.providers.openrouter_tts.requests.post",
+        return_value=mock_response,
+    ) as mock_post:
+        with pytest.raises(SystemExit) as exit_info:
+            cli.main()
+
+    assert exit_info.value.code == 30
+    assert mock_post.call_count == 1
+    captured = capsys.readouterr()
+    assert "empty audio body" in captured.out
+    assert captured.err == ""
+    run_state = json.loads(
+        (tmp_path / "out" / "failed-dialogue" / "run_state.json").read_text(encoding="utf-8")
+    )
+    assert run_state["completed_count"] == 0
+    assert run_state["chunk_count"] == 4
+    assert run_state["chunks"] == []
 
 
 def test_omnivoice_dialogue_validation_accepts_admitted_bank_profiles(tmp_path):

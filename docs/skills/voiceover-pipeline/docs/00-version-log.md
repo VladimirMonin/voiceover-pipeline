@@ -8,7 +8,7 @@
 | Поле | Значение |
 |---|---|
 | **Compatible app** | voiceover-pipeline 0.6.0 |
-| **Skill revision** | 2026-08-17 |
+| **Skill revision** | 2026-08-24 |
 | **Минимальная версия CLI** | 0.4.0 |
 | **Максимальная проверенная** | 0.6.0 |
 
@@ -18,12 +18,13 @@
 - Локальные ASR routes: `faster-whisper`, `qwen-local`, `nemotron-local`
 - Общий `audio.cpp` runtime для локальных non-Whisper моделей с GPU lease,
   lifecycle, receipts и отдельными Linux/native-Windows launchers
-- 7 протестированных моделей с реальными ценами из smoke-прогонов
+- 7 исторически протестированных моделей; текущая доступность сверяется отдельно
 - Полные списки голосов: OpenAI TTS (11), ElevenLabs через Polza (21), Gemini TTS через OpenRouter (30), Qwen preset (9)
 - `list voices --json` контракт: `voices` как плоский массив + `voice_categories` объект
 - ElevenLabs через Polza: async `/api/v1/media` (submit → poll → download)
 - Polza TTS OpenAI: JSON base64 через `/api/v1/audio/speech`
-- OpenRouter OpenAI TTS: `/audio/speech` без style_prompt
+- OpenRouter Gemini TTS: exact `model`/`input`/`voice`/`response_format` payload, prefix style prompt,
+  raw MP3/WAV/PCM response validation; JSON/data URI/SSE rejected
 - Voiceover metadata: `format: voiceover` frontmatter для provider/model/voice/fallback/style_prompt, auto-detect in validate/generate
 - OpenRouter Gemini dialogue: `--format gemini-dialogue`, frontmatter speaker map, inline audio tags, strict UTF-8 byte validation
 - Gemini prompting guide: voice direction skeleton, safe audio tags, emotion recipes, voice selection, chunking limits
@@ -43,13 +44,14 @@
 | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 | RUB |
 | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 | RUB |
 | `google/gemini-3.1-flash-tts-preview` | ~$0.030 | USD |
-| `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041 | USD |
+| `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | ~$0.00041 | USD |
 | Qwen-local | Бесплатно | — |
 
 ## История изменений
 
 | Дата | Изменение |
 |---|---|
+| 2026-08-24 | OpenRouter Gemini 3.1 Flash TTS приведён к текущему `/audio/speech` контракту: `model`/`input`/`voice`/`response_format="pcm"`, style prompt как prefix внутри `input`, raw audio response. Недокументированное отдельное поле `prompt`, empty и wrapped JSON/data URI/SSE fail closed; withdrawn OpenAI Mini TTS ID отклоняется до billing. |
 | 2026-08-24 | Реализован offline contract канонического `dialogue`: `gemini-dialogue` сохранён alias, OpenRouter и OmniVoice выполняют turn-by-turn, final audio включает PCM паузы, resume использует fail-closed `synthesis_identity`, а receipts не публикуют private text. `0.6.0` всё ещё held до отдельных human audible PASS OpenRouter и OmniVoice; прошлый OpenRouter live failure остаётся историческим evidence, не текущим transport contract. |
 | 2026-08-24 | OmniVoice Russian design теперь fail-closed отклоняет English accent/Chinese dialect conditioning и long-form requests выше 30 estimated seconds до provider/GPU; short design остаётся warning + experimental. JSON перечисляет clone/preset/short experimental/other-provider alternatives без неявной подмены. Добавлены path-free execution provenance и transcript-free `verify-tts`; hallucination не объявляется исправленной, technical PASS не заменяет human listening. |
 | 2026-08-22 | **0.6.0 held:** live-приёмка двухголосого `gemini-dialogue` FAILED — OpenRouter игнорирует `multi_speaker_voice_config` и синтезирует одним голосом. Двухголосый результат недоступен до фикса по плану `docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`; не заявлять, что два голоса работают. |

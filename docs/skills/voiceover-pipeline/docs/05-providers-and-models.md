@@ -113,16 +113,15 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 ---
 
-## OpenRouter TTS — Gemini + OpenAI TTS
+## OpenRouter TTS — Gemini
 
-Агрегатор, единый `/audio/speech`. Две модели, разные семейства голосов.
+Агрегатор, единый `/audio/speech`. Текущий speech-каталог допускает Gemini.
 
 ### Модели
 
 | Модель | ID | Цена/мин | Style prompt | Голоса |
 |---|---|---|---|---|
 | Gemini TTS | `google/gemini-3.1-flash-tts-preview` | **~$0.030** | Да | Google (30) |
-| OpenAI Mini TTS | `openai/gpt-4o-mini-tts-2025-12-15` | **~$0.00041** | Нет (пропускается) | OpenAI (11) |
 
 ### Голоса Gemini TTS (30 имён)
 
@@ -132,7 +131,9 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 ### Style prompt (Gemini)
 
-Управление подачей через `--style-prompt`. Gemini использует **native prompt** — поле `prompt` передаётся отдельно от `input` в request body:
+Управление подачей через `--style-prompt`. Для Gemini 3.1 Flash TTS через
+OpenRouter prompt добавляется префиксом к `input`; отдельное поле `prompt` этот
+model-specific `/audio/speech` endpoint не документирует.
 
 ```powershell
 voiceover generate `
@@ -154,13 +155,16 @@ voiceover generate `
 ```
 
 Дефолт: «Голос технического подкаста: спокойный, вдумчивый, живой и уверенный.»
-Fallback: если style prompt отвергнут, автоматически пробуется укороченный вариант.
-
-**OpenAI TTS модели НЕ принимают style_prompt** — CLI автоматически пропускает.
+OpenRouter делает ровно один платный synthesis-запрос на turn; автоматического
+generation retry или fallback-запроса с другим prompt нет.
 
 ### Особенности OpenRouter
 
-- Только `response_format="pcm"` (не mp3). Пайплайн сам конвертирует PCM → MP3.
+- Gemini-запрос содержит `model`, `input`, `voice`, `response_format="pcm"`;
+  ответ — raw audio body. JSON, data URI, base64 field и SSE отклоняются.
+- Отсутствующий в текущем speech-каталоге model ID отклоняется до billing.
+- `openai/gpt-audio-mini` и `openai/gpt-audio` используют chat-audio контракт,
+  а не `/audio/speech`, поэтому не добавляются как ложная замена.
 - Ретраи для цены: `GET /api/v1/generation?id=...` до 4 попыток с паузой 3 сек.
 - Cost может быть `null` если OpenRouter не успел обновить usage.
 
@@ -206,7 +210,6 @@ Groq Whisper и xAI STT, их модели, виды таймкодов и ог�
 | Чистый голос, рубли | Polza TTS | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 RUB/мин |
 | Лучшее качество речи, рубли | Polza TTS | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 RUB/мин |
 | Качество интонаций (chat) | Polza Chat Audio | `openai/gpt-audio` | ~7.00 RUB/мин |
-| Самый дешёвый TTS, доллары | OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041/мин |
 | Западные голоса, качество | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
 | Бесплатно, есть GPU | Qwen-local | CustomVoice (preset) | Бесплатно |
 | Локальные тайминги, сегменты | faster-whisper | `small` | Бесплатно (CPU) |

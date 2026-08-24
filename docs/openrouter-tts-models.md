@@ -1,16 +1,21 @@
 # OpenRouter TTS
 
-Две модели text-to-speech через OpenRouter: Google Gemini TTS и OpenAI GPT-4o Mini TTS.
+Текущий поддерживаемый text-to-speech route через OpenRouter: Google Gemini TTS.
 
 ## Модели
 
-| | Google Gemini | OpenAI GPT-4o Mini |
-|---|---|---|
-| ID | `google/gemini-3.1-flash-tts-preview` | `openai/gpt-4o-mini-tts-2025-12-15` |
-| Endpoint | `/api/v1/audio/speech` | `/api/v1/audio/speech` |
-| Контекст | 32 000 токенов | 4 096 токенов |
-| Языки | 70+, включая русский | 50+, включая русский |
-| Цена/мин | ~$0.030 | ~$0.00041 |
+| Поле | Значение |
+|---|---|
+| ID | `google/gemini-3.1-flash-tts-preview` |
+| Endpoint | `/api/v1/audio/speech` |
+| Контекст | 32 000 токенов |
+| Языки | 70+, включая русский |
+| Исторический smoke | ~$0.030/мин (2026-04-29, не текущая котировка) |
+
+`openai/gpt-4o-mini-tts-2025-12-15` больше не публикуется текущим
+`/api/v1/models?output_modalities=speech` и отклоняется до запроса. Модели
+`openai/gpt-audio-mini` и `openai/gpt-audio` принадлежат chat-audio контракту
+`/chat/completions`; они не являются drop-in заменой для `/audio/speech`.
 
 ## Голоса
 
@@ -51,23 +56,7 @@
 
 Характеры и пол: [Google AI for Developers — Speech Generation](https://ai.google.dev/gemini-api/docs/speech-generation).
 
-### OpenAI GPT-4o Mini TTS voices
-
-| Голос | Характер |
-|---|---|
-| `alloy` | Нейтральный, универсальный (**дефолт, только OpenAI TTS**) |
-| `ash` | Мужской, спокойный |
-| `ballad` | Мужской, эмоциональный |
-| `coral` | Женский, тёплый |
-| `echo` | Нейтральный |
-| `fable` | Британский, выразительный |
-| `nova` | Женский, мягкий |
-| `onyx` | Мужской, глубокий |
-| `sage` | Нейтральный |
-| `shimmer` | Женский, лёгкий |
-| `verse` | Мужской, выразительный |
-
-Клиент автоматически выбирает дефолтный голос по модели: `Puck` для Gemini, `alloy` для OpenAI TTS.
+Клиент автоматически выбирает `Puck` для Gemini.
 
 Важно:
 - OpenAI voices вроде `alloy`, `ash`, `nova` не работают для Gemini.
@@ -76,11 +65,13 @@
 
 > **Образцы:**
 > - [openrouter-gemini-tts-chunk-01.ogg](openrouter-gemini-tts-chunk-01.ogg) — Gemini, голос `Puck`, ~$0.030/мин
-> - [openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg](openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg) — GPT-4o Mini TTS, голос `ash`, ~$0.00041/мин
+> - [openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg](openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg) — исторический GPT-4o Mini TTS smoke; модель больше не предлагается текущим speech-каталогом
 
 ## Style prompt (Gemini)
 
-Gemini поддерживает стилевой prompt — передаётся отдельным полем `prompt` в request body (native mode):
+Gemini поддерживает стилевое управление через текст запроса. Для актуального
+OpenRouter `/audio/speech` style prompt добавляется префиксом к `input`: отдельное
+поле `prompt` этим model-specific endpoint не документировано.
 
 ```powershell
 voiceover generate `
@@ -99,10 +90,12 @@ voiceover generate `
 | `--no-style-prompt` | Отключить prompt (чистый TTS) |
 | (ничего) | Дефолтный prompt из config.py |
 
-### Native prompt vs prefix fallback
+### Prompt mode
 
-- **Native** (Gemini по умолчанию): `prompt` и `input` передаются раздельно в request body
-- **Prefix** (старый fallback): prompt конкатенируется с текстом в поле `input`
+- **Prefix** (Gemini по умолчанию): style prompt и текст объединяются в `input`.
+- **None**: отправляется только исходный текст.
+- **Native**: для Gemini 3.1 Flash TTS через OpenRouter отклоняется до запроса,
+  потому что отдельное поле `prompt` отсутствует в официальном примере endpoint.
 
 Gemini 3.1 Flash TTS поддерживает inline audio tags: `[whispers]`, `[laughs]`, `[excited]` и другие.
 
@@ -112,10 +105,6 @@ Gemini 3.1 Flash TTS поддерживает inline audio tags: `[whispers]`, `
 Голос технического подкаста: спокойный, вдумчивый, живой и уверенный.
 Тёплый мужской тембр, средний темп, ясная артикуляция, без театральности.
 ```
-
-## Style prompt (OpenAI TTS)
-
-**Не используется.** Для OpenAI TTS моделей `--style-prompt` игнорируется — текст передаётся как есть.
 
 ## Запуск
 
@@ -132,11 +121,6 @@ voiceover generate `
   --model "google/gemini-3.1-flash-tts-preview" `
   --voice "Charon"
 
-# OpenAI GPT-4o Mini TTS через OpenRouter
-voiceover generate `
-  --provider openrouter-tts `
-  --model "openai/gpt-4o-mini-tts-2025-12-15" `
-  --voice "nova"
 ```
 
 ## Ключ
@@ -147,36 +131,22 @@ OPENROUTER_API_KEY=sk-or-v1-...
 
 ## Как работает
 
-### Gemini TTS (native prompt)
+### Gemini TTS
 
 ```
 POST https://openrouter.ai/api/v1/audio/speech
 {
   "model": "google/gemini-3.1-flash-tts-preview",
-  "input": "<текст чанка>",
-  "prompt": "<style prompt>",
+  "input": "<style prompt>\n\n<текст чанка>",
   "voice": "Puck",
   "response_format": "pcm"
 }
 ```
 
-Поле `prompt` передаётся отдельно от `input`. Если `--no-style-prompt` — поле `prompt` не отправляется.
-
-Gemini через OpenRouter принимает только `response_format="pcm"`. Пайплайн конвертирует PCM в MP3 через FFmpeg.
-
-### OpenAI TTS
-
-```
-POST https://openrouter.ai/api/v1/audio/speech
-{
-  "model": "openai/gpt-4o-mini-tts-2025-12-15",
-  "input": "текст чанка",
-  "voice": "ash",
-  "response_format": "pcm"
-}
-```
-
-Style prompt не добавляется. Пайплайн конвертирует PCM в MP3 через FFmpeg.
+Ответ — raw audio body, не JSON, data URI, base64 field или SSE. Пайплайн
+явно запрашивает документированный `pcm`, валидирует raw MP3/PCM MIME-типы
+и конвертирует PCM в MP3 через FFmpeg. Пустой или обёрнутый JSON/text/SSE
+payload отклоняется без попытки угадать формат.
 
 ## Multi-speaker (Gemini dialogue)
 
@@ -217,6 +187,6 @@ OpenRouter.
 | Модель | Стоимость | Длина | Цена/мин |
 |---|---:|---:|---|
 | `google/gemini-3.1-flash-tts-preview` | $0.0135 | 26.7 сек | ~$0.030/мин |
-| `openai/gpt-4o-mini-tts-2025-12-15` | $0.00022 | 32.3 сек | ~$0.00041/мин |
+| `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | $0.00022 | 32.3 сек | ~$0.00041/мин |
 
 Точная стоимость: `GET /api/v1/generation?id=...` → `total_cost`.

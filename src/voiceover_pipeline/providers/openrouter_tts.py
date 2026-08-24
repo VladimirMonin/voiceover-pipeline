@@ -1,11 +1,10 @@
-import sys
-
 import requests
 
 from voiceover_pipeline.config import (
     OPENROUTER_BASE_URL,
-    PODCAST_NARRATION_FALLBACK_PROMPT,
+    OPENROUTER_TTS_MODELS,
     PODCAST_NARRATION_PROMPT,
+    TTS_PROMPT_MODE_NATIVE,
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
@@ -17,6 +16,25 @@ from voiceover_pipeline.tts_prompting import (
 # ── OpenRouter app attribution headers ──────────────────────────────────────
 _APP_TITLE = "Voiceover Pipeline"
 _APP_REFERER = "https://github.com/visper-io/voiceover-pipeline"
+_GEMINI_31_FLASH_TTS = "google/gemini-3.1-flash-tts-preview"
+_AUDIO_CONTENT_TYPES = {
+    "audio/mpeg": "mp3",
+    "audio/pcm": "pcm16",
+}
+
+
+def _response_audio_format(response: requests.Response, fallback: str) -> str:
+    content_type = str(response.headers.get("Content-Type", "")).split(";", 1)[0].lower()
+    if content_type:
+        audio_format = _AUDIO_CONTENT_TYPES.get(content_type)
+        if audio_format is None:
+            raise RuntimeError("OpenRouter TTS returned a non-audio response.")
+        return audio_format
+
+    prefix = response.content.lstrip()[:16].lower()
+    if prefix.startswith((b"{", b"[", b"data:")):
+        raise RuntimeError("OpenRouter TTS returned a non-audio response without a content type.")
+    return fallback
 
 
 class OpenRouterTTSProvider(TTSProvider):
@@ -34,12 +52,16 @@ class OpenRouterTTSProvider(TTSProvider):
         response_format: str = "pcm",
         timeout_seconds: int = 240,
     ) -> None:
+        if model not in OPENROUTER_TTS_MODELS:
+            raise ValueError(
+                f"OpenRouter TTS model '{model}' is not in the current OpenRouter speech catalog. "
+                f"Supported models: {OPENROUTER_TTS_MODELS}"
+            )
         self.api_key = api_key
         self.model = model
         self.voice = voice
         self.style_prompt = style_prompt
 
-        self.fallback_style_prompt = PODCAST_NARRATION_FALLBACK_PROMPT
         self._raw_prompt_mode = prompt_mode
         self.prompt_mode = resolve_prompt_mode(self.provider_id, model, prompt_mode)
         self.base_url = base_url.rstrip("/")
@@ -50,27 +72,26 @@ class OpenRouterTTSProvider(TTSProvider):
     def _is_openai_model(self) -> bool:
         return self.model.startswith("openai/")
 
+    @property
+    def _uses_documented_gemini_speech_contract(self) -> bool:
+        return self.model == _GEMINI_31_FLASH_TTS
+
     def synthesize_chunk(
         self, text: str, chunk_id: str, voice: str | None = None
     ) -> SynthesisResult:
         active_voice = voice or self.voice
         if self._is_openai_model:
             return self._request_audio(text=text, style_prompt=None, voice=active_voice)
+        if (
+            self._uses_documented_gemini_speech_contract
+            and self.prompt_mode == TTS_PROMPT_MODE_NATIVE
+        ):
+            raise ValueError(
+                "OpenRouter Gemini 3.1 Flash TTS does not document a separate prompt field; "
+                "use prompt_mode=auto, prefix, or none."
+            )
 
-        try:
-            return self._request_audio(
-                text=text, style_prompt=self.style_prompt, voice=active_voice
-            )
-        except RuntimeError as error:
-            if "No successful provider responses" not in str(error):
-                raise
-            print(
-                f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.",
-                file=sys.stderr,
-            )
-            return self._request_audio(
-                text=text, style_prompt=self.fallback_style_prompt, voice=active_voice
-            )
+        return self._request_audio(text=text, style_prompt=self.style_prompt, voice=active_voice)
 
     def _request_audio(
         self, text: str, style_prompt: str | None, voice: str | None = None
@@ -83,7 +104,6 @@ class OpenRouterTTSProvider(TTSProvider):
             style_prompt=style_prompt,
             prompt_mode=self.prompt_mode,
         )
-
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
@@ -96,14 +116,17 @@ class OpenRouterTTSProvider(TTSProvider):
             timeout=self.timeout_seconds,
         )
         if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+            raise RuntimeError(f"OpenRouter TTS request failed with HTTP {response.status_code}.")
 
         if not response.content:
             raise RuntimeError("OpenRouter TTS returned an empty audio body.")
 
+        fallback_format = "pcm16" if self.response_format == "pcm" else self.response_format
+        audio_format = _response_audio_format(response, fallback_format)
+
         return SynthesisResult(
             audio_bytes=response.content,
-            audio_format="pcm16" if self.response_format == "pcm" else self.response_format,
+            audio_format=audio_format,
             transcript=text,
             generation_id=response.headers.get("X-Generation-Id"),
             client_path="requests",

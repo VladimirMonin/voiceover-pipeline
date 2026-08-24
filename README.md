@@ -192,7 +192,7 @@ out/<run-id>/
 | Polza | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 ₽/мин |
 | Polza | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 ₽/мин |
 | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
-| OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041/мин |
+| OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | ~$0.00041/мин |
 | Qwen3-TTS | CustomVoice (preset/clone) | Бесплатно (GPU) |
 | OmniVoice | `audio-cpp/omnivoice-q8_0` (auto/preset/clone/design) | Бесплатно (GPU, локально) |
 

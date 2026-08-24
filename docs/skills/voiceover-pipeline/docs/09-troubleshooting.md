@@ -156,8 +156,8 @@ POLZA_API_KEY not found / OPENROUTER_API_KEY is required
 No successful provider responses
 ```
 
-- Автоматически пробуется укороченный fallback prompt
-- Можно задать свой: `--style-prompt "..."` покороче и проще
+- Автоматического fallback/retry-запроса нет: один turn делает один платный запрос
+- Задайте свой `--style-prompt "..."` покороче и продолжите через `--resume`
 
 ## Output / Filesystem
 

@@ -118,7 +118,6 @@ def test_generate_markdown_skip_existing_all_providers_no_frontmatter(tmp_path):
         ("polza-chat-audio", None),
         ("polza-tts", "openai/gpt-4o-mini-tts"),
         ("openrouter-tts", "google/gemini-3.1-flash-tts-preview"),
-        ("openrouter-tts", "openai/gpt-4o-mini-tts-2025-12-15"),
         ("qwen-local", None),
     ]
 
@@ -202,7 +201,6 @@ def test_generate_voiceover_metadata_skip_existing_all_single_speaker_providers(
         ("polza-tts", "openai/gpt-4o-mini-tts", "ash"),
         ("polza-tts", "elevenlabs/text-to-speech-turbo-2-5", "Rachel"),
         ("openrouter-tts", "google/gemini-3.1-flash-tts-preview", "Puck"),
-        ("openrouter-tts", "openai/gpt-4o-mini-tts-2025-12-15", "alloy"),
         ("qwen-local", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", "Aiden"),
     ]
 

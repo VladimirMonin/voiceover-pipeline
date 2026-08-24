@@ -1327,11 +1327,12 @@ def _generate_step(
     total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
     if dialogue_run and chunk_artifacts:
         total_duration_ms += chunk_artifacts[-1].pause_after_ms
+    openrouter_single_attempt = args.provider == "openrouter-tts"
     retry_policy = RetryPolicy(
-        attempts=args.retries,
+        attempts=1 if openrouter_single_attempt else args.retries,
         delay_seconds=args.retry_delay,
         max_delay_seconds=args.retry_max_delay,
-        enabled=not args.no_retry,
+        enabled=not args.no_retry and not openrouter_single_attempt,
     )
 
     for chunk in chunks:
@@ -2368,7 +2369,7 @@ def list_cmd(args: argparse.Namespace) -> None:
                 "onyx",
             ],
             "polza-tts": OPENAI_TTS_VOICES + ELEVENLABS_TTS_VOICES,
-            "openrouter-tts": GEMINI_TTS_VOICES + OPENAI_TTS_VOICES,
+            "openrouter-tts": GEMINI_TTS_VOICES,
             "qwen-local": QWEN_PRESET_SPEAKERS,
             "omnivoice-local": [],
         }
@@ -2379,7 +2380,6 @@ def list_cmd(args: argparse.Namespace) -> None:
             },
             "openrouter-tts": {
                 "gemini": GEMINI_TTS_VOICES,
-                "openai": OPENAI_TTS_VOICES,
             },
         }
         data = {"provider": provider, "voices": voices_flat.get(provider, [])}

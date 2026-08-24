@@ -207,11 +207,20 @@ def test_list_polza_tts_providers():
     assert "openai/gpt-4o-mini-tts" in models
 
 
-def test_openrouter_tts_models_include_openai():
+def test_openrouter_tts_models_match_current_speech_catalog():
     code, data = cli_json("list", "providers", "--json")
     assert code == 0
     or_tts = next(p for p in data["providers"] if p["id"] == "openrouter-tts")
-    assert "openai/gpt-4o-mini-tts-2025-12-15" in or_tts["models"]
+    assert or_tts["models"] == ["google/gemini-3.1-flash-tts-preview"]
+
+
+def test_openrouter_tts_voices_match_current_speech_catalog():
+    code, data = cli_json("list", "voices", "--provider", "openrouter-tts", "--json")
+    assert code == 0
+    categories = data["voice_categories"]
+    assert isinstance(categories, dict)
+    assert data["voices"] == categories["gemini"]
+    assert set(categories) == {"gemini"}
 
 
 def test_list_polza_tts_voices():
@@ -305,6 +314,16 @@ def test_model_validation_rejects_invalid():
     assert exc_info.value.code == 2
 
 
+def test_model_validation_rejects_stale_openrouter_tts_before_request():
+    import pytest
+
+    from voiceover_pipeline.cli import CliError, _validate_model_for_provider
+
+    with pytest.raises(CliError, match="not valid for provider 'openrouter-tts'") as exc_info:
+        _validate_model_for_provider("openrouter-tts", "openai/gpt-4o-mini-tts-2025-12-15")
+    assert exc_info.value.code == 2
+
+
 def test_direct_cost_kwargs_populates_for_polza_tts():
     from voiceover_pipeline.cli import _direct_cost_kwargs
     from voiceover_pipeline.models import SynthesisResult
@@ -333,11 +352,11 @@ def test_direct_cost_kwargs_none_for_other_providers():
     assert _direct_cost_kwargs("polza-chat-audio", result) == {}
 
 
-def test_gemini_prompt_mode_in_manifest_is_native():
+def test_gemini_prompt_mode_in_manifest_is_prefix():
     from voiceover_pipeline.tts_prompting import resolve_prompt_mode
 
     mode = resolve_prompt_mode("openrouter-tts", "google/gemini-3.1-flash-tts-preview")
-    assert mode == "native"
+    assert mode == "prefix"
 
 
 def test_qwen_instruct_flag_reaches_local_provider():
@@ -730,85 +749,6 @@ def test_invalid_gemini_dialogue_generate_json_is_single_error_object(tmp_path):
     json_lines = [line for line in proc.stdout.splitlines() if line.strip().startswith("{")]
     assert len(json_lines) == 1
     assert proc.stderr.strip() == ""
-
-
-def test_gemini_dialogue_style_fallback_diagnostic_stays_off_stdout(tmp_path, monkeypatch, capsys):
-    import sys
-
-    script = _write_gemini_dialogue(
-        tmp_path,
-        "Speaker1: [warmly] Привет.\nSpeaker2: [curious] Проверяем два голоса.",
-    )
-
-    def failing_synthesize_chunk(self, text, chunk_id):
-        from voiceover_pipeline.models import SynthesisResult
-
-        if getattr(self, "_fallback_done", False):
-            return SynthesisResult(
-                audio_bytes=b"audio",
-                audio_format="mp3",
-                transcript=text,
-                generation_id=f"gen-{chunk_id}",
-                client_path="fake",
-            )
-        self._fallback_done = True
-        print(
-            f"Style prompt failed for {chunk_id}; retrying with shorter podcast style prompt.",
-            file=sys.stderr,
-        )
-        return SynthesisResult(
-            audio_bytes=b"audio",
-            audio_format="mp3",
-            transcript=text,
-            generation_id=f"gen-{chunk_id}",
-            client_path="fake",
-        )
-
-    import voiceover_pipeline.cli as cli
-
-    monkeypatch.setattr(
-        cli, "write_audio_as_mp3", lambda _ffmpeg, _audio, _fmt, path: path.write_bytes(b"mp3")
-    )
-    monkeypatch.setattr(cli, "trim_final_silence", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cli, "mp3_duration_ms", lambda *_args, **_kwargs: 1000)
-    monkeypatch.setattr(
-        cli,
-        "concat_dialogue_turns",
-        lambda _ffmpeg, _chunks_dir, output_path: output_path.write_bytes(b"full"),
-    )
-    monkeypatch.setattr(cli, "attach_costs", lambda *args, **kwargs: args[-1])
-    monkeypatch.setattr(cli, "fetch_pricing_snapshot", lambda _provider, _api_key, _model: None)
-    monkeypatch.setattr(cli.OpenRouterTTSProvider, "synthesize_chunk", failing_synthesize_chunk)
-    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
-    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test-only-placeholder")
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "voiceover",
-            "generate",
-            "--script",
-            str(script),
-            "--output-dir",
-            str(tmp_path / "out"),
-            "--run-id",
-            "fallback-stdout",
-            "--json",
-        ],
-    )
-
-    with pytest.raises(SystemExit) as exit_info:
-        cli.main()
-
-    assert exit_info.value.code == 0
-    captured = capsys.readouterr()
-    data = json.loads(captured.out)
-    assert data["status"] == "success"
-    assert data["run_id"] == "fallback-stdout"
-    json_lines = [line for line in captured.out.splitlines() if line.strip().startswith("{")]
-    assert len(json_lines) == 1
-    assert "Style prompt failed" not in captured.out
-    assert "Style prompt failed" in captured.err
 
 
 def test_gemini_dialogue_json_and_json_events_rejected(tmp_path):

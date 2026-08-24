@@ -161,19 +161,21 @@
 2. Установил отсутствующие зависимости сам (если можно)
 3. Пользователю дана команда только при невозможности установки
 
-### Кейс 10: Gemini with native prompt
+### Кейс 10: Gemini with documented OpenRouter speech payload
 
 **Контекст:** пользователь хочет Gemini TTS с expressive prompt.
 
 **Ожидание:**
-- Gemini использует native prompt mode: `prompt` отдельно от `input`
+- Gemini использует prefix prompt mode: style prompt входит в `input`
 - `--style-prompt-file` читает prompt из файла
-- `--no-style-prompt` не отправляет `prompt` в request body
+- `--no-style-prompt` отправляет исходный `input` без префикса
+- request body содержит `model`, `input`, `voice`, `response_format="pcm"`; ответ — raw audio
 
 **Assertions:**
-1. В request body есть поле `prompt` (не `input` содержит prompt)
+1. В request body нет недокументированного `prompt`; `response_format="pcm"` присутствует
 2. `--style-prompt-file` корректно читает файл
-3. `--no-style-prompt` убирает `prompt` из тела запроса
+3. `--no-style-prompt` убирает стилевой префикс из `input`
+4. Пустой, JSON/data URI/SSE ответ отклоняется без повторного платного запроса
 
 ## Заметки качественного обзора
 

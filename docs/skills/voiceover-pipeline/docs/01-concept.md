@@ -64,9 +64,9 @@ voiceover generate --with-timings        ← TTS + Whisper
 - `openai/*` → `POST /api/v1/audio/speech` (JSON с base64 audio, `contentType: audio/mpeg`)
 - `elevenlabs/*` → `POST /api/v1/media` (async task → poll `GET /media/{id}` → download URL)
 
-**OpenRouter TTS** — агрегатор, поддерживает Gemini и OpenAI TTS:
+**OpenRouter TTS** — текущий speech-каталог поддерживает Gemini:
 - Gemini: style_prompt работает, голоса Google (30 имён)
-- OpenAI TTS: style_prompt НЕ используется, голоса OpenAI (11 имён)
+- исторический OpenAI Mini TTS ID больше не допускается до запроса
 
 ## Семь протестированных моделей
 
@@ -78,7 +78,7 @@ voiceover generate --with-timings        ← TTS + Whisper
 | 4 | `elevenlabs/text-to-speech-turbo-2-5` | polza-tts | ~3.51 | RUB |
 | 5 | `elevenlabs/text-to-speech-multilingual-v2` | polza-tts | ~7.57 | RUB |
 | 6 | `google/gemini-3.1-flash-tts-preview` | openrouter-tts | ~$0.030 | USD |
-| 7 | `openai/gpt-4o-mini-tts-2025-12-15` | openrouter-tts | ~$0.00041 | USD |
+| 7 | `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | openrouter-tts | ~$0.00041 | USD |
 
 Цены — реальные smoke-прогоны 2026-04-29, не гарантия провайдера.
 Модель Qwen-local не показана — бесплатно на локальном GPU.

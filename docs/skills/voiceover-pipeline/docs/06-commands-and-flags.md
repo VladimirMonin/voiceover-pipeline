@@ -86,7 +86,7 @@
 | `--confirm-delete-paid-audio` | flag | false | Разрешить `--overwrite` удалить существующие `chunk_*.mp3` |
 | `--skip-existing` | flag | false | Пропустить если прогон уже есть |
 | `--resume` | flag | false | Продолжить interrupted run без повторной генерации готовых chunks |
-| `--retries` | int | `3` | Количество попыток на retryable provider error |
+| `--retries` | int | `3` | Количество попыток на retryable provider error; для `openrouter-tts` всегда 1 |
 | `--retry-delay` | float | `2.0` | Начальная задержка retry в секундах |
 | `--retry-max-delay` | float | `30.0` | Максимальная задержка retry |
 | `--no-retry` | flag | false | Отключить retry |

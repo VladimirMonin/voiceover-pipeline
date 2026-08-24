@@ -243,6 +243,6 @@ CLI-флаги переопределяют frontmatter, например:
 voiceover generate `
   --script "script.md" `
   --provider openrouter-tts `
-  --model "openai/gpt-4o-mini-tts-2025-12-15" `
-  --voice alloy
+  --model "google/gemini-3.1-flash-tts-preview" `
+  --voice Puck
 ```

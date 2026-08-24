@@ -148,17 +148,19 @@ Exit code: 2.
 
 Нужно указать subcommand: `generate`, `split`, `timings`, `doctor`, `validate`, `list`.
 
-## Gemini prompt body ошибка
+## OpenRouter Gemini generation error
 
 ```
-Style prompt failed for chunk_01; retrying with shorter podcast style prompt.
+Failed to synthesize turn_0001: OpenRouter TTS request failed with HTTP 502.
 ```
 
-Gemini может отклонить слишком длинный style prompt. Пайплайн автоматически ретраит с укороченным fallback-промптом. Если и это не помогает — попробуйте `--no-style-prompt`.
+OpenRouter generation не ретраится автоматически: один turn делает ровно один
+платный запрос. Исправьте prompt/voice или продолжите подтверждённый partial run
+через `--resume`; уже сохранённые turns повторно не генерируются.
 
 ## Unsupported prompt mode
 
-Если модель не поддерживает выбранный `prompt_mode`, пайплайн молча использует безопасный fallback:
+Если модель не поддерживает выбранный `prompt_mode`, пайплайн использует model-aware режим:
 - `openai/*` → `none` (prompt игнорируется)
-- `google/*` → `native` (раздельный prompt + input)
+- текущий OpenRouter Gemini TTS → `prefix` (prompt включается в `input`)
 - остальные → `none`

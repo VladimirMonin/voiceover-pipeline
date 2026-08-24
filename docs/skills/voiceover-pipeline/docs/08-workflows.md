@@ -81,19 +81,6 @@ voiceover generate `
   --resume
 ```
 
-OpenAI TTS через OpenRouter — самый дешёвый TTS в долларах:
-
-```powershell
-voiceover generate `
-  --provider openrouter-tts `
-  --model "openai/gpt-4o-mini-tts-2025-12-15" `
-  --voice "alloy" `
-  --script "script.md" `
-  --run-id "openai-or" `
-  --json `
-  --resume
-```
-
 С style prompt (Gemini):
 
 ```powershell
@@ -339,6 +326,5 @@ voiceover generate ... --overwrite --confirm-delete-paid-audio  # удалить
 | Чистый голос, рубли | Polza TTS | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 RUB/мин |
 | Лучшее качество речи | Polza TTS | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 RUB/мин |
 | Качество интонаций | Polza Chat Audio | `openai/gpt-audio` | ~7.00 RUB/мин |
-| Самый дешёвый TTS, USD | OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` | ~$0.00041/мин |
 | Западные голоса | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
 | Бесплатно, GPU | Qwen-local | CustomVoice | Бесплатно |

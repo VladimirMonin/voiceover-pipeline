@@ -81,14 +81,13 @@ TTS_PROMPT_MODE_PREFIX = "prefix"
 TTS_PROMPT_MODE_NATIVE = "native"
 
 PROMPTABLE_TTS_MODELS: dict[str, str] = {
-    "google/gemini-3.1-flash-tts-preview": "native",
+    "google/gemini-3.1-flash-tts-preview": "prefix",
 }
 
 POLZA_PROMPTABLE_TTS_MODELS: dict[str, str] = {}
 
 OPENROUTER_TTS_MODELS = [
     "google/gemini-3.1-flash-tts-preview",
-    "openai/gpt-4o-mini-tts-2025-12-15",
 ]
 
 OPENROUTER_WHISPER_MODELS = [
