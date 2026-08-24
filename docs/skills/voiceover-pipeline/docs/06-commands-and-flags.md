@@ -70,7 +70,7 @@
 | `--output-dir` | path | `out` | Корень выходной директории |
 | `--run-id` | str | авто | Имя прогона (только `[a-zA-Z0-9._-]`) |
 | `--voice` | str | зависит от провайдера | Голос |
-| `--format` | choice | `markdown` | `markdown`, `voiceover` или `gemini-dialogue` |
+| `--format` | choice | `markdown` | `markdown`, `voiceover`, `dialogue` или compatibility alias `gemini-dialogue` |
 | `--max-chunk-chars` | int | `2000` | Validation limit для `voiceover` metadata scripts |
 | `--speaker-voice` | repeat | — | Override для Gemini dialogue: `Speaker1=Puck` (можно повторять, по одному на спикера) |
 | `--fallback-voice` | str | `onyx` | Запасной голос для Polza Chat Audio |
@@ -100,12 +100,13 @@
 | `--sample` | str | — | Путь к референс-аудио для clone |
 | `--sample-text` | str | `""` | Текст референса для clone (точнее) |
 
-### OmniVoice-local опции (локальный, один голос на прогон)
+### OmniVoice-local опции (локальный)
 
 `omnivoice-local` — явный offline-only провайдер, модель
-`audio-cpp/omnivoice-q8_0`. В 0.6.0 — один голос на прогон; двухголосый
-подкаст локально не поддерживается (и платный `gemini-dialogue` двухголосым
-тоже пока НЕ является — см. `SKILL.md` режим F и план фикса). Режимы:
+`audio-cpp/omnivoice-q8_0`. Обычная одноголосая озвучка остаётся одним native
+session на прогон. `format: dialogue` создаёт один bound bank profile на turn,
+при этом admission/runtime остаётся общим; два profile ID с одинаковым
+`reference_sha256` отклоняются. Режимы:
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
@@ -139,25 +140,25 @@
 
 | Флаг | Тип | Default | Назначение |
 |---|---|---|---|
-| `--format` | choice | `markdown` | Включить `voiceover` или `gemini-dialogue` валидатор |
+| `--format` | choice | `markdown` | Включить `voiceover`, `dialogue` или alias `gemini-dialogue` валидатор |
 | `--provider` | choice | frontmatter | Override provider для `voiceover` metadata |
 | `--model` | str | frontmatter | Override/check model for metadata format |
 | `--voice` | str | frontmatter | Override voice для `voiceover` metadata |
 | `--speaker-voice` | repeat | — | Override voice map: `Speaker2=Kore` |
 | `--agent` | flag | false | Добавить snippets и suggested fixes в JSON |
 
-`voiceover` и `gemini-dialogue` валидаторы возвращают все ошибки за один прогон.
+`voiceover` и `dialogue` (включая alias `gemini-dialogue`) валидаторы возвращают все ошибки за один прогон.
 Генерация с metadata-форматом блокируется, если `valid: false`.
 
-### Gemini dialogue: локальные и платные флаги
+### Dialogue: локальные и платные флаги
 
-- Платный путь: `--provider openrouter-tts` + `--format gemini-dialogue`
+- Платный путь: `--provider openrouter-tts` + `--format dialogue`
   (модель `google/gemini-3.1-flash-tts-preview`). Top-level `--voice` для
   dialogue — производная совместимость от первого спикера; явный
   конфликтующий `--voice` отклоняется до создания провайдера.
-- Локальный путь: `--provider omnivoice-local` (один голос на прогон) или
-  `--provider qwen-local`. `--format gemini-dialogue` с локальным провайдером
-  не поддерживается.
+- Локальный путь: `--provider omnivoice-local --mode preset --voice-bank
+  <catalog.json>`; two-speaker dialogue требует два bank profile с разными
+  fingerprints. `qwen-local` не является dialogue provider.
 - `--speaker-voice` (repeat) переопределяет голос спикера: `Host=Kore`,
   `Guest=Puck`. Оба спикера должны остаться с различными голосами.
 

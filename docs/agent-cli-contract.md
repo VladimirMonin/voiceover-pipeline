@@ -207,35 +207,30 @@ fallback к container нет. Полный pinned receipt и ограничен�
 
 ## Gemini Dialogue (machine-facing)
 
-`format: gemini-dialogue` — двухголосый диалог. Каноническое имя формата
-идёт вперёд: **`dialogue`** (provider-independent); `gemini-dialogue`
-сохраняется как compatibility alias, идентичный по плану. State/manifests
-пишут `format: dialogue`. Режиссура и prompting живут в skill tree
+`format: dialogue` — канонический provider-independent двухголосый диалог.
+`gemini-dialogue` сохраняется как compatibility alias с идентичным планом.
+State/manifests всегда пишут `format: dialogue`. Режиссура и prompting живут в skill tree
 (`docs/skills/voiceover-pipeline/`).
 
-### Статус: BROKEN, не заявлять как рабочий
+### Статус и граница доказательств
 
 - OpenRouter `/api/v1/audio/speech` поддерживает **один голос на запрос**
   (одно top-level `voice`); поле `multi_speaker_voice_config` не
-  документировано, провайдер его игнорирует.
-- Live-приёмка 2026-08-21 отмечена **FAILED/BLOCKED** (2026-08-22): весь
-  диалог озвучен одним голосом `Kore`; audible cast assignment не
-  произошёл. См. `docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md`.
-- Гибридный payload (top-level `voice` + `multi_speaker_voice_config`)
-  **rejected/blocked**: как только фикс внедрён, такой запрос отклоняется
-  до provider-вызова. Это не рабочий transport.
-- Исполнение планируется как **turn-by-turn**: один запрос на реплику (turn)
-  с одним документированным top-level `voice` (`model`, `input`, `voice`,
-  `response_format`). Фикс по плану:
-  `docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`.
-- Двухголосый результат **недоступен**, пока фикс не внедрён и человек не
-  прослушал и не подтвердил два различных голоса. Не обещать два голоса и
-  не использовать `multi_speaker_voice_config`.
+  документировано и никогда не отправляется.
+- Исполнение `turn-by-turn-v1`: один request на реплику, с одним
+  документированным `voice` и только `model`, `input`, `voice`,
+  `response_format`. `Alias:` не входит в spoken text.
+- Для OmniVoice admission/runtime происходит один раз; turn вызывает bound
+  bank profile. Два разных profile ID с одинаковым `reference_sha256`
+  отклоняются до native call.
+- Offline contract покрыт детерминированными tests. Это не доказывает
+  слышимое различие: прошлый OpenRouter live attempt FAILED/BLOCKED, а новый
+  OpenRouter и OmniVoice audible PASS остаются отдельными human gates.
 
 ### Frontmatter schema
 
 ```yaml
-format: gemini-dialogue
+format: dialogue
 language: ru
 model: google/gemini-3.1-flash-tts-preview
 speakers:
@@ -263,20 +258,24 @@ max_chunk_bytes: 3500
 
 ### Ограничения
 
-- Провайдер: только `openrouter-tts`; модель: только
-  `google/gemini-3.1-flash-tts-preview`. Другая модель — `MODEL_NOT_GEMINI_TTS`.
+- OpenRouter использует только `openrouter-tts` +
+  `google/gemini-3.1-flash-tts-preview`; другая модель — `MODEL_NOT_GEMINI_TTS`.
+- OmniVoice использует `omnivoice-local --mode preset --voice-bank` и profile
+  IDs из admitted catalog. Обычный single-speaker OmniVoice сохраняет один
+  native session; dialogue не смешивает его turns.
 - Top-level `--voice` — производная совместимость: равен голосу первого
-  спикера из карты. Явный конфликтующий `--voice` отклоняется (exit `2`)
-  до создания провайдера.
+  спикера для OpenRouter. Явный конфликтующий `--voice` отклоняется (exit
+  `2`) до создания провайдера.
 - `--speaker-voice <Alias>=<Voice>` (repeat) переопределяет голос спикера;
-  после overrides действуют те же правила (ровно два, различны, из allowlist).
+  после overrides действуют те же правила: ровно два и различны; OmniVoice
+  также требует разные fingerprints.
 - **Недокументированный `multi_speaker_voice_config` в payload не
   отправляется и не поддерживается.** Один запрос — одна реплика (turn) —
   один top-level документированный `voice` (в рамках плана turn-by-turn).
 
 ### JSON и exit codes
 
-- `validate --format gemini-dialogue --agent --json` — один JSON-объект
+- `validate --format dialogue --agent --json` — один JSON-объект
   отчёта (поля `status`, `valid`, `speaker_voice_map`, `chunk_reports`,
   `errors`, `warnings`), exit `0` даже при `valid: false`.
 - Невалидный диалог при `generate --json` — один объект
@@ -287,24 +286,24 @@ max_chunk_bytes: 3500
 
 ### Resume identity
 
-Канонический hash: SHA-256 от UTF-8 JSON
-`{format, provider, model, speaker_voice_map (sorted), style_prompt_sha256, prompt_mode}`
-с sorted keys. Хранится в `run_state.json` как `voice_identity`.
-
-- Изменение голоса спикера, модели, style prompt (vibe/profile) или prompt
-  mode при `--resume` — exit `30` до генерации.
-- Старое состояние без `voice_identity` — fail closed (exit `30`), без
-  смешивания артефактов.
+`run_state.json` хранит `synthesis_identity`: SHA-256 канонического UTF-8
+JSON с strategy, provider/model, alias→voice/profile/fingerprint, hashes
+упорядоченных turns и пауз, style/prompt hashes и trim policy; OmniVoice также
+включает mode, seed, steps и guidance. Изменение каста, fingerprint, текста,
+порядка, паузы, trim/model/prompt или OmniVoice parameters даёт exit `30`
+до provider call. Старое dialogue state без `synthesis_identity`, равно как
+orphan dialogue MP3 без trusted state, fail closed.
 
 ### Артефакты
 
-- `chunks.json`: `script_format` (`dialogue` / alias `gemini-dialogue`) и
-  `speaker_voice_map` (алиас → голос).
-- `run_state.json`: `voice_identity` (диалоговый hash) и `script_format`.
-- Текущее ограничение: per-turn WAV и per-turn timing metadata не
-  производятся; чанк — это смысловой блок диалога, а не отдельная реплика.
-- Планируется per-turn артефакты и новый resume-identity `synthesis_identity`
-  (по `docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`).
+- `chunks.json` и run manifest: `script_format: dialogue`, `speaker_voice_map`
+  и один public receipt на turn: `turn_index`, `speech_duration_ms`,
+  `audio_sha256`, `start_ms`, `end_ms`, `pause_after_ms`, speaker/voice и
+  доступный fingerprint. Transcript, reference paths/text и voice-bank private
+  data отсутствуют.
+- `run_state.json` хранит тот же trusted receipt без private dialogue text.
+  Final concat использует turn files строго в плане и после speech trim
+  материализует локальную PCM тишину: 250/600/0 ms.
 
 ## `generate --json` (output)
 

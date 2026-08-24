@@ -166,25 +166,22 @@ voiceover generate `
   --resume
 ```
 
-## Agent Podcast Workflow (gemini-dialogue, платный)
+## Agent Podcast Workflow (dialogue)
 
 Канонический путь для «сделай подкаст с двумя ведущими».
 
-> **ВНИМАНИЕ (2026-08-22): двухголосый диалог через OpenRouter BROKEN** —
-> один голос на запрос; `multi_speaker_voice_config` игнорируется
-> (live-приёмка FAILED/BLOCKED). Не заявляй двухголосый результат и не
-> запускай платный двухголосый прогон до фикса
-> (`docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`).
-> После фикса: один запрос на реплику (turn), один документированный
-> top-level `voice`; реплики склеиваются с детерминированными паузами.
+> OpenRouter использует один документированный top-level `voice` на turn;
+> `multi_speaker_voice_config` не отправляется. Offline contract реализует
+> turn-by-turn concat с детерминированными паузами. Не заявляй audible PASS
+> без отдельного human listening acceptance для provider.
 
 1. **Автор сценарий.** Из темы и состава ведущих пользователя напиши
-   `podcast.md` в формате `gemini-dialogue` (см. `docs/04-input-format.md`,
+   `podcast.md` в формате `dialogue` (см. `docs/04-input-format.md`,
    пример `examples/gemini-dialogue-podcast.md`). Ровно два спикера, два
    различных голоса.
 2. **Валидация без платного запроса:**
    ```powershell
-   voiceover validate --script "podcast.md" --format gemini-dialogue --agent --json
+   voiceover validate --script "podcast.md" --format dialogue --agent --json
    ```
 3. **Проверка окружения** (не читая `.env`):
    ```powershell
@@ -203,11 +200,11 @@ voiceover generate `
    безопасном прогоне. Отдельный `voiceover timings` — только с ДРУГИМ
    `--output-dir`/`--run-id`, никогда с `--overwrite` по папке платного прогона.
 
-## OmniVoice Local Workflows (бесплатно, GPU, один голос на прогон)
+## OmniVoice Local Workflows (бесплатно, GPU)
 
 Требуется NVIDIA GPU + CUDA + native audio.cpp package
-(см. `docs/14-local-audio-cpp-models.md`). В 0.6.0 OmniVoice — один голос
-на прогон.
+(см. `docs/14-local-audio-cpp-models.md`). Обычная озвучка использует один
+голос и один native session; `dialogue` маршрутизирует отдельный bank profile на turn.
 
 Дефолтный preset из voice bank (без `--voice` берётся `default_voice` каталога):
 

@@ -1,5 +1,5 @@
 ---
-format: gemini-dialogue
+format: dialogue
 language: ru
 model: google/gemini-3.1-flash-tts-preview
 speakers:

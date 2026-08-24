@@ -107,75 +107,20 @@ voiceover timings --audio "out/prod/prod-voiceover-model.mp3" --run-id "prod" --
 Если всё же используется `generate --with-timings`, зависимость `faster-whisper`
 проверяется до первого платного TTS-запроса.
 
-## Gemini Dialogue format
+## Dialogue format
 
-Для Gemini 3.1 Flash TTS через OpenRouter есть отдельный формат для подкастов
-с двумя дикторами, голосами и inline emotion tags.
+`dialogue` — provider-neutral формат для подкастов с двумя дикторами,
+голосами и inline emotion tags. `gemini-dialogue` принимается как
+compatibility alias, но planner, manifest и run state используют только
+`dialogue`.
 
-> **ВНИМАНИЕ (2026-08-22): двухголосый результат через OpenRouter BROKEN.**
-> OpenRouter применяет один top-level `voice` на запрос и игнорирует
-> `multi_speaker_voice_config`; live-прослушивание подтвердило один женский
-> голос для обоих спикеров (live-приёмка FAILED/BLOCKED). Пока не внедрён
-> фикс (`docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`),
-> двухголосый результат не доступен; после фикса — один запрос на реплику
-> (turn) с одним документированным `voice`.
+> OpenRouter поддерживает один top-level `voice` на запрос. Диалоговый
+> маршрут делает один запрос на реплику с голосом её alias, не отправляет
+> `multi_speaker_voice_config` и не озвучивает `Alias:`.
 
 ```markdown
 ---
-format: gemini-dialogue
-language: ru
-model: google/gemini-3.1-flash-tts-preview
-speakers:
-  Speaker1:
-    display_name: Первый диктор
-    voice: Puck
-    profile: calm, warm, confident technical host
-  Speaker2:
-    display_name: Второй диктор
-    voice: Kore
-    profile: curious, energetic co-host
-vibe: >
-  Russian technical podcast. Warm, smart, conversational.
-allowed_tags:
-  - warmly
-  - curious
-  - laughs
-  - serious
-  - short pause
-max_chunk_bytes: 3500
----
-
-Speaker1: [warmly] Привет. Это начало выпуска.
-Speaker2: [curious] А это второй голос с другим характером.
-
-******
-
-Speaker1: [serious] Новый смысловой чанк.
-Speaker2: [laughs] Короткая эмоциональная реакция.
-```
-
-Правила:
-
-- Frontmatter читает pipeline, в TTS он не отправляется как реплика.
-- **Ровно два спикера** с **двумя различными голосами** из Gemini voice list.
-  Один спикер, три спикера или повтор голоса — ошибка валидации
-  (`SPEAKER_COUNT_INVALID`, `DUPLICATE_SPEAKER_VOICE`).
-- В dialogue body разрешены только aliases из `speakers`, например `Speaker1:`.
-- Speaker aliases должны быть alphanumeric без пробелов.
-- Голоса должны быть из списка Gemini voices.
-- Emotion tags пишутся по-английски в квадратных скобках.
-- Каждый чанк проверяется по UTF-8 bytes. Default safety limit: `3500`, hard limit: `4000`.
-- Если хотя бы один чанк невалиден, `generate --format gemini-dialogue` не стартует.
-- `******` делит диалог на смысловые блоки. После фикса каждый чанк будет
-  исполняться **по репликам (turn-by-turn): одна реплика = один запрос с
-  одним документированным top-level `voice` спикера**; состав спикеров и
-  голосов один на весь скрипт.
-
-Компактный Q/A пример с `Host` и `Guest`:
-
-```markdown
----
-format: gemini-dialogue
+format: dialogue
 language: ru
 model: google/gemini-3.1-flash-tts-preview
 speakers:
@@ -206,29 +151,46 @@ Host: [curious] Можно работать полностью локально?
 Guest: Да. Для одноголосой озвучки доступны OmniVoice и Qwen.
 ```
 
-Валидация:
+Правила:
+
+- Frontmatter читает pipeline, в TTS он не отправляется как реплика.
+- Ровно два aliases, alphanumeric без пробелов. Один или три спикера, а также
+  повтор голоса/profile — ошибка (`SPEAKER_COUNT_INVALID`,
+  `DUPLICATE_SPEAKER_VOICE`).
+- Для OpenRouter голос берётся из Gemini voice list. Для OmniVoice `voice` —
+  profile ID из admitted bank; два профиля должны иметь разные
+  `reference_sha256`.
+- Emotion tags пишутся по-английски в квадратных скобках. Каждый смысловой
+  блок проверяется по UTF-8 bytes: default `3500`, hard limit `4000`.
+- `******` делит диалог на смысловые блоки. Каждая реплика становится turn:
+  один provider request с одним документированным voice, 250 ms между turns,
+  600 ms после разделителя и 0 ms после последнего turn.
+- После trim паузы материализуются как локальный PCM silence в final audio.
+  Receipt каждого turn содержит `turn_index`, `speech_duration_ms`,
+  `audio_sha256`, offsets, voice и доступный fingerprint; transcript и
+  reference text не публикуются.
+- `--resume` требует state с точным `synthesis_identity`. Изменение каста,
+  fingerprint, текста, порядка, паузы или trim policy, а также orphan turn
+  audio без state, завершается exit `30` до provider call.
+
+Валидация и OpenRouter generation:
 
 ```powershell
-voiceover validate `
-  --script "script.md" `
-  --format gemini-dialogue `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --agent `
-  --json
-```
-
-Генерация:
-
-```powershell
+voiceover validate --script "script.md" --format dialogue --agent --json
 voiceover generate `
   --provider openrouter-tts `
   --model "google/gemini-3.1-flash-tts-preview" `
-  --format gemini-dialogue `
+  --format dialogue `
   --script "script.md" `
   --run-id "podcast-prod" `
   --json `
   --resume
 ```
+
+Для локального варианта укажи `--provider omnivoice-local --mode preset
+--voice-bank <catalog.json>` и явно выбранные два profile ID в frontmatter.
+Проверенный offline contract не заменяет отдельное human listening acceptance:
+не заявляй два слышимо разных голоса до PASS для нужного provider.
 
 ## Voiceover metadata format
 
@@ -254,12 +216,14 @@ max_chunk_chars: 2000
 Поддерживаемые поля:
 
 - `format: voiceover` — включает metadata validator.
-- `provider` или `service` — `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local`.
+- `provider` или `service` — `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local`, `omnivoice-local`.
 - `model` — модель выбранного провайдера.
 - `voice` — голос, если провайдер его поддерживает.
 - `fallback_voice` — только для `polza-chat-audio`.
 - `style_prompt` или `prompt` — работает для OpenRouter Gemini TTS, для остальных режимов валидатор даст warning.
-- `max_chunk_chars` — лимит символов на чанк.
+- `max_chunk_chars` — настроенный лимит символов на чанк; для `omnivoice-local` с его штатной моделью валидатор показывает локальный лимит 420, если CLI-лимит не задан.
+
+JSON-отчёт также содержит `spoken_text` с политикой raw digits и информационной статистикой состава текста: количеством Latin-символов и Latin-слов, смешанных по алфавиту слов, всех букв и долей Latin. Для OmniVoice raw digits блокируют валидацию; для остальных маршрутов это warning.
 
 Валидация:
 

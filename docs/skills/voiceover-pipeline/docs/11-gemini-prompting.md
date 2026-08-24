@@ -6,7 +6,8 @@
 ## Для чего этот guide
 
 Используй этот документ, когда пользователь работает с `google/gemini-3.1-flash-tts-preview`,
-`format: gemini-dialogue`, подкастами, диалогами, эмоциями, voice direction,
+`format: dialogue` (или compatibility alias `gemini-dialogue`), подкастами,
+диалогами, эмоциями, voice direction,
 inline audio tags или длинной озвучкой. Главная идея: Gemini TTS — не обычный
 «робот-чтец», а LLM-TTS исполнитель, которому нужна понятная режиссура.
 

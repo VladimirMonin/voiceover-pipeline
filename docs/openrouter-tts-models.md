@@ -188,12 +188,11 @@ Style prompt не добавляется. Пайплайн конвертиру�
 весь диалог был озвучен одним женским голосом `Kore`.
 
 Гибридный payload (top-level `voice` + `multi_speaker_voice_config`) больше
-не используется и не должен документироваться как рабочий. Двухголосый
-`gemini-dialogue` сейчас BROKEN и перерабатывается; НЕ заявляй, что он
-работает. План: один запрос на реплику (turn) с одним документированным
-top-level `voice`; запланировано в
-[docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).
-Два голоса недоступны, пока фикс не внедрён и человек не прослушал результат.
+не используется и не должен документироваться как рабочий. Канонический
+`dialogue` выполняется как один request на реплику (turn) с одним
+документированным top-level `voice`; `gemini-dialogue` — compatibility alias.
+Offline tests проверяют маршрутизацию, но audible PASS всё ещё требует human
+listening acceptance и не должен подменяться metadata или mocked response.
 
 Нативный multi-speaker существует только в прямом Gemini API
 (`generation_config.speech_config` с двумя `{speaker, voice}`), но не через

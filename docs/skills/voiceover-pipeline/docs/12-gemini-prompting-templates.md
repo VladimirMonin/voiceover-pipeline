@@ -10,7 +10,7 @@ it wholesale into the spoken body of a `voiceover-pipeline` script.
 
 Project-native mapping:
 
-| Conceptual block | `format: voiceover` | `format: gemini-dialogue` |
+| Conceptual block | `format: voiceover` | `format: dialogue` |
 |---|---|---|
 | AUDIO PROFILE | `style_prompt` / `prompt` | `speakers.<alias>.profile` |
 | SCENE | `style_prompt` / `prompt` | `vibe` or compact profile text |
@@ -43,7 +43,7 @@ max_chunk_chars: 2000
 
 ```markdown
 ---
-format: gemini-dialogue
+format: dialogue
 language: ru
 model: google/gemini-3.1-flash-tts-preview
 speakers:
@@ -95,7 +95,7 @@ Accent: Natural Russian speech.
 ```
 
 Use this template as direction source, then map it into `style_prompt` or
-`gemini-dialogue` frontmatter.
+`dialogue` frontmatter (the legacy `gemini-dialogue` spelling is accepted).
 
 ## Emotional line template
 

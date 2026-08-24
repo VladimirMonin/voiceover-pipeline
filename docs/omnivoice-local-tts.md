@@ -64,6 +64,22 @@ script. A bounded `--limit-chunks 3` run therefore creates one session
 containing the first three prepared fragments, rather than three
 independently initialized voices.
 
+For a session longer than the internal limit, the completed prepared atoms are
+whitespace-padded to the next 420-character boundary, so each internal split
+lands after its terminal punctuation rather than inside a spoken word. An atom
+that exactly fills the limit already ends on that boundary and needs no padding.
+`inspect_omnivoice_internal_seams` is the deterministic diagnostic for this
+invariant; a rare overlong sentence that can only be split between words is
+reported as word-safe rather than falsely described as sentence-safe.
+
+The Linux container transport uses the 300-second base timeout per 420-character
+workload unit, scaling with the decoded request text and capping the total wait
+at 1,800 seconds. On timeout or cancellation it terminates and reaps the whole
+container process group before the private workspace is removed; successful WAV
+bytes are decoded into the response before that cleanup. Retrying therefore
+cannot begin while the previous container process is still being reaped. The
+Windows native factory and its platform-specific process semantics are unchanged.
+
 ## Approved local inputs
 
 | Item | Exact value |

@@ -81,25 +81,23 @@ max_chunk_chars: 2000
 Второй фрагмент озвучки.
 ```
 
-Для Gemini 3.1 Flash TTS podcasts доступен `format: gemini-dialogue` с двумя
+Для двухголосых podcasts доступен provider-neutral `format: dialogue` с двумя
 спикерами, voice map и inline tags вроде `[laughs]`, `[serious]`, `[short pause]`.
+`gemini-dialogue` остаётся compatibility alias; state и manifests пишут
+канонический `dialogue`.
 
-> **Статус (2026-08-22): двухголосый диалог через OpenRouter BROKEN и
-> перерабатывается.** OpenRouter `/api/v1/audio/speech` поддерживает один
-> голос на запрос; недокументированное поле `multi_speaker_voice_config`
-> игнорируется, и live-прослушивание подтвердило один женский голос для
-> обоих спикеров. Два различных голоса недоступны, пока не внедрён план
-> turn-by-turn (один запрос на реплику с одним документированным `voice`)
-> и человек не подтвердил аудируемость:
-> [docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md).
-> Live-приёмка отмечена FAILED/BLOCKED:
-> [docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md](docs/reports/2026-08-21-gemini-dialogue-live-acceptance.md).
+> OpenRouter получает один документированный top-level `voice` на каждую
+> реплику; `multi_speaker_voice_config` не используется. OmniVoice dialogue
+> использует один admitted runtime и отдельный bank profile на turn. Offline
+> contract проверен, но audible PASS OpenRouter и OmniVoice по-прежнему требует
+> human listening: не заявляй слышимое различие голосов или выпуск 0.6.0 без
+> двух PASS.
 
 ### Agent-first podcast (два спикера)
 
 ```powershell
 # 1. Валидация без платного запроса
-voiceover validate --script "podcast.md" --format gemini-dialogue --agent --json
+voiceover validate --script "podcast.md" --format dialogue --agent --json
 
 # 2. Проверка окружения (не читая .env)
 voiceover doctor --provider openrouter-tts --json
@@ -109,15 +107,9 @@ voiceover generate --script "podcast.md" --run-id "podcast-prod" --json --resume
 ```
 
 Provider/model/каст/направление берутся из frontmatter скрипта. Resume
-защищён каноническим identity: смена голоса/модели/style prompt отклоняется
-(exit 30) до платного запроса.
-
-> **Недоступно до фикса (2026-08-22):** текущий `gemini-dialogue` прогон не
-> производит двух различных голосов — OpenRouter игнорирует
-> `multi_speaker_voice_config`. Не запускать платный двухголосый прогон,
-> пока фикс
-> ([docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md](docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md))
-> не внедрён, и не заявлять двухголосый результат.
+защищён `synthesis_identity`: смена голоса/profile/fingerprint, модели,
+текста, порядка, пауз или style/trim policy отклоняется (exit 30) до provider
+request; orphan dialogue MP3 не восстанавливается без trusted state.
 
 ### Gemini prompting quick guide
 
