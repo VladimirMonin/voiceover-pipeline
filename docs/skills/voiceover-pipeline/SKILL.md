@@ -1,26 +1,17 @@
 ---
 name: voiceover-pipeline
 description: >
-  Установка и использование voiceover-pipeline CLI для генерации озвучки
-  из Markdown-сценариев, включая frontmatter metadata для provider/model/voice
-  и Gemini dialogue scripts, TTS-аудио, Whisper-таймингов, SRT, manifest.json
-  и Remotion-ready артефактов. Используй ВСЕГДА, когда пользователь просит
-  озвучить текст, создать voiceover, TTS, аудио для видео, подкаста или
-  Remotion, получить тайминги, scene durations, subtitles, timestamps,
-  whisper timing, распознать речь, транскрибировать аудио, выбрать
-  timing-провайдера или проверить voiceover project. Провайдеры TTS: Polza
-  GPT Audio, Polza TTS (OpenAI + ElevenLabs), OpenRouter TTS (Gemini +
-  OpenAI), Qwen3-TTS и OmniVoice (локальный GPU). Провайдеры распознавания:
-  faster-whisper, Qwen3-ASR и Nemotron (локальные), openrouter-whisper
-  (облачный, без таймкодов), groq-whisper (облачный, сегменты + слова),
-  xai-stt (облачный, слова + confidence). Локальные non-Whisper модели могут
-  работать через общий audio.cpp runtime. Агент создаёт project skeleton
-  (.env.example, .gitignore, script.md, out/), просит ключи однократно,
-  никогда не читает .env. Триггеры: озвучь, voiceover, TTS, тайминги,
-  whisper timing, аудио для видео, подкаст, generate audio, timings for
-  Remotion, voiceover-pipeline, выбери провайдера, сравни модели TTS,
-  голос для озвучки, format: voiceover, gemini-dialogue, --resume,
-  status run, concat partial audio, Gemini prompting, audio tags.
+  Используй ВСЕГДА для озвучки, голосовых отчётов, обзоров и рассказов голосом,
+  TTS, аудио для видео, подкаста или Remotion, а также для таймингов,
+  субтитров и распознавания речи через voiceover-pipeline CLI. Локальные
+  провайдеры Qwen3-TTS и OmniVoice работают на GPU; явно названный
+  пользователем провайдер не подменяется. Триггеры: озвучь, голосовой отчёт,
+  обзор голосом, расскажи голосом, запиши аудио или новости, на нашей
+  видеокарте, voiceover, TTS, тайминги, whisper timing, аудио для видео,
+  подкаст, generate audio, timings for Remotion, voiceover-pipeline, выбери
+  провайдера, сравни модели TTS, голос для озвучки, format: voiceover,
+  dialogue, --resume, status run, concat partial audio, Gemini prompting,
+  audio tags.
 ---
 # Voiceover Pipeline — навык агента
 
@@ -61,6 +52,8 @@ description: >
 - «нужно получить SRT из MP3»
 - «поставь voiceover-pipeline и проверь что работает»
 - «сделай подкаст из сценария»
+- «сделай голосовой отчёт / обзор голосом / расскажи это голосом»
+- «запиши рассказ или новости на нашей видеокарте»
 - «сделай подкаст с двумя ведущими» (→ режим F, gemini-dialogue)
 - «озвучь диалог мужчины и женщины» (→ режим F, gemini-dialogue)
 - «сделай Q&A / вопрос-ответ двух спикеров» (→ режим F, gemini-dialogue)

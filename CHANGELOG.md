@@ -2,11 +2,12 @@
 
 ## 0.6.0
 
-> **0.6.0 held — live acceptance of two-voice dialogue FAILED (OpenRouter
-> applies a single voice); fix in progress per plan 2026-08-22
-> (`docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`).**
-> 0.6.0 must not be tagged/published until two distinct voices are proven
-> audibly.
+> **0.6.0 publication authorized by the owner on 2026-08-24.** The package is
+> published before the final audible dialogue check. OpenRouter dialogue now
+> uses one paid request and one `voice` per turn, sends only the exact current
+> turn text, and requires a per-turn ASR quality gate before concat. This
+> release does not claim that two voices have passed final human listening;
+> the post-publication live check remains open while OpenRouter returns 502.
 
 ### OmniVoice Local Voice Bank
 

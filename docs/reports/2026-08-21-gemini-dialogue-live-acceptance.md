@@ -5,6 +5,11 @@ Date: 2026-08-21
 > **Status: FAILED/BLOCKED — 0.6.0 must not be tagged/published until two
 > distinct voices are proven audibly.**
 >
+> Historical decision note: this report remains evidence for the failed legacy
+> multi-speaker request. On 2026-08-24 the owner explicitly authorized PyPI
+> publication before the replacement turn-by-turn route completes its final
+> human listening gate. This does not convert the historical audio to PASS.
+>
 > Обновлено 2026-08-22 после прослушивания: audible cast assignment FAILED.
 > OpenRouter проигнорировал недокументированное поле
 > `multi_speaker_voice_config` и синтезировал весь диалог с одним голосом —
