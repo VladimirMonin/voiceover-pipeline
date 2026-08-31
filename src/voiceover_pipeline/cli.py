@@ -2030,6 +2030,7 @@ def _verify_dialogue_turns_before_concat(
             maximum_missing_ratio=0.0,
             maximum_unexpected_ratio=0.0,
             maximum_repeated_ngram_excess=0,
+            strip_audio_tags=True,
         )
         turn_receipt = quality.public_receipt(
             audio_sha256=_sha256_file(audio_path),

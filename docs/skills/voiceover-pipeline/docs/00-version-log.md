@@ -49,8 +49,9 @@
 
 ## История изменений
 
-| Дата | Изменение |
+| Дата | Изменения |
 |---|---|
+| 2026-08-31 | **v0.6.1 candidate:** dialogue ASR quality gate удаляет из expected text только непроизносимые audio tags, нормализует `ё/е` и допускает эквивалентное деление ASR-токенов (`OmniVoice` / `Omni Voice`). Реальная лишняя речь и повторы остаются fail-closed. |
 | 2026-08-24 | OpenRouter dialogue переведён на строгий verbatim turn input: style/profile/vibe/labels/соседний текст не попадают в synthesis request. Перед final concat обязателен явный per-turn ASR quality gate с transcript-free receipt; вставки, пропуски и повторы дают exit `60`. |
 | 2026-08-24 | Исторический промежуточный transport fix перевёл Gemini 3.1 Flash TTS на `model`/`input`/`voice`/`response_format="pcm"` и raw audio response. Его prefix-style поведение в тот же день superseded строгим verbatim contract строкой выше; empty и wrapped JSON/data URI/SSE по-прежнему fail closed. |
 | 2026-08-24 | Реализован offline contract канонического `dialogue`: `gemini-dialogue` сохранён alias, OpenRouter и OmniVoice выполняют turn-by-turn, final audio включает PCM паузы, resume использует fail-closed `synthesis_identity`, а receipts не публикуют private text. Владелец разрешил публикацию `0.6.0` до финального human audible PASS; post-publication live gate остаётся открытым и не подменяется transport/static доказательствами. |

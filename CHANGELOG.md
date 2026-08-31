@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.6.1
+
+- Fixed false dialogue quality failures for non-spoken audio tags, Russian
+  `ё`/`е` ASR drift, and equivalent ASR token boundaries such as
+  `OmniVoice` / `Omni Voice`.
+- Extra speech, omissions and repeated phrases still fail closed.
+- No new TTS request is needed to re-check already generated trusted turns;
+  `--resume` reruns the per-turn ASR gate before concat.
+
 ## 0.6.0
 
 > **0.6.0 publication authorized by the owner on 2026-08-24.** The package is

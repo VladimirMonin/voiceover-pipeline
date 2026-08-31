@@ -10,11 +10,17 @@ from difflib import SequenceMatcher
 from typing import Any
 
 _WORD_RE = re.compile(r"[^\W_]+", re.UNICODE)
+_AUDIO_TAG_RE = re.compile(r"\[[^\]\n]{1,80}\]")
 
 
 def normalize_quality_text(text: str) -> str:
     """Return the stable, privacy-local normalization used by the quality gate."""
-    return " ".join(_WORD_RE.findall(text.casefold()))
+    return " ".join(_WORD_RE.findall(text.casefold().replace("ё", "е")))
+
+
+def strip_expected_audio_tags(text: str) -> str:
+    """Remove non-spoken dialogue performance tags from expected text only."""
+    return _AUDIO_TAG_RE.sub(" ", text)
 
 
 def _repeated_ngram_excess(expected: list[str], actual: list[str]) -> int:
@@ -82,25 +88,31 @@ def evaluate_tts_transcript(
     maximum_missing_ratio: float = 0.05,
     maximum_unexpected_ratio: float = 0.05,
     maximum_repeated_ngram_excess: int = 0,
+    strip_audio_tags: bool = False,
 ) -> TTSQualityResult:
     """Detect major omissions, unexpected speech, and repetition fail-closed."""
-    expected_normalized = normalize_quality_text(expected_text)
+    expected_source = (
+        strip_expected_audio_tags(expected_text) if strip_audio_tags else expected_text
+    )
+    expected_normalized = normalize_quality_text(expected_source)
     actual_normalized = normalize_quality_text(actual_transcript)
     expected_words = expected_normalized.split()
     actual_words = actual_normalized.split()
     if not expected_words:
         raise ValueError("Expected TTS text must contain at least one word")
 
+    compact_equivalent = "".join(expected_words) == "".join(actual_words)
     matcher = SequenceMatcher(None, expected_words, actual_words, autojunk=False)
     missing = 0
     unexpected = 0
-    for tag, expected_start, expected_end, actual_start, actual_end in matcher.get_opcodes():
-        if tag in ("delete", "replace"):
-            missing += expected_end - expected_start
-        if tag in ("insert", "replace"):
-            unexpected += actual_end - actual_start
+    if not compact_equivalent:
+        for tag, expected_start, expected_end, actual_start, actual_end in matcher.get_opcodes():
+            if tag in ("delete", "replace"):
+                missing += expected_end - expected_start
+            if tag in ("insert", "replace"):
+                unexpected += actual_end - actual_start
     repeated = _repeated_ngram_excess(expected_words, actual_words)
-    similarity = round(matcher.ratio(), 9)
+    similarity = 1.0 if compact_equivalent else round(matcher.ratio(), 9)
     denominator = len(expected_words)
 
     reasons: list[str] = []

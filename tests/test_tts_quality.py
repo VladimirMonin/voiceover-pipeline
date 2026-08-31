@@ -60,3 +60,55 @@ def test_quality_fails_major_omission_and_repetition():
     assert result.repeated_ngram_excess > 0
     assert "missing_words" in result.failure_reasons
     assert "repeated_ngram" in result.failure_reasons
+
+
+def test_dialogue_quality_ignores_expected_audio_tags_and_yo_drift():
+    result = evaluate_tts_transcript(
+        expected_text="[warmly] Она создаёт озвучку.",
+        actual_transcript="Она создает озвучку.",
+        minimum_similarity=1.0,
+        maximum_missing_ratio=0.0,
+        maximum_unexpected_ratio=0.0,
+        strip_audio_tags=True,
+    )
+
+    assert result.passed is True
+    assert result.similarity == 1.0
+    assert result.missing_word_count == 0
+    assert result.unexpected_word_count == 0
+
+
+def test_quality_allows_asr_token_boundary_drift_without_allowing_extra_speech():
+    equivalent = evaluate_tts_transcript(
+        expected_text="Доступны OmniVoice и Qwen.",
+        actual_transcript="Доступны Omni Voice и Qwen.",
+        minimum_similarity=1.0,
+        maximum_missing_ratio=0.0,
+        maximum_unexpected_ratio=0.0,
+    )
+    extra = evaluate_tts_transcript(
+        expected_text="Доступны OmniVoice и Qwen.",
+        actual_transcript="Доступны Omni Voice и Qwen, а также лишняя речь.",
+        minimum_similarity=1.0,
+        maximum_missing_ratio=0.0,
+        maximum_unexpected_ratio=0.0,
+    )
+
+    assert equivalent.passed is True
+    assert equivalent.similarity == 1.0
+    assert extra.passed is False
+    assert "unexpected_words" in extra.failure_reasons
+
+
+def test_audio_tag_is_unexpected_when_asr_actually_speaks_it():
+    result = evaluate_tts_transcript(
+        expected_text="[warmly] Проверяем речь.",
+        actual_transcript="Warmly, проверяем речь.",
+        minimum_similarity=1.0,
+        maximum_missing_ratio=0.0,
+        maximum_unexpected_ratio=0.0,
+        strip_audio_tags=True,
+    )
+
+    assert result.passed is False
+    assert "unexpected_words" in result.failure_reasons
