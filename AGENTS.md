@@ -1,15 +1,19 @@
 # AGENTS.md — voiceover-pipeline
 
-Repository instructions are split into small, scoped files. Read this router first, then load every matching file from `instructions/` before acting.
+Repository instructions are split into small, scoped files. Read this router first, then load every matching file from `instructions/` before acting. Repository research uses Codebase → Serena → ast-grep. When accepted behavior changes a fundamental durable rule, updating the owning instruction is mandatory; follow `instructions/instruction-authoring.instructions.md`.
 
-## Required routes
+## Instructions
 
-- Always: [`instructions/core.instructions.md`](instructions/core.instructions.md)
-- Provider, model, prompt, timing, or CLI behavior: [`instructions/provider-cli.instructions.md`](instructions/provider-cli.instructions.md)
-- Tests or behavior changes: [`instructions/test-quality.instructions.md`](instructions/test-quality.instructions.md)
-- Documentation: [`instructions/docs-governance.instructions.md`](instructions/docs-governance.instructions.md)
-- Agent task tracking: [`instructions/agent-kanban.instructions.md`](instructions/agent-kanban.instructions.md)
-- Git, versioning, packaging, or releases: [`instructions/git-release-safety.instructions.md`](instructions/git-release-safety.instructions.md)
+Every file in `instructions/` has exactly one link below. Listing is not loading: load every `Always` route on each task, and load a conditional route only when its condition matches the files and work you are handling.
+
+- Load always — [`instructions/core.instructions.md`](instructions/core.instructions.md): baseline scope, source-of-truth, and change-safety rules.
+- Load always — [`instructions/code-intelligence.instructions.md`](instructions/code-intelligence.instructions.md): Codebase → Serena → ast-grep research order.
+- Load always — [`instructions/agent-kanban.instructions.md`](instructions/agent-kanban.instructions.md): agent task tracking.
+- Load always — [`instructions/git-release-safety.instructions.md`](instructions/git-release-safety.instructions.md): Git, versioning, packaging, and releases.
+- Load when creating or editing `AGENTS.md` or `instructions/**` — [`instructions/instruction-authoring.instructions.md`](instructions/instruction-authoring.instructions.md): instruction ownership, routing, and maintenance.
+- Load for provider, model, prompt, timing, or CLI behavior — [`instructions/provider-cli.instructions.md`](instructions/provider-cli.instructions.md).
+- Load for tests or behavior changes — [`instructions/test-quality.instructions.md`](instructions/test-quality.instructions.md).
+- Load for documentation — [`instructions/docs-governance.instructions.md`](instructions/docs-governance.instructions.md).
 
 ## Source-of-truth map
 
