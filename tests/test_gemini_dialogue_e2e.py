@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sys
 
@@ -69,6 +70,181 @@ def _patch_generation_io(monkeypatch):
         },
     )
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+
+def _write_dialogue_raw_resume_fixture(script, argv, *, state_voice):
+    """Seed a one-turn dialogue run whose paid attempt saved raw audio pre-FFmpeg.
+
+    The state mirrors exactly what ``generate --limit-chunks 1`` would persist with
+    no ``--voice``: the cast voice, script hash, and synthesis identity all come
+    from the helpers the CLI itself uses, so only the resume voice selection under
+    test can differ. ``state_voice`` overrides just the stored ``run_state.json``
+    voice to model a foreign or older run.
+    """
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        raw_audio_relative_path,
+        record_raw_audio_saved,
+    )
+    from voiceover_pipeline.tts_prompting import resolve_prompt_mode
+
+    args = cli.build_parser().parse_args(argv[1:])
+    args.format = cli._resolve_script_format(args.script, args.format)
+    args.provider = args.provider or "openrouter-tts"
+    cli._resolve_model(args)
+    gemini_report = cli.validate_gemini_dialogue_file(
+        args.script,
+        delimiter=args.delimiter,
+        model=args.model,
+        speaker_voice_overrides=args.speaker_voice,
+        agent=True,
+        provider=args.provider,
+        allowed_voices=None,
+    )
+    args.speaker_voice_map = gemini_report["speaker_voice_map"]
+    chunks = cli.dialogue_turns_from_validation(gemini_report)[: args.limit_chunks]
+    synthesis_identity = cli._dialogue_synthesis_identity(
+        args, None, resolve_prompt_mode(args.provider, args.model), chunks
+    )
+
+    paths = build_run_paths(args.output_dir, args.model, args.run_id or None)
+    paths.output_root.mkdir(parents=True, exist_ok=True)
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=state_voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="dialogue",
+        run_id=paths.prefix,
+        limited_to_chunks=args.limit_chunks,
+        synthesis_identity=synthesis_identity,
+    )
+    chunk = chunks[0]
+    begin_chunk_attempt(state, chunk_id=chunk.id, number=chunk.number)
+    raw_relative = raw_audio_relative_path(chunk.id, "pcm16")
+    raw_path = paths.output_root / raw_relative
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_bytes = b"paid-gemini-pcm-bytes"
+    raw_path.write_bytes(raw_bytes)
+    record_raw_audio_saved(
+        state,
+        chunk_id=chunk.id,
+        number=chunk.number,
+        audio_format="pcm16",
+        relative_path=raw_relative,
+        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        generation_id="gen-resume-1",
+    )
+    atomic_write_json(paths.output_root / cli.STATE_FILE, state)
+    return paths, chunk.id, raw_path
+
+
+def _dialogue_resume_argv(tmp_path, script):
+    return [
+        "voiceover",
+        "generate",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "resume-dialogue",
+        "--limit-chunks",
+        "1",
+        "--resume",
+        "--tts-quality-provider",
+        "fixture-asr",
+        "--json",
+    ]
+
+
+def test_openrouter_dialogue_resume_raw_recovery_uses_cast_voice_not_default(
+    tmp_path, monkeypatch, capsys
+):
+    from unittest.mock import MagicMock
+
+    import voiceover_pipeline.cli as cli
+
+    class ForbiddenProvider:
+        def synthesize_chunk(self, *_args, **_kwargs):
+            pytest.fail("saved raw must not trigger a second paid synthesis")
+
+        def recover_media_task(self, *_args, **_kwargs):
+            pytest.fail("saved raw must not trigger provider GET recovery")
+
+    script = _write_dialogue_script(tmp_path)
+    argv = _dialogue_resume_argv(tmp_path, script)
+    paths, chunk_id, raw_path = _write_dialogue_raw_resume_fixture(script, argv, state_voice="Kore")
+
+    mock_post = MagicMock(side_effect=AssertionError("resume must not send a paid request"))
+    _patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg-fixture", "ffprobe-fixture"))
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: "sk-or-v1-test-only-placeholder")
+    monkeypatch.setattr(cli, "build_provider", lambda *_args, **_kwargs: ForbiddenProvider())
+    monkeypatch.setattr("voiceover_pipeline.providers.openrouter_tts.requests.post", mock_post)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 0
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "success"
+    assert data["provider"] == "openrouter-tts"
+    assert captured.err == ""
+    assert mock_post.call_count == 0
+
+    run_state = json.loads((paths.output_root / cli.STATE_FILE).read_text(encoding="utf-8"))
+    assert run_state["voice"] == "Kore"
+    assert "pending_attempt" not in run_state
+    assert [entry["status"] for entry in run_state["chunks"]] == ["completed"]
+    assert run_state["chunks"][0]["id"] == chunk_id
+    assert run_state["chunks"][0]["voice"] == "Kore"
+    assert (paths.chunks_dir / f"{chunk_id}.mp3").exists()
+    assert raw_path.exists()
+
+
+def test_openrouter_dialogue_resume_rejects_mismatched_saved_voice_early(
+    tmp_path, monkeypatch, capsys
+):
+    import voiceover_pipeline.cli as cli
+
+    script = _write_dialogue_script(tmp_path)
+    argv = _dialogue_resume_argv(tmp_path, script)
+    paths, _chunk_id, raw_path = _write_dialogue_raw_resume_fixture(
+        script, argv, state_voice="Puck"
+    )
+    state_before = (paths.output_root / cli.STATE_FILE).read_bytes()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("mismatched saved voice must block before key/provider/pricing work")
+
+    _patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg-fixture", "ffprobe-fixture"))
+    monkeypatch.setattr(cli, "read_api_key", forbidden)
+    monkeypatch.setattr(cli, "fetch_pricing_snapshot", forbidden)
+    monkeypatch.setattr(cli, "build_provider", forbidden)
+    monkeypatch.setattr("voiceover_pipeline.providers.openrouter_tts.requests.post", forbidden)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 30
+    captured = capsys.readouterr()
+    data = json.loads(captured.out)
+    assert data["status"] == "error"
+    assert data["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert data["details"]["chunk_id"] == _chunk_id
+    assert (paths.output_root / cli.STATE_FILE).read_bytes() == state_before
+    assert raw_path.exists()
+    assert not (paths.chunks_dir / f"{_chunk_id}.mp3").exists()
 
 
 def test_gemini_dialogue_e2e_mocked_generation(tmp_path, monkeypatch, capsys):

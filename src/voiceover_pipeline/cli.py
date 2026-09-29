@@ -1102,7 +1102,9 @@ def generate(args: argparse.Namespace) -> None:
         # The one exception is a paid attempt the same command can recover without
         # a new submit: saved raw audio rebuilt locally, or a stored paid Polza
         # media id finished with GET calls only. Both still match this exact
-        # provider/model/voice/script chunk. Every other marker keeps the block.
+        # provider/model/voice/script chunk, where a validated dialogue's voice is
+        # its first cast voice rather than the provider default. Every other marker
+        # keeps the block.
         # ``--skip-existing`` keeps its precedence and reports an existing folder as
         # skipped without loading run state. The same guard runs inside
         # ``_generate_step`` for direct callers.
@@ -1113,7 +1115,7 @@ def generate(args: argparse.Namespace) -> None:
                 resume_state,
                 provider=args.provider,
                 model=args.model,
-                voice=args.voice or _default_voice(args),
+                voice=_resume_guard_voice(args, gemini_report),
                 chunks=chunks,
                 chunks_dir=paths.chunks_dir,
                 run_root=paths.output_root,
@@ -3108,6 +3110,23 @@ def _public_artifact_projection(result) -> dict[str, Any]:
 def _default_voice(args: argparse.Namespace) -> str | None:
     """Compatibility wrapper for ``services.prepare.default_voice``."""
     return default_voice(args)
+
+
+def _resume_guard_voice(
+    args: argparse.Namespace, gemini_report: dict[str, Any] | None
+) -> str | None:
+    """Voice the early paid-marker resume guard must match for this exact command.
+
+    A validated dialogue run without ``--voice`` binds its first cast voice as the
+    run identity later in ``services.prepare.prepare_generation_identity``, not the
+    provider default. Mirroring that choice here lets a saved raw attempt recover
+    locally instead of being falsely reported as an unconfirmed paid submit; a
+    genuine provider/model/voice mismatch still fails closed.
+    """
+    requested_voice = args.voice
+    if not requested_voice and gemini_report:
+        return next(iter(gemini_report["speaker_voice_map"].values()))
+    return requested_voice or _default_voice(args)
 
 
 def read_api_key(args: argparse.Namespace) -> str:
