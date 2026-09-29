@@ -16,6 +16,7 @@ projection, and the Polza id boundary.
 import base64
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -822,3 +823,70 @@ def test_polza_tts_speech_raw_response_direct_cost_is_exact_end_to_end(monkeypat
     assert total_exact == "0.1234567890123456789"
     assert currency == "RUB"
     assert source == "Polza API usage.cost_rub (direct)"
+
+
+class TestDirectCostProjectionService:
+    """The extracted ``services.costs`` keeps the CLI's exact cost projection."""
+
+    def test_direct_cost_kwargs_matches_legacy_values(self):
+        from voiceover_pipeline.services import costs
+
+        result = SimpleNamespace(
+            raw_metadata={"usage_direct": {"cost_rub": Decimal("0.1234567890123456789")}}
+        )
+        kwargs = costs.direct_cost_kwargs("polza-tts", result)
+        assert kwargs["cost"] == 0.1234567890123456789
+        assert kwargs["cost_exact"] == "0.1234567890123456789"
+        assert kwargs["generation_detail_source"] == "Polza API usage.cost_rub (direct)"
+
+        assert costs.direct_cost_kwargs("openrouter-tts", result) == {}
+
+    @pytest.mark.parametrize(
+        ("value", "expected_cost", "expected_exact"),
+        [
+            (0, 0.0, "0"),
+            ("0.1575", 0.1575, "0.1575"),
+            (0.25, 0.25, None),
+            ("bad", None, None),
+            (True, None, None),
+            ([0.5], None, None),
+        ],
+    )
+    def test_direct_cost_kwargs_covers_zero_exact_string_and_unknown(
+        self, value, expected_cost, expected_exact
+    ):
+        from voiceover_pipeline.services import costs
+
+        result = SimpleNamespace(raw_metadata={"usage_direct": {"cost_rub": value}})
+        kwargs = costs.direct_cost_kwargs("polza-tts", result)
+        if expected_cost is None:
+            assert kwargs == {}
+        else:
+            assert kwargs["cost"] == expected_cost
+            assert kwargs["cost_exact"] == expected_exact
+            assert kwargs["cost_currency"] == "RUB"
+
+    def test_direct_cost_kwargs_projects_nonfinite_metadata_json_safe(self):
+        from voiceover_pipeline.services import costs
+
+        result = SimpleNamespace(
+            raw_metadata={
+                "usage_direct": {
+                    "cost_rub": Decimal("0.1"),
+                    "nested": {"inf": float("inf"), "nan": float("nan")},
+                }
+            }
+        )
+        kwargs = costs.direct_cost_kwargs("polza-tts", result)
+        assert kwargs["usage"]["nested"] == {"inf": None, "nan": None}
+        json.dumps(kwargs, allow_nan=False)
+
+    def test_media_and_recovered_projection_helpers(self):
+        from voiceover_pipeline.services import costs
+
+        assert costs.media_observed_cost({"cost": "0.3"}) == (0.3, "0.3")
+        assert costs.media_observed_cost(None) == (None, None)
+        assert costs.recovered_attempt_cost_kwargs({"cost": True}) == {}
+        recovered = costs.recovered_attempt_cost_kwargs({"cost": 0.5, "cost_exact": "0.5"})
+        assert recovered["cost_exact"] == "0.5"
+        assert recovered["generation_detail_source"] == "Polza API usage.cost_rub (direct)"

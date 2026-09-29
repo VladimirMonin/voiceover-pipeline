@@ -565,6 +565,22 @@ def test_direct_cost_kwargs_unknown_cost_value_is_empty(value):
     assert _direct_cost_kwargs("polza-tts", result) == {}
 
 
+def test_direct_cost_kwargs_cli_wrapper_delegates_to_service():
+    from decimal import Decimal
+
+    from voiceover_pipeline.cli import _direct_cost_kwargs, _media_observed_cost
+    from voiceover_pipeline.models import SynthesisResult
+    from voiceover_pipeline.services import costs
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": Decimal("0.1"), "tokens": 4}},
+    )
+    assert _direct_cost_kwargs("polza-tts", result) == costs.direct_cost_kwargs("polza-tts", result)
+    assert _media_observed_cost({"cost": 0.3}) == costs.media_observed_cost({"cost": 0.3})
+
+
 def test_gemini_prompt_mode_in_manifest_is_none():
     from voiceover_pipeline.tts_prompting import resolve_prompt_mode
 

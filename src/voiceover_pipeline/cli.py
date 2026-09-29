@@ -3,7 +3,6 @@ import glob as glob_mod
 import hashlib
 import importlib.util
 import json
-import math
 import os
 import shutil
 import sys
@@ -117,7 +116,6 @@ from .pricing import (
     fetch_openrouter_model_pricing,
     fetch_polza_generation_detail,
     fetch_polza_model_pricing,
-    observed_cost,
 )
 from .providers import (
     OmniVoiceLocalTTSProvider,
@@ -161,6 +159,7 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
+from .services import costs
 from .services.prepare import prepare_run
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request, validate_result_capabilities
@@ -1378,19 +1377,8 @@ def _merge_attached_costs_into_state(state: dict[str, Any], artifacts: list[Chun
 
 
 def _media_observed_cost(usage: Any) -> tuple[float | None, str | None]:
-    """Project the completed media payload's billed cost through ``observed_cost``.
-
-    Only the recognized cost fields are read; a missing or unparseable value is
-    unknown, so an arbitrary usage field never becomes a cost.
-    """
-    if not isinstance(usage, dict):
-        return None, None
-    value = usage.get("cost_rub")
-    if value is None:
-        value = usage.get("cost")
-    if value is None:
-        return None, None
-    return observed_cost(value)
+    """Compatibility wrapper for ``services.costs.media_observed_cost``."""
+    return costs.media_observed_cost(usage)
 
 
 def _bind_polza_media_attempt(
@@ -3822,52 +3810,18 @@ def _sha256_file(path: Path) -> str:
 
 
 def _polza_direct_cost_kwargs(cost: float, cost_exact: str | None) -> dict:
-    """Build the Polza direct-cost fields from one observed value pair."""
-    return {
-        "cost": cost,
-        "cost_exact": cost_exact,
-        "cost_currency": "RUB",
-        "cost_rub": cost,
-        "cost_rub_exact": cost_exact,
-        "generation_detail_source": "Polza API usage.cost_rub (direct)",
-    }
+    """Compatibility wrapper for ``services.costs.polza_direct_cost_kwargs``."""
+    return costs.polza_direct_cost_kwargs(cost, cost_exact)
 
 
 def _recovered_attempt_cost_kwargs(recovery: dict[str, Any]) -> dict:
-    """Reuse the exact cost the recovered paid attempt already reported.
-
-    A recovered chunk (a saved raw file or a GET-only media task) can read a
-    payload without usage, so the bounded cost stored in the attempt marker
-    before the recovery stays the observed amount for this chunk.
-    """
-    cost = recovery.get("cost")
-    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
-        return {}
-    return _polza_direct_cost_kwargs(float(cost), recovery.get("cost_exact"))
+    """Compatibility wrapper for ``services.costs.recovered_attempt_cost_kwargs``."""
+    return costs.recovered_attempt_cost_kwargs(recovery)
 
 
 def _direct_cost_kwargs(provider: str, result) -> dict:
-    if provider != "polza-tts":
-        return {}
-    usage = (result.raw_metadata or {}).get("usage_direct")
-    if not isinstance(usage, dict):
-        return {}
-    cost_rub = usage.get("cost_rub")
-    if cost_rub is None:
-        cost_rub = usage.get("cost")
-    if cost_rub is None:
-        return {}
-    # ``observed_cost`` keeps an exact value string and refuses to invent one from
-    # a binary float, so the direct cost obeys the same rule as the history path.
-    cost, cost_exact = observed_cost(cost_rub)
-    if cost is None:
-        return {}
-    return {
-        **_polza_direct_cost_kwargs(cost, cost_exact),
-        # Project the copied usage only after the exact cost was extracted, so a
-        # Decimal from ``parse_float=Decimal`` never reaches run state/manifests.
-        "usage": json_safe_metadata(usage),
-    }
+    """Compatibility wrapper for ``services.costs.direct_cost_kwargs``."""
+    return costs.direct_cost_kwargs(provider, result)
 
 
 def _public_runtime_receipt(result) -> dict[str, str] | None:
@@ -4091,28 +4045,8 @@ def fetch_pricing_snapshot(provider: str, api_key: str, model: str) -> dict | No
 
 
 def json_safe_metadata(value: Any) -> Any:
-    """Project provider metadata to strict-JSON-safe legacy values.
-
-    The history detail boundaries parse JSON with ``parse_float=Decimal`` so that
-    observed costs stay exact, but that conversion also applies to every other
-    JSON float in the same payload, and a non-finite ``Infinity``/``NaN`` constant
-    can still arrive. Manifests and run state use ``json.dumps`` and must stay
-    serializable, so a ``Decimal`` or non-finite number is projected here to a
-    finite legacy float or ``None``; ``str``/``int``/``bool`` and the list/dict
-    shape are preserved.
-    """
-    if isinstance(value, Decimal):
-        if not value.is_finite():
-            return None
-        legacy = float(value)
-        return legacy if math.isfinite(legacy) else None
-    if isinstance(value, float):
-        return value if math.isfinite(value) else None
-    if isinstance(value, dict):
-        return {key: json_safe_metadata(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [json_safe_metadata(item) for item in value]
-    return value
+    """Compatibility wrapper for ``services.costs.json_safe_metadata``."""
+    return costs.json_safe_metadata(value)
 
 
 def attach_costs(provider, api_key, model, run_started_at, chunks):
