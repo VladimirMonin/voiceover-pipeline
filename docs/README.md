@@ -35,6 +35,7 @@
 | [OmniVoice Local TTS](omnivoice-local-tts.md) | Явный offline встроенный female style condition через pinned Linux CUDA container; Q8_0, provenance и platform boundary |
 | [OmniVoice hallucination research](reports/2026-08-24-omnivoice-hallucination-research.md) | Upstream и exact-run evidence: unsupported Russian accent conditioning, long-form nonclaims и bounded quality gate |
 | [S00 baseline и проверки](reports/2026-09-29-s00-baseline.md) | Исходное состояние поверх `3355c23`; после настройки среды — результаты pytest/Ruff/mypy и версия `0.6.1`; отдельно — статическая карта событий `generation.log` (не live-проверка). |
+| [S01 source-only отчёт по внешним контрактам](reports/2026-09-29-s01-source-only.md) | Source-only проверка узких контрактов Gemini/Polza, Qwen ASR и двух embedding-режимов: что подтверждено кодом на `1ba5743`, что `BLOCKED_PROVIDER_CONTRACT`/`NOT_RUN`; live/listening не выполнялись. |
 
 ## Быстрый старт
 
