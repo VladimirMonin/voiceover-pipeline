@@ -158,7 +158,7 @@ from .run_state import (
 )
 from .script_splitter import split_markdown_by_delimiter
 from .services import cost_enrichment, costs, recovery
-from .services.prepare import prepare_run
+from .services.prepare import prepare_run, prepare_runtime_chunks, prepare_script_fragments
 from .services.recovery import _PAID_SUBMIT_TTS_PROVIDERS
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request, validate_result_capabilities
@@ -1078,47 +1078,25 @@ def generate(args: argparse.Namespace) -> None:
             "remove --style-prompt/--style-prompt-file and select delivery with --voice only.",
             _EXIT_ARGS,
         )
-    if not is_dialogue_format(script_format):
-        try:
-            chunks = prepare_local_tts_chunks(chunks, args.provider, args.model)
-        except ValueError as exc:
-            fail(str(exc), _EXIT_ARGS)
-    if not chunks:
-        fail("Script produced no chunks. Check delimiter and content.", _EXIT_ARGS)
-    original_chunk_count = len(chunks)
-    if args.limit_chunks is not None:
-        if args.limit_chunks <= 0:
-            fail("--limit-chunks must be greater than zero", _EXIT_ARGS)
-        chunks = chunks[: args.limit_chunks]
-    requested_fragment_count = len(chunks)
+    try:
+        fragment_preparation = prepare_script_fragments(
+            args,
+            chunks,
+            script_format,
+            local_prepare=prepare_local_tts_chunks,
+        )
+    except ValueError as exc:
+        fail(str(exc), _EXIT_ARGS)
+    chunks = fragment_preparation.chunks
+    original_chunk_count = fragment_preparation.original_count
+    requested_fragment_count = fragment_preparation.requested_count
     _enforce_omnivoice_design_route(args, chunks)
-    if (
-        args.provider == "omnivoice-local"
-        and args.model == OMNIVOICE_LOCAL_MODEL_ID
-        and not is_dialogue_format(script_format)
-    ):
-        bank_profile = getattr(args, "voice_bank_profile", None)
-        bank_catalog = getattr(args, "voice_bank_catalog", None)
-        if getattr(args, "mode", "preset") == "preset" and bank_profile is not None:
-            reference_audio_path = (
-                str(bank_catalog.root / bank_profile.reference_audio)
-                if bank_catalog is not None
-                else str(Path(bank_profile.reference_audio))
-            )
-            chunks = merge_omnivoice_session_fragments(
-                chunks,
-                mode="clone",
-                reference_audio_path=reference_audio_path,
-                reference_text=bank_profile.reference_text,
-            )
-        else:
-            chunks = merge_omnivoice_session_fragments(
-                chunks,
-                mode=getattr(args, "mode", "preset"),
-                reference_audio_path=getattr(args, "reference_audio", None),
-                reference_text=getattr(args, "reference_text", None),
-                design_instruction=getattr(args, "design_instruction", None),
-            )
+    chunks = prepare_runtime_chunks(
+        args,
+        chunks,
+        script_format,
+        merge_session_fragments=merge_omnivoice_session_fragments,
+    )
     runtime_session_count = len(chunks)
     if args.run_id:
         _validate_run_id(args.run_id)
