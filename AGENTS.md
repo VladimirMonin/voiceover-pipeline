@@ -1,5 +1,19 @@
 # AGENTS.md — voiceover-pipeline
 
+## Owner's agent workflow
+
+- Act as a thin orchestrator: assign narrow implementation tasks; the parent owns Git scope and final verification. Keep one writer per worktree and delegate write or Git ownership explicitly.
+- Use independent review for substantial stages or material risks, not every small correction. Consult the expert when genuinely blocked.
+- Run offline tests and already-authorized Git steps without asking again. After a confirmed stage, make a scoped commit and push when the owner has explicitly authorized that push; do not infer approval for live/paid/cloud calls, tags, releases, or secret handling.
+
+| Pi role | Agent | Default provider/model (owner-editable here) |
+|---|---|---|
+| Main coder | `worker` | `ollama-cloud/deepseek-v4.1-flash` |
+| Stage reviewer | `reviewer` | `openai-codex/gpt-6-sol` |
+| Blocker expert | `oracle` | `openai-codex/gpt-6-astra` |
+
+Check the current agent/model availability before delegation; do not silently substitute another model. These are defaults, not immutable requirements.
+
 Repository instructions are split into small, scoped files. Read this router first, then load every matching file from `instructions/` before acting. Repository research uses Codebase → Serena → ast-grep. When accepted behavior changes a fundamental durable rule, updating the owning instruction is mandatory; follow `instructions/instruction-authoring.instructions.md`.
 
 ## Instructions
