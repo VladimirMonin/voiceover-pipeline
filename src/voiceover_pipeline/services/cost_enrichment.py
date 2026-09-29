@@ -8,13 +8,25 @@ chunk's own body id. It performs no submit and no other provider request.
 Both history lookups are injected as explicit keyword dependencies, so
 ``cli.attach_costs`` can forward its currently bound callables and existing
 monkeypatch targets keep steering this body without importing ``cli``.
+
+The same module also owns the two summaries the observed cost feeds into: the
+late cost metadata copied into the matching trusted state chunk, and the run
+total whose canonical value is a Decimal sum of provider-reported exact strings.
+Neither writes an unobserved cost or calls a provider.
 """
 
 import time
+from decimal import Decimal, InvalidOperation, localcontext
+from typing import Any
 
 from ..models import ChunkArtifact
 from ..pricing import cost_from_generation
 from . import costs
+from .recovery import state_entry_number
+
+
+class AttachedCostStateMismatchError(RuntimeError):
+    """A late-observed cost artifact matches no single completed state chunk."""
 
 
 def generation_source(provider: str) -> str:
@@ -149,3 +161,97 @@ def attach_costs(
             )
         )
     return enriched
+
+
+# Cost metadata that a late history lookup can add after a chunk was already
+# saved to run state.
+_ATTACHED_COST_STATE_FIELDS = (
+    "cost",
+    "cost_exact",
+    "cost_currency",
+    "cost_rub",
+    "cost_rub_exact",
+    "usage",
+    "generation_time_ms",
+    "generated_at",
+    "generation_detail_source",
+)
+
+
+def merge_attached_costs_into_state(state: dict[str, Any], artifacts: list[ChunkArtifact]) -> None:
+    """Copy late-observed cost metadata into the matching trusted state chunk.
+
+    ``attach_costs`` runs after each chunk was already saved to ``run_state.json``,
+    so a cost that only the history lookup revealed would otherwise live in the
+    manifests alone and be lost by a resume whose lookup is unavailable. An
+    artifact is bound by its own ``id`` *and* ``number``; a missing or ambiguous
+    match raises ``AttachedCostStateMismatchError`` before applying that artifact;
+    the caller persists state only after the full merge succeeds. Only values
+    present on the enriched artifact overwrite state, so a lookup that reports
+    nothing can never erase an already-observed direct cost.
+    """
+    entries = state.get("chunks", [])
+    for artifact in artifacts:
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("status") == "completed"
+            and entry.get("id") == artifact.id
+            and state_entry_number(entry) == artifact.number
+        ]
+        if len(matches) != 1:
+            raise AttachedCostStateMismatchError(
+                "Cannot persist observed costs: run state has no single completed "
+                f"chunk matching {artifact.id}/{artifact.number}."
+            )
+        entry = matches[0]
+        for field in _ATTACHED_COST_STATE_FIELDS:
+            value = getattr(artifact, field)
+            if value is not None:
+                entry[field] = value
+
+
+def summarize_costs(provider: str, chunks: list[ChunkArtifact]) -> tuple:
+    """Return the run cost total, exact total, currency, and provenance.
+
+    The float total stays the legacy compatibility value, while the canonical
+    total sums only finite, parsable canonical exact cost strings. A missing,
+    non-finite, unparsable, or foreign exact value disables the canonical total
+    rather than promoting the float total into a pseudo-exact number.
+    """
+    if not chunks or any(chunk.cost is None for chunk in chunks):
+        return None, None, None, None
+    currency = chunks[0].cost_currency
+    if currency is None or any(chunk.cost_currency != currency for chunk in chunks):
+        return None, None, None, None
+    total = sum(float(chunk.cost or 0) for chunk in chunks)
+    source = generation_source(provider)
+    # The sum runs in a local context wide enough for every observed digit so it
+    # is never rounded to the default 28 significant digits.
+    values: list[Decimal] = []
+    for chunk in chunks:
+        # Only a canonical exact string can join the Decimal total. Any other
+        # value (a legacy float, a bool, a list, or a Decimal from untrusted
+        # resumed state) is not a canonical exact cost, so it disables the exact
+        # total instead of guessing a value or raising.
+        if not isinstance(chunk.cost_exact, str):
+            return round(total, 8), None, currency, source
+        try:
+            value = Decimal(chunk.cost_exact)
+        except (InvalidOperation, ValueError):
+            return round(total, 8), None, currency, source
+        if not value.is_finite():
+            return round(total, 8), None, currency, source
+        values.append(value)
+    precision = max(
+        28,
+        max(value.adjusted() for value in values)
+        - min(int(value.as_tuple().exponent) for value in values)
+        + len(str(len(values)))
+        + 1,
+    )
+    with localcontext() as context:
+        context.prec = precision
+        exact_total = sum(values, Decimal(0))
+    return round(total, 8), str(exact_total), currency, source

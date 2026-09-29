@@ -9,7 +9,6 @@ import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -1280,58 +1279,22 @@ def _preflight_dialogue_resume(
         fail("Cannot resume: dialogue synthesis identity changed.", _EXIT_PROVIDER)
 
 
-# Cost metadata that a late history lookup can add after a chunk was already
-# saved to run state.
-_ATTACHED_COST_STATE_FIELDS = (
-    "cost",
-    "cost_exact",
-    "cost_currency",
-    "cost_rub",
-    "cost_rub_exact",
-    "usage",
-    "generation_time_ms",
-    "generated_at",
-    "generation_detail_source",
-)
-
-
 def _state_entry_number(entry: dict[str, Any]) -> int | None:
     """Compatibility wrapper for ``services.recovery.state_entry_number``."""
     return recovery.state_entry_number(entry)
 
 
 def _merge_attached_costs_into_state(state: dict[str, Any], artifacts: list[ChunkArtifact]) -> None:
-    """Copy late-observed cost metadata into the matching trusted state chunk.
+    """Compatibility wrapper for ``services.cost_enrichment.merge_attached_costs_into_state``.
 
-    ``attach_costs`` runs after each chunk was already saved to ``run_state.json``,
-    so a cost that only the history lookup revealed would otherwise live in the
-    manifests alone and be lost by a resume whose lookup is unavailable. An
-    artifact is bound by its own ``id`` *and* ``number``; a missing or ambiguous
-    match fails closed instead of writing a cost onto the wrong chunk. Only values
-    present on the enriched artifact overwrite state, so a lookup that reports
-    nothing can never erase an already-observed direct cost.
+    The service owns the trusted-state merge and reports a missing or ambiguous
+    chunk match as ``AttachedCostStateMismatchError``; this wrapper keeps the
+    former name and the provider exit envelope that callers already expect.
     """
-    entries = state.get("chunks", [])
-    for artifact in artifacts:
-        matches = [
-            entry
-            for entry in entries
-            if isinstance(entry, dict)
-            and entry.get("status") == "completed"
-            and entry.get("id") == artifact.id
-            and _state_entry_number(entry) == artifact.number
-        ]
-        if len(matches) != 1:
-            fail(
-                "Cannot persist observed costs: run state has no single completed "
-                f"chunk matching {artifact.id}/{artifact.number}.",
-                _EXIT_PROVIDER,
-            )
-        entry = matches[0]
-        for field in _ATTACHED_COST_STATE_FIELDS:
-            value = getattr(artifact, field)
-            if value is not None:
-                entry[field] = value
+    try:
+        cost_enrichment.merge_attached_costs_into_state(state, artifacts)
+    except cost_enrichment.AttachedCostStateMismatchError as exc:
+        fail(str(exc), _EXIT_PROVIDER)
 
 
 def _media_observed_cost(usage: Any) -> tuple[float | None, str | None]:
@@ -3430,44 +3393,8 @@ def attach_costs(provider, api_key, model, run_started_at, chunks):
 
 
 def summarize_costs(provider: str, chunks: list[ChunkArtifact]) -> tuple:
-    if not chunks or any(chunk.cost is None for chunk in chunks):
-        return None, None, None, None
-    currency = chunks[0].cost_currency
-    if currency is None or any(chunk.cost_currency != currency for chunk in chunks):
-        return None, None, None, None
-    total = sum(float(chunk.cost or 0) for chunk in chunks)
-    source = generation_source(provider)
-    # Canonical total: Decimal sum of provider-reported exact cost strings only.
-    # A missing, non-finite, or unparsable exact value disables it rather than
-    # promoting the compatibility float total into a pseudo-exact number. The sum
-    # runs in a local context wide enough for every observed digit so it is never
-    # rounded to the default 28 significant digits.
-    values: list[Decimal] = []
-    for chunk in chunks:
-        # Only a canonical exact string can join the Decimal total. Any other
-        # value (a legacy float, a bool, a list, or a Decimal from untrusted
-        # resumed state) is not a canonical exact cost, so it disables the exact
-        # total instead of guessing a value or raising.
-        if not isinstance(chunk.cost_exact, str):
-            return round(total, 8), None, currency, source
-        try:
-            value = Decimal(chunk.cost_exact)
-        except (InvalidOperation, ValueError):
-            return round(total, 8), None, currency, source
-        if not value.is_finite():
-            return round(total, 8), None, currency, source
-        values.append(value)
-    precision = max(
-        28,
-        max(value.adjusted() for value in values)
-        - min(int(value.as_tuple().exponent) for value in values)
-        + len(str(len(values)))
-        + 1,
-    )
-    with localcontext() as context:
-        context.prec = precision
-        exact_total = sum(values, Decimal(0))
-    return round(total, 8), str(exact_total), currency, source
+    """Compatibility wrapper for ``services.cost_enrichment.summarize_costs``."""
+    return cost_enrichment.summarize_costs(provider, chunks)
 
 
 def generation_source(provider: str) -> str:

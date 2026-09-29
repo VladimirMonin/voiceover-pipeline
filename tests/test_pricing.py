@@ -988,3 +988,116 @@ class TestCostEnrichmentService:
 
         assert seen == [("patched-key", "A1")]
         assert result[0].cost_exact == "0.11"
+
+
+class TestCostSummaryAndStateMergeService:
+    """``services.cost_enrichment`` owns the exact summary and the trusted-state merge.
+
+    ``cli`` keeps thin wrappers so its exit envelope and existing call sites stay
+    identical, while the merge binds an artifact by its own ``id`` and ``number``
+    and a missing or ambiguous match fails closed instead of writing a cost onto
+    the wrong state chunk.
+    """
+
+    def test_summarize_costs_service_owns_exact_decimal_total_and_unknown_fallback(self):
+        from voiceover_pipeline.services import cost_enrichment
+
+        chunks = [
+            _chunk(1, "a", cost=0.1, cost_exact="0.1", currency="RUB"),
+            _chunk(2, "b", cost=0.2, cost_exact="0.2", currency="RUB"),
+        ]
+
+        total, total_exact, currency, source = cost_enrichment.summarize_costs("polza-tts", chunks)
+
+        assert (total, total_exact, currency) == (0.3, "0.3", "RUB")
+        assert source == "Polza API usage.cost_rub (direct)"
+
+        zero = [_chunk(1, "a", cost=0.0, cost_exact="0", currency="RUB")]
+        assert cost_enrichment.summarize_costs("polza-tts", zero) == (
+            0.0,
+            "0",
+            "RUB",
+            "Polza API usage.cost_rub (direct)",
+        )
+
+        unknown = [_chunk(2, "b")]
+        assert cost_enrichment.summarize_costs("polza-tts", unknown) == (None, None, None, None)
+
+    def test_merge_attached_costs_service_binds_by_id_and_number_and_fails_closed(self):
+        from copy import deepcopy
+
+        from voiceover_pipeline.services import cost_enrichment
+
+        state = {
+            "chunks": [
+                {
+                    "status": "completed",
+                    "id": "chunk-1",
+                    "number": 1,
+                    "cost": 0.5,
+                    "cost_exact": "0.5",
+                },
+                {"status": "completed", "id": "chunk-2", "number": 2},
+            ]
+        }
+        artifact = _chunk(1, "g", cost=0.25, cost_exact="0.25", currency="RUB")
+
+        cost_enrichment.merge_attached_costs_into_state(state, [artifact])
+
+        entry = state["chunks"][0]
+        assert entry["cost"] == 0.25
+        assert entry["cost_exact"] == "0.25"
+        assert entry["cost_rub"] == 0.25
+        assert entry["cost_rub_exact"] == "0.25"
+        assert entry["cost_currency"] == "RUB"
+        # A field the artifact does not carry is not written, and the unmatched
+        # second entry stays byte-identical.
+        assert "usage" not in entry
+        assert state["chunks"][1] == {"status": "completed", "id": "chunk-2", "number": 2}
+
+        for chunks in (
+            [{"status": "running", "id": "chunk-1", "number": 1}],
+            [{"status": "completed", "id": "chunk-1", "number": 2}],
+            [
+                {"status": "completed", "id": "chunk-1", "number": 1},
+                {"status": "completed", "id": "chunk-1", "number": 1},
+            ],
+        ):
+            mismatched = {"chunks": chunks}
+            before = deepcopy(chunks)
+            with pytest.raises(cost_enrichment.AttachedCostStateMismatchError) as exc_info:
+                cost_enrichment.merge_attached_costs_into_state(mismatched, [artifact])
+            assert str(exc_info.value) == (
+                "Cannot persist observed costs: run state has no single completed "
+                "chunk matching chunk-1/1."
+            )
+            assert mismatched["chunks"] == before
+
+    def test_cli_merge_wrapper_delegates_to_service_and_keeps_provider_exit(self, monkeypatch):
+        from voiceover_pipeline.services import cost_enrichment
+
+        state = {"chunks": []}
+        seen: list[tuple[dict, list]] = []
+
+        def recording_merge(state_arg, artifacts_arg):
+            seen.append((state_arg, artifacts_arg))
+
+        monkeypatch.setattr(cost_enrichment, "merge_attached_costs_into_state", recording_merge)
+        cli._merge_attached_costs_into_state(state, [])
+
+        assert seen == [(state, [])]
+
+        def mismatching_merge(state_arg, artifacts_arg):
+            raise cost_enrichment.AttachedCostStateMismatchError(
+                "Cannot persist observed costs: run state has no single completed "
+                "chunk matching x/9."
+            )
+
+        monkeypatch.setattr(cost_enrichment, "merge_attached_costs_into_state", mismatching_merge)
+        with pytest.raises(cli.CliError) as exc_info:
+            cli._merge_attached_costs_into_state({"chunks": []}, [])
+
+        assert exc_info.value.code == cli._EXIT_PROVIDER
+        assert str(exc_info.value) == (
+            "Cannot persist observed costs: run state has no single completed chunk matching x/9."
+        )
