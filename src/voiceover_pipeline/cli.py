@@ -6,16 +6,13 @@ import json
 import os
 import shutil
 import sys
-import time
+import time  # noqa: F401 - shared sleep seam tests patch via cli.time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
 from .artifacts import (
-    build_chunks_manifest,
-    build_manifest_json,
-    build_run_manifest,
     build_run_paths,
     build_srt,
     build_timing_manifest,
@@ -134,7 +131,6 @@ from .run_state import (
     LOG_FILE,
     STATE_FILE,
     GenerationLogger,
-    append_error,
     atomic_write_json,
     completed_numbers,
     load_state,
@@ -143,7 +139,7 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
-from .services import cost_enrichment, costs, execution, recovery, transcription
+from .services import cost_enrichment, costs, execution, finalization, recovery, transcription
 from .services.prepare import prepare_runtime_chunks, prepare_script_fragments
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request
@@ -1428,123 +1424,37 @@ def _generate_step(
         hooks=hooks,
     )
 
-    chunk_artifacts = [
-        chunk_artifacts_by_number[number] for number in sorted(chunk_artifacts_by_number)
-    ]
-
-    time.sleep(2)
-    chunk_artifacts = attach_costs(
-        args.provider, api_key, args.model, run_started_at, chunk_artifacts
-    )
-    _merge_attached_costs_into_state(state, chunk_artifacts)
-    atomic_write_json(state_path, state)
-    cost_total, cost_total_exact, cost_currency, cost_source = summarize_costs(
-        args.provider, chunk_artifacts
-    )
-
-    tts_quality_receipt = (
-        _verify_dialogue_turns_before_concat(args, chunks, chunk_artifacts, paths)
-        if dialogue_run
-        else None
-    )
-
-    chunks_manifest = build_chunks_manifest(
-        provider=prepared.provider,
-        model=prepared.model,
-        voice=prepared.voice,
-        style_prompt=prepared.style_prompt,
-        script=args.script,
-        chunks_dir=paths.chunks_dir,
+    summary = finalization.finalize_generation(
+        args=args,
+        paths=paths,
+        state=state,
+        state_path=state_path,
+        logger=logger,
+        chunks=chunks,
+        chunk_artifacts_by_number=chunk_artifacts_by_number,
+        prepared=prepared,
         pricing_snapshot=pricing_snapshot,
-        cost_exact_available=cost_total_exact is not None,
-        cost_total=cost_total,
-        cost_total_exact=cost_total_exact,
-        cost_currency=cost_currency,
-        cost_source=cost_source,
-        chunk_artifacts=chunk_artifacts,
+        api_key=api_key,
+        run_started_at=run_started_at,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
-        prompt_mode=prepared.prompt_mode,
-        script_format=getattr(args, "format", "markdown"),
-        speaker_voice_map=getattr(args, "speaker_voice_map", None) or None,
-        execution_source=state.get("execution_source"),
-        tts_quality_receipt=tts_quality_receipt,
+        dialogue_run=dialogue_run,
+        hooks=finalization.FinalizationHooks(
+            # The finalization seam runs in ``services.finalization``; these are
+            # the CLI-bound callables existing tests patch and the failure codes.
+            attach_costs=attach_costs,
+            verify_dialogue_turns_before_concat=_verify_dialogue_turns_before_concat,
+            concat_dialogue_turns=concat_dialogue_turns,
+            concat_mp3_chunks=concat_mp3_chunks,
+            mp3_duration_ms=mp3_duration_ms,
+            extract_timings=_extract_timings,
+            fail_provider=lambda message: fail(message, _EXIT_PROVIDER),
+            fail_output=lambda message: fail(message, _EXIT_OUTPUT),
+            fail_missing_dep=lambda message: fail(message, _EXIT_MISSING_DEP),
+            fail_whisper=lambda message: fail(message, _EXIT_WHISPER),
+        ),
     )
-    try:
-        write_json(paths.chunks_json, chunks_manifest)
-    except Exception as e:
-        fail(f"Failed to write {paths.chunks_json}: {e}", _EXIT_OUTPUT)
-
-    try:
-        logger.event("info", "concat_started", output=paths.full_mp3.name)
-        if dialogue_run:
-            concat_dialogue_turns(
-                ffmpeg_path,
-                [
-                    (paths.chunks_dir / artifact.file, artifact.pause_after_ms)
-                    for artifact in chunk_artifacts
-                ],
-                paths.full_mp3,
-            )
-        else:
-            concat_mp3_chunks(ffmpeg_path, paths.chunks_dir, paths.full_mp3)
-    except Exception as e:
-        append_error(state, chunk_id=None, message=str(e))
-        atomic_write_json(state_path, state)
-        logger.event("error", "concat_failed", error=str(e))
-        fail(f"Failed to concat MP3 chunks: {e}", _EXIT_OUTPUT)
-    main_duration_ms = mp3_duration_ms(ffprobe_path, paths.full_mp3)
-    logger.event(
-        "info", "concat_complete", output=paths.full_mp3.name, duration_ms=main_duration_ms
-    )
-    run_manifest = build_run_manifest(chunks_manifest, paths, main_duration_ms)
-    try:
-        write_json(paths.run_json, run_manifest)
-    except Exception as e:
-        fail(f"Failed to write {paths.run_json}: {e}", _EXIT_OUTPUT)
-
-    timing_info = None
-    if getattr(args, "with_timings", False):
-        try:
-            logger.event("info", "timings_started", audio=paths.full_mp3.name)
-            timing_info = _extract_timings(
-                audio_path=paths.full_mp3,
-                output_dir=paths.output_root,
-                prefix=paths.prefix,
-                timing_provider=getattr(args, "timing_provider", "faster-whisper"),
-                model=args.timing_model,
-                device=args.timing_device,
-                compute_type=args.timing_compute,
-                language=args.timing_language,
-                word_timestamps=args.word_timestamps,
-                quiet=args.json_output,
-            )
-        except ModuleNotFoundError as exc:
-            logger.event("error", "timings_failed", error=str(exc))
-            fail(
-                f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
-                _EXIT_MISSING_DEP,
-            )
-        except Exception as exc:
-            logger.event("error", "timings_failed", error=str(exc))
-            fail(
-                f"Voiceover generated but timing extraction failed: {exc}",
-                _EXIT_WHISPER,
-            )
-
-    manifest_json = build_manifest_json(paths, main_duration_ms)
-    try:
-        write_json(paths.output_root / "manifest.json", manifest_json)
-    except Exception as e:
-        fail(f"Failed to write manifest.json: {e}", _EXIT_OUTPUT)
-
-    files = _list_artifact_files(paths)
-    state["status"] = "completed"
-    state["full_mp3"] = str(paths.full_mp3)
-    state["main_duration_ms"] = main_duration_ms
-    atomic_write_json(state_path, state)
-    logger.event("info", "run_complete", run_id=paths.prefix, duration_ms=main_duration_ms)
-    _emit_json_event(args, "run_complete", run_id=paths.prefix, duration_ms=main_duration_ms)
+    _emit_json_event(args, "run_complete", run_id=paths.prefix, duration_ms=summary.duration_ms)
     if args.json_output:
         _json_ok(
             {
@@ -1552,10 +1462,10 @@ def _generate_step(
                 "provider": args.provider,
                 "model": args.model,
                 "run_id": paths.prefix,
-                "files": files,
-                "duration_ms": main_duration_ms,
-                "segment_count": timing_info["segment_count"] if timing_info else None,
-                "cost": {"total": cost_total, "currency": cost_currency},
+                "files": summary.files,
+                "duration_ms": summary.duration_ms,
+                "segment_count": summary.segment_count,
+                "cost": {"total": summary.cost_total, "currency": summary.cost_currency},
             }
         )
     else:
@@ -2911,19 +2821,8 @@ def _extract_timings(
 
 
 def _list_artifact_files(paths) -> dict:
-    files = {
-        "full_mp3": str(paths.full_mp3),
-        "run_json": str(paths.run_json),
-        "chunks_json": str(paths.chunks_json),
-        "manifest_json": str(paths.output_root / "manifest.json"),
-    }
-    timings_json = paths.output_root / f"{paths.prefix}.timings.json"
-    srt_path = paths.output_root / f"{paths.prefix}.srt"
-    if timings_json.exists():
-        files["timings_json"] = str(timings_json)
-    if srt_path.exists():
-        files["srt"] = str(srt_path)
-    return files
+    """Compatibility wrapper for ``services.finalization.list_artifact_files``."""
+    return finalization.list_artifact_files(paths)
 
 
 def _json_ok(data: dict) -> NoReturn:
