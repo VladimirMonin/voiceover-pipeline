@@ -161,6 +161,8 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
+from .services.prepare import prepare_run
+from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request, validate_result_capabilities
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
 from .tts_quality import evaluate_tts_transcript
@@ -1648,8 +1650,10 @@ def _generate_step(
         max_delay_seconds=args.retry_max_delay,
         enabled=not args.no_retry and not paid_submit,
     )
+    prepared = prepare_run(args, chunks, style_prompt, prompt_mode)
 
-    for chunk in chunks:
+    for part in prepared.parts:
+        chunk = part.chunk
         output_path = paths.chunks_dir / f"{chunk.id}.mp3"
         if chunk.number in completed and output_path.exists():
             if dialogue_run:
@@ -1698,17 +1702,7 @@ def _generate_step(
                 # The paid submit for this chunk already happened, so only GET
                 # calls may finish it; no POST is sent a second time.
                 return provider.recover_media_task(recovery["remote_task_id"], chunk.text, chunk.id)
-            selected_provider: Any = provider
-            if isinstance(provider, dict):
-                selected_provider = provider[chunk.voice]
-            if not isinstance(selected_provider, OpenRouterTTSProvider):
-                return selected_provider.synthesize_chunk(chunk.text, chunk.id)
-            try:
-                return selected_provider.synthesize_chunk(chunk.text, chunk.id, voice=chunk.voice)
-            except TypeError as error:
-                if "unexpected keyword argument 'voice'" not in str(error):
-                    raise
-                return selected_provider.synthesize_chunk(chunk.text, chunk.id)
+            return synthesize_part(provider, part)
 
         if paid_submit and isinstance(provider, PolzaTTSProvider):
             _bind_polza_media_attempt(
@@ -1838,7 +1832,7 @@ def _generate_step(
             client_path=result.client_path,
             generation_id=result.generation_id,
             speaker=chunk.speaker,
-            voice=chunk.voice or args.voice,
+            voice=part.voice or prepared.voice,
             voice_fingerprint=chunk.voice_fingerprint,
             turn_index=chunk.number if dialogue_run else None,
             speech_duration_ms=duration_ms if dialogue_run else None,
@@ -1854,7 +1848,7 @@ def _generate_step(
             state,
             artifact=artifact,
             model=args.model,
-            voice=chunk.voice or args.voice,
+            voice=part.voice or prepared.voice,
             text=chunk.text,
             include_text=not dialogue_run,
             include_transcript=not dialogue_run,
@@ -1899,10 +1893,10 @@ def _generate_step(
     )
 
     chunks_manifest = build_chunks_manifest(
-        provider=args.provider,
-        model=args.model,
-        voice=args.voice,
-        style_prompt=style_prompt,
+        provider=prepared.provider,
+        model=prepared.model,
+        voice=prepared.voice,
+        style_prompt=prepared.style_prompt,
         script=args.script,
         chunks_dir=paths.chunks_dir,
         pricing_snapshot=pricing_snapshot,
@@ -1914,7 +1908,7 @@ def _generate_step(
         chunk_artifacts=chunk_artifacts,
         ffmpeg_path=ffmpeg_path,
         ffprobe_path=ffprobe_path,
-        prompt_mode=prompt_mode,
+        prompt_mode=prepared.prompt_mode,
         script_format=getattr(args, "format", "markdown"),
         speaker_voice_map=getattr(args, "speaker_voice_map", None) or None,
         execution_source=state.get("execution_source"),

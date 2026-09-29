@@ -1588,6 +1588,11 @@ def test_paid_media_ffmpeg_failure_resumes_from_raw_without_any_provider_call(
         tmp_path, "paid-media-raw", resume=True, model=args.model, voice=args.voice
     )
 
+    def unexpected_synthesis(*_args, **_kwargs):
+        raise AssertionError("a recovered paid attempt must not reach the submit seam")
+
+    monkeypatch.setattr(cli, "synthesize_part", unexpected_synthesis)
+
     with pytest.raises(SystemExit) as resume_exit:
         cli._generate_step(
             resume_args,
@@ -4272,3 +4277,170 @@ def test_timing_artifact_writer_keeps_legacy_file_names_and_manifest_shape(tmp_p
     assert (tmp_path / "legacy.srt").read_text(
         encoding="utf-8"
     ) == "1\n00:00:00,000 --> 00:00:01,000\nfixture\n"
+
+
+def test_prepare_run_wraps_the_original_chunks_without_changing_identity(tmp_path):
+    """Preparation reuses the exact hashed chunks and keeps the run identity.
+
+    A prepared part must hold the original ``ScriptChunk`` object rather than a
+    regenerated one, so ids, text, order, and ``script_hash`` stay identical
+    between preparation and synthesis.
+    """
+    from voiceover_pipeline.run_state import script_hash
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services.prepare import prepare_run
+
+    args = make_args(tmp_path, run_id="prepared-identity")
+    chunks = split_markdown_by_delimiter(args.script, "******")[:2]
+
+    prepared = prepare_run(args, chunks, "run-scoped style", "auto")
+
+    assert prepared.provider == args.provider
+    assert prepared.model == args.model
+    assert prepared.voice == args.voice
+    assert prepared.style_prompt == "run-scoped style"
+    assert prepared.prompt_mode == "auto"
+    assert [part.chunk for part in prepared.parts] == chunks
+    assert all(part.chunk is chunk for part, chunk in zip(prepared.parts, chunks))
+    assert [part.voice for part in prepared.parts] == [chunk.voice for chunk in chunks]
+    assert script_hash([part.chunk for part in prepared.parts]) == script_hash(chunks)
+
+
+def test_generate_step_drives_every_synthesis_call_with_a_prepared_part(tmp_path, monkeypatch):
+    """The run loop calls the single synthesis seam once per prepared part.
+
+    Each call receives the prepared part wrapping the original chunk, so the
+    order and identity that reach the provider are the ones the run hashed and
+    stored.
+    """
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services.synthesis import synthesize_part
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="prepared-parts")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:2]
+    seen: list[tuple[object, str, str | None]] = []
+
+    def recording_synthesize(provider, part):
+        seen.append((part.chunk, part.chunk.text, part.voice))
+        return synthesize_part(provider, part)
+
+    monkeypatch.setattr(cli, "synthesize_part", recording_synthesize)
+    provider = FakeProvider()
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    assert [item[1] for item in seen] == [chunk.text for chunk in chunks]
+    assert [item[2] for item in seen] == [chunk.voice for chunk in chunks]
+    assert all(item[0] is chunk for item, chunk in zip(seen, chunks))
+    assert provider.calls == [chunk.id for chunk in chunks]
+    state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+    assert [item["voice"] for item in state["chunks"]] == [args.voice] * len(chunks)
+
+
+def test_synthesize_part_keeps_the_openrouter_cast_voice_per_turn(tmp_path, monkeypatch):
+    """Prepared dialogue parts still send their own turn text and cast voice.
+
+    Every OpenRouter call must carry ``voice=<turn voice>`` from the prepared
+    part, and no turn may leak into another request body.
+    """
+    import voiceover_pipeline.providers.openrouter_tts as openrouter_tts
+    from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+    from voiceover_pipeline.services.prepare import prepare_run
+    from voiceover_pipeline.services.synthesis import synthesize_part
+
+    class FakeResponse:
+        status_code = 200
+        content = b"pcm"
+        headers = {"Content-Type": "audio/pcm"}
+
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"])
+    prepared = prepare_run(args, chunks, report["style_prompt"], "native")
+    bodies: list[dict] = []
+
+    def post(_url, **kwargs):
+        bodies.append(kwargs["json"])
+        return FakeResponse()
+
+    monkeypatch.setattr(openrouter_tts.requests, "post", post)
+    provider = OpenRouterTTSProvider(
+        api_key="test",
+        model=args.model,
+        voice=args.voice,
+        speaker_voice_map=report["speaker_voice_map"],
+        prompt_mode="native",
+    )
+
+    results = [synthesize_part(provider, part) for part in prepared.parts]
+
+    assert [body["voice"] for body in bodies] == [chunk.voice for chunk in chunks]
+    assert [body["input"] for body in bodies] == [chunk.text for chunk in chunks]
+    assert [result.transcript for result in results] == [chunk.text for chunk in chunks]
+
+
+def test_synthesize_part_selects_the_cast_provider_and_tolerates_legacy_signatures(
+    tmp_path, monkeypatch
+):
+    """Provider selection follows the part voice, with only the documented fallback.
+
+    A voice-keyed cast map must route each part to its own provider, and a legacy
+    OpenRouter signature that rejects ``voice`` may fall back to the two-argument
+    call while every other ``TypeError`` still propagates.
+    """
+    from voiceover_pipeline.models import SynthesisResult
+    from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+    from voiceover_pipeline.services.prepare import prepare_run
+    from voiceover_pipeline.services.synthesis import synthesize_part
+
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"])
+    prepared = prepare_run(args, chunks, report["style_prompt"], "native")
+    host_voice, guest_voice = chunks[0].voice, chunks[1].voice
+    providers = {host_voice: FakeProvider(), guest_voice: FakeProvider()}
+
+    for part in prepared.parts:
+        synthesize_part(providers, part)
+
+    assert providers[host_voice].calls == [
+        chunk.id for chunk in chunks if chunk.voice == host_voice
+    ]
+    assert providers[guest_voice].calls == [
+        chunk.id for chunk in chunks if chunk.voice == guest_voice
+    ]
+
+    openrouter_args = make_args(tmp_path, run_id="legacy-openrouter")
+    openrouter_args.provider = "openrouter-tts"
+    openrouter_args.model = "google/gemini-3.1-flash-tts-preview"
+    legacy_part = prepare_run(openrouter_args, chunks[:1], None, "none").parts[0]
+    provider = OpenRouterTTSProvider(
+        api_key="test", model=openrouter_args.model, voice="Kore", prompt_mode="none"
+    )
+    legacy_calls: list[tuple[str, str]] = []
+
+    def legacy_synthesize_chunk(self, text, chunk_id):
+        legacy_calls.append((text, chunk_id))
+        return SynthesisResult(audio_bytes=b"audio", audio_format="mp3")
+
+    monkeypatch.setattr(OpenRouterTTSProvider, "synthesize_chunk", legacy_synthesize_chunk)
+
+    result = synthesize_part(provider, legacy_part)
+
+    assert legacy_calls == [(chunks[0].text, chunks[0].id)]
+    assert result.audio_bytes == b"audio"
+
+    def broken_synthesize_chunk(self, text, chunk_id, voice=None):
+        raise TypeError("internal provider failure")
+
+    monkeypatch.setattr(OpenRouterTTSProvider, "synthesize_chunk", broken_synthesize_chunk)
+
+    with pytest.raises(TypeError, match="internal provider failure"):
+        synthesize_part(provider, legacy_part)
