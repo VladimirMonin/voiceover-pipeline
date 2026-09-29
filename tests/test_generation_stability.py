@@ -4550,11 +4550,12 @@ def test_synthesize_part_keeps_the_openrouter_cast_voice_per_turn(tmp_path, monk
 def test_synthesize_part_selects_the_cast_provider_and_tolerates_legacy_signatures(
     tmp_path, monkeypatch
 ):
-    """Provider selection follows the part voice, with only the documented fallback.
+    """Provider selection follows the part voice via signature inspection.
 
     A voice-keyed cast map must route each part to its own provider, and a legacy
-    OpenRouter signature that rejects ``voice`` may fall back to the two-argument
-    call while every other ``TypeError`` still propagates.
+    OpenRouter signature without a ``voice`` parameter is detected up front and
+    receives the two-argument call while a ``TypeError`` raised by a
+    voice-accepting signature still propagates.
     """
     from voiceover_pipeline.models import SynthesisResult
     from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
@@ -4604,6 +4605,42 @@ def test_synthesize_part_selects_the_cast_provider_and_tolerates_legacy_signatur
 
     with pytest.raises(TypeError, match="internal provider failure"):
         synthesize_part(provider, legacy_part)
+
+
+def test_synthesize_part_does_not_resubmit_after_a_voice_typeerror(tmp_path, monkeypatch):
+    """A rejected first submit must not trigger a second paid OpenRouter call.
+
+    If an OpenRouter submit has already left the process and then raises
+    ``TypeError`` mentioning ``voice``, the single synthesis seam must let that
+    error escape after exactly one provider call. Re-invoking the provider would
+    be a second paid submit for the same part.
+    """
+    from voiceover_pipeline.providers.openrouter_tts import OpenRouterTTSProvider
+    from voiceover_pipeline.services.prepare import prepare_run
+    from voiceover_pipeline.services.synthesis import synthesize_part
+
+    script, report, chunks = _write_dialogue_fixture(tmp_path)
+    args = make_dialogue_args(tmp_path, script, report["speaker_voice_map"])
+    part = prepare_run(args, chunks[:1], report["style_prompt"], "native").parts[0]
+    provider = OpenRouterTTSProvider(
+        api_key="test",
+        model=args.model,
+        voice=args.voice,
+        speaker_voice_map=report["speaker_voice_map"],
+        prompt_mode="native",
+    )
+    calls: list[tuple[str, str]] = []
+
+    def submitted_then_rejected(self, text, chunk_id, voice=None):
+        calls.append((text, chunk_id))
+        raise TypeError("unexpected keyword argument 'voice'")
+
+    monkeypatch.setattr(OpenRouterTTSProvider, "synthesize_chunk", submitted_then_rejected)
+
+    with pytest.raises(TypeError, match="unexpected keyword argument 'voice'"):
+        synthesize_part(provider, part)
+
+    assert calls == [(part.chunk.text, part.chunk.id)]
 
 
 def test_generate_step_routes_media_hooks_through_patched_cli_functions(tmp_path, monkeypatch):
