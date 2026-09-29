@@ -12,7 +12,7 @@
 | Stage reviewer | `reviewer` | `openai-codex/gpt-6-sol` |
 | Blocker expert | `oracle` | `openai-codex/gpt-6-astra` |
 
-Check the current agent/model availability before delegation; do not silently substitute another model. These are defaults, not immutable requirements.
+Use `ollama-cloud/deepseek-v4.1-flash` as the primary `worker` route. If it is unavailable or quota-limited, `polza/deepseek/deepseek-v4.1-flash` is the owner-approved backup for the same Pi subagent role; report the switch rather than substituting silently. Check current agent/model availability before delegation. This model routing does not authorize live/paid calls by the application.
 
 Repository instructions are split into small, scoped files. Read this router first, then load every matching file from `instructions/` before acting. Repository research uses Codebase → Serena → ast-grep. When accepted behavior changes a fundamental durable rule, updating the owning instruction is mandatory; follow `instructions/instruction-authoring.instructions.md`.
 
