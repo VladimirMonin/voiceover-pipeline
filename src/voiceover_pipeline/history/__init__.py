@@ -1,0 +1,81 @@
+"""Canonical SQLite history storage for the voiceover pipeline.
+
+Plan section 6 makes this package the single source of truth for run history.
+:mod:`voiceover_pipeline.history.database` owns the connection contract and the
+versioned checksummed migration ledger; :mod:`voiceover_pipeline.history.repository`
+owns the typed entity API (records, cost provenance, bounded metadata queries).
+"""
+
+from .database import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    LATEST_SCHEMA_VERSION,
+    MIGRATIONS,
+    HistoryDatabase,
+    HistoryDatabaseError,
+    Migration,
+    MigrationChecksumError,
+    SchemaVersionTooNewError,
+    apply_migrations,
+    backup_database,
+    utc_now,
+)
+from .repository import (
+    COST_SOURCE_EXACT,
+    COST_SOURCE_LEGACY_FLOAT,
+    COST_SOURCE_UNKNOWN,
+    DEFAULT_QUERY_LIMIT,
+    MAX_QUERY_LIMIT,
+    PATH_KIND_EXTERNAL_ABSOLUTE,
+    PATH_KIND_MANAGED_RELATIVE,
+    REDACTED_VALUE,
+    TEXT_COMPLETENESS_COMPLETE,
+    TEXT_COMPLETENESS_INCOMPLETE,
+    TEXT_KIND_ASR_TRANSCRIPT,
+    TEXT_KIND_TTS_DIRECTION,
+    TEXT_KIND_TTS_SCRIPT,
+    TEXT_KIND_VERIFICATION_TRANSCRIPT,
+    ArtifactRecord,
+    AttemptRecord,
+    Cost,
+    HistoryRepository,
+    HistoryRepositoryError,
+    PartRecord,
+    RunRecord,
+    TextSourceRecord,
+)
+
+__all__ = [
+    "COST_SOURCE_EXACT",
+    "COST_SOURCE_LEGACY_FLOAT",
+    "COST_SOURCE_UNKNOWN",
+    "DEFAULT_BUSY_TIMEOUT_MS",
+    "DEFAULT_QUERY_LIMIT",
+    "LATEST_SCHEMA_VERSION",
+    "MAX_QUERY_LIMIT",
+    "MIGRATIONS",
+    "PATH_KIND_EXTERNAL_ABSOLUTE",
+    "PATH_KIND_MANAGED_RELATIVE",
+    "REDACTED_VALUE",
+    "TEXT_COMPLETENESS_COMPLETE",
+    "TEXT_COMPLETENESS_INCOMPLETE",
+    "TEXT_KIND_ASR_TRANSCRIPT",
+    "TEXT_KIND_TTS_DIRECTION",
+    "TEXT_KIND_TTS_SCRIPT",
+    "TEXT_KIND_VERIFICATION_TRANSCRIPT",
+    "ArtifactRecord",
+    "AttemptRecord",
+    "Cost",
+    "HistoryDatabase",
+    "HistoryDatabaseError",
+    "HistoryRepository",
+    "HistoryRepositoryError",
+    "Migration",
+    "MigrationChecksumError",
+    "PartRecord",
+    "RunRecord",
+    "SchemaVersionTooNewError",
+    "TextSourceRecord",
+    "apply_migrations",
+    "backup_database",
+    "utc_now",
+]
