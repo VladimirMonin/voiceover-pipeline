@@ -3,7 +3,10 @@
 Plan section 6 makes this package the single source of truth for run history.
 :mod:`voiceover_pipeline.history.database` owns the connection contract and the
 versioned checksummed migration ledger; :mod:`voiceover_pipeline.history.repository`
-owns the typed entity API (records, cost provenance, bounded metadata queries).
+owns the typed entity API (records, cost provenance, bounded metadata queries);
+:mod:`voiceover_pipeline.history.paths` resolves the private ``VOICEOVER_HOME``
+layout; and :mod:`voiceover_pipeline.history.legacy_import` safely imports old
+``out/<run-id>`` trees without touching them.
 """
 
 from .database import (
@@ -18,6 +21,33 @@ from .database import (
     apply_migrations,
     backup_database,
     utc_now,
+)
+from .legacy_import import (
+    LEGACY_OPERATION,
+    LEGACY_ORIGIN,
+    LegacyChunkPreview,
+    LegacyImportPreview,
+    LegacyImportResult,
+    LegacyRunImportResult,
+    LegacyRunPreview,
+    import_legacy_runs,
+    preview_legacy_import,
+)
+from .paths import (
+    APP_DIR_NAME,
+    HISTORY_DATABASE_FILENAME,
+    PRIVATE_DIR_MODE,
+    HistoryHomePermissionError,
+    HistoryPathsError,
+    default_history_home,
+    ensure_history_home,
+    ensure_private_directory,
+    history_backups_dir,
+    history_database_path,
+    history_home,
+    history_logs_dir,
+    history_runs_dir,
+    resolve_history_home,
 )
 from .repository import (
     COST_SOURCE_EXACT,
@@ -45,16 +75,21 @@ from .repository import (
 )
 
 __all__ = [
+    "APP_DIR_NAME",
     "COST_SOURCE_EXACT",
     "COST_SOURCE_LEGACY_FLOAT",
     "COST_SOURCE_UNKNOWN",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "DEFAULT_QUERY_LIMIT",
+    "HISTORY_DATABASE_FILENAME",
     "LATEST_SCHEMA_VERSION",
+    "LEGACY_OPERATION",
+    "LEGACY_ORIGIN",
     "MAX_QUERY_LIMIT",
     "MIGRATIONS",
     "PATH_KIND_EXTERNAL_ABSOLUTE",
     "PATH_KIND_MANAGED_RELATIVE",
+    "PRIVATE_DIR_MODE",
     "REDACTED_VALUE",
     "TEXT_COMPLETENESS_COMPLETE",
     "TEXT_COMPLETENESS_INCOMPLETE",
@@ -67,8 +102,15 @@ __all__ = [
     "Cost",
     "HistoryDatabase",
     "HistoryDatabaseError",
+    "HistoryHomePermissionError",
+    "HistoryPathsError",
     "HistoryRepository",
     "HistoryRepositoryError",
+    "LegacyChunkPreview",
+    "LegacyImportPreview",
+    "LegacyImportResult",
+    "LegacyRunImportResult",
+    "LegacyRunPreview",
     "Migration",
     "MigrationChecksumError",
     "PartRecord",
@@ -77,5 +119,16 @@ __all__ = [
     "TextSourceRecord",
     "apply_migrations",
     "backup_database",
+    "default_history_home",
+    "ensure_history_home",
+    "ensure_private_directory",
+    "history_backups_dir",
+    "history_database_path",
+    "history_home",
+    "history_logs_dir",
+    "history_runs_dir",
+    "import_legacy_runs",
+    "preview_legacy_import",
+    "resolve_history_home",
     "utc_now",
 ]
