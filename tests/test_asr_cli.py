@@ -2,12 +2,14 @@ import argparse
 import json
 import sys
 import types
+from pathlib import Path
 
 import pytest
 from conftest import cli_json, fixture_path
 
 from voiceover_pipeline.models import (
     ASRCapabilities,
+    ASRContextHints,
     ASRExecutionReceipt,
     ASRRequest,
     ASRResult,
@@ -800,3 +802,147 @@ def test_doctor_checks_only_the_selected_asr_dependency_probe(monkeypatch, capsy
     }
     assert data["workflow_ok"] is False
     assert "Install the approved optional ASR runtime." in data["warnings"]
+
+
+def test_build_asr_request_applies_default_model_runtime_and_timestamp_mode():
+    from voiceover_pipeline.cli import build_parser
+    from voiceover_pipeline.services.transcription import build_asr_request
+
+    args = build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--language",
+            "ru",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            "--runtime",
+            "python",
+        ]
+    )
+
+    request = build_asr_request(args, _fixture_spec(), ASRContextHints(), Path("audio.wav"))
+
+    assert request.model_id == "fixture-model"
+    assert request.timestamp_mode == "none"
+    assert request.runtime_choice == "python"
+    assert request.language == "ru"
+
+
+def test_build_asr_request_maps_word_timestamps_and_explicit_model():
+    from voiceover_pipeline.cli import build_parser
+    from voiceover_pipeline.services.transcription import build_asr_request
+
+    args = build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--model",
+            "fixture-model",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+            "--word-timestamps",
+        ]
+    )
+
+    request = build_asr_request(args, _fixture_spec(), ASRContextHints(), Path("audio.wav"))
+
+    assert request.model_id == "fixture-model"
+    assert request.timestamp_mode == "word"
+    assert request.runtime_choice == "auto"
+
+
+def test_validate_result_capabilities_reports_provider_and_declaration_errors():
+    from voiceover_pipeline.services.transcription import validate_result_capabilities
+
+    spec = _fixture_spec()
+    declared = ASRResult(
+        transcript="ok",
+        provider_id="fixture-local",
+        model_id="fixture-model",
+        execution=ASRExecutionReceipt(runtime="fixture-runtime"),
+    )
+    assert validate_result_capabilities(declared, spec) is None
+
+    foreign = ASRResult(
+        transcript="ok",
+        provider_id="someone-else",
+        model_id="fixture-model",
+        execution=ASRExecutionReceipt(runtime="fixture-runtime"),
+    )
+    assert (
+        validate_result_capabilities(foreign, spec)
+        == "ASR provider fixture-local returned provider ID someone-else"
+    )
+
+    undeclared = ASRResult(
+        transcript="ok",
+        provider_id="fixture-local",
+        model_id="fixture-model",
+        execution=ASRExecutionReceipt(runtime="fixture-runtime"),
+        words=(ASRWordSpan(text="ok", start_s=0.0, end_s=0.1),),
+        alignment_origin="native",
+    )
+    assert (
+        validate_result_capabilities(undeclared, spec)
+        == "ASR provider fixture-local returned undeclared word timestamps"
+    )
+
+
+def test_transcribe_provider_identity_mismatch_keeps_exit_code_and_message(monkeypatch):
+    import voiceover_pipeline.cli as cli
+
+    class ForeignProvider(ASRProvider):
+        provider_id = "fixture-local"
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            return ASRResult(
+                transcript="fixture transcript",
+                provider_id="someone-else",
+                model_id="fixture-model",
+                execution=ASRExecutionReceipt(runtime="fixture-runtime"),
+            )
+
+    spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=ForeignProvider,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            device_modes=("cpu",),
+            compute_modes=("float32",),
+        ),
+        dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
+    )
+    monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    args = cli.build_parser().parse_args(
+        [
+            "transcribe",
+            "--audio",
+            str(fixture_path("smoke_test.md")),
+            "--provider",
+            "fixture-local",
+            "--device",
+            "cpu",
+            "--compute",
+            "float32",
+        ]
+    )
+
+    with pytest.raises(
+        cli.CliError, match="fixture-local returned provider ID someone-else"
+    ) as error:
+        cli.transcribe_cmd(args)
+
+    assert error.value.code == 30

@@ -12,7 +12,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
-from typing import Any, NoReturn, cast
+from typing import Any, NoReturn
 
 from .artifacts import (
     build_chunks_manifest,
@@ -96,7 +96,6 @@ from .models import (
     ASRContextHints,
     ASRRequest,
     ASRResult,
-    ASRRuntimeChoice,
     ChunkArtifact,
     ScriptChunk,
     SynthesisResult,
@@ -162,6 +161,7 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
+from .services.transcription import build_asr_request, validate_result_capabilities
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
 from .tts_quality import evaluate_tts_transcript
 from .voiceover_script import (
@@ -2155,7 +2155,8 @@ def _transcribe_result(args: argparse.Namespace) -> tuple[ASRResult, Path]:
         fail(str(exc), _EXIT_ARGS)
 
     _validate_asr_request_options(args, spec, hints)
-    runtime = cast(ASRRuntimeChoice, getattr(args, "runtime", "auto"))
+    request = build_asr_request(args, spec, hints, audio_path)
+    runtime = request.runtime_choice
     if spec.provider_id == "nemotron-local" and runtime == "audio-cpp":
         from .providers.audio_cpp_nemotron_asr import audio_cpp_nemotron_asr_dependency_probe
         from .providers.nemotron_asr_local import nemotron_asr_audio_cpp_provider_factory
@@ -2185,19 +2186,6 @@ def _transcribe_result(args: argparse.Namespace) -> tuple[ASRResult, Path]:
     if not health.available:
         fail(health.remediation, _EXIT_MISSING_DEP)
 
-    model_id = args.model
-    if model_id is None:
-        model_id = next((model["id"] for model in spec.models if model.get("default")), None)
-    request = ASRRequest(
-        audio_path=audio_path,
-        model_id=model_id,
-        language=args.language,
-        device=args.device,
-        compute=args.compute,
-        hints=hints,
-        timestamp_mode="word" if getattr(args, "word_timestamps", False) else "none",
-        runtime_choice=runtime,
-    )
     provider = provider_factory()
     try:
         raw_result = (
@@ -2213,26 +2201,9 @@ def _transcribe_result(args: argparse.Namespace) -> tuple[ASRResult, Path]:
     except Exception as exc:
         fail(f"ASR provider {spec.provider_id} failed: {exc}", _EXIT_PROVIDER)
 
-    capabilities = spec.capabilities
-    if result.provider_id != spec.provider_id:
-        fail(
-            f"ASR provider {spec.provider_id} returned provider ID {result.provider_id}",
-            _EXIT_PROVIDER,
-        )
-    if (
-        any(segment.start_s is not None for segment in result.segments)
-        and not capabilities.segment_timestamps
-    ):
-        fail(
-            f"ASR provider {spec.provider_id} returned undeclared segment timestamps",
-            _EXIT_PROVIDER,
-        )
-    if result.words and not capabilities.word_timestamps:
-        fail(f"ASR provider {spec.provider_id} returned undeclared word timestamps", _EXIT_PROVIDER)
-    if result.alignment_origin == "forced" and not capabilities.forced_alignment:
-        fail(
-            f"ASR provider {spec.provider_id} returned undeclared forced alignment", _EXIT_PROVIDER
-        )
+    capability_error = validate_result_capabilities(result, spec)
+    if capability_error is not None:
+        fail(capability_error, _EXIT_PROVIDER)
 
     return result, audio_path
 
