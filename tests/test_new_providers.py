@@ -1222,3 +1222,199 @@ class TestReadStylePromptFromFile:
         pf.write_text("   ", encoding="utf-8")
         with pytest.raises(ValueError, match="empty"):
             read_style_prompt_from_file(pf)
+
+
+def _wav_fixture() -> bytes:
+    """A minimal valid 44-byte PCM RIFF/WAVE header with no samples."""
+    return (
+        b"RIFF"
+        + (36).to_bytes(4, "little")
+        + b"WAVE"
+        + b"fmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (24000).to_bytes(4, "little")
+        + (48000).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + (0).to_bytes(4, "little")
+    )
+
+
+class TestPolzaSpeechAudioFormat:
+    @staticmethod
+    def _synthesize(resp_json, *, response_format="mp3"):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = json.dumps(resp_json).encode()
+        mock_response.json.return_value = resp_json
+        mock_response.headers = {}
+
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response
+        ):
+            provider = PolzaTTSProvider(
+                api_key="sk-test",
+                model="openai/gpt-4o-mini-tts",
+                voice="ash",
+                response_format=response_format,
+            )
+            return provider.synthesize_chunk("Hello world", "chunk_01")
+
+    @pytest.mark.parametrize(
+        ("content_type", "audio_bytes", "expected_format"),
+        [
+            ("audio/mpeg", b"ID3fixture", "mp3"),
+            ("audio/pcm", b"\x00\x01\x02\x03", "pcm16"),
+            ("audio/wav", _wav_fixture(), "wav"),
+        ],
+    )
+    def test_maps_documented_content_types(self, content_type, audio_bytes, expected_format):
+        resp_json = {
+            "audio": base64.b64encode(audio_bytes).decode(),
+            "contentType": content_type,
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = json.dumps(resp_json).encode()
+        mock_response.json.return_value = resp_json
+        mock_response.headers = {}
+
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response
+        ):
+            provider = PolzaTTSProvider(
+                api_key="sk-test", model="openai/gpt-4o-mini-tts", voice="ash"
+            )
+            result = provider.synthesize_chunk("Hello world", "chunk_01")
+
+        assert result.audio_format == expected_format
+        assert result.audio_bytes == audio_bytes
+
+    @pytest.mark.parametrize(
+        ("content_type", "audio_bytes", "error_match"),
+        [
+            ("audio/wav", b"not-a-wav-header", "without a valid WAV header"),
+            ("audio/flac", b"fLaCfixture", "unsupported audio content type"),
+        ],
+    )
+    def test_unsupported_or_mislabelled_audio_fails_closed(
+        self, content_type, audio_bytes, error_match
+    ):
+        resp_json = {
+            "audio": base64.b64encode(audio_bytes).decode(),
+            "contentType": content_type,
+        }
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = json.dumps(resp_json).encode()
+        mock_response.json.return_value = resp_json
+        mock_response.headers = {}
+
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=mock_response
+        ):
+            provider = PolzaTTSProvider(
+                api_key="sk-test", model="openai/gpt-4o-mini-tts", voice="ash"
+            )
+            with pytest.raises(RuntimeError, match=error_match):
+                provider.synthesize_chunk("Hello world", "chunk_01")
+
+    def test_missing_content_type_with_real_wav_reports_wav(self):
+        # ``response_format`` was mp3, but the bytes carry a real RIFF/WAVE
+        # header, so the actual container is what the receipt must record.
+        result = self._synthesize({"audio": base64.b64encode(_wav_fixture()).decode()})
+
+        assert result.audio_format == "wav"
+        assert result.audio_bytes == _wav_fixture()
+
+    def test_declared_mp3_with_real_wav_reports_wav(self):
+        result = self._synthesize(
+            {
+                "audio": base64.b64encode(_wav_fixture()).decode(),
+                "contentType": "audio/mpeg",
+            }
+        )
+
+        assert result.audio_format == "wav"
+        assert result.audio_bytes == _wav_fixture()
+
+    def test_l16_content_type_is_rejected_as_unsupported(self):
+        # L16 is network big-endian while media.py decodes pcm16 as little-endian
+        # s16le, so it must fail closed rather than byte-swap every sample.
+        with pytest.raises(RuntimeError, match="unsupported audio content type"):
+            self._synthesize(
+                {
+                    "audio": base64.b64encode(b"\x00\x01").decode(),
+                    "contentType": "audio/l16",
+                }
+            )
+
+
+class _FakeRun:
+    def __init__(self, args):
+        self.args = args
+        self.returncode = 0
+        self.stdout = b""
+        self.stderr = b""
+
+
+class TestRawAudioFormatRouting:
+    def test_mp3_is_written_without_ffmpeg(self, tmp_path):
+        from voiceover_pipeline import media
+
+        out = tmp_path / "chunk.mp3"
+        media.write_audio_as_mp3("ffmpeg", b"ID3fixture", "mp3", out)
+        assert out.read_bytes() == b"ID3fixture"
+
+    def test_genuine_pcm16_is_piped_as_s16le(self, tmp_path, monkeypatch):
+        from voiceover_pipeline import media
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            media.subprocess, "run", lambda args, **kwargs: calls.append(args) or _FakeRun(args)
+        )
+        media.write_audio_as_mp3("ffmpeg", b"\x00\x01\x02\x03", "pcm16", tmp_path / "chunk.mp3")
+        assert calls and "s16le" in calls[0]
+
+    def test_wav_container_is_never_piped_as_pcm(self, tmp_path, monkeypatch):
+        from voiceover_pipeline import media
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            media.subprocess, "run", lambda args, **kwargs: calls.append(args) or _FakeRun(args)
+        )
+        # Labelled PCM on purpose: the RIFF/WAVE container must still be decoded
+        # as a file, never reinterpreted through the s16le demuxer.
+        media.write_audio_as_mp3("ffmpeg", _wav_fixture(), "pcm16", tmp_path / "chunk.mp3")
+        assert calls
+        assert all("s16le" not in call for call in calls)
+
+    def test_labeled_wav_is_decoded_as_a_file(self, tmp_path, monkeypatch):
+        from voiceover_pipeline import media
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            media.subprocess, "run", lambda args, **kwargs: calls.append(args) or _FakeRun(args)
+        )
+        media.write_audio_as_mp3("ffmpeg", _wav_fixture(), "wav", tmp_path / "chunk.mp3")
+        assert calls
+        assert all("s16le" not in call for call in calls)
+
+    def test_wav_header_beats_mp3_label_and_is_never_copied(self, tmp_path, monkeypatch):
+        from voiceover_pipeline import media
+
+        calls: list[list[str]] = []
+        monkeypatch.setattr(
+            media.subprocess, "run", lambda args, **kwargs: calls.append(args) or _FakeRun(args)
+        )
+        out = tmp_path / "chunk.mp3"
+        # Labelled MP3 on purpose: real RIFF/WAVE bytes must be decoded through
+        # ffmpeg, never fast-copied into the ``.mp3`` output.
+        media.write_audio_as_mp3("ffmpeg", _wav_fixture(), "mp3", out)
+        assert calls
+        assert calls[0][calls[0].index("-i") + 1].endswith(".wav")
+        assert all("s16le" not in call for call in calls)
+        assert not out.exists()

@@ -98,6 +98,7 @@ from .models import (
     ASRRuntimeChoice,
     ChunkArtifact,
     ScriptChunk,
+    SynthesisResult,
 )
 from .omnivoice_design import (
     OMNIVOICE_LONG_FORM_THRESHOLD_SECONDS,
@@ -148,9 +149,12 @@ from .run_state import (
     initial_state,
     load_state,
     pending_media_recovery,
+    pending_raw_recovery,
+    raw_audio_relative_path,
     record_chunk_attempt_outcome,
     record_media_observed_cost,
     record_media_task_accepted,
+    record_raw_audio_saved,
     script_hash,
     state_chunks_as_artifacts,
     unconfirmed_attempt,
@@ -1143,22 +1147,24 @@ def generate(args: argparse.Namespace) -> None:
         # any optional quality/timing preflight, key read, provider build, identity
         # check, or pricing I/O: the documented PAID_SUBMIT_UNCONFIRMED envelope
         # cannot be replaced by a key or dependency error, and no request may leave.
-        # The one exception is a paid Polza media submit whose accepted id is stored
-        # and still matches this exact provider/model/voice/script chunk: that chunk
-        # is finished with GET calls only, so no new POST can be billed. Every other
-        # marker keeps the block. ``--skip-existing`` keeps its precedence and
-        # reports an existing folder as skipped without loading run state. The same
-        # guard runs inside ``_generate_step`` for direct callers.
+        # The one exception is a paid attempt the same command can recover without
+        # a new submit: saved raw audio rebuilt locally, or a stored paid Polza
+        # media id finished with GET calls only. Both still match this exact
+        # provider/model/voice/script chunk. Every other marker keeps the block.
+        # ``--skip-existing`` keeps its precedence and reports an existing folder as
+        # skipped without loading run state. The same guard runs inside
+        # ``_generate_step`` for direct callers.
         pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
         if pending_attempt is not None:
             resume_state, _state_unreadable = _load_status_state(paths.output_root / STATE_FILE)
-            if not _recoverable_media_attempts(
+            if not _recoverable_paid_attempts(
                 resume_state,
                 provider=args.provider,
                 model=args.model,
                 voice=args.voice or _default_voice(args),
                 chunks=chunks,
                 chunks_dir=paths.chunks_dir,
+                run_root=paths.output_root,
             ):
                 _reject_unconfirmed_paid_resume(
                     pending_attempt, GenerationLogger(paths.output_root / LOG_FILE)
@@ -1418,6 +1424,83 @@ def _bind_polza_media_attempt(
     provider.on_media_completed = on_completed
 
 
+def _persist_paid_raw_audio(
+    result,
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    paths,
+    chunk: ScriptChunk,
+    logger: GenerationLogger,
+) -> None:
+    """Write the accepted paid bytes to a run-local raw file and record the receipt.
+
+    The raw file is the rebuild source rather than a disposable cache: it is
+    written atomically before any FFmpeg step and survives a later conversion
+    failure. Only the bounded format, the deterministic path, the digest, a
+    bounded generation id, and the recognized direct cost join the attempt marker
+    atomically, so a crash leaves either the whole receipt or none of it. A
+    failure propagates to keep the paid outcome unconfirmed instead of allowing
+    another submit.
+    """
+    relative_path = raw_audio_relative_path(chunk.id, result.audio_format)
+    raw_path = paths.output_root / relative_path
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = raw_path.with_suffix(raw_path.suffix + ".tmp")
+    temp_path.write_bytes(result.audio_bytes)
+    temp_path.replace(raw_path)
+    record_raw_audio_saved(
+        state,
+        chunk_id=chunk.id,
+        number=chunk.number,
+        audio_format=result.audio_format,
+        relative_path=relative_path,
+        sha256=_sha256_file(raw_path),
+        generation_id=result.generation_id,
+    )
+    # The synchronous ``/audio/speech`` route reports its billed amount only in
+    # this response, so it joins the same atomic write as the raw receipt; a later
+    # conversion failure therefore cannot lose the observed cost. A response
+    # without a recognized cost leaves an already stored observation untouched.
+    cost, cost_exact = _media_observed_cost((result.raw_metadata or {}).get("usage_direct"))
+    if cost is not None:
+        record_media_observed_cost(state, cost=cost, cost_exact=cost_exact)
+    atomic_write_json(state_path, state)
+    logger.event(
+        "info",
+        "raw_audio_saved",
+        chunk=chunk.number,
+        id=chunk.id,
+        format=result.audio_format,
+        bytes=len(result.audio_bytes),
+    )
+
+
+def _raw_recovery_result(
+    args, chunk: ScriptChunk, run_root: Path, recovery: dict[str, Any]
+) -> SynthesisResult:
+    """Rebuild a SynthesisResult from saved raw paid bytes with no provider call.
+
+    The bytes were already paid for, so a resume reads them from disk instead of
+    issuing another POST or a media GET. The transcript is the exact submitted
+    chunk text, and the stored exact cost is applied separately from the marker,
+    so no unbounded provider payload is reconstructed.
+    """
+    audio_bytes = (run_root / recovery["raw_path"]).read_bytes()
+    return SynthesisResult(
+        audio_bytes=audio_bytes,
+        audio_format=recovery["raw_format"],
+        transcript=chunk.text,
+        generation_id=recovery["generation_id"],
+        client_path="requests",
+        raw_metadata={
+            "voice": args.voice,
+            "provider": args.provider,
+            "model": args.model,
+        },
+    )
+
+
 def _generate_step(
     args,
     provider,
@@ -1452,10 +1535,10 @@ def _generate_step(
         else None
     )
     state = load_state(state_path)
-    # A paid media submit on the ElevenLabs ``/media`` route whose accepted id
-    # is stored can only be finished with GET calls, so this exact command may
-    # resume it instead of failing closed. Every other marker keeps the
-    # unconfirmed block below.
+    # A paid attempt may be recovered without a new submit when its accepted
+    # response was saved locally (raw bytes on disk) or when a Polza media task
+    # id is stored and can be finished with GET calls. Every other marker keeps
+    # the unconfirmed block below.
     recoverable_attempts: dict[int, dict[str, Any]] = {}
     if state and args.resume:
         if state.get("script_hash") != current_hash:
@@ -1464,14 +1547,15 @@ def _generate_step(
                 "Cannot resume: script chunks do not match the previous run_state.json.",
                 _EXIT_PROVIDER,
             )
-        if isinstance(provider, PolzaTTSProvider) and _polza_media_route_model(provider.model):
-            recoverable_attempts = _recoverable_media_attempts(
+        if args.provider in _PAID_SUBMIT_TTS_PROVIDERS:
+            recoverable_attempts = _recoverable_paid_attempts(
                 state,
                 provider=args.provider,
                 model=args.model,
                 voice=args.voice,
                 chunks=chunks,
                 chunks_dir=paths.chunks_dir,
+                run_root=paths.output_root,
             )
         if dialogue_run:
             if "synthesis_identity" not in state:
@@ -1599,10 +1683,17 @@ def _generate_step(
 
         recovery = recoverable_attempts.get(chunk.number)
         if recovery is not None:
-            logger.event("info", "paid_media_recovery", chunk=chunk.number, id=chunk.id)
+            recovery_event = (
+                "paid_raw_recovery" if recovery.get("kind") == "raw" else "paid_media_recovery"
+            )
+            logger.event("info", recovery_event, chunk=chunk.number, id=chunk.id)
 
         def synthesize_current_chunk():
             if recovery is not None:
+                if recovery.get("kind") == "raw":
+                    # The paid bytes are already on disk, so this rebuilds the
+                    # chunk with no provider request at all.
+                    return _raw_recovery_result(args, chunk, paths.output_root, recovery)
                 # The paid submit for this chunk already happened, so only GET
                 # calls may finish it; no POST is sent a second time.
                 return provider.recover_media_task(recovery["remote_task_id"], chunk.text, chunk.id)
@@ -1669,10 +1760,36 @@ def _generate_step(
             id=chunk.id,
             generation_id=result.generation_id,
         )
+        if paid_submit:
+            try:
+                _persist_paid_raw_audio(
+                    result,
+                    state=state,
+                    state_path=state_path,
+                    paths=paths,
+                    chunk=chunk,
+                    logger=logger,
+                )
+            except Exception as e:
+                # The paid bytes could not be persisted, so the outcome stays
+                # unconfirmed and no second POST may be sent; the marker is kept
+                # as evidence and the error is reported honestly.
+                record_chunk_attempt_outcome(state, status=ATTEMPT_OUTCOME_UNKNOWN)
+                append_error(state, chunk_id=chunk.id, message=str(e))
+                atomic_write_json(state_path, state)
+                logger.event(
+                    "error", "chunk_raw_save_failed", chunk=chunk.number, id=chunk.id, error=str(e)
+                )
+                _emit_json_event(
+                    args, "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e)
+                )
+                fail(f"Failed to save raw paid audio {chunk.id}: {e}", _EXIT_OUTPUT)
         try:
             write_audio_as_mp3(ffmpeg_path, result.audio_bytes, result.audio_format, output_path)
         except Exception as e:
-            if paid_submit:
+            if paid_submit and pending_raw_recovery(state) is None:
+                # Without a saved raw receipt the paid response is lost, so the
+                # attempt is a definite failure; with one it stays recoverable.
                 record_chunk_attempt_outcome(state, status=ATTEMPT_FAILED)
             append_error(state, chunk_id=chunk.id, message=str(e))
             atomic_write_json(state_path, state)
@@ -1688,7 +1805,7 @@ def _generate_step(
                 trim_final_silence(ffmpeg_path, ffprobe_path, output_path)
                 logger.event("info", "chunk_trimmed", chunk=chunk.number, id=chunk.id)
             except Exception as e:
-                if paid_submit:
+                if paid_submit and pending_raw_recovery(state) is None:
                     record_chunk_attempt_outcome(state, status=ATTEMPT_FAILED)
                 append_error(state, chunk_id=chunk.id, message=str(e))
                 atomic_write_json(state_path, state)
@@ -1704,9 +1821,9 @@ def _generate_step(
 
         direct_cost_kwargs = _direct_cost_kwargs(args.provider, result)
         if not direct_cost_kwargs and recovery is not None:
-            # A GET-only recovery can see a completion payload without usage, so
+            # A recovered attempt can see a completion payload without usage, so
             # the exact cost stored before the failed download stays observed.
-            direct_cost_kwargs = _recovered_media_cost_kwargs(recovery)
+            direct_cost_kwargs = _recovered_attempt_cost_kwargs(recovery)
         artifact = ChunkArtifact(
             number=chunk.number,
             id=chunk.id,
@@ -2417,16 +2534,22 @@ def status_cmd(args: argparse.Namespace) -> None:
         can_resume = False
         resume_block_reason = _RUN_STATE_UNREADABLE_RESUME_BLOCK_REASON
     elif unconfirmed_attempt(state) is not None:
-        # A stored paid media id resumes with GET calls only, but only when every
-        # earlier chunk is genuinely finished: state-completed and still on disk.
-        # A chunk whose MP3 is missing is regenerated, and that paid submit would
-        # collide with the stored id, so status reports the same block --resume
-        # would hit instead of promising a resume.
-        recovery = _known_media_recovery(state)
-        if recovery is None or not all(
-            number in completed and (chunks_dir / f"chunk_{number:02d}.mp3").exists()
-            for number in range(1, recovery["number"])
-        ):
+        # A marker holding saved raw audio or a stored paid media id resumes
+        # without a new submit, but only when every earlier chunk is genuinely
+        # finished: state-completed and still on disk. A chunk whose MP3 is
+        # missing is regenerated, and that paid submit would collide with the
+        # stored attempt, so status reports the same block --resume would hit
+        # instead of promising a resume.
+        raw_recovery = _known_raw_recovery(state, run_dir, chunks_dir)
+        media_recovery = _known_media_recovery(state)
+        prior_ids = _state_completed_chunk_ids(state)
+        raw_ready = raw_recovery is not None and _preceding_chunks_ready(
+            prior_ids, chunks_dir, completed, raw_recovery["number"]
+        )
+        media_ready = media_recovery is not None and _preceding_chunks_ready(
+            prior_ids, chunks_dir, completed, media_recovery["number"]
+        )
+        if not raw_ready and not media_ready:
             can_resume = False
             resume_block_reason = _PAID_SUBMIT_RESUME_BLOCK_REASON
     data = {
@@ -3118,6 +3241,145 @@ def _known_media_recovery(state: dict[str, Any] | None) -> dict[str, Any] | None
     return recovery
 
 
+def _preceding_chunks_ready(
+    prior_ids: dict[int, str], chunks_dir: Path, completed: set[int], number: int
+) -> bool:
+    """Whether every earlier chunk is state-completed with its MP3 still on disk.
+
+    A missing earlier MP3 would be regenerated into a new paid submit, which
+    must not collide with a stored paid attempt, so recovery is refused until
+    the run is genuinely contiguous up to this chunk. The file name follows the
+    chunk id, which is ``chunk_NN`` for narration and ``turn_NNNN`` for dialogue.
+    """
+    for earlier in range(1, number):
+        if earlier not in completed:
+            return False
+        chunk_id = prior_ids.get(earlier)
+        if not isinstance(chunk_id, str) or not (chunks_dir / f"{chunk_id}.mp3").exists():
+            return False
+    return True
+
+
+def _state_completed_chunk_ids(state: dict[str, Any] | None) -> dict[int, str]:
+    """Map completed state-chunk numbers to their stored ids for resume checks."""
+    ids: dict[int, str] = {}
+    if not isinstance(state, dict):
+        return ids
+    for entry in state.get("chunks", []):
+        if not isinstance(entry, dict) or entry.get("status") != "completed":
+            continue
+        number = _state_entry_number(entry)
+        chunk_id = entry.get("id")
+        if number is not None and isinstance(chunk_id, str):
+            ids[number] = chunk_id
+    return ids
+
+
+def _known_raw_recovery(
+    state: dict[str, Any] | None, run_root: Path, chunks_dir: Path
+) -> dict[str, Any] | None:
+    """Return the bounded raw receipt of a saved paid audio attempt, if usable.
+
+    Raw recovery applies to every paid provider: the bytes were saved before any
+    conversion, so a resume rebuilds the chunk locally with no POST and no GET.
+    A marker next to a completed entry is stale evidence, and a missing or
+    digest-mismatched raw file fails closed so the caller keeps the documented
+    paid-submit block instead of resubmitting.
+    """
+    if not isinstance(state, dict) or state.get("provider") not in _PAID_SUBMIT_TTS_PROVIDERS:
+        return None
+    recovery = pending_raw_recovery(state)
+    if recovery is None or recovery["number"] in completed_numbers(state):
+        return None
+    raw_path = run_root / recovery["raw_path"]
+    if not raw_path.is_file() or _sha256_file(raw_path) != recovery["raw_sha256"]:
+        return None
+    return recovery
+
+
+def _recoverable_raw_attempts(
+    state: dict[str, Any] | None,
+    *,
+    provider: str,
+    model: str,
+    voice: str | None,
+    chunks: list[ScriptChunk],
+    chunks_dir: Path,
+    run_root: Path,
+) -> dict[int, dict[str, Any]]:
+    """Map chunk number to the saved raw audio this exact command may rebuild.
+
+    The raw bytes count only while the whole identity still matches — same
+    provider, model, voice, and script — the receipt is bound to one of that
+    script's chunks, the file exists with the recorded digest, and every earlier
+    chunk is finished. Every other marker keeps the documented block.
+    """
+    if provider not in _PAID_SUBMIT_TTS_PROVIDERS:
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    if state.get("provider") != provider or state.get("model") != model:
+        return {}
+    if state.get("voice") != voice:
+        return {}
+    if state.get("script_hash") != script_hash(chunks):
+        return {}
+    recovery = _known_raw_recovery(state, run_root, chunks_dir)
+    if recovery is None:
+        return {}
+    completed = completed_numbers(state)
+    prior_ids = {chunk.number: chunk.id for chunk in chunks}
+    for chunk in chunks:
+        if chunk.number in completed:
+            continue
+        if chunk.id == recovery["id"] and chunk.number == recovery["number"]:
+            if not _preceding_chunks_ready(prior_ids, chunks_dir, completed, chunk.number):
+                return {}
+            return {chunk.number: {**recovery, "kind": "raw"}}
+        # The stored attempt belongs to a later chunk while this one is still
+        # unfinished, so it is not the attempt that was in flight.
+        return {}
+    return {}
+
+
+def _recoverable_paid_attempts(
+    state: dict[str, Any] | None,
+    *,
+    provider: str,
+    model: str,
+    voice: str | None,
+    chunks: list[ScriptChunk],
+    chunks_dir: Path,
+    run_root: Path,
+) -> dict[int, dict[str, Any]]:
+    """Map chunk number to the paid attempt this exact command may recover.
+
+    Saved raw audio takes precedence over a known media task id: it needs no
+    provider request at all, so a chunk that somehow holds both is rebuilt
+    locally. Every other marker keeps the documented PAID_SUBMIT_UNCONFIRMED
+    block.
+    """
+    raw = _recoverable_raw_attempts(
+        state,
+        provider=provider,
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+        run_root=run_root,
+    )
+    if raw:
+        return raw
+    return _recoverable_media_attempts(
+        state,
+        provider=provider,
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+    )
+
+
 def _recoverable_media_attempts(
     state: dict[str, Any] | None,
     *,
@@ -3148,18 +3410,16 @@ def _recoverable_media_attempts(
     if recovery is None:
         return {}
     completed = completed_numbers(state)
+    prior_ids = {chunk.number: chunk.id for chunk in chunks}
     for chunk in chunks:
         if chunk.number in completed:
             continue
         if chunk.id == recovery["id"] and chunk.number == recovery["number"]:
             # A missing earlier MP3 must be regenerated first; that would
             # overwrite this paid marker, so block before key/provider work.
-            if not all(
-                (chunks_dir / f"chunk_{number:02d}.mp3").exists()
-                for number in range(1, chunk.number)
-            ):
+            if not _preceding_chunks_ready(prior_ids, chunks_dir, completed, chunk.number):
                 return {}
-            return {chunk.number: recovery}
+            return {chunk.number: {**recovery, "kind": "media"}}
         # The stored attempt belongs to a later chunk while this one is still
         # unfinished, so it is not the attempt that was in flight. Keeping the
         # documented block is safer than overwriting a known paid id.
@@ -3607,12 +3867,12 @@ def _polza_direct_cost_kwargs(cost: float, cost_exact: str | None) -> dict:
     }
 
 
-def _recovered_media_cost_kwargs(recovery: dict[str, Any]) -> dict:
-    """Reuse the exact cost the accepted paid media task already reported.
+def _recovered_attempt_cost_kwargs(recovery: dict[str, Any]) -> dict:
+    """Reuse the exact cost the recovered paid attempt already reported.
 
-    The GET-only recovery can read a completion payload without usage, so the
-    bounded cost stored in the attempt marker before the failed download stays
-    the observed amount for the recovered chunk.
+    A recovered chunk (a saved raw file or a GET-only media task) can read a
+    payload without usage, so the bounded cost stored in the attempt marker
+    before the recovery stays the observed amount for this chunk.
     """
     cost = recovery.get("cost")
     if isinstance(cost, bool) or not isinstance(cost, (int, float)):

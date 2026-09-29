@@ -305,6 +305,25 @@ def _raw_json_response(body: str, status_code: int = 200) -> requests.Response:
     return response
 
 
+def _wav_bytes() -> bytes:
+    """A minimal valid 44-byte PCM RIFF/WAVE header with no samples."""
+    return (
+        b"RIFF"
+        + (36).to_bytes(4, "little")
+        + b"WAVE"
+        + b"fmt "
+        + (16).to_bytes(4, "little")
+        + (1).to_bytes(2, "little")
+        + (1).to_bytes(2, "little")
+        + (24000).to_bytes(4, "little")
+        + (48000).to_bytes(4, "little")
+        + (2).to_bytes(2, "little")
+        + (16).to_bytes(2, "little")
+        + b"data"
+        + (0).to_bytes(4, "little")
+    )
+
+
 def _polza_chat_audio_args(tmp_path, run_id, resume):
     args = make_args(tmp_path, run_id=run_id, resume=resume)
     args.provider = "polza-chat-audio"
@@ -1397,8 +1416,16 @@ def test_non_media_model_fake_id_blocks_resume_and_status(tmp_path, monkeypatch,
     assert data["resume_block_reason"] == "paid_submit_unconfirmed"
 
 
-def test_paid_chunk_write_failure_blocks_resubmit(tmp_path, monkeypatch):
-    """An accepted paid response that cannot be saved is not paid for twice."""
+def test_paid_chunk_write_failure_recovers_saved_raw_without_resubmit(tmp_path, monkeypatch):
+    """An accepted paid response that cannot be converted is rebuilt from saved raw.
+
+    The raw bytes and their bounded receipt are persisted before FFmpeg, so a
+    failed conversion leaves a recoverable attempt instead of one that blocks a
+    resume. The resume rebuilds the chunk from those exact bytes with no provider
+    call, and the raw file stays as the rebuild source.
+    """
+    import hashlib
+
     import voiceover_pipeline.cli as cli
     from voiceover_pipeline.artifacts import build_run_paths
     from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
@@ -1406,10 +1433,15 @@ def test_paid_chunk_write_failure_blocks_resubmit(tmp_path, monkeypatch):
     patch_generation_io(monkeypatch)
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
 
-    def failing_write(_ffmpeg, _audio, _fmt, _path):
-        raise OSError("disk full")
+    write_calls = {"count": 0}
 
-    monkeypatch.setattr(cli, "write_audio_as_mp3", failing_write)
+    def flaky_write(_ffmpeg, _audio, _fmt, path):
+        write_calls["count"] += 1
+        if write_calls["count"] == 1:
+            raise OSError("disk full")
+        path.write_bytes(b"mp3")
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
 
     args = _paid_submit_args(tmp_path, "paid-write-failure")
     paths = build_run_paths(args.output_dir, args.model, args.run_id)
@@ -1425,10 +1457,358 @@ def test_paid_chunk_write_failure_blocks_resubmit(tmp_path, monkeypatch):
     assert error.value.code == 50
     assert provider.calls == ["chunk_01"]
     state_path = paths.output_root / "run_state.json"
-    state = json.loads(state_path.read_text(encoding="utf-8"))
-    assert state["pending_attempt"]["status"] == "failed"
+    marker = json.loads(state_path.read_text(encoding="utf-8"))["pending_attempt"]
+    assert marker["status"] == "raw_saved"
+    # The raw bytes and receipt were persisted before the conversion failed.
+    raw_path = paths.output_root / "raw" / "chunk_01.mp3"
+    assert raw_path.read_bytes() == b"audio"
+    assert marker["raw"] == {
+        "format": "mp3",
+        "path": "raw/chunk_01.mp3",
+        "sha256": hashlib.sha256(b"audio").hexdigest(),
+        "generation_id": "gen-chunk_01",
+    }
+    assert "disk full" not in json.dumps(marker)
 
+    # The resume rebuilds the chunk from saved raw; no provider call is made.
     resume_args = _paid_submit_args(tmp_path, "paid-write-failure", resume=True)
+    resumed_provider = FakeProvider()
+
+    with pytest.raises(SystemExit) as resume_exit:
+        cli._generate_step(
+            resume_args,
+            resumed_provider,
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert resume_exit.value.code == 0
+    assert resumed_provider.calls == []
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "pending_attempt" not in resumed
+    assert resumed["chunks"][0]["generation_id"] == "gen-chunk_01"
+    # The paid raw file is a rebuild source, not a disposable cache.
+    assert raw_path.read_bytes() == b"audio"
+
+
+def test_paid_media_ffmpeg_failure_resumes_from_raw_without_any_provider_call(
+    tmp_path, monkeypatch
+):
+    """A completed paid media download survives an FFmpeg failure without a new submit.
+
+    The signed-URL download succeeds and the exact cost is already in the marker;
+    the raw MP3 is saved before conversion, so the failed conversion leaves a
+    recoverable attempt. The resume rebuilds from raw with zero POST and zero
+    provider GET, and the exact cost stays on the saved chunk.
+    """
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.providers.polza_tts as polza_tts
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    posts: list[str] = []
+    get_urls: list[str] = []
+    signed_url = "https://cdn.example.com/paid.mp3?token=sk-live-secret-12345"
+
+    def submit(url, **_kwargs):
+        posts.append(url)
+        return _raw_json_response('{"id": "task-1", "status": "pending"}')
+
+    def get(url, **_kwargs):
+        get_urls.append(url)
+        if url.endswith("/media/task-1"):
+            return _raw_json_response(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "data": {"url": signed_url},
+                        "usage": {"cost_rub": 0.3},
+                    }
+                )
+            )
+        return _raw_json_response("recovered-audio")
+
+    monkeypatch.setattr(polza_tts.requests, "post", submit)
+    monkeypatch.setattr(polza_tts.requests, "get", get)
+
+    write_calls = {"count": 0}
+
+    def flaky_write(_ffmpeg, _audio, _fmt, path):
+        write_calls["count"] += 1
+        if write_calls["count"] == 1:
+            raise OSError("ffmpeg exploded")
+        path.write_bytes(b"mp3")
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
+
+    args = _paid_submit_args(
+        tmp_path, "paid-media-raw", model="elevenlabs/text-to-speech-turbo-2-5", voice="Rachel"
+    )
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    with pytest.raises(cli.CliError, match="Failed to write chunk audio") as error:
+        cli._generate_step(
+            args,
+            PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert error.value.code == 50
+    assert posts == [f"{polza_tts.POLZA_BASE_URL}/media"]
+    state_path = paths.output_root / "run_state.json"
+    marker = json.loads(state_path.read_text(encoding="utf-8"))["pending_attempt"]
+    assert marker["status"] == "raw_saved"
+    assert marker["remote_task_id"] == "task-1"
+    assert marker["cost_exact"] == "0.3"
+    raw_path = paths.output_root / "raw" / "chunk_01.mp3"
+    assert raw_path.read_bytes() == b"recovered-audio"
+    assert signed_url not in state_path.read_text(encoding="utf-8")
+
+    posts_before = list(posts)
+    gets_before = list(get_urls)
+    resume_args = _paid_submit_args(
+        tmp_path, "paid-media-raw", resume=True, model=args.model, voice=args.voice
+    )
+
+    with pytest.raises(SystemExit) as resume_exit:
+        cli._generate_step(
+            resume_args,
+            PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert resume_exit.value.code == 0
+    # The resume used the saved raw bytes: no new POST and no provider GET.
+    assert posts == posts_before
+    assert get_urls == gets_before
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "pending_attempt" not in resumed
+    assert resumed["chunks"][0]["cost_exact"] == "0.3"
+    assert resumed["chunks"][0]["cost_rub_exact"] == "0.3"
+    assert raw_path.read_bytes() == b"recovered-audio"
+
+
+def test_audio_speech_wav_response_is_receipted_and_converted_as_wav(tmp_path, monkeypatch):
+    """A real RIFF/WAVE response without a content type is receipted and converted as WAV.
+
+    The synchronous ``/audio/speech`` route may omit ``contentType`` while still
+    returning real WAV bytes. The raw receipt must record WAV, and the conversion
+    must decode the container through FFmpeg instead of fast-copying it into the
+    ``.mp3`` output or piping it through the raw s16le demuxer.
+    """
+    import base64
+    import subprocess as subprocess_module
+    from pathlib import Path
+
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.media as media
+    import voiceover_pipeline.providers.polza_tts as polza_tts
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    # Use the real conversion so the RIFF/WAVE routing is exercised end to end.
+    monkeypatch.setattr(cli, "write_audio_as_mp3", media.write_audio_as_mp3)
+    ffmpeg_calls: list[list[str]] = []
+
+    class _FakeMediaSubprocess:
+        PIPE = subprocess_module.PIPE
+
+        @staticmethod
+        def run(command, **_kwargs):
+            ffmpeg_calls.append(list(command))
+            # Mimic ffmpeg writing the requested output file.
+            Path(command[-1]).write_bytes(b"mp3")
+            return subprocess_module.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    # Scope the fake to media so unrelated subprocess callers keep working.
+    monkeypatch.setattr(media, "subprocess", _FakeMediaSubprocess())
+
+    wav_bytes = _wav_bytes()
+    body = json.dumps({"audio": base64.b64encode(wav_bytes).decode(), "usage": {"cost_rub": 0.3}})
+    monkeypatch.setattr(polza_tts.requests, "post", lambda url, **_kwargs: _raw_json_response(body))
+
+    args = _paid_submit_args(tmp_path, "paid-audio-speech-wav")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+    provider = PolzaTTSProvider(
+        api_key="sk-test", model=args.model, voice=args.voice, response_format="mp3"
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "sk-test", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    # The receipt path follows the actual container, not the requested format.
+    assert (paths.output_root / "raw" / "chunk_01.wav").read_bytes() == wav_bytes
+    assert not (paths.output_root / "raw" / "chunk_01.mp3").exists()
+    assert ffmpeg_calls
+    assert ffmpeg_calls[0][ffmpeg_calls[0].index("-i") + 1].endswith(".wav")
+    assert all("s16le" not in call for call in ffmpeg_calls)
+    # The ``.mp3`` output is the converted result, never the raw WAV bytes.
+    assert (paths.chunks_dir / "chunk_01.mp3").read_bytes() == b"mp3"
+
+
+def test_audio_speech_direct_cost_survives_ffmpeg_failure_and_raw_resume(tmp_path, monkeypatch):
+    """The direct usage cost is stored with the raw receipt, not after conversion.
+
+    ``/audio/speech`` reports its billed amount only in the synchronous response.
+    It must join the same atomic marker write as the raw receipt so a later FFmpeg
+    failure cannot lose it: the raw-only resume keeps the exact cost on the
+    completed chunk with no new POST.
+    """
+    import base64
+
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.providers.polza_tts as polza_tts
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    posts: list[str] = []
+    body = json.dumps(
+        {
+            "audio": base64.b64encode(b"paid-mp3").decode(),
+            "contentType": "audio/mpeg",
+            "usage": {"cost_rub": 0.3},
+        }
+    )
+
+    def post(url, **_kwargs):
+        posts.append(url)
+        return _raw_json_response(body)
+
+    monkeypatch.setattr(polza_tts.requests, "post", post)
+
+    write_calls = {"count": 0}
+
+    def flaky_write(_ffmpeg, _audio, _fmt, path):
+        write_calls["count"] += 1
+        if write_calls["count"] == 1:
+            raise OSError("ffmpeg exploded")
+        path.write_bytes(b"mp3")
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
+
+    args = _paid_submit_args(tmp_path, "paid-audio-speech-cost")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    with pytest.raises(cli.CliError, match="Failed to write chunk audio") as error:
+        cli._generate_step(
+            args,
+            PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert error.value.code == 50
+    assert posts == [f"{polza_tts.POLZA_BASE_URL}/audio/speech"]
+    state_path = paths.output_root / "run_state.json"
+    marker = json.loads(state_path.read_text(encoding="utf-8"))["pending_attempt"]
+    assert marker["status"] == "raw_saved"
+    # The direct usage cost landed in the same atomic write as the raw receipt.
+    assert marker["cost"] == 0.3
+    assert marker["cost_exact"] == "0.3"
+    assert (paths.output_root / "raw" / "chunk_01.mp3").read_bytes() == b"paid-mp3"
+
+    resume_args = _paid_submit_args(tmp_path, "paid-audio-speech-cost", resume=True)
+
+    with pytest.raises(SystemExit) as resume_exit:
+        cli._generate_step(
+            resume_args,
+            PolzaTTSProvider(api_key="sk-test", model=resume_args.model, voice=resume_args.voice),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert resume_exit.value.code == 0
+    # The raw-only recovery sent no second POST.
+    assert posts == [f"{polza_tts.POLZA_BASE_URL}/audio/speech"]
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "pending_attempt" not in resumed
+    assert resumed["chunks"][0]["cost_exact"] == "0.3"
+    assert resumed["chunks"][0]["cost_rub"] == 0.3
+
+
+def test_corrupt_saved_raw_receipt_blocks_resume_instead_of_resubmitting(tmp_path, monkeypatch):
+    """A saved raw file whose digest no longer matches fails closed.
+
+    The receipt is evidence that a paid response exists, so a corrupt or replaced
+    file must block the run rather than be treated as a fresh submit.
+    """
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    def failing_write(_ffmpeg, _audio, _fmt, _path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", failing_write)
+
+    args = _paid_submit_args(tmp_path, "paid-corrupt-raw")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+    provider = FakeProvider()
+
+    with pytest.raises(cli.CliError, match="Failed to write chunk audio"):
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "sk-test", None, paths, None, "auto"
+        )
+    assert provider.calls == ["chunk_01"]
+
+    # The paid raw file is replaced after the receipt was recorded.
+    (paths.output_root / "raw" / "chunk_01.mp3").write_bytes(b"replaced")
+
+    resume_args = _paid_submit_args(tmp_path, "paid-corrupt-raw", resume=True)
     resumed_provider = FakeProvider()
 
     with pytest.raises(cli.CliError, match="unconfirmed paid submit") as resume_error:
@@ -2735,6 +3115,102 @@ def test_pending_media_recovery_requires_bound_chunk_and_opaque_id():
     # The id must be the generated form for its own number to be recoverable.
     mismatched_form = {"pending_attempt": {**marker, "id": "chunk_07", "number": 1}}
     assert pending_media_recovery(mismatched_form) is None
+
+
+def test_pending_raw_recovery_bounds_path_format_and_digest():
+    """Only a bounded raw receipt can be reported, and it never echoes a URL."""
+    from voiceover_pipeline.run_state import (
+        begin_chunk_attempt,
+        pending_raw_recovery,
+        record_raw_audio_saved,
+    )
+
+    state: dict = {}
+    begin_chunk_attempt(state, chunk_id="chunk_01", number=1)
+    assert pending_raw_recovery(state) is None
+    digest = "a" * 64
+    record_raw_audio_saved(
+        state,
+        chunk_id="chunk_01",
+        number=1,
+        audio_format="mp3",
+        relative_path="raw/chunk_01.mp3",
+        sha256=digest,
+        generation_id="gen-1",
+    )
+    recovery = pending_raw_recovery(state)
+    assert recovery == {
+        "id": "chunk_01",
+        "number": 1,
+        "status": "raw_saved",
+        "raw_format": "mp3",
+        "raw_path": "raw/chunk_01.mp3",
+        "raw_sha256": digest,
+        "generation_id": "gen-1",
+        "cost": None,
+        "cost_exact": None,
+    }
+
+    with pytest.raises(ValueError, match="different chunk"):
+        record_raw_audio_saved(
+            state,
+            chunk_id="chunk_02",
+            number=2,
+            audio_format="mp3",
+            relative_path="raw/chunk_02.mp3",
+            sha256=digest,
+            generation_id=None,
+        )
+    with pytest.raises(ValueError, match="deterministic generated path"):
+        record_raw_audio_saved(
+            state,
+            chunk_id="chunk_01",
+            number=1,
+            audio_format="mp3",
+            relative_path="https://cdn.example.com/paid.mp3?token=sk-live-secret",
+            sha256=digest,
+            generation_id=None,
+        )
+    with pytest.raises(ValueError, match="sha256"):
+        record_raw_audio_saved(
+            state,
+            chunk_id="chunk_01",
+            number=1,
+            audio_format="mp3",
+            relative_path="raw/chunk_01.mp3",
+            sha256="not-a-digest",
+            generation_id=None,
+        )
+
+    # A tampered marker cannot point at an arbitrary path or echo a URL id.
+    url_path = {
+        "pending_attempt": {
+            "id": "chunk_01",
+            "number": 1,
+            "status": "raw_saved",
+            "raw": {
+                "format": "mp3",
+                "path": "https://cdn.example.com/paid.mp3?token=sk-live-secret",
+                "sha256": digest,
+                "generation_id": "gen-1",
+            },
+        }
+    }
+    assert pending_raw_recovery(url_path) is None
+    url_id = {
+        "pending_attempt": {
+            "id": "chunk_01",
+            "number": 1,
+            "status": "raw_saved",
+            "raw": {
+                "format": "mp3",
+                "path": "raw/chunk_01.mp3",
+                "sha256": digest,
+                "generation_id": "https://cdn.example.com/paid.mp3?token=sk-live-secret",
+            },
+        }
+    }
+    assert pending_raw_recovery(url_id)["generation_id"] is None
 
 
 def test_status_marks_unconfirmed_paid_submit_as_not_resumable(tmp_path):

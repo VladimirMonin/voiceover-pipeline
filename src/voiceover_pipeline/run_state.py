@@ -19,10 +19,16 @@ PENDING_ATTEMPT_FIELD = "pending_attempt"
 ATTEMPT_SUBMITTING = "submitting"
 ATTEMPT_OUTCOME_UNKNOWN = "outcome_unknown"
 ATTEMPT_FAILED = "failed"
+# The paid audio response was persisted to a run-local raw file before any
+# conversion, so a later process can rebuild the chunk from those exact bytes
+# without another paid submit.
+ATTEMPT_RAW_SAVED = "raw_saved"
 
 # Stages a writer of this module can store. Any other value is reported as
 # unknown instead of being echoed back into diagnostics.
-_PENDING_ATTEMPT_STATUSES = frozenset({ATTEMPT_SUBMITTING, ATTEMPT_OUTCOME_UNKNOWN, ATTEMPT_FAILED})
+_PENDING_ATTEMPT_STATUSES = frozenset(
+    {ATTEMPT_SUBMITTING, ATTEMPT_OUTCOME_UNKNOWN, ATTEMPT_FAILED, ATTEMPT_RAW_SAVED}
+)
 
 
 def utc_now() -> str:
@@ -187,6 +193,58 @@ def record_media_observed_cost(
     state["updated_at"] = utc_now()
 
 
+def record_raw_audio_saved(
+    state: dict[str, Any],
+    *,
+    chunk_id: str,
+    number: int,
+    audio_format: str,
+    relative_path: str,
+    sha256: str,
+    generation_id: str | None,
+) -> None:
+    """Store the run-local raw-audio receipt of an accepted paid response.
+
+    The audio bytes are already on disk; this records only the bounded format,
+    the deterministic generated path, the digest, and a bounded generation id in
+    the existing attempt marker, so a later process can rebuild the chunk from
+    the exact paid bytes without another submit. Request text, signed URLs, and
+    provider bodies are never stored. A generation id already on the marker
+    survives a later call that cannot supply one, and only the same chunk the
+    ``begin_chunk_attempt`` marker names may be bound.
+    """
+    marker = state.get(PENDING_ATTEMPT_FIELD)
+    if not isinstance(marker, dict):
+        raise ValueError("raw audio saved without a pending attempt marker")
+    if marker.get("id") != chunk_id or marker.get("number") != number:
+        raise ValueError("raw audio saved for a different chunk than the pending attempt")
+    bounded_format = _bounded_raw_format(audio_format)
+    if bounded_format is None:
+        raise ValueError("raw audio format is not a bounded supported format")
+    bounded_path = _bounded_raw_path(
+        relative_path, _bounded_chunk_id(chunk_id, _bounded_attempt_number(number)), bounded_format
+    )
+    if bounded_path is None:
+        raise ValueError("raw audio path is not the deterministic generated path")
+    bounded_sha = _bounded_sha256(sha256)
+    if bounded_sha is None:
+        raise ValueError("raw audio digest is not a sha256 hex value")
+    bounded_generation = _bounded_generation_id(generation_id)
+    if bounded_generation is None:
+        previous = marker.get("raw")
+        if isinstance(previous, dict):
+            bounded_generation = _bounded_generation_id(previous.get("generation_id"))
+    marker["raw"] = {
+        "format": bounded_format,
+        "path": bounded_path,
+        "sha256": bounded_sha,
+        "generation_id": bounded_generation,
+    }
+    marker["status"] = ATTEMPT_RAW_SAVED
+    marker["at"] = utc_now()
+    state["updated_at"] = utc_now()
+
+
 # Largest chunk or turn number a bounded marker may echo back. Chunks and dialogue
 # turns are numbered from 1, so a boolean, non-positive, or larger ``number`` was
 # not written by this repository and is reported as unknown instead of echoed.
@@ -273,6 +331,48 @@ def _bounded_media_task_id(value: Any) -> str | None:
     return None
 
 
+# A paid response's audio is written to a run-local ``raw/<chunk-id>.<ext>``
+# file before conversion. The stored format, path, digest, and generation id are
+# projected onto exact bounded forms on read, because ``run_state.json`` is
+# user-editable and must not be able to point a later process at an arbitrary
+# path or an unbounded provider value.
+_RAW_FILE_EXTENSIONS = {"mp3": "mp3", "wav": "wav", "pcm16": "pcm"}
+_RAW_SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+
+
+def _bounded_raw_format(value: Any) -> str | None:
+    """Keep only a supported raw-audio format."""
+    return value if isinstance(value, str) and value in _RAW_FILE_EXTENSIONS else None
+
+
+def _bounded_raw_path(value: Any, chunk_id: str | None, raw_format: str | None) -> str | None:
+    """Keep only the deterministic ``raw/<chunk-id>.<ext>`` path for this chunk."""
+    if chunk_id is None or raw_format is None or not isinstance(value, str):
+        return None
+    expected = f"raw/{chunk_id}.{_RAW_FILE_EXTENSIONS[raw_format]}"
+    return expected if value == expected else None
+
+
+def _bounded_sha256(value: Any) -> str | None:
+    """Keep only a lowercase sha256 hex digest."""
+    if isinstance(value, str) and _RAW_SHA256_PATTERN.fullmatch(value) is not None:
+        return value
+    return None
+
+
+def _bounded_generation_id(value: Any) -> str | None:
+    """Keep only a bounded opaque generation id, exactly like a media task id."""
+    return _bounded_media_task_id(value)
+
+
+def raw_audio_relative_path(chunk_id: str, audio_format: str) -> str:
+    """Return the deterministic run-local path for a paid raw audio file."""
+    bounded_format = _bounded_raw_format(audio_format)
+    if bounded_format is None:
+        raise ValueError(f"Unsupported raw audio format: {audio_format}")
+    return f"raw/{chunk_id}.{_RAW_FILE_EXTENSIONS[bounded_format]}"
+
+
 def _bounded_marker_cost(marker: dict[str, Any]) -> tuple[float | None, str | None]:
     """Project the marker's stored cost onto a finite number and exact string."""
     cost = marker.get("cost")
@@ -309,6 +409,46 @@ def pending_media_recovery(state: dict[str, Any] | None) -> dict[str, Any] | Non
         return None
     cost, cost_exact = _bounded_marker_cost(marker)
     return {**bounded_attempt, "remote_task_id": task_id, "cost": cost, "cost_exact": cost_exact}
+
+
+def pending_raw_recovery(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the bounded raw-audio receipt of the persisted paid attempt.
+
+    A paid response whose audio was saved before any conversion can be rebuilt
+    from those exact bytes with no provider request at all. Only a marker bound
+    to a generated chunk identity and holding a supported format, the
+    deterministic generated path, and a sha256 digest is usable; a marker holding
+    a URL, request text, or any other shape reports ``None`` so the caller keeps
+    failing closed. The returned mapping adds no unbounded provider value.
+    """
+    bounded_attempt = unconfirmed_attempt(state)
+    if (
+        bounded_attempt is None
+        or bounded_attempt["id"] is None
+        or bounded_attempt["number"] is None
+    ):
+        return None
+    marker = state[PENDING_ATTEMPT_FIELD] if isinstance(state, dict) else None
+    if not isinstance(marker, dict):
+        return None
+    raw = marker.get("raw")
+    if not isinstance(raw, dict):
+        return None
+    bounded_format = _bounded_raw_format(raw.get("format"))
+    bounded_path = _bounded_raw_path(raw.get("path"), bounded_attempt["id"], bounded_format)
+    bounded_sha = _bounded_sha256(raw.get("sha256"))
+    if bounded_format is None or bounded_path is None or bounded_sha is None:
+        return None
+    cost, cost_exact = _bounded_marker_cost(marker)
+    return {
+        **bounded_attempt,
+        "raw_format": bounded_format,
+        "raw_path": bounded_path,
+        "raw_sha256": bounded_sha,
+        "generation_id": _bounded_generation_id(raw.get("generation_id")),
+        "cost": cost,
+        "cost_exact": cost_exact,
+    }
 
 
 def _exact_cost_string(value: Any) -> str | None:

@@ -23,6 +23,56 @@ _MEDIA_POLL_MAX = 60
 # request, and a non-token id is never echoed into an error or report.
 _MEDIA_SAFE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
+# The OpenAI-style ``/audio/speech`` route returns base64 audio in JSON and names
+# its container through ``contentType``. Only documented audio MIME types map to
+# a raw format; anything else fails closed instead of being guessed as raw PCM.
+_POLZA_AUDIO_CONTENT_TYPES = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/pcm": "pcm16",
+}
+# ``audio/l16`` is intentionally absent: L16 is network byte order (big-endian)
+# while ``media.write_audio_as_mp3`` decodes ``pcm16`` as little-endian s16le, so
+# mapping it would byte-swap every sample. It stays unsupported until an explicit
+# correct endian/rate implementation exists.
+# Format used when the provider omits a content type: the one the caller asked
+# for in ``response_format`` is the only remaining evidence.
+_REQUESTED_AUDIO_FORMATS = {"mp3": "mp3", "wav": "wav", "pcm": "pcm16", "pcm16": "pcm16"}
+
+
+def _has_wav_header(audio_bytes: bytes) -> bool:
+    return len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE"
+
+
+def _audio_format_from_response(
+    content_type: object, audio_bytes: bytes, requested_format: str
+) -> str:
+    """Map the response container to a raw format, failing closed when unknown.
+
+    An unsupported reported MIME type fails closed, and a reported WAV without a
+    valid RIFF/WAVE header is rejected rather than stored. A real RIFF/WAVE
+    container then wins over a missing or incorrect declaration: the receipt and
+    the conversion step must see the actual format, so real WAV bytes are never
+    recorded as raw MP3/PCM.
+    """
+    base = str(content_type).split(";", 1)[0].strip().lower() if content_type else ""
+    if not base:
+        audio_format = _REQUESTED_AUDIO_FORMATS.get(requested_format)
+        if audio_format is None:
+            raise RuntimeError("Polza TTS returned audio without a content type.")
+    else:
+        audio_format = _POLZA_AUDIO_CONTENT_TYPES.get(base)
+        if audio_format is None:
+            raise RuntimeError(f"Polza TTS returned an unsupported audio content type: {base}.")
+        if audio_format == "wav" and not _has_wav_header(audio_bytes):
+            raise RuntimeError("Polza TTS reported WAV audio without a valid WAV header.")
+    if _has_wav_header(audio_bytes):
+        return "wav"
+    return audio_format
+
 
 def _safe_media_id(value: object) -> str | None:
     """Return a bounded opaque id, or None when the value is not one."""
@@ -98,7 +148,8 @@ class PolzaTTSProvider(TTSProvider):
             )
 
         audio_bytes = base64.b64decode(audio_b64)
-        content_type = resp_json.get("contentType", "audio/mpeg")
+        content_type = resp_json.get("contentType")
+        audio_format = _audio_format_from_response(content_type, audio_bytes, self.response_format)
         usage = resp_json.get("usage")
 
         generation_id = (
@@ -109,7 +160,7 @@ class PolzaTTSProvider(TTSProvider):
 
         return SynthesisResult(
             audio_bytes=audio_bytes,
-            audio_format="mp3" if "mpeg" in content_type else "pcm16",
+            audio_format=audio_format,
             transcript=text,
             generation_id=generation_id,
             client_path="requests",

@@ -26,22 +26,31 @@ def check_media_tools() -> tuple[str, str]:
     return ffmpeg_path, ffprobe_path
 
 
+def _has_wav_container(audio_bytes: bytes) -> bool:
+    """Whether the bytes carry a RIFF/WAVE container header."""
+    return len(audio_bytes) >= 12 and audio_bytes[:4] == b"RIFF" and audio_bytes[8:12] == b"WAVE"
+
+
 def write_audio_as_mp3(
     ffmpeg_path: str, audio_bytes: bytes, audio_format: str, output_path: Path
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if audio_format == "mp3":
-        output_path.write_bytes(audio_bytes)
-        return
-
-    if audio_format == "wav":
+    if _has_wav_container(audio_bytes) or audio_format == "wav":
+        # A real RIFF/WAVE container is decoded by ffmpeg even when a caller
+        # labelled the bytes as MP3 or raw PCM. It must never reach the MP3 fast
+        # copy below (which would store a WAV header in a ``.mp3``) or the s16le
+        # demuxer (which would reinterpret the header as samples).
         temp_wav = output_path.with_suffix(".temp.wav")
         temp_wav.write_bytes(audio_bytes)
         try:
             _wav_to_mp3(ffmpeg_path, temp_wav, output_path)
         finally:
             temp_wav.unlink(missing_ok=True)
+        return
+
+    if audio_format == "mp3":
+        output_path.write_bytes(audio_bytes)
         return
 
     if audio_format not in ("pcm16", "pcm"):
