@@ -112,7 +112,7 @@ from .pricing import (
     cost_from_generation,
     fetch_openrouter_generation_detail,
     fetch_openrouter_model_pricing,
-    fetch_polza_generation_costs,
+    fetch_polza_generation_detail,
     fetch_polza_model_pricing,
 )
 from .providers import (
@@ -3394,21 +3394,70 @@ def attach_costs(provider, api_key, model, run_started_at, chunks):
                 )
             )
         return enriched
-    generations: list[dict[str, Any] | None] = []
-    if provider in ("polza-chat-audio", "polza-tts"):
-        generations.extend(
-            fetch_polza_generation_costs(api_key, model, run_started_at, len(chunks))
-        )
-    else:
-        generations = []
+    if provider == "polza-tts":
+        # polza-tts generation ids are not comparable to /history/generations ids:
+        # they mix media submit/poll task ids and generic /audio/speech body ids,
+        # and a resumed ChunkArtifact can carry an old ambiguous id. A history
+        # lookup therefore cannot be bound to the chunk that produced it, so keep
+        # the direct cost (including zero) for provenance and never fetch here.
+        return chunks
+    if provider == "polza-chat-audio":
+        # chat-audio ids come exclusively from the response X-Generation-Id
+        # header, so the detail addressed by that exact id is the chunk's own
+        # generation. A detail without a matching explicit id, or one declaring a
+        # different model, is foreign: keep the chunk's existing direct cost
+        # untouched. A missing id, missing detail, or a payload without a cost
+        # likewise preserves the existing direct cost and generation id.
+        enriched = []
         for chunk in chunks:
-            detail = None
-            for _ in range(4):
-                detail = fetch_openrouter_generation_detail(api_key, chunk.generation_id)
-                if detail:
-                    break
-                time.sleep(3)
-            generations.append(detail)
+            generation = (
+                fetch_polza_generation_detail(api_key, chunk.generation_id)
+                if chunk.generation_id
+                else None
+            )
+            if generation is not None:
+                reported_id = generation.get("id")
+                reported_model = generation.get("model")
+                if (
+                    reported_id is None
+                    or str(reported_id) != chunk.generation_id
+                    or (reported_model is not None and reported_model != model)
+                ):
+                    generation = None
+            if generation is None:
+                enriched.append(chunk)
+                continue
+            cost, cost_exact, currency = cost_from_generation(provider, generation)
+            if cost is None:
+                enriched.append(chunk)
+                continue
+            enriched.append(
+                ChunkArtifact(
+                    **{
+                        **chunk.__dict__,
+                        "cost_rub": cost if currency == "RUB" else None,
+                        "cost_rub_exact": cost_exact if currency == "RUB" else None,
+                        "cost": cost,
+                        "cost_exact": cost_exact,
+                        "cost_currency": currency,
+                        "usage": generation.get("usage"),
+                        "generation_time_ms": generation.get("generationTimeMs")
+                        or generation.get("generation_time"),
+                        "generated_at": generation.get("createdAt") or generation.get("created_at"),
+                        "generation_detail_source": generation_source(provider),
+                    }
+                )
+            )
+        return enriched
+    generations: list[dict[str, Any] | None] = []
+    for chunk in chunks:
+        detail = None
+        for _ in range(4):
+            detail = fetch_openrouter_generation_detail(api_key, chunk.generation_id)
+            if detail:
+                break
+            time.sleep(3)
+        generations.append(detail)
     if len(generations) != len(chunks):
         return chunks
     enriched = []
@@ -3453,7 +3502,7 @@ def summarize_costs(provider: str, chunks: list[ChunkArtifact]) -> tuple:
 def generation_source(provider: str) -> str:
     return {
         "polza-chat-audio": "Polza GET /api/v1/history/generations/{id}",
-        "polza-tts": "Polza API usage.cost_rub or GET /api/v1/history/generations/{id}",
+        "polza-tts": "Polza API usage.cost_rub (direct)",
         "openrouter-tts": "OpenRouter GET /api/v1/generation?id=...",
         "qwen-local": "qwen-local (free)",
         "omnivoice-local": "omnivoice-local (local model; no billing request)",

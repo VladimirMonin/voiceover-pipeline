@@ -1,14 +1,24 @@
-"""Regression tests for observed-cost precedence in ``pricing.cost_from_generation``.
+"""Regression tests for observed-cost handling in the pricing pipeline.
 
-An observed zero cost (``0``/``0.0``/``Decimal("0")``) is a real billing fact, not a
-missing value: it must win over any fallback field. These tests cover the field-level
-selection only; they do not claim the whole cost pipeline is Decimal-based.
+``cost_from_generation`` treats an observed zero cost (``0``/``0.0``/``Decimal("0")``)
+as a real billing fact, not a missing value, so it wins over any fallback field.
+``cli.attach_costs`` may bind a Polza cost by the chunk's own known remote
+generation id only for ``polza-chat-audio``, whose id comes exclusively from the
+response ``X-Generation-Id`` header. ``polza-tts`` ids mix media task ids and
+generic ``/audio/speech`` body ids with resumed chunk artifacts, so they are not
+comparable to history ids and must never trigger a history lookup; those chunks
+keep their direct cost and generation id untouched. No lookup may erase an
+existing direct cost. These tests cover the field-level selection and the Polza
+id boundary only; the surrounding pipeline still uses floats and is out of scope
+here.
 """
 
 from decimal import Decimal
 
 import pytest
 
+from voiceover_pipeline import cli
+from voiceover_pipeline.models import ChunkArtifact
 from voiceover_pipeline.pricing import cost_from_generation
 
 
@@ -156,3 +166,242 @@ class TestDecimalObservedCost:
         assert cost == 0.3
         assert cost_exact == "0.3"
         assert currency == "RUB"
+
+
+def _chunk(
+    number: int,
+    generation_id: str | None,
+    *,
+    cost: float | None = None,
+    cost_exact: str | None = None,
+    currency: str | None = None,
+) -> ChunkArtifact:
+    return ChunkArtifact(
+        number=number,
+        id=f"chunk-{number}",
+        file=f"chunk-{number}.mp3",
+        duration_ms=1000,
+        duration_sec=1.0,
+        start_ms=0,
+        end_ms=1000,
+        text_characters=10,
+        transcript="text",
+        client_path="requests",
+        generation_id=generation_id,
+        cost=cost,
+        cost_exact=cost_exact,
+        cost_currency=currency,
+        cost_rub=cost if currency == "RUB" else None,
+        cost_rub_exact=cost_exact if currency == "RUB" else None,
+    )
+
+
+class TestAttachCostsPolzaGenerationIdBoundary:
+    """Only chat-audio may bind a cost by its own remote generation id.
+
+    chat-audio ids come exclusively from the response ``X-Generation-Id`` header,
+    so a detail addressed by that exact id is provably the chunk's own generation.
+    polza-tts ids mix media task ids and generic ``/audio/speech`` body ids with
+    resumed chunk artifacts, so no history lookup can be trusted to bind them; the
+    unrelated ``B1``/``B2`` run must never supply costs for ``A1``/``A2``.
+    """
+
+    def test_chat_audio_own_generation_ids_map_per_chunk(self, monkeypatch):
+        chunks = [_chunk(1, "A1"), _chunk(2, "A2")]
+        requested: list[str | None] = []
+        details = {
+            "A1": {"id": "A1", "clientCost": 0.11},
+            "A2": {"id": "A2", "clientCost": 0.22},
+        }
+
+        def fake_detail(api_key, generation_id):
+            requested.append(generation_id)
+            return details.get(generation_id)
+
+        monkeypatch.setattr(cli, "fetch_polza_generation_detail", fake_detail)
+        monkeypatch.setattr(
+            cli,
+            "fetch_polza_generation_costs",
+            lambda *args, **kwargs: [
+                {"id": "B2", "clientCost": 6.0},
+                {"id": "B1", "clientCost": 5.0},
+            ],
+            raising=False,
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert requested == ["A1", "A2"]
+        assert [chunk.generation_id for chunk in result] == ["A1", "A2"]
+        assert [chunk.cost for chunk in result] == [0.11, 0.22]
+        assert [chunk.cost_exact for chunk in result] == ["0.11", "0.22"]
+        assert [chunk.cost_currency for chunk in result] == ["RUB", "RUB"]
+
+    @pytest.mark.parametrize(
+        "generation_id",
+        [
+            "media-task-elevenlabs",
+            "speech-openai-body-id",
+            "legacy-resumed-body-id",
+        ],
+    )
+    def test_polza_tts_never_looks_up_history(self, monkeypatch, generation_id):
+        chunks = [
+            _chunk(1, generation_id, cost=0.75, cost_exact="0.75", currency="RUB"),
+            _chunk(2, generation_id, cost=0.0, cost_exact="0", currency="RUB"),
+            _chunk(3, generation_id),
+        ]
+        calls: list[str | None] = []
+
+        def fake_detail(api_key, requested_id):
+            calls.append(requested_id)
+            return {"id": requested_id, "clientCost": 9.0}
+
+        monkeypatch.setattr(cli, "fetch_polza_generation_detail", fake_detail)
+
+        result = cli.attach_costs("polza-tts", "test-key", "polza/model", None, chunks)
+
+        assert calls == []
+        assert [chunk.generation_id for chunk in result] == [generation_id] * 3
+        assert [chunk.cost for chunk in result] == [0.75, 0.0, None]
+        assert [chunk.cost_exact for chunk in result] == ["0.75", "0", None]
+        assert [chunk.cost_currency for chunk in result] == ["RUB", "RUB", None]
+
+    def test_chat_audio_missing_generation_id_skips_lookup_and_preserves_direct_cost(
+        self, monkeypatch
+    ):
+        chunks = [_chunk(1, None, cost=0.5, cost_exact="0.5", currency="RUB")]
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            cli, "fetch_polza_generation_detail", lambda *args: calls.append(args) or None
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert calls == []
+        assert result[0].generation_id is None
+        assert result[0].cost == 0.5
+        assert result[0].cost_exact == "0.5"
+
+    @pytest.mark.parametrize("direct_cost", [0.5, None])
+    def test_chat_audio_missing_detail_preserves_existing_cost(self, monkeypatch, direct_cost):
+        chunks = [
+            _chunk(
+                1,
+                "A1",
+                cost=direct_cost,
+                cost_exact="0.5" if direct_cost is not None else None,
+                currency="RUB" if direct_cost is not None else None,
+            )
+        ]
+        monkeypatch.setattr(cli, "fetch_polza_generation_detail", lambda *args: None)
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert result[0].cost == direct_cost
+        assert result[0].generation_id == "A1"
+
+    def test_chat_audio_mismatched_declared_id_is_not_assigned(self, monkeypatch):
+        chunks = [_chunk(1, "A1", cost=0.5, cost_exact="0.5", currency="RUB")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_polza_generation_detail",
+            lambda *args: {"id": "B1", "clientCost": 9.0},
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert result[0].generation_id == "A1"
+        assert result[0].cost == 0.5
+        assert result[0].cost_exact == "0.5"
+
+    def test_chat_audio_mismatched_model_is_not_assigned(self, monkeypatch):
+        chunks = [_chunk(1, "A1", cost=0.5, cost_exact="0.5", currency="RUB")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_polza_generation_detail",
+            lambda *args: {"id": "A1", "model": "other/model", "clientCost": 9.0},
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert result[0].cost == 0.5
+        assert result[0].generation_id == "A1"
+
+    @pytest.mark.parametrize("direct_cost", [0.5, None])
+    def test_chat_audio_detail_without_id_is_not_assigned(self, monkeypatch, direct_cost):
+        chunks = [
+            _chunk(
+                1,
+                "A1",
+                cost=direct_cost,
+                cost_exact="0.5" if direct_cost is not None else None,
+                currency="RUB" if direct_cost is not None else None,
+            )
+        ]
+        monkeypatch.setattr(
+            cli, "fetch_polza_generation_detail", lambda *args: {"clientCost": 0.75}
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert result[0].cost == direct_cost
+        assert result[0].generation_id == "A1"
+
+    def test_chat_audio_zero_cost_with_matching_id_stays_zero(self, monkeypatch):
+        chunks = [_chunk(1, "A1")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_polza_generation_detail",
+            lambda *args: {"id": "A1", "clientCost": 0},
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert result[0].cost == 0.0
+        assert result[0].cost_exact == "0"
+        assert result[0].cost_currency == "RUB"
+
+    def test_chat_audio_detail_without_cost_does_not_erase_direct_cost(self, monkeypatch):
+        chunks = [_chunk(1, "A1", cost=0.5, cost_exact="0.5", currency="RUB")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_polza_generation_detail",
+            lambda *args: {"id": "A1", "usage": {"tokens": 3}},
+        )
+
+        result = cli.attach_costs("polza-chat-audio", "test-key", "polza/model", None, chunks)
+
+        assert result[0].cost == 0.5
+        assert result[0].cost_exact == "0.5"
+        assert result[0].cost_currency == "RUB"
+
+
+def test_openrouter_path_still_uses_per_chunk_generation_detail(monkeypatch):
+    chunks = [_chunk(1, "or-1")]
+    requested: list[str | None] = []
+    monkeypatch.setattr(
+        cli,
+        "fetch_openrouter_generation_detail",
+        lambda api_key, generation_id: requested.append(generation_id) or {"total_cost": 0.002},
+    )
+
+    result = cli.attach_costs("openrouter-tts", "test-key", "openrouter/model", None, chunks)
+
+    assert requested == ["or-1"]
+    assert result[0].cost == 0.002
+    assert result[0].cost_currency == "USD"
+
+
+def test_summarize_costs_reports_direct_polza_tts_source_without_history():
+    priced = [_chunk(1, "media-task-id", cost=0.0, cost_exact="0", currency="RUB")]
+
+    total, total_exact, currency, source = cli.summarize_costs("polza-tts", priced)
+
+    assert total == 0.0
+    assert total_exact == "0.0"
+    assert currency == "RUB"
+    assert source == "Polza API usage.cost_rub (direct)"
+
+    unknown = [_chunk(2, "media-task-id")]
+    assert cli.summarize_costs("polza-tts", unknown) == (None, None, None, None)

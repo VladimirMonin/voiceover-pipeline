@@ -178,4 +178,4 @@ Pricing snapshot от Polza (`GET /api/v1/models`):
 | `elevenlabs/text-to-speech-turbo-2-5` | — | — | 4500 ₽ |
 | `elevenlabs/text-to-speech-multilingual-v2` | — | — | 9000 ₽ |
 
-Точная стоимость берётся из `usage.cost_rub` в ответе API или из `GET /api/v1/history/generations/{id}` → `clientCost`.
+Стоимость чанка берётся из `usage.cost_rub` (при его отсутствии — `usage.cost`) в ответе API. History-lookup не выполняется: соответствие task id `/media` и id тела `/audio/speech` id генерации в истории не подтверждено. Если прямой стоимости нет, стоимость чанка неизвестна. Итоговая стоимость — сумма наблюдаемых значений чанков, а не отдельный точный пересчёт.

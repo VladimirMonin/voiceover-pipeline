@@ -157,7 +157,9 @@ ffmpeg -f concat -safe 0 -i список.txt -codec:a libmp3lame -b:a 128k full.
 
 **Polza:**
 - Снимок цен: `GET /api/v1/models`
-- Точная стоимость: `GET /api/v1/history/generations/{id}` → поле `clientCost` (RUB)
+- `polza-chat-audio`: стоимость чанка — `GET /api/v1/history/generations/{id}` → поле `clientCost` (RUB), только если `id` из заголовка `X-Generation-Id` совпадает с `id` в ответе detail.
+- `polza-tts`: стоимость чанка — `usage.cost_rub` (при его отсутствии — `usage.cost`) из ответа API. History-lookup не выполняется: для task id `/media` и id тела `/audio/speech` не подтверждено соответствие id генерации в истории. Без прямой стоимости чанка она остаётся неизвестной.
+- Итоговая стоимость — сумма наблюдаемых стоимостей чанков (числа с плавающей точкой), а не отдельно пересчитанная точная сумма.
 
 **OpenRouter:**
 - Снимок цен: `GET /api/v1/models?output_modalities=speech`
