@@ -890,3 +890,101 @@ class TestDirectCostProjectionService:
         recovered = costs.recovered_attempt_cost_kwargs({"cost": 0.5, "cost_exact": "0.5"})
         assert recovered["cost_exact"] == "0.5"
         assert recovered["generation_detail_source"] == "Polza API usage.cost_rub (direct)"
+
+
+class TestCostEnrichmentService:
+    """The extracted enrichment body keeps its id/model guards and injects lookups.
+
+    ``services.cost_enrichment.attach_costs`` owns the history lookup body but
+    receives both lookups explicitly, so ``cli.attach_costs`` can forward its
+    currently bound (and monkeypatched) callables without importing ``cli``.
+    """
+
+    def test_polza_chat_audio_binds_own_id_and_guards_id_and_model(self, monkeypatch):
+        from voiceover_pipeline.services import cost_enrichment
+
+        monkeypatch.setattr(cost_enrichment.time, "sleep", lambda _seconds: None)
+        chunks = [
+            _chunk(1, "A1"),
+            _chunk(2, "A2", cost=0.5, cost_exact="0.5", currency="RUB"),
+            _chunk(3, "A3", cost=0.5, cost_exact="0.5", currency="RUB"),
+            _chunk(4, "A4"),
+        ]
+        details = {
+            "A1": {"id": "A1", "model": "polza/model", "clientCost": 0},
+            "A2": {"id": "B2", "model": "polza/model", "clientCost": 9.0},
+            "A3": {"id": "A3", "model": "other/model", "clientCost": 9.0},
+            "A4": {"id": "A4", "model": "polza/model", "clientCost": "0.25"},
+        }
+        requested: list[str | None] = []
+
+        def fetch_polza_detail(api_key, generation_id):
+            requested.append(generation_id)
+            return details.get(generation_id)
+
+        result = cost_enrichment.attach_costs(
+            "polza-chat-audio",
+            "key",
+            "polza/model",
+            None,
+            chunks,
+            fetch_polza_detail=fetch_polza_detail,
+            fetch_openrouter_detail=lambda *_args: None,
+        )
+
+        assert requested == ["A1", "A2", "A3", "A4"]
+        assert [chunk.generation_id for chunk in result] == ["A1", "A2", "A3", "A4"]
+        # Zero clientCost is a real fact; a foreign id/model keeps the direct cost.
+        assert [chunk.cost for chunk in result] == [0.0, 0.5, 0.5, 0.25]
+        assert [chunk.cost_exact for chunk in result] == ["0", "0.5", "0.5", "0.25"]
+        assert [chunk.cost_currency for chunk in result] == ["RUB", "RUB", "RUB", "RUB"]
+        assert result[1].__dict__ == chunks[1].__dict__
+        assert result[2].__dict__ == chunks[2].__dict__
+
+    def test_openrouter_foreign_or_missing_detail_preserves_direct_cost(self, monkeypatch):
+        from voiceover_pipeline.services import cost_enrichment
+
+        monkeypatch.setattr(cost_enrichment.time, "sleep", lambda _seconds: None)
+        chunks = [
+            _chunk(1, "A1", cost=0.5, cost_exact="0.5", currency="USD"),
+            _chunk(2, "A2"),
+        ]
+        calls: list[str | None] = []
+
+        def fetch_openrouter_detail(api_key, generation_id):
+            calls.append(generation_id)
+            if generation_id == "A1":
+                return {"id": "B1", "total_cost": 9.0}
+            return None
+
+        result = cost_enrichment.attach_costs(
+            "openrouter-tts",
+            "key",
+            "openrouter/model",
+            None,
+            chunks,
+            fetch_polza_detail=lambda *_args: None,
+            fetch_openrouter_detail=fetch_openrouter_detail,
+        )
+
+        # A foreign declared id is not retried; a missing detail is polled four times.
+        assert calls == ["A1"] + ["A2"] * 4
+        assert result[0].__dict__ == chunks[0].__dict__
+        assert result[1].__dict__ == chunks[1].__dict__
+        assert result[0].cost == 0.5
+        assert result[0].cost_currency == "USD"
+
+    def test_cli_wrapper_forwards_currently_bound_lookups(self, monkeypatch):
+        chunks = [_chunk(1, "A1")]
+        seen: list[tuple[str, str | None]] = []
+
+        def fake_detail(api_key, generation_id):
+            seen.append((api_key, generation_id))
+            return {"id": "A1", "clientCost": "0.11"}
+
+        monkeypatch.setattr(cli, "fetch_polza_generation_detail", fake_detail)
+
+        result = cli.attach_costs("polza-chat-audio", "patched-key", "polza/model", None, chunks)
+
+        assert seen == [("patched-key", "A1")]
+        assert result[0].cost_exact == "0.11"
