@@ -152,6 +152,79 @@ class TestPolzaTTSProvider:
             with pytest.raises(RuntimeError, match="missing"):
                 p.synthesize_chunk("Hello", "chunk_01")
 
+    def test_synthesize_chunk_speech_keeps_unquoted_usage_numbers_exact(self):
+        import base64
+        from decimal import Decimal
+
+        import requests
+
+        from voiceover_pipeline.config import POLZA_BASE_URL
+
+        audio_b64 = base64.b64encode(b"fake-audio").decode()
+        body = (
+            f'{{"audio": "{audio_b64}", "contentType": "audio/mpeg", '
+            '"usage": {"cost_rub": 0.1234567890123456789, "tokens": 3}}'
+        )
+        response = requests.Response()
+        response.status_code = 200
+        response.encoding = "utf-8"
+        response._content = body.encode("utf-8")
+        response.headers["X-Generation-Id"] = "gen-123"
+
+        with patch(
+            "voiceover_pipeline.providers.polza_tts.requests.post", return_value=response
+        ) as mock_post:
+            p = PolzaTTSProvider(api_key="sk-test", model="openai/gpt-4o-mini-tts", voice="ash")
+            result = p.synthesize_chunk("Hello", "chunk_01")
+
+        mock_post.assert_called_once()
+        assert mock_post.call_args[0][0] == f"{POLZA_BASE_URL}/audio/speech"
+        usage = result.raw_metadata["usage_direct"]
+        assert isinstance(usage["cost_rub"], Decimal)
+        assert usage["cost_rub"] == Decimal("0.1234567890123456789")
+        assert result.generation_id == "gen-123"
+
+    def test_poll_media_completed_keeps_unquoted_usage_numbers_exact(self):
+        from decimal import Decimal
+
+        import requests
+
+        submit = requests.Response()
+        submit.status_code = 200
+        submit.encoding = "utf-8"
+        submit._content = b'{"id": "task-1", "status": "pending"}'
+
+        poll = requests.Response()
+        poll.status_code = 200
+        poll.encoding = "utf-8"
+        poll._content = (
+            b'{"id": "task-1", "status": "completed", '
+            b'"data": [{"url": "https://s3.polza.ai/fake.mp3"}], '
+            b'"usage": {"cost_rub": 0.1234567890123456789}}'
+        )
+
+        download = requests.Response()
+        download.status_code = 200
+        download._content = b"fake-elevenlabs-audio"
+
+        with patch("voiceover_pipeline.providers.polza_tts.requests.post", return_value=submit):
+            with patch(
+                "voiceover_pipeline.providers.polza_tts.requests.get",
+                side_effect=[poll, download],
+            ):
+                with patch("voiceover_pipeline.providers.polza_tts.time.sleep", return_value=None):
+                    p = PolzaTTSProvider(
+                        api_key="sk-test",
+                        model="elevenlabs/text-to-speech-turbo-2-5",
+                        voice="Rachel",
+                    )
+                    result = p.synthesize_chunk("Hello", "chunk_01")
+
+        assert result.audio_bytes == b"fake-elevenlabs-audio"
+        usage = result.raw_metadata["usage_direct"]
+        assert isinstance(usage["cost_rub"], Decimal)
+        assert usage["cost_rub"] == Decimal("0.1234567890123456789")
+
 
 class TestOpenRouterTTSProviderOpenAI:
     def test_stale_openai_speech_model_fails_before_billing(self):

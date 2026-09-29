@@ -1,4 +1,6 @@
+import math
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import requests
@@ -77,7 +79,9 @@ def fetch_polza_generation_detail(api_key: str, generation_id: str | None) -> di
     if response.status_code >= 400:
         return None
 
-    return response.json()
+    # parse_float=Decimal keeps an unquoted cost number exact instead of routing
+    # it through a binary float; observed_cost accepts the Decimal value.
+    return response.json(parse_float=Decimal)
 
 
 def fetch_openrouter_model_pricing(model: str) -> dict[str, Any] | None:
@@ -116,7 +120,42 @@ def fetch_openrouter_generation_detail(
     if response.status_code >= 400:
         return None
 
-    return response.json().get("data")
+    # parse_float=Decimal keeps an unquoted cost number exact instead of routing
+    # it through a binary float; observed_cost accepts the Decimal value.
+    return response.json(parse_float=Decimal).get("data")
+
+
+def observed_cost(value: Any) -> tuple[float | None, str | None]:
+    """Project one observed provider cost value to a legacy number and exact string.
+
+    Detail endpoints are parsed with ``parse_float=Decimal``, so a value can be an
+    exact string, a ``Decimal``, or an ``int``; a value that never passed through
+    that boundary can still be a binary ``float``. Only the exact sources keep a
+    canonical string -- a binary float has no exact decimal representation and
+    reports none. Anything unusable (``None``, ``bool``, a container, a malformed
+    string, or a non-finite/overflowing number) is unknown and never raises. An
+    observed zero is a real billing fact, so it is returned rather than treated as
+    missing.
+    """
+    if value is None or isinstance(value, bool):
+        return None, None
+    if isinstance(value, float):
+        return (value, None) if math.isfinite(value) else (None, None)
+    if isinstance(value, (int, Decimal, str)):
+        if isinstance(value, str):
+            try:
+                parsed = Decimal(value)
+            except (InvalidOperation, ValueError):
+                return None, None
+            exact = value
+        else:
+            parsed = Decimal(value)
+            exact = str(value)
+        if not parsed.is_finite():
+            return None, None
+        legacy = float(parsed)
+        return (legacy, exact) if math.isfinite(legacy) else (None, None)
+    return None, None
 
 
 def cost_from_generation(
@@ -129,7 +168,10 @@ def cost_from_generation(
         value = generation.get("clientCost")
         if value is None:
             value = generation.get("cost")
-        return (float(value), str(value), "RUB") if value is not None else (None, None, None)
+        if value is None:
+            return None, None, None
+        cost, cost_exact = observed_cost(value)
+        return (cost, cost_exact, "RUB") if cost is not None else (None, None, None)
 
     if provider == "openrouter-tts":
         value = generation.get("total_cost")
@@ -137,6 +179,9 @@ def cost_from_generation(
             value = generation.get("cost")
         if value is None:
             value = generation.get("usage")
-        return (float(value), str(value), "USD") if value is not None else (None, None, None)
+        if value is None:
+            return None, None, None
+        cost, cost_exact = observed_cost(value)
+        return (cost, cost_exact, "USD") if cost is not None else (None, None, None)
 
     return None, None, None

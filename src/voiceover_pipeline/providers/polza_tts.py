@@ -1,5 +1,6 @@
 import base64
 import time
+from decimal import Decimal
 
 import requests
 
@@ -63,7 +64,9 @@ class PolzaTTSProvider(TTSProvider):
         if not response.content:
             raise RuntimeError("Polza TTS returned an empty body.")
 
-        resp_json = response.json()
+        # parse_float=Decimal keeps an unquoted usage cost exact instead of
+        # routing it through a binary float; _direct_cost_kwargs extracts it.
+        resp_json = response.json(parse_float=Decimal)
         audio_b64 = resp_json.get("audio")
         if not audio_b64:
             raise RuntimeError(
@@ -152,7 +155,9 @@ class PolzaTTSProvider(TTSProvider):
             if response.status_code >= 400:
                 raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
 
-            js = response.json()
+            # The completed payload carries usage cost; keep unquoted numbers
+            # exact. The submit response above stays plain JSON.
+            js = response.json(parse_float=Decimal)
             status = js.get("status") or js.get("state")
 
             if status == "completed":

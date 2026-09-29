@@ -4,6 +4,7 @@ import hashlib
 import json
 
 import pytest
+import requests
 from conftest import cli_json, fixture_path
 
 
@@ -138,6 +139,437 @@ def test_generate_step_writes_state_and_log_after_each_chunk(tmp_path, monkeypat
     log_text = (paths.output_root / "generation.log").read_text(encoding="utf-8")
     assert "chunk_started" in log_text
     assert "chunk_state_saved" in log_text
+
+
+def test_generate_step_marks_exact_cost_unavailable_without_observed_exact(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.models import ChunkArtifact
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="legacy-cost-only")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    def attach_legacy_float_cost(_provider, _api_key, _model, _started, artifacts):
+        return [
+            ChunkArtifact(**{**artifact.__dict__, "cost": 0.5, "cost_currency": "RUB"})
+            for artifact in artifacts
+        ]
+
+    monkeypatch.setattr(cli, "attach_costs", attach_legacy_float_cost)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert manifest["cost_exact_available"] is False
+    assert "cost_total_exact" not in manifest
+    assert manifest["cost_total"] == 0.5
+
+
+def test_resume_normalizes_malformed_exact_cost_and_keeps_float_total(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.models import ChunkArtifact
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        initial_state,
+        upsert_completed_chunk,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="malformed-exact", resume=True)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+    (paths.chunks_dir / "chunk_01.mp3").write_bytes(b"existing")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    upsert_completed_chunk(
+        state,
+        artifact=ChunkArtifact(
+            number=1,
+            id="chunk_01",
+            file="chunk_01.mp3",
+            duration_ms=1000,
+            duration_sec=1.0,
+            start_ms=0,
+            end_ms=1000,
+            text_characters=len(chunks[0].text),
+            transcript=None,
+            client_path="fake",
+            generation_id="old-gen",
+            cost=0.5,
+            cost_exact=0.1,
+            cost_currency="RUB",
+        ),
+        model=args.model,
+        voice=args.voice,
+        text=chunks[0].text,
+    )
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert manifest["cost_exact_available"] is False
+    assert "cost_total_exact" not in manifest
+    assert manifest["cost_total"] == 0.5
+
+
+def test_resume_preserves_well_formed_exact_cost_string(tmp_path, monkeypatch):
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.models import ChunkArtifact
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        initial_state,
+        upsert_completed_chunk,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="exact-roundtrip", resume=True)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+    (paths.chunks_dir / "chunk_01.mp3").write_bytes(b"existing")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    upsert_completed_chunk(
+        state,
+        artifact=ChunkArtifact(
+            number=1,
+            id="chunk_01",
+            file="chunk_01.mp3",
+            duration_ms=1000,
+            duration_sec=1.0,
+            start_ms=0,
+            end_ms=1000,
+            text_characters=len(chunks[0].text),
+            transcript=None,
+            client_path="fake",
+            generation_id="old-gen",
+            cost=0.1234567890123456789,
+            cost_exact="0.1234567890123456789",
+            cost_currency="RUB",
+        ),
+        model=args.model,
+        voice=args.voice,
+        text=chunks[0].text,
+    )
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert manifest["cost_exact_available"] is True
+    assert manifest["cost_total_exact"] == "0.1234567890123456789"
+    assert manifest["cost_total"] == round(0.1234567890123456789, 8)
+
+
+def _raw_json_response(body: str, status_code: int = 200) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status_code
+    response.encoding = "utf-8"
+    response._content = body.encode("utf-8")
+    return response
+
+
+def _polza_chat_audio_args(tmp_path, run_id, resume):
+    args = make_args(tmp_path, run_id=run_id, resume=resume)
+    args.provider = "polza-chat-audio"
+    args.model = "polza/model"
+    return args
+
+
+def test_resume_keeps_history_detail_costs_persisted_in_run_state(tmp_path, monkeypatch):
+    """A history-detail cost observed after the chunk save survives a resume.
+
+    The detail lookup is a real raw JSON body parsed by
+    ``pricing.fetch_polza_generation_detail`` with ``parse_float=Decimal``, so the
+    exact cost crosses the provider boundary instead of arriving as a
+    monkeypatched dict. The resumed run cannot obtain any detail, so its exact
+    total must come from the run state written after the first run's lookup.
+    """
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.pricing as pricing
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    real_attach_costs = cli.attach_costs
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli, "attach_costs", real_attach_costs)
+
+    exact = "0.1234567890123456789"
+    detail_bodies = {
+        "gen-chunk_01": (
+            '{"id": "gen-chunk_01", "model": "polza/model", '
+            f'"clientCost": {exact}, "generationTimeMs": 1500, '
+            '"usage": {"cost_rub": 0.00000000000000000001, "tokens": 3}, '
+            '"createdAt": "2026-01-01T00:00:00Z"}'
+        ),
+        "gen-chunk_02": '{"id": "gen-chunk_02", "model": "polza/model", "clientCost": 0}',
+    }
+    requested: list[str | None] = []
+
+    def history_get(url, headers=None, params=None, timeout=None):
+        generation_id = url.rsplit("/", 1)[-1]
+        requested.append(generation_id)
+        body = detail_bodies.get(generation_id)
+        return _raw_json_response(body) if body else _raw_json_response("{}", 404)
+
+    monkeypatch.setattr(pricing.requests, "get", history_get)
+
+    args = _polza_chat_audio_args(tmp_path, "money-state", resume=False)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")
+    provider = FakeProvider()
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, provider, "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    assert provider.calls == ["chunk_01", "chunk_02"]
+    assert requested == ["gen-chunk_01", "gen-chunk_02"]
+    state_path = paths.output_root / "run_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    state_by_id = {item["id"]: item for item in state["chunks"]}
+    assert state_by_id["chunk_01"]["cost_exact"] == exact
+    assert state_by_id["chunk_01"]["cost_rub_exact"] == exact
+    assert state_by_id["chunk_01"]["cost_currency"] == "RUB"
+    assert state_by_id["chunk_01"]["cost"] == float(exact)
+    assert state_by_id["chunk_01"]["usage"] == {"cost_rub": 1e-20, "tokens": 3}
+    assert state_by_id["chunk_01"]["generation_time_ms"] == 1500
+    assert state_by_id["chunk_01"]["generated_at"] == "2026-01-01T00:00:00Z"
+    assert state_by_id["chunk_01"]["generation_detail_source"] == (
+        "Polza GET /api/v1/history/generations/{id}"
+    )
+    assert state_by_id["chunk_02"]["cost_exact"] == "0"
+    assert state_by_id["chunk_02"]["cost"] == 0.0
+    json.dumps(state, allow_nan=False)
+
+    manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert manifest["cost_exact_available"] is True
+    assert manifest["cost_total_exact"] == exact
+    assert manifest["cost_total"] == round(float(exact), 8)
+
+    monkeypatch.setattr(
+        pricing.requests, "get", lambda *args, **kwargs: _raw_json_response("{}", 404)
+    )
+    resume_args = _polza_chat_audio_args(tmp_path, "money-state", resume=True)
+    resume_provider = FakeProvider()
+
+    with pytest.raises(SystemExit) as resume_exit:
+        cli._generate_step(
+            resume_args,
+            resume_provider,
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "key",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert resume_exit.value.code == 0
+    assert resume_provider.calls == []
+    resumed_state = json.loads(state_path.read_text(encoding="utf-8"))
+    resumed_by_id = {item["id"]: item for item in resumed_state["chunks"]}
+    assert resumed_by_id["chunk_01"]["cost_exact"] == exact
+    assert resumed_by_id["chunk_01"]["cost_currency"] == "RUB"
+    assert resumed_by_id["chunk_01"]["usage"] == {"cost_rub": 1e-20, "tokens": 3}
+    assert resumed_by_id["chunk_02"]["cost_exact"] == "0"
+    json.dumps(resumed_state, allow_nan=False)
+    resumed_manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert resumed_manifest["cost_exact_available"] is True
+    assert resumed_manifest["cost_total_exact"] == exact
+    assert resumed_manifest["cost_total"] == round(float(exact), 8)
+
+
+def test_generate_step_persists_openrouter_detail_cost_in_run_state(tmp_path, monkeypatch):
+    """The same late-cost persistence covers the OpenRouter detail boundary.
+
+    Phase 1 observes the cost from a real unquoted raw JSON body, the shape
+    ``pricing.fetch_openrouter_generation_detail`` parses with
+    ``parse_float=Decimal``. A resume whose detail lookup is unavailable must not
+    synthesize again and must keep the previously observed exact total,
+    currency, and source from the trusted run state.
+    """
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.pricing as pricing
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    real_attach_costs = cli.attach_costs
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli, "attach_costs", real_attach_costs)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    body = (
+        '{"data": {"id": "gen-chunk_01", "total_cost": 0.0001234567890123456789, '
+        '"generationTimeMs": 1200, "usage": {"prompt_tokens": 5}, '
+        '"createdAt": "2026-01-02T00:00:00Z"}}'
+    )
+    monkeypatch.setattr(pricing.requests, "get", lambda *args, **kwargs: _raw_json_response(body))
+
+    args = make_args(tmp_path, run_id="openrouter-state")
+    args.provider = "openrouter-tts"
+    args.model = "openrouter/model"
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+    entry = state["chunks"][0]
+    assert entry["generation_id"] == "gen-chunk_01"
+    assert entry["cost_exact"] == "0.0001234567890123456789"
+    assert entry["cost"] == 0.0001234567890123456789
+    assert entry["cost_currency"] == "USD"
+    assert entry["usage"] == {"prompt_tokens": 5}
+    assert entry["generation_time_ms"] == 1200
+    assert entry["generated_at"] == "2026-01-02T00:00:00Z"
+    json.dumps(state, allow_nan=False)
+    manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert manifest["cost_total_exact"] == "0.0001234567890123456789"
+    assert manifest["cost_currency"] == "USD"
+
+    monkeypatch.setattr(
+        pricing.requests, "get", lambda *args, **kwargs: _raw_json_response("{}", 404)
+    )
+    resume_args = make_args(tmp_path, run_id="openrouter-state", resume=True)
+    resume_args.provider = "openrouter-tts"
+    resume_args.model = "openrouter/model"
+    resume_provider = FakeProvider()
+
+    with pytest.raises(SystemExit) as resume_exit:
+        cli._generate_step(
+            resume_args,
+            resume_provider,
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "key",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert resume_exit.value.code == 0
+    assert resume_provider.calls == []
+    resumed_state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+    resumed_entry = resumed_state["chunks"][0]
+    assert resumed_entry["generation_id"] == "gen-chunk_01"
+    assert resumed_entry["cost_exact"] == "0.0001234567890123456789"
+    assert resumed_entry["cost_currency"] == "USD"
+    assert resumed_entry["usage"] == {"prompt_tokens": 5}
+    json.dumps(resumed_state, allow_nan=False)
+    resumed_manifest = json.loads(paths.chunks_json.read_text(encoding="utf-8"))
+    assert resumed_manifest["cost_exact_available"] is True
+    assert resumed_manifest["cost_total_exact"] == "0.0001234567890123456789"
+    assert resumed_manifest["cost_total"] == round(0.0001234567890123456789, 8)
+    assert resumed_manifest["cost_currency"] == "USD"
+
+
+def test_openrouter_foreign_declared_id_never_reaches_state_or_manifest(tmp_path, monkeypatch):
+    """A detail declaring another generation id must not charge this run.
+
+    The lookup is addressed by the chunk's own ``generation_id``, so a raw body
+    declaring ``gen-other`` must leave the state's generation id and absent cost
+    untouched and keep the manifest total unknown instead of adopting the
+    foreign price.
+    """
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.pricing as pricing
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    real_attach_costs = cli.attach_costs
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli, "attach_costs", real_attach_costs)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    lookups: list[tuple[str, dict | None]] = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        lookups.append((url, params))
+        return _raw_json_response('{"data": {"id": "gen-other", "total_cost": 0.5}}')
+
+    monkeypatch.setattr(pricing.requests, "get", fake_get)
+
+    args = make_args(tmp_path, run_id="openrouter-foreign")
+    args.provider = "openrouter-tts"
+    args.model = "openrouter/model"
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    # One targeted lookup by the chunk's own id; the returned foreign id is not
+    # retried and never requested.
+    assert len(lookups) == 1
+    assert lookups[0][0].endswith("/generation")
+    assert lookups[0][1] == {"id": "gen-chunk_01"}
+    state = json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+    entry = state["chunks"][0]
+    assert entry["generation_id"] == "gen-chunk_01"
+    assert entry.get("cost") is None
+    assert entry.get("cost_exact") is None
+    assert entry.get("cost_currency") is None
+    json.dumps(state, allow_nan=False)
+    manifest_text = paths.chunks_json.read_text(encoding="utf-8")
+    manifest = json.loads(manifest_text)
+    assert manifest["cost_exact_available"] is False
+    assert manifest.get("cost_total") is None
+    assert manifest.get("cost_currency") is None
+    assert "gen-other" not in manifest_text
 
 
 def test_generate_step_persists_the_public_omnivoice_runtime_receipt(tmp_path, monkeypatch):

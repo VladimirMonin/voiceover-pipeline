@@ -367,7 +367,7 @@ def test_direct_cost_kwargs_zero_cost_rub_without_fallback_cost():
     )
     kwargs = _direct_cost_kwargs("polza-tts", result)
     assert kwargs["cost"] == 0.0
-    assert kwargs["cost_exact"] == "0.0"
+    assert kwargs["cost_exact"] is None
     assert kwargs["cost_currency"] == "RUB"
 
 
@@ -382,7 +382,7 @@ def test_direct_cost_kwargs_falls_back_to_cost_when_cost_rub_missing():
     )
     kwargs = _direct_cost_kwargs("polza-tts", result)
     assert kwargs["cost"] == 0.25
-    assert kwargs["cost_exact"] == "0.25"
+    assert kwargs["cost_exact"] is None
     assert kwargs["cost_rub"] == 0.25
     assert kwargs["cost_currency"] == "RUB"
 
@@ -428,6 +428,84 @@ def test_direct_cost_kwargs_none_for_other_providers():
     )
     assert _direct_cost_kwargs("openrouter-tts", result) == {}
     assert _direct_cost_kwargs("polza-chat-audio", result) == {}
+
+
+def test_direct_cost_kwargs_keeps_integer_and_string_exact_values():
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    integer = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": 0}},
+    )
+    int_kwargs = _direct_cost_kwargs("polza-tts", integer)
+    assert int_kwargs["cost"] == 0.0
+    assert int_kwargs["cost_exact"] == "0"
+    assert int_kwargs["cost_rub_exact"] == "0"
+
+    string = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": "0.1575"}},
+    )
+    str_kwargs = _direct_cost_kwargs("polza-tts", string)
+    assert str_kwargs["cost"] == 0.1575
+    assert str_kwargs["cost_exact"] == "0.1575"
+    assert str_kwargs["cost_rub_exact"] == "0.1575"
+
+
+def test_direct_cost_kwargs_keeps_decimal_exact_value():
+    from decimal import Decimal
+
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": Decimal("0.1234567890123456789")}},
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["cost"] == 0.1234567890123456789
+    assert kwargs["cost_exact"] == "0.1234567890123456789"
+
+
+def test_direct_cost_kwargs_projects_decimal_usage_to_json_safe_numbers():
+    from decimal import Decimal
+
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={
+            "usage_direct": {
+                "cost_rub": Decimal("0.1"),
+                "nested": {"cost": Decimal("0.2")},
+                "tokens": 4,
+            }
+        },
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["cost_exact"] == "0.1"
+    assert kwargs["usage"]["nested"]["cost"] == 0.2
+    assert not isinstance(kwargs["usage"]["nested"]["cost"], Decimal)
+    json.dumps(kwargs, allow_nan=False)
+
+
+@pytest.mark.parametrize("value", ["bad", "", True, False, [0.5], {"amount": 0.5}])
+def test_direct_cost_kwargs_unknown_cost_value_is_empty(value):
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": value}},
+    )
+    assert _direct_cost_kwargs("polza-tts", result) == {}
 
 
 def test_gemini_prompt_mode_in_manifest_is_none():

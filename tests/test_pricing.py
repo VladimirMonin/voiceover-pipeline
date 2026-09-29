@@ -8,16 +8,19 @@ response ``X-Generation-Id`` header. ``polza-tts`` ids mix media task ids and
 generic ``/audio/speech`` body ids with resumed chunk artifacts, so they are not
 comparable to history ids and must never trigger a history lookup; those chunks
 keep their direct cost and generation id untouched. No lookup may erase an
-existing direct cost. These tests cover the field-level selection and the Polza
-id boundary only; the surrounding pipeline still uses floats and is out of scope
-here.
+existing direct cost. These tests cover the field-level selection, the exact
+``Decimal`` parsing at both detail boundaries, the strict-JSON metadata
+projection, and the Polza id boundary.
 """
 
+import base64
+import json
 from decimal import Decimal
 
 import pytest
+import requests
 
-from voiceover_pipeline import cli
+from voiceover_pipeline import cli, pricing
 from voiceover_pipeline.models import ChunkArtifact
 from voiceover_pipeline.pricing import cost_from_generation
 
@@ -40,7 +43,7 @@ class TestPolzaGenerationCost:
         cost, cost_exact, currency = cost_from_generation(provider, generation)
 
         assert cost == 0.0
-        assert cost_exact == "0.0"
+        assert cost_exact is None
         assert currency == "RUB"
 
     def test_missing_client_cost_falls_back_to_cost(self):
@@ -49,7 +52,7 @@ class TestPolzaGenerationCost:
         cost, cost_exact, currency = cost_from_generation("polza-tts", generation)
 
         assert cost == 0.5
-        assert cost_exact == "0.5"
+        assert cost_exact is None
         assert currency == "RUB"
 
     def test_none_client_cost_falls_back_to_cost(self):
@@ -58,14 +61,14 @@ class TestPolzaGenerationCost:
         cost, cost_exact, currency = cost_from_generation("polza-tts", generation)
 
         assert cost == 0.5
-        assert cost_exact == "0.5"
+        assert cost_exact is None
         assert currency == "RUB"
 
     def test_no_cost_fields_reports_unknown(self):
         assert cost_from_generation("polza-tts", {}) == (None, None, None)
 
-    def test_legacy_float_and_exact_string_fields_are_preserved(self):
-        cost, cost_exact, currency = cost_from_generation("polza-tts", {"clientCost": 0.1575})
+    def test_exact_string_value_reports_legacy_float_and_exact_string(self):
+        cost, cost_exact, currency = cost_from_generation("polza-tts", {"clientCost": "0.1575"})
 
         assert cost == 0.1575
         assert cost_exact == "0.1575"
@@ -104,7 +107,7 @@ class TestOpenRouterGenerationCost:
         )
 
         assert cost == 0.25
-        assert cost_exact == "0.25"
+        assert cost_exact is None
         assert currency == "USD"
 
     def test_none_total_cost_and_cost_fall_back_to_numeric_usage(self):
@@ -113,7 +116,7 @@ class TestOpenRouterGenerationCost:
         )
 
         assert cost == 0.1
-        assert cost_exact == "0.1"
+        assert cost_exact is None
         assert currency == "USD"
 
     def test_zero_numeric_usage_wins_when_other_fields_are_absent(self):
@@ -125,8 +128,8 @@ class TestOpenRouterGenerationCost:
         assert cost_exact == "0"
         assert currency == "USD"
 
-    def test_legacy_float_and_exact_string_fields_are_preserved(self):
-        cost, cost_exact, currency = cost_from_generation("openrouter-tts", {"total_cost": 0.001})
+    def test_exact_string_value_reports_legacy_float_and_exact_string(self):
+        cost, cost_exact, currency = cost_from_generation("openrouter-tts", {"total_cost": "0.001"})
 
         assert cost == 0.001
         assert cost_exact == "0.001"
@@ -140,6 +143,134 @@ class TestCostFromGenerationGuards:
 
     def test_unknown_provider_reports_unknown(self):
         assert cost_from_generation("qwen-local", {"cost": 1.0}) == (None, None, None)
+
+
+_COST_PROVIDERS = ["polza-chat-audio", "polza-tts", "openrouter-tts"]
+
+
+def _cost_field(provider: str, value: object) -> dict:
+    key = "clientCost" if provider in ("polza-chat-audio", "polza-tts") else "total_cost"
+    return {key: value}
+
+
+def _raw_json_response(body: str, status_code: int = 200) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status_code
+    response.encoding = "utf-8"
+    response._content = body.encode("utf-8")
+    return response
+
+
+class TestObservedCostValueGuards:
+    """A malformed observed value is unknown, never an exception or a float guess."""
+
+    @pytest.mark.parametrize("provider", _COST_PROVIDERS)
+    @pytest.mark.parametrize("value", [True, False, {"amount": 1}, ["0.5"]])
+    def test_bool_and_container_values_are_unknown(self, provider, value):
+        assert cost_from_generation(provider, _cost_field(provider, value)) == (None, None, None)
+
+    @pytest.mark.parametrize("provider", _COST_PROVIDERS)
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_float_values_are_unknown(self, provider, value):
+        assert cost_from_generation(provider, _cost_field(provider, value)) == (None, None, None)
+
+    @pytest.mark.parametrize("provider", _COST_PROVIDERS)
+    @pytest.mark.parametrize("value", ["abc", "", "nan", "Infinity", "1e2x"])
+    def test_malformed_string_values_are_unknown(self, provider, value):
+        assert cost_from_generation(provider, _cost_field(provider, value)) == (None, None, None)
+
+    @pytest.mark.parametrize("provider", _COST_PROVIDERS)
+    @pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")])
+    def test_non_finite_decimal_values_are_unknown(self, provider, value):
+        assert cost_from_generation(provider, _cost_field(provider, value)) == (None, None, None)
+
+    @pytest.mark.parametrize("provider", _COST_PROVIDERS)
+    def test_overflowing_decimal_is_unknown_not_infinity(self, provider):
+        assert cost_from_generation(provider, _cost_field(provider, Decimal("1e400"))) == (
+            None,
+            None,
+            None,
+        )
+
+    @pytest.mark.parametrize("provider", _COST_PROVIDERS)
+    def test_int_and_exact_string_are_exact_but_float_is_legacy_only(self, provider):
+        currency = "USD" if provider == "openrouter-tts" else "RUB"
+
+        assert cost_from_generation(provider, _cost_field(provider, 7)) == (7.0, "7", currency)
+        assert cost_from_generation(provider, _cost_field(provider, "0.1234567890123456789")) == (
+            0.1234567890123456789,
+            "0.1234567890123456789",
+            currency,
+        )
+        assert cost_from_generation(provider, _cost_field(provider, 0.5)) == (0.5, None, currency)
+
+    def test_fallback_advances_only_on_none(self):
+        assert cost_from_generation("polza-tts", {"clientCost": 0, "cost": 1.25}) == (
+            0.0,
+            "0",
+            "RUB",
+        )
+        assert cost_from_generation("polza-tts", {"clientCost": None, "cost": "0.5"}) == (
+            0.5,
+            "0.5",
+            "RUB",
+        )
+        assert cost_from_generation(
+            "openrouter-tts", {"total_cost": None, "cost": None, "usage": 0.5}
+        ) == (0.5, None, "USD")
+
+
+class TestGenerationDetailParsesExactNumbers:
+    """Both detail boundaries keep unquoted JSON numbers out of binary float."""
+
+    def test_polza_detail_parses_unquoted_numbers_as_decimal(self, monkeypatch):
+        body = (
+            '{"id": "gen-1", "model": "polza/model", '
+            '"clientCost": 0.1234567890123456789, "generationTimeMs": 1500, '
+            '"usage": {"cost_rub": 0.00000000000000000001, "tokens": 3}}'
+        )
+        monkeypatch.setattr(
+            pricing.requests, "get", lambda *args, **kwargs: _raw_json_response(body)
+        )
+
+        detail = pricing.fetch_polza_generation_detail("key", "gen-1")
+
+        assert detail is not None
+        assert isinstance(detail["clientCost"], Decimal)
+        assert isinstance(detail["usage"]["cost_rub"], Decimal)
+        assert cost_from_generation("polza-chat-audio", detail) == (
+            0.1234567890123456789,
+            "0.1234567890123456789",
+            "RUB",
+        )
+
+    def test_openrouter_detail_parses_unquoted_numbers_as_decimal(self, monkeypatch):
+        body = (
+            '{"data": {"id": "or-1", "total_cost": 0.0001234567890123456789, '
+            '"generationTimeMs": 1500, '
+            '"usage": {"cost": 0.0000000000000001, "prompt_tokens": 5}}}'
+        )
+        monkeypatch.setattr(
+            pricing.requests, "get", lambda *args, **kwargs: _raw_json_response(body)
+        )
+
+        detail = pricing.fetch_openrouter_generation_detail("key", "or-1")
+
+        assert detail is not None
+        assert isinstance(detail["total_cost"], Decimal)
+        assert isinstance(detail["usage"]["cost"], Decimal)
+        assert cost_from_generation("openrouter-tts", detail) == (
+            0.0001234567890123456789,
+            "0.0001234567890123456789",
+            "USD",
+        )
+
+    def test_polza_detail_http_error_returns_none_without_parsing(self, monkeypatch):
+        monkeypatch.setattr(
+            pricing.requests, "get", lambda *args, **kwargs: _raw_json_response("oops", 500)
+        )
+
+        assert pricing.fetch_polza_generation_detail("key", "gen-1") is None
 
 
 class TestDecimalObservedCost:
@@ -210,8 +341,8 @@ class TestAttachCostsPolzaGenerationIdBoundary:
         chunks = [_chunk(1, "A1"), _chunk(2, "A2")]
         requested: list[str | None] = []
         details = {
-            "A1": {"id": "A1", "clientCost": 0.11},
-            "A2": {"id": "A2", "clientCost": 0.22},
+            "A1": {"id": "A1", "clientCost": "0.11"},
+            "A2": {"id": "A2", "clientCost": "0.22"},
         }
 
         def fake_detail(api_key, generation_id):
@@ -393,15 +524,301 @@ def test_openrouter_path_still_uses_per_chunk_generation_detail(monkeypatch):
     assert result[0].cost_currency == "USD"
 
 
+class TestAttachCostsOpenRouterGenerationIdBoundary:
+    """An OpenRouter detail may only charge the chunk whose id was requested.
+
+    The detail GET is targeted by ``params={"id": chunk.generation_id}``, so a
+    response that declares a different ``id`` belongs to another generation and
+    must never supply a cost, replace the chunk's generation id, or erase an
+    already trusted direct/state-derived cost. A detail without a declared id
+    stays allowed because the request itself was addressed by the chunk id.
+    """
+
+    def test_foreign_declared_id_never_charges_or_renames(self, monkeypatch):
+        chunks = [_chunk(1, "A1", cost=0.5, cost_exact="0.5", currency="USD")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_openrouter_generation_detail",
+            lambda *args: {"id": "B1", "total_cost": 9.0},
+        )
+
+        result = cli.attach_costs("openrouter-tts", "test-key", "openrouter/model", None, chunks)
+
+        assert result[0].__dict__ == chunks[0].__dict__
+        assert result[0].generation_id == "A1"
+        assert result[0].cost == 0.5
+        assert result[0].cost_exact == "0.5"
+        assert result[0].cost_currency == "USD"
+
+    def test_foreign_declared_id_leaves_uncosted_chunk_unknown(self, monkeypatch):
+        chunks = [_chunk(1, "A1")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_openrouter_generation_detail",
+            lambda *args: {"id": "B1", "total_cost": 9.0},
+        )
+
+        result = cli.attach_costs("openrouter-tts", "test-key", "openrouter/model", None, chunks)
+
+        assert result[0].__dict__ == chunks[0].__dict__
+        assert result[0].generation_id == "A1"
+        assert result[0].cost is None
+        assert result[0].cost_exact is None
+        assert result[0].cost_currency is None
+
+    def test_missing_declared_id_keeps_targeted_lookup_contract(self, monkeypatch):
+        chunks = [_chunk(1, "A1")]
+        monkeypatch.setattr(
+            cli,
+            "fetch_openrouter_generation_detail",
+            lambda *args: {"total_cost": "0.002"},
+        )
+
+        result = cli.attach_costs("openrouter-tts", "test-key", "openrouter/model", None, chunks)
+
+        assert result[0].generation_id == "A1"
+        assert result[0].cost == 0.002
+        assert result[0].cost_exact == "0.002"
+        assert result[0].cost_currency == "USD"
+
+    def test_missing_generation_id_skips_lookup_and_preserves_cost(self, monkeypatch):
+        chunks = [_chunk(1, None, cost=0.5, cost_exact="0.5", currency="USD")]
+        calls: list[tuple] = []
+        monkeypatch.setattr(
+            cli,
+            "fetch_openrouter_generation_detail",
+            lambda *args: calls.append(args) or None,
+        )
+        monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+        result = cli.attach_costs("openrouter-tts", "test-key", "openrouter/model", None, chunks)
+
+        assert calls == []
+        assert result[0].generation_id is None
+        assert result[0].cost == 0.5
+        assert result[0].cost_exact == "0.5"
+        assert result[0].cost_currency == "USD"
+
+    def test_unavailable_detail_preserves_resumed_cost_metadata(self, monkeypatch):
+        chunks = [_chunk(1, "A1", cost=0.125, cost_exact="0.125", currency="USD")]
+        monkeypatch.setattr(cli, "fetch_openrouter_generation_detail", lambda *args: None)
+        monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+        result = cli.attach_costs("openrouter-tts", "test-key", "openrouter/model", None, chunks)
+
+        assert result[0].__dict__ == chunks[0].__dict__
+        assert result[0].cost == 0.125
+        assert result[0].cost_exact == "0.125"
+        assert result[0].cost_currency == "USD"
+
+
+class TestAttachCostsStrictJsonMetadata:
+    """Decimal detail metadata is projected before it can reach a manifest."""
+
+    def test_chat_audio_decimal_usage_and_timing_are_projected(self, monkeypatch):
+        chunks = [_chunk(1, "A1")]
+        detail = {
+            "id": "A1",
+            "model": "polza/model",
+            "clientCost": Decimal("0.1000000000000000055511151231257827"),
+            "generationTimeMs": Decimal("1500.5"),
+            "usage": {"cost_rub": Decimal("0.2"), "tokens": 3, "nested": [Decimal("0.3")]},
+            "createdAt": "2026-01-01T00:00:00Z",
+        }
+        monkeypatch.setattr(cli, "fetch_polza_generation_detail", lambda *args: detail)
+
+        result = cli.attach_costs("polza-chat-audio", "key", "polza/model", None, chunks)
+
+        chunk = result[0]
+        assert chunk.cost_exact == "0.1000000000000000055511151231257827"
+        assert chunk.usage == {"cost_rub": 0.2, "tokens": 3, "nested": [0.3]}
+        assert chunk.generation_time_ms == 1500.5
+        assert not isinstance(chunk.usage["cost_rub"], Decimal)
+        assert not isinstance(chunk.usage["nested"][0], Decimal)
+        assert not isinstance(chunk.generation_time_ms, Decimal)
+        json.dumps(chunk.__dict__, allow_nan=False)
+
+    def test_chat_audio_non_finite_metadata_becomes_null(self, monkeypatch):
+        chunks = [_chunk(1, "A1")]
+        detail = {
+            "id": "A1",
+            "clientCost": 0.5,
+            "generationTimeMs": float("inf"),
+            "usage": {"score": float("nan")},
+        }
+        monkeypatch.setattr(cli, "fetch_polza_generation_detail", lambda *args: detail)
+
+        result = cli.attach_costs("polza-chat-audio", "key", "polza/model", None, chunks)
+
+        assert result[0].usage == {"score": None}
+        assert result[0].generation_time_ms is None
+        json.dumps(result[0].__dict__, allow_nan=False)
+
+    def test_openrouter_decimal_usage_and_timing_are_projected(self, monkeypatch):
+        chunks = [_chunk(1, "or-1")]
+        detail = {
+            "id": "or-1",
+            "total_cost": Decimal("0.002"),
+            "generationTimeMs": Decimal("1500.5"),
+            "usage": {"cost": Decimal("0.002"), "prompt_tokens": 5},
+            "createdAt": "2026-01-01T00:00:00Z",
+        }
+        monkeypatch.setattr(cli, "fetch_openrouter_generation_detail", lambda *args: detail)
+
+        result = cli.attach_costs("openrouter-tts", "key", "openrouter/model", None, chunks)
+
+        chunk = result[0]
+        assert chunk.cost == 0.002
+        assert chunk.cost_exact == "0.002"
+        assert chunk.usage == {"cost": 0.002, "prompt_tokens": 5}
+        assert chunk.generation_time_ms == 1500.5
+        assert not isinstance(chunk.usage["cost"], Decimal)
+        json.dumps(chunk.__dict__, allow_nan=False)
+
+
 def test_summarize_costs_reports_direct_polza_tts_source_without_history():
     priced = [_chunk(1, "media-task-id", cost=0.0, cost_exact="0", currency="RUB")]
 
     total, total_exact, currency, source = cli.summarize_costs("polza-tts", priced)
 
     assert total == 0.0
-    assert total_exact == "0.0"
+    assert total_exact == "0"
     assert currency == "RUB"
     assert source == "Polza API usage.cost_rub (direct)"
 
     unknown = [_chunk(2, "media-task-id")]
     assert cli.summarize_costs("polza-tts", unknown) == (None, None, None, None)
+
+
+class TestSummarizeCostsCanonicalTotal:
+    """The canonical total is a Decimal sum of observed exact cost strings.
+
+    Legacy float fields stay compatible, but must never become a pseudo-exact
+    total, and a mixed or missing currency must not be summed as if it were one.
+    """
+
+    def test_exact_cost_strings_sum_to_the_decimal_total(self):
+        chunks = [
+            _chunk(1, "a", cost=0.1, cost_exact="0.1", currency="RUB"),
+            _chunk(2, "b", cost=0.2, cost_exact="0.2", currency="RUB"),
+        ]
+
+        total, total_exact, currency, _source = cli.summarize_costs("polza-tts", chunks)
+
+        assert total == 0.3
+        assert total_exact == "0.3"
+        assert currency == "RUB"
+
+    def test_high_precision_exact_total_is_not_rounded_to_a_float_total(self):
+        chunks = [
+            _chunk(
+                1,
+                "a",
+                cost=0.1234567890123456789,
+                cost_exact="0.1234567890123456789",
+                currency="RUB",
+            ),
+            _chunk(2, "b", cost=0.2, cost_exact="0.2", currency="RUB"),
+        ]
+
+        _total, total_exact, _currency, _source = cli.summarize_costs("polza-tts", chunks)
+
+        assert total_exact == "0.3234567890123456789"
+
+    def test_exact_total_keeps_digits_beyond_the_default_decimal_precision(self):
+        chunks = [
+            _chunk(
+                1,
+                "a",
+                cost=0.12345678901234567890123456789,
+                cost_exact="0.12345678901234567890123456789",
+                currency="RUB",
+            ),
+            _chunk(2, "b", cost=0.2, cost_exact="0.2", currency="RUB"),
+        ]
+
+        _total, total_exact, _currency, _source = cli.summarize_costs("polza-tts", chunks)
+
+        assert total_exact == "0.32345678901234567890123456789"
+
+    def test_observed_zero_exact_string_makes_a_canonical_zero(self):
+        chunks = [_chunk(1, "a", cost=0.0, cost_exact="0", currency="RUB")]
+
+        total, total_exact, _currency, _source = cli.summarize_costs("polza-tts", chunks)
+
+        assert total == 0.0
+        assert total_exact == "0"
+
+    @pytest.mark.parametrize("cost_exact", [None, "abc", "nan", "inf", ""])
+    def test_unusable_exact_keeps_float_total_without_canonical_total(self, cost_exact):
+        chunks = [_chunk(1, "a", cost=0.5, cost_exact=cost_exact, currency="RUB")]
+
+        total, total_exact, currency, _source = cli.summarize_costs("polza-tts", chunks)
+
+        assert total == 0.5
+        assert total_exact is None
+        assert currency == "RUB"
+
+    @pytest.mark.parametrize(
+        "cost_exact", [0.5, 0.1, True, False, ["0.5"], {"v": "0.5"}, Decimal("0.5")]
+    )
+    def test_non_string_exact_is_not_canonical_and_never_raises(self, cost_exact):
+        chunks = [_chunk(1, "a", cost=0.5, cost_exact=cost_exact, currency="RUB")]
+
+        total, total_exact, currency, _source = cli.summarize_costs("polza-tts", chunks)
+
+        assert total == 0.5
+        assert total_exact is None
+        assert currency == "RUB"
+
+    def test_mixed_currency_fails_closed_to_no_total(self):
+        chunks = [
+            _chunk(1, "a", cost=0.5, cost_exact="0.5", currency="RUB"),
+            _chunk(2, "b", cost=0.5, cost_exact="0.5", currency="USD"),
+        ]
+
+        assert cli.summarize_costs("polza-tts", chunks) == (None, None, None, None)
+
+    def test_missing_currency_fails_closed_to_no_total(self):
+        chunks = [_chunk(1, "a", cost=0.5, cost_exact="0.5")]
+
+        assert cli.summarize_costs("polza-tts", chunks) == (None, None, None, None)
+
+
+def test_polza_tts_speech_raw_response_direct_cost_is_exact_end_to_end(monkeypatch):
+    """A raw speech body's unquoted cost reaches the canonical total exactly."""
+    from voiceover_pipeline.providers import polza_tts
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+
+    audio_b64 = base64.b64encode(b"fake").decode()
+    body = (
+        '{"audio": "' + audio_b64 + '", "contentType": "audio/mpeg", '
+        '"usage": {"cost_rub": 0.1234567890123456789}}'
+    )
+    monkeypatch.setattr(
+        polza_tts.requests, "post", lambda *args, **kwargs: _raw_json_response(body)
+    )
+
+    provider = PolzaTTSProvider(api_key="k", model="openai/gpt-4o-mini-tts", voice="ash")
+    result = provider.synthesize_chunk("text", "chunk_01")
+    kwargs = cli._direct_cost_kwargs("polza-tts", result)
+    artifact = ChunkArtifact(
+        number=1,
+        id="chunk_01",
+        file="chunk_01.mp3",
+        duration_ms=1000,
+        duration_sec=1.0,
+        start_ms=0,
+        end_ms=1000,
+        text_characters=4,
+        transcript=None,
+        client_path="requests",
+        generation_id=None,
+        **kwargs,
+    )
+
+    total, total_exact, currency, source = cli.summarize_costs("polza-tts", [artifact])
+
+    assert total_exact == "0.1234567890123456789"
+    assert currency == "RUB"
+    assert source == "Polza API usage.cost_rub (direct)"

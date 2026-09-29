@@ -92,6 +92,17 @@ def completed_numbers(state: dict[str, Any] | None) -> set[int]:
     }
 
 
+def _exact_cost_string(value: Any) -> str | None:
+    """Keep a canonical exact-cost string; any other state value is unknown.
+
+    ``run_state.json`` is user-editable and may hold a legacy float, a bool, or a
+    container where an exact cost string is expected. Only a string is a canonical
+    exact value; everything else resumes as unknown so it can never be mistaken
+    for an exact billed amount.
+    """
+    return value if isinstance(value, str) else None
+
+
 def artifact_from_state(item: dict[str, Any]) -> ChunkArtifact:
     return ChunkArtifact(
         number=int(item["number"]),
@@ -116,9 +127,9 @@ def artifact_from_state(item: dict[str, Any]) -> ChunkArtifact:
         voice_selection=item.get("voice_selection"),
         voice_session=item.get("voice_session"),
         cost_rub=item.get("cost_rub"),
-        cost_rub_exact=item.get("cost_rub_exact"),
+        cost_rub_exact=_exact_cost_string(item.get("cost_rub_exact")),
         cost=item.get("cost"),
-        cost_exact=item.get("cost_exact"),
+        cost_exact=_exact_cost_string(item.get("cost_exact")),
         cost_currency=item.get("cost_currency"),
         usage=item.get("usage"),
         generation_time_ms=item.get("generation_time_ms"),

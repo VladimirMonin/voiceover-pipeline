@@ -3,12 +3,14 @@ import glob as glob_mod
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import shutil
 import sys
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
@@ -114,6 +116,7 @@ from .pricing import (
     fetch_openrouter_model_pricing,
     fetch_polza_generation_detail,
     fetch_polza_model_pricing,
+    observed_cost,
 )
 from .providers import (
     OmniVoiceLocalTTSProvider,
@@ -1249,6 +1252,65 @@ def _preflight_dialogue_resume(
         fail("Cannot resume: dialogue synthesis identity changed.", _EXIT_PROVIDER)
 
 
+# Cost metadata that a late history lookup can add after a chunk was already
+# saved to run state.
+_ATTACHED_COST_STATE_FIELDS = (
+    "cost",
+    "cost_exact",
+    "cost_currency",
+    "cost_rub",
+    "cost_rub_exact",
+    "usage",
+    "generation_time_ms",
+    "generated_at",
+    "generation_detail_source",
+)
+
+
+def _state_entry_number(entry: dict[str, Any]) -> int | None:
+    number = entry.get("number")
+    if number is None:
+        return None
+    try:
+        return int(number)
+    except (TypeError, ValueError):
+        return None
+
+
+def _merge_attached_costs_into_state(state: dict[str, Any], artifacts: list[ChunkArtifact]) -> None:
+    """Copy late-observed cost metadata into the matching trusted state chunk.
+
+    ``attach_costs`` runs after each chunk was already saved to ``run_state.json``,
+    so a cost that only the history lookup revealed would otherwise live in the
+    manifests alone and be lost by a resume whose lookup is unavailable. An
+    artifact is bound by its own ``id`` *and* ``number``; a missing or ambiguous
+    match fails closed instead of writing a cost onto the wrong chunk. Only values
+    present on the enriched artifact overwrite state, so a lookup that reports
+    nothing can never erase an already-observed direct cost.
+    """
+    entries = state.get("chunks", [])
+    for artifact in artifacts:
+        matches = [
+            entry
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("status") == "completed"
+            and entry.get("id") == artifact.id
+            and _state_entry_number(entry) == artifact.number
+        ]
+        if len(matches) != 1:
+            fail(
+                "Cannot persist observed costs: run state has no single completed "
+                f"chunk matching {artifact.id}/{artifact.number}.",
+                _EXIT_PROVIDER,
+            )
+        entry = matches[0]
+        for field in _ATTACHED_COST_STATE_FIELDS:
+            value = getattr(artifact, field)
+            if value is not None:
+                entry[field] = value
+
+
 def _generate_step(
     args,
     provider,
@@ -1528,6 +1590,8 @@ def _generate_step(
     chunk_artifacts = attach_costs(
         args.provider, api_key, args.model, run_started_at, chunk_artifacts
     )
+    _merge_attached_costs_into_state(state, chunk_artifacts)
+    atomic_write_json(state_path, state)
     cost_total, cost_total_exact, cost_currency, cost_source = summarize_costs(
         args.provider, chunk_artifacts
     )
@@ -1546,7 +1610,7 @@ def _generate_step(
         script=args.script,
         chunks_dir=paths.chunks_dir,
         pricing_snapshot=pricing_snapshot,
-        cost_exact_available=cost_total is not None,
+        cost_exact_available=cost_total_exact is not None,
         cost_total=cost_total,
         cost_total_exact=cost_total_exact,
         cost_currency=cost_currency,
@@ -3153,13 +3217,20 @@ def _direct_cost_kwargs(provider: str, result) -> dict:
         cost_rub = usage.get("cost")
     if cost_rub is None:
         return {}
+    # ``observed_cost`` keeps an exact value string and refuses to invent one from
+    # a binary float, so the direct cost obeys the same rule as the history path.
+    cost, cost_exact = observed_cost(cost_rub)
+    if cost is None:
+        return {}
     return {
-        "cost": float(cost_rub),
-        "cost_exact": str(cost_rub),
+        "cost": cost,
+        "cost_exact": cost_exact,
         "cost_currency": "RUB",
-        "cost_rub": float(cost_rub),
-        "cost_rub_exact": str(cost_rub),
-        "usage": usage,
+        "cost_rub": cost,
+        "cost_rub_exact": cost_exact,
+        # Project the copied usage only after the exact cost was extracted, so a
+        # Decimal from ``parse_float=Decimal`` never reaches run state/manifests.
+        "usage": json_safe_metadata(usage),
         "generation_detail_source": "Polza API usage.cost_rub (direct)",
     }
 
@@ -3384,6 +3455,31 @@ def fetch_pricing_snapshot(provider: str, api_key: str, model: str) -> dict | No
     return None
 
 
+def json_safe_metadata(value: Any) -> Any:
+    """Project provider metadata to strict-JSON-safe legacy values.
+
+    The history detail boundaries parse JSON with ``parse_float=Decimal`` so that
+    observed costs stay exact, but that conversion also applies to every other
+    JSON float in the same payload, and a non-finite ``Infinity``/``NaN`` constant
+    can still arrive. Manifests and run state use ``json.dumps`` and must stay
+    serializable, so a ``Decimal`` or non-finite number is projected here to a
+    finite legacy float or ``None``; ``str``/``int``/``bool`` and the list/dict
+    shape are preserved.
+    """
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            return None
+        legacy = float(value)
+        return legacy if math.isfinite(legacy) else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: json_safe_metadata(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe_metadata(item) for item in value]
+    return value
+
+
 def attach_costs(provider, api_key, model, run_started_at, chunks):
     if provider in {"qwen-local", "omnivoice-local"}:
         enriched = []
@@ -3440,50 +3536,59 @@ def attach_costs(provider, api_key, model, run_started_at, chunks):
                         "cost": cost,
                         "cost_exact": cost_exact,
                         "cost_currency": currency,
-                        "usage": generation.get("usage"),
-                        "generation_time_ms": generation.get("generationTimeMs")
-                        or generation.get("generation_time"),
+                        "usage": json_safe_metadata(generation.get("usage")),
+                        "generation_time_ms": json_safe_metadata(
+                            generation.get("generationTimeMs") or generation.get("generation_time")
+                        ),
                         "generated_at": generation.get("createdAt") or generation.get("created_at"),
                         "generation_detail_source": generation_source(provider),
                     }
                 )
             )
         return enriched
-    generations: list[dict[str, Any] | None] = []
+    # openrouter-tts ids come from the response body and the detail GET is
+    # targeted by ``params={"id": chunk.generation_id}``, so a detail that
+    # declares a different id belongs to another generation: it must never
+    # supply a cost or replace this chunk's generation id. A missing id stays
+    # allowed because the request itself was addressed by the chunk id. A
+    # missing/errored lookup or a payload without a cost keeps the artifact
+    # (including any direct or state-derived cost) untouched, and a chunk with
+    # no generation id never hits the network.
+    enriched = []
     for chunk in chunks:
         detail = None
-        for _ in range(4):
-            detail = fetch_openrouter_generation_detail(api_key, chunk.generation_id)
-            if detail:
-                break
-            time.sleep(3)
-        generations.append(detail)
-    if len(generations) != len(chunks):
-        return chunks
-    enriched = []
-    for chunk, generation in zip(chunks, generations):
-        cost, cost_exact, currency = cost_from_generation(provider, generation)
+        if chunk.generation_id:
+            for _ in range(4):
+                detail = fetch_openrouter_generation_detail(api_key, chunk.generation_id)
+                if detail:
+                    break
+                time.sleep(3)
+        if detail is not None:
+            reported_id = detail.get("id")
+            if reported_id is not None and str(reported_id) != chunk.generation_id:
+                detail = None
+        if detail is None:
+            enriched.append(chunk)
+            continue
+        cost, cost_exact, currency = cost_from_generation(provider, detail)
+        if cost is None:
+            enriched.append(chunk)
+            continue
         enriched.append(
             ChunkArtifact(
                 **{
                     **chunk.__dict__,
-                    "generation_id": generation.get("id") or chunk.generation_id
-                    if generation
-                    else chunk.generation_id,
                     "cost_rub": cost if currency == "RUB" else None,
                     "cost_rub_exact": cost_exact if currency == "RUB" else None,
                     "cost": cost,
                     "cost_exact": cost_exact,
                     "cost_currency": currency,
-                    "usage": generation.get("usage") if generation else None,
-                    "generation_time_ms": generation.get("generationTimeMs")
-                    or generation.get("generation_time")
-                    if generation
-                    else None,
-                    "generated_at": generation.get("createdAt") or generation.get("created_at")
-                    if generation
-                    else None,
-                    "generation_detail_source": generation_source(provider) if generation else None,
+                    "usage": json_safe_metadata(detail.get("usage")),
+                    "generation_time_ms": json_safe_metadata(
+                        detail.get("generationTimeMs") or detail.get("generation_time")
+                    ),
+                    "generated_at": detail.get("createdAt") or detail.get("created_at"),
+                    "generation_detail_source": generation_source(provider),
                 }
             )
         )
@@ -3493,10 +3598,42 @@ def attach_costs(provider, api_key, model, run_started_at, chunks):
 def summarize_costs(provider: str, chunks: list[ChunkArtifact]) -> tuple:
     if not chunks or any(chunk.cost is None for chunk in chunks):
         return None, None, None, None
-    total = sum(float(chunk.cost or 0) for chunk in chunks)
     currency = chunks[0].cost_currency
+    if currency is None or any(chunk.cost_currency != currency for chunk in chunks):
+        return None, None, None, None
+    total = sum(float(chunk.cost or 0) for chunk in chunks)
     source = generation_source(provider)
-    return round(total, 8), str(round(total, 8)), currency, source
+    # Canonical total: Decimal sum of provider-reported exact cost strings only.
+    # A missing, non-finite, or unparsable exact value disables it rather than
+    # promoting the compatibility float total into a pseudo-exact number. The sum
+    # runs in a local context wide enough for every observed digit so it is never
+    # rounded to the default 28 significant digits.
+    values: list[Decimal] = []
+    for chunk in chunks:
+        # Only a canonical exact string can join the Decimal total. Any other
+        # value (a legacy float, a bool, a list, or a Decimal from untrusted
+        # resumed state) is not a canonical exact cost, so it disables the exact
+        # total instead of guessing a value or raising.
+        if not isinstance(chunk.cost_exact, str):
+            return round(total, 8), None, currency, source
+        try:
+            value = Decimal(chunk.cost_exact)
+        except (InvalidOperation, ValueError):
+            return round(total, 8), None, currency, source
+        if not value.is_finite():
+            return round(total, 8), None, currency, source
+        values.append(value)
+    precision = max(
+        28,
+        max(value.adjusted() for value in values)
+        - min(int(value.as_tuple().exponent) for value in values)
+        + len(str(len(values)))
+        + 1,
+    )
+    with localcontext() as context:
+        context.prec = precision
+        exact_total = sum(values, Decimal(0))
+    return round(total, 8), str(exact_total), currency, source
 
 
 def generation_source(provider: str) -> str:
