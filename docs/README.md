@@ -36,6 +36,7 @@
 | [OmniVoice hallucination research](reports/2026-08-24-omnivoice-hallucination-research.md) | Upstream и exact-run evidence: unsupported Russian accent conditioning, long-form nonclaims и bounded quality gate |
 | [S00 baseline и проверки](reports/2026-09-29-s00-baseline.md) | Исходное состояние поверх `3355c23`; после настройки среды — результаты pytest/Ruff/mypy и версия `0.6.1`; отдельно — статическая карта событий `generation.log` (не live-проверка). |
 | [S01 source-only отчёт по внешним контрактам](reports/2026-09-29-s01-source-only.md) | Source-only проверка узких контрактов Gemini/Polza, Qwen ASR и двух embedding-режимов: что подтверждено кодом на `1ba5743`, что `BLOCKED_PROVIDER_CONTRACT`/`NOT_RUN`; live/listening не выполнялись. |
+| [S02 офлайн-приёмка оплаченных запросов](reports/2026-09-29-s02-paid-safety.md) | На `141a4d5`: точные суммы, запрет повторного paid POST, GET-only Media и сохранённый raw до FFmpeg; тесты и известные `NOT_RUN`/пробелы отдельно. |
 
 ## Быстрый старт
 

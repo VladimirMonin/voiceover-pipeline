@@ -83,7 +83,7 @@
 | `--json` | flag | false | JSON-вывод в stdout |
 | `--json-events` | flag | false | NDJSON progress events: `chunk_started`, `chunk_saved`, `chunk_failed`, `run_complete` |
 | `--overwrite` | flag | false | Удалить существующую папку прогона; взаимоисключающий с `--resume` |
-| `--confirm-delete-paid-audio` | flag | false | Разрешить `--overwrite` удалить существующие `chunk_*.mp3` |
+| `--confirm-delete-paid-audio` | flag | false | Разрешить `--overwrite` удалить подтверждённый запуск целиком, включая `chunk_*.mp3` и `raw/`; при `pending_attempt` удаление всё равно запрещено |
 | `--skip-existing` | flag | false | Пропустить если прогон уже есть |
 | `--resume` | flag | false | Продолжить interrupted run без повторной генерации готовых chunks; взаимоисключающий с `--overwrite` |
 | `--retries` | int | `3` | Попытки на retryable provider error; для `polza-tts`/`polza-chat-audio`/`openrouter-tts` всегда 1 (локальные `qwen-local`/`omnivoice-local` сохраняют прежние значения) |
@@ -292,7 +292,7 @@ voiceover list timing-providers --json
 | Папка существует + `--overwrite` + `pending_attempt` (неподтверждённый платный submit) | Ошибка exit code 30 даже с `--confirm-delete-paid-audio`; нужен другой `--run-id` |
 | Папка существует + `--overwrite` + `run_state.json` не-объект или нечитаем | Ошибка exit code 30: состояние не доказывает отсутствие платного submit |
 | Папка существует + `--skip-existing` | Вернуть `status: skipped`, не менять файлы |
-| Папка существует + `--resume` | Продолжить с первого несохранённого chunk; блокируется, пока есть `pending_attempt` (кроме известной paid media задачи, см. ниже) |
+| Папка существует + `--resume` | Продолжить с первого несохранённого chunk; при `pending_attempt` допускается лишь проверенный raw receipt либо известная paid media задача (см. ниже) |
 | Папка существует без флагов | Ошибка exit code 30 |
 
 ### Платный submit и маркер `pending_attempt`
@@ -301,27 +301,33 @@ voiceover list timing-providers --json
   отправляют не более одного POST на часть от CLI; ошибка после отправки
   завершает запуск с exit code 30 без автоматического повтора.
 - Перед submit CLI пишет маркер `pending_attempt` в `run_state.json` и удаляет
-  его вместе с сохранением части. Маркер содержит только `id`/`number`, стадию
-  (`submitting`, `outcome_unknown`, `failed`), время и — на ElevenLabs `/media`
-  маршруте — ограниченный opaque `remote_task_id` и уже наблюдённую стоимость.
-- Пока маркер присутствует, `--overwrite` закрыт всегда (exit code 30),
-  а `--resume` закрыт тем же кодом, кроме известной paid media задачи (см.
-  ниже); `details.error_code = "PAID_SUBMIT_UNCONFIRMED"`. Для новой явной
-  попытки используется другой `--run-id`. В диагностику попадает только `id`
-  вида `chunk_*`/`turn_*`; другой `id` (URL, текст запроса, секрет) репортится
-  как `null`.
-- Исключение для `--resume`: единственная известная paid media задача
-  ElevenLabs `/media` провайдера `polza-tts`. Если маркер хранит принятый
-  `remote_task_id` и command совпадает по provider/model/voice/script, а все
-  более ранние `chunk_*.mp3` уже на диске, CLI доводит первую незавершённую
-  часть GET-запросами (poll + download) без второго платного POST, а маркер
-  снимается вместе с сохранением части. Во всех остальных случаях `--resume`
-  остаётся закрыт.
+  его вместе с сохранением части. Маркер содержит только ограниченные `id`/
+  `number`, стадию (`submitting`, `outcome_unknown`, `failed`, `raw_saved`),
+  время и bounded raw receipt после сохранения ответа; на ElevenLabs `/media`
+  маршруте также допускаются opaque `remote_task_id` и наблюдённая стоимость.
+- Полученное платное аудио сохраняется в `raw/<chunk-id>.<mp3|wav|pcm>` до
+  FFmpeg и остаётся пригодным для пересборки. Если raw receipt совпадает с
+  файлом/SHA-256, identity вызова и первой незавершённой частью, `--resume`
+  конвертирует его локально **без POST и Media GET**; повреждённый raw не
+  разрешает повторный платный POST.
+- При отсутствии пригодного raw известная принятая задача ElevenLabs `/media`
+  провайдера `polza-tts` может завершиться через GET poll/download без второго
+  POST, если `remote_task_id` безопасен, совпадает provider/model/voice/script,
+  а все более ранние MP3 уже на диске. Даже при испорченном raw тот же валидный
+  Media ID допускает только GET-only восстановление.
+- Пока маркер присутствует, `--overwrite` закрыт всегда (exit code 30).
+  Подтверждённый overwrite без маркера удаляет и сохранённый `raw/` только при
+  явном согласии на удаление платного аудио. Если нет ни пригодного raw, ни
+  допустимого Media ID, `--resume` также закрыт:
+  `details.error_code = "PAID_SUBMIT_UNCONFIRMED"`. Для новой явной попытки
+  используется другой `--run-id`. Чужой `id` (URL, текст запроса, секрет)
+  репортится как `null`.
 - Флаги `--resume` и `--overwrite` нельзя использовать вместе: CLI отклоняет их
   до удаления папки и до сети (exit code 2).
 - `status --json` сообщает `can_resume: false` и `resume_block_reason:
-  "paid_submit_unconfirmed"` для такого запуска, кроме валидной известной
-  media-задачи с более ранними MP3 на диске (тогда `can_resume: true`).
+  "paid_submit_unconfirmed"` для такого запуска, кроме проверенного raw
+  receipt либо известной media-задачи с более ранними MP3 на диске (тогда
+  `can_resume: true`).
   `status` не знает будущую identity вызова, поэтому `can_resume: true` не
   гарантирует, что конкретный следующий `--resume` пройдёт.
 - `polza-chat-audio` не делает автоматический второй POST с `--fallback-voice`;
