@@ -1,6 +1,8 @@
 import json
+import tomllib
 from pathlib import Path
 
+from voiceover_pipeline import __version__
 from voiceover_pipeline.execution_identity import build_execution_identity
 
 
@@ -23,7 +25,7 @@ def test_execution_identity_is_path_free_and_hashes_package_bytes(tmp_path, monk
     (package / "module.py").write_text("answer = 43\n", encoding="utf-8")
     second = build_execution_identity()
 
-    assert first["package_version"] == "0.6.0"
+    assert first["package_version"] == "0.6.1"
     assert first["source_kind"] == "editable-checkout"
     assert first["source_revision"] == "a" * 40
     assert first["source_dirty"] is True
@@ -49,3 +51,10 @@ def test_execution_identity_classifies_noneditable_distribution_as_installed_whe
     assert receipt["source_revision"] is None
     assert receipt["source_dirty"] is None
     assert str(Path.home()) not in json.dumps(receipt)
+
+
+def test_package_version_matches_pyproject_metadata():
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    project_version = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"]
+
+    assert __version__ == project_version

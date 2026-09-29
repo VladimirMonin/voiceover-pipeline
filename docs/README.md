@@ -34,6 +34,7 @@
 | [Qwen Local](qwen-local-tts.md) | Qwen3-TTS локально: preset-голоса, клонирование голоса, бесплатно (GPU) |
 | [OmniVoice Local TTS](omnivoice-local-tts.md) | Явный offline встроенный female style condition через pinned Linux CUDA container; Q8_0, provenance и platform boundary |
 | [OmniVoice hallucination research](reports/2026-08-24-omnivoice-hallucination-research.md) | Upstream и exact-run evidence: unsupported Russian accent conditioning, long-form nonclaims и bounded quality gate |
+| [S00 baseline и проверки](reports/2026-09-29-s00-baseline.md) | Исходное состояние поверх `3355c23`; после настройки среды — результаты pytest/Ruff/mypy и версия `0.6.1`; отдельно — статическая карта событий `generation.log` (не live-проверка). |
 
 ## Быстрый старт
 

@@ -82,10 +82,13 @@ def test_valid_output_dir_ok(tmp_path):
         "valid-dir-test",
         "--script",
         str(fixture_path("smoke_test.md")),
-        "--skip-existing",
+        "--dry-run-cost",
         "--json",
     )
-    assert code in (0, 30), f"expected 0 or 30, got {code}: {data}"
+    assert code == 0, f"expected 0, got {code}: {data}"
+    assert data["status"] == "success"
+    assert data["dry_run"] is True
+    assert not out.exists(), f"dry run created output directory: {out}"
 
 
 def test_omnivoice_parser_keeps_global_mode_vocabulary_and_specific_fields(tmp_path):
