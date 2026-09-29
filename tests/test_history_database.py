@@ -17,10 +17,12 @@ import pytest
 from voiceover_pipeline.history.database import (
     HistoryDatabase,
     HistoryDatabaseError,
+    HistoryDatabaseReadOnlyError,
     Migration,
     MigrationChecksumError,
     SchemaVersionTooNewError,
     apply_migrations,
+    connect_readonly,
 )
 
 _LEDGER_DDL = (
@@ -465,3 +467,128 @@ def test_required_backup_without_directory_fails_closed(tmp_path):
         assert kept[0] == 1
     finally:
         connection.close()
+
+
+def test_connect_readonly_reads_without_sidecar_or_modification(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as database:
+        database.migrate()
+        _insert_run(database, "run-1", "/tmp/run-1")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    assert sorted(before) == ["history.sqlite3"]
+
+    connection = connect_readonly(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 1
+    finally:
+        connection.close()
+
+    after = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    assert after == before
+
+
+def test_connect_readonly_missing_file_raises(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        connect_readonly(tmp_path / "missing.sqlite3")
+
+
+def test_connect_readonly_refuses_wal_sidecar_without_writes(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as database:
+        database.migrate()
+    wal_path = database_path.with_name(database_path.name + "-wal")
+    wal_path.write_bytes(b"uncheckpointed-frames")
+
+    with pytest.raises(HistoryDatabaseReadOnlyError):
+        connect_readonly(database_path)
+
+    assert wal_path.read_bytes() == b"uncheckpointed-frames"
+    assert not database_path.with_name(database_path.name + "-shm").exists()
+
+
+def test_connect_readonly_accepts_empty_database(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    database_path.write_bytes(b"")
+
+    connection = connect_readonly(database_path)
+    try:
+        assert connection.execute("SELECT name FROM sqlite_master").fetchall() == []
+    finally:
+        connection.close()
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["history.sqlite3"]
+
+
+def test_connect_readonly_rejects_corrupt_database(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    database_path.write_bytes(b"not a database at all")
+
+    with pytest.raises(sqlite3.DatabaseError):
+        connect_readonly(database_path)
+
+
+def test_connect_readonly_rejects_stale_ledger(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    _write_ledger_only_database(database_path, [(1, "create_widgets", "0" * 64, "t")])
+
+    with pytest.raises(MigrationChecksumError):
+        connect_readonly(database_path, migrations=[_widgets_v1()])
+
+
+def _file_bytes(directory):
+    return {path.name: path.read_bytes() for path in directory.iterdir()}
+
+
+def test_connect_readonly_rejects_symlinked_database_file(tmp_path):
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    external_db = external_dir / "history.sqlite3"
+    with HistoryDatabase(external_db) as database:
+        database.migrate()
+        _insert_run(database, "run-1", "/tmp/run-1")
+    before = _file_bytes(external_dir)
+
+    link = tmp_path / "history.sqlite3"
+    link.symlink_to(external_db)
+
+    with pytest.raises(HistoryDatabaseError):
+        connect_readonly(link)
+
+    assert _file_bytes(external_dir) == before
+
+
+def test_connect_readonly_rejects_symlinked_home_directory(tmp_path):
+    external_dir = tmp_path / "external-home"
+    external_dir.mkdir()
+    external_db = external_dir / "history.sqlite3"
+    with HistoryDatabase(external_db) as database:
+        database.migrate()
+    before = _file_bytes(external_dir)
+
+    linked_dir = tmp_path / "linked-home"
+    linked_dir.symlink_to(external_dir, target_is_directory=True)
+
+    with pytest.raises(HistoryDatabaseError):
+        connect_readonly(linked_dir / "history.sqlite3")
+
+    assert _file_bytes(external_dir) == before
+
+
+def test_history_database_connect_rejects_symlinked_database_file(tmp_path):
+    external_dir = tmp_path / "external"
+    external_dir.mkdir()
+    external_db = external_dir / "history.sqlite3"
+    with HistoryDatabase(external_db) as database:
+        database.migrate()
+    before = _file_bytes(external_dir)
+
+    link = tmp_path / "history.sqlite3"
+    link.symlink_to(external_db)
+
+    database = HistoryDatabase(link)
+    with pytest.raises(HistoryDatabaseError):
+        database.migrate()
+
+    assert _file_bytes(external_dir) == before
+    assert not link.with_name(link.name + "-wal").exists()
+    assert not link.with_name(link.name + "-shm").exists()

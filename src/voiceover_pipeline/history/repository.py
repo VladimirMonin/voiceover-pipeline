@@ -86,7 +86,9 @@ _SENSITIVE_KEY_PATTERN = re.compile(
 )
 # String values that are themselves secret-bearing, regardless of their key.
 _SENSITIVE_VALUE_PATTERNS = (
+    re.compile(r"\b(?:proxy-)?authorization\s*:", re.IGNORECASE),
     re.compile(r"\bbearer\s+\S+", re.IGNORECASE),
+    re.compile(r"\bbasic\s+\S+", re.IGNORECASE),
     re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}"),
     re.compile(r"\bgsk_[A-Za-z0-9_\-]{8,}"),
     re.compile(r"\bxai-[A-Za-z0-9_\-]{8,}"),

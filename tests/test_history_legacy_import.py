@@ -21,6 +21,7 @@ import pytest
 from voiceover_pipeline.history.database import (
     MIGRATIONS,
     HistoryDatabase,
+    HistoryDatabaseError,
     Migration,
     SchemaVersionTooNewError,
 )
@@ -183,6 +184,23 @@ def _write_legacy_run(
         chunks_json["cost_total"] = cost_total
     chunks_json_path.write_text(json.dumps(chunks_json, ensure_ascii=False), encoding="utf-8")
     return root
+
+
+def _rewrite_json_run_id(root, run_id):
+    """Rewrite the JSON ``run_id`` fields while leaving the directory name alone.
+
+    A real signed-URL run ID contains ``/`` and so cannot be a POSIX directory
+    name; a synthetic tree therefore declares it only in the JSON identity files.
+    """
+    paths = [
+        root / "run_state.json",
+        root / "manifest.json",
+        *sorted(root.glob("*-voiceover-*.json")),
+    ]
+    for path in paths:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["run_id"] = run_id
+        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
 def test_preview_creates_no_home_database_or_directory(tmp_path):
@@ -553,6 +571,26 @@ def test_conflict_event_is_logged_without_content(tmp_path, caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert any(message.startswith("history_conflict") for message in messages)
     assert any("malformed_json" in message for message in messages)
+
+
+def test_conflict_log_does_not_leak_signed_url_run_id(tmp_path, caplog):
+    sentinel = "SIGNATURE_SENTINEL_DO_NOT_ECHO"
+    signed_run_id = f"https://x.invalid/?sig={sentinel}"
+    source = tmp_path / "out"
+    root = _write_legacy_run(source, run_id="prod", chunks=[_default_chunk(file="../escape.mp3")])
+    _rewrite_json_run_id(root, signed_run_id)
+    database_path = tmp_path / "history.sqlite3"
+
+    with caplog.at_level(logging.INFO, logger="voiceover_pipeline.history"):
+        result = import_legacy_runs(source, database_path=database_path)
+
+    assert result.imported_count == 1
+    assert result.runs[0].conflicts == ("unsafe_chunk_path",)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(message.startswith("history_conflict") for message in messages)
+    assert all(sentinel not in message for message in messages)
+    assert all(signed_run_id not in message for message in messages)
+    assert all("sig=" not in message for message in messages)
 
 
 def test_malformed_identity_fails_closed_without_writes(tmp_path):
@@ -1249,3 +1287,50 @@ def test_import_rejects_insecure_existing_explicit_parent(tmp_path):
 
     assert not database_path.exists()
     assert (parent.stat().st_mode & 0o077) != 0
+
+
+def _file_bytes(directory):
+    return {path.name: path.read_bytes() for path in directory.iterdir() if path.is_file()}
+
+
+def test_preview_reports_unknown_for_symlinked_database_file(tmp_path):
+    external_dir = tmp_path / "external"
+    external_dir.mkdir(mode=0o700)
+    external_db = external_dir / "history.sqlite3"
+    source = tmp_path / "out"
+    _write_legacy_run(source, run_id="prod")
+    import_legacy_runs(source, database_path=external_db)
+    before = _file_bytes(external_dir)
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    linked_db = home / "history.sqlite3"
+    linked_db.symlink_to(external_db)
+
+    preview = preview_legacy_import(source, database_path=linked_db)
+
+    assert preview.database_readable is False
+    assert "database_status_unknown" in preview.scan_conflicts
+    assert preview.runs[0].already_imported is None
+    assert _file_bytes(external_dir) == before
+
+
+def test_import_rejects_symlinked_database_file_without_writing_target(tmp_path):
+    external_dir = tmp_path / "external"
+    external_dir.mkdir(mode=0o700)
+    external_db = external_dir / "history.sqlite3"
+    source = tmp_path / "out"
+    _write_legacy_run(source, run_id="prod")
+    import_legacy_runs(source, database_path=external_db)
+    before = _file_bytes(external_dir)
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    linked_db = home / "history.sqlite3"
+    linked_db.symlink_to(external_db)
+
+    with pytest.raises(HistoryDatabaseError):
+        import_legacy_runs(source, database_path=linked_db)
+
+    assert _file_bytes(external_dir) == before
+    assert not (home / "runs").exists()

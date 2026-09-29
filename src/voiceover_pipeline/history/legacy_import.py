@@ -29,9 +29,11 @@ Safety contracts enforced here:
 * The preview validates the existing database's migration ledger and schema on
   an ``immutable=1`` read-only connection, so a foreign, corrupt, too-new, or
   WAL-backed database reports an unknown status (``database_status_unknown``)
-  instead of an unearned conflict-free one, and never creates a sidecar. The
-  importer refuses to write plaintext history into a group- or world-accessible
-  existing directory instead of chmodding a user-owned tree.
+  instead of an unearned conflict-free one, and never creates a sidecar. A
+  symlinked database file, or one under a symlinked home directory, is rejected
+  before any connect, probe, or write. The importer refuses to write plaintext
+  history into a group- or world-accessible existing directory instead of
+  chmodding a user-owned tree.
 * Costs prefer a valid exact string and otherwise keep the legacy JSON numeric
   lexeme with ``source=legacy_import`` and ``exact_available=False``. A stored
   ``0`` is a real zero, a missing price is unknown, currencies never merge, and
@@ -39,7 +41,9 @@ Safety contracts enforced here:
   charge is never counted twice.
 * Imported config snapshots are whitelisted field-by-field and still pass
   through the repository's fail-closed secret redaction. Log events carry only
-  bounded labels and counts.
+  bounded labels and counts; a conflict label that looks like a signed URL or a
+  secret token is replaced by a short digest instead of the raw run ID or root
+  name.
 * Every part, attempt, artifact, and text source lands in one caller-managed
   transaction with its run, so a failed import rolls back completely and a retry
   imports the whole run exactly once.
@@ -76,6 +80,7 @@ from .repository import (
     TEXT_KIND_TTS_SCRIPT,
     Cost,
     HistoryRepository,
+    _is_sensitive_string,
 )
 
 _logger = logging.getLogger("voiceover_pipeline.history")
@@ -98,6 +103,9 @@ MAX_JSON_BYTES = 5 * 1024 * 1024
 MAX_CHUNKS_PER_RUN = 20_000
 MAX_TEXT_BYTES = 2 * 1024 * 1024
 MAX_LABEL_LENGTH = 64
+# A bounded run ID or root name can still be a short signed URL or a
+# secret-bearing token; a conflict log line replaces such a label with a digest.
+_UNSAFE_LOG_LABEL_MARKERS = ("://", "?", "#", "@")
 
 _RUN_MANIFEST_ROLE = "run_manifest"
 _MIME_JSON = "application/json"
@@ -1004,8 +1012,12 @@ def _probe_database(database_path: Path) -> tuple[str, set[str]]:
     applies, so a foreign, corrupt, or too-new database is reported ``unknown``
     instead of being mistaken for an importable database without conflicts. The
     canonical validator is reused rather than reimplemented so the preview and
-    the import can never disagree on what is acceptable.
+    the import can never disagree on what is acceptable. A symlinked database
+    file, or one under a symlinked home directory, is never followed: the target
+    is reported ``unknown`` without being read or written.
     """
+    if database_path.is_symlink() or database_path.parent.is_symlink():
+        return "unknown", set()
     if not database_path.exists():
         return "absent", set()
     for suffix in ("-wal", "-journal"):
@@ -1099,8 +1111,33 @@ def _hash_text(text: str) -> str:
 
 
 def _log_conflict(run: _LegacyRun) -> None:
-    label = _bounded_text(run.run_id or run.root.name, MAX_LABEL_LENGTH) or "unknown"
-    _logger.warning("history_conflict root=%s codes=%s", label, ",".join(run.conflicts) or "none")
+    _logger.warning(
+        "history_conflict root=%s codes=%s",
+        _conflict_log_label(run),
+        ",".join(run.conflicts) or "none",
+    )
+
+
+def _conflict_log_label(run: _LegacyRun) -> str:
+    """Return a content-free label for a ``history_conflict`` log event.
+
+    A bounded run ID can still be a short signed URL, and the run root name can
+    carry the same secret, so a label with a URL scheme, query, fragment, or
+    user-info (or a secret-shaped token) is replaced by a short digest. A plain
+    label such as ``prod`` is kept so the event stays actionable.
+    """
+    candidate = _bounded_text(run.run_id or run.root.name, MAX_LABEL_LENGTH)
+    if candidate is None:
+        return "unknown"
+    if any(marker in candidate for marker in _UNSAFE_LOG_LABEL_MARKERS):
+        return _label_digest(candidate)
+    if _is_sensitive_string(candidate):
+        return _label_digest(candidate)
+    return candidate
+
+
+def _label_digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
 
 
 def _import_run(repository: HistoryRepository, run: _LegacyRun) -> LegacyRunImportResult:

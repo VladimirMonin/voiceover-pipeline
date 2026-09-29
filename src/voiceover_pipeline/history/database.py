@@ -71,6 +71,10 @@ class MigrationChecksumError(HistoryDatabaseError):
     """A recorded migration no longer matches this binary's statements."""
 
 
+class HistoryDatabaseReadOnlyError(HistoryDatabaseError):
+    """An existing database cannot be read read-only without writing a sidecar."""
+
+
 @dataclass(frozen=True)
 class Migration:
     """One versioned schema change with a checksum over its exact statements."""
@@ -390,6 +394,66 @@ def apply_migrations(
     return pending
 
 
+def _reject_symlinked_database(path: Path) -> None:
+    """Refuse a database reached through a symlinked file or home directory.
+
+    A symlinked ``history.sqlite3``, or a database under a symlinked home
+    directory, would redirect a read or import outside the OS-private tree, so
+    the target is rejected before any ``sqlite3.connect``, probe, DDL, or write.
+    """
+    if path.is_symlink():
+        raise HistoryDatabaseError(f"history database must not be a symlink: {path}")
+    if path.parent.is_symlink():
+        raise HistoryDatabaseError(
+            f"history database home directory must not be a symlink: {path.parent}"
+        )
+
+
+def connect_readonly(
+    path: Path | str,
+    *,
+    migrations: Sequence[Migration] | None = None,
+) -> sqlite3.Connection:
+    """Open an existing history database read-only for metadata queries, writing nothing.
+
+    The reader is deliberately narrower than :meth:`HistoryDatabase.connect`: it
+    runs no migration or DDL, never switches the journal mode, and never creates
+    a ``-wal`` or ``-shm`` sidecar. The main file is opened with
+    ``mode=ro&immutable=1``, which is only trustworthy when no committed state can
+    live outside the main file, so an adjacent ``-wal`` or ``-journal`` sidecar
+    raises :class:`HistoryDatabaseReadOnlyError` instead of reading a possibly
+    stale snapshot.
+
+    The migration ledger and schema are validated with the same read-only gate as
+    :meth:`HistoryDatabase.migrate`, so a foreign, corrupt, or newer database
+    raises the corresponding :class:`HistoryDatabaseError` rather than being
+    queried. A missing file raises :class:`FileNotFoundError`; a genuinely empty
+    database (no tables, ``user_version`` 0) is accepted and yields a connection
+    with no schema. A symlinked database file, or one under a symlinked home
+    directory, raises :class:`HistoryDatabaseError` before any connect.
+    """
+    target = Path(path).expanduser().absolute()
+    _reject_symlinked_database(target)
+    if not target.exists():
+        raise FileNotFoundError(str(target))
+    for suffix in ("-wal", "-journal"):
+        sidecar = target.with_name(target.name + suffix)
+        if sidecar.exists():
+            raise HistoryDatabaseReadOnlyError(
+                f"history database {target} has a {suffix.lstrip('-')} sidecar; refusing to "
+                "read a possibly stale main file or create a sidecar"
+            )
+    connection = sqlite3.connect(f"{target.as_uri()}?mode=ro&immutable=1", uri=True, timeout=2.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        _validate_schema(connection, MIGRATIONS if migrations is None else migrations)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
 class HistoryDatabase:
     """Owns the SQLite connection and migration state for one history database.
 
@@ -440,6 +504,7 @@ class HistoryDatabase:
         """Open the connection, validate the schema read-only, then set pragmas."""
         if self._connection is not None:
             return self._connection
+        _reject_symlinked_database(self.path)
         connection = sqlite3.connect(
             str(self.path), timeout=self.busy_timeout_ms / 1000.0, isolation_level=None
         )

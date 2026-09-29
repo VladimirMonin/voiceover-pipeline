@@ -21,6 +21,7 @@ from .asr_longform import (
     transcribe_prerecorded_long_form,
     uses_long_form_orchestration,
 )
+from .commands import history as history_commands
 from .commands.split import ScriptNotFoundError, prepare_split_chunks
 from .config import (
     DEFAULT_ASR_COMPUTE,
@@ -65,6 +66,7 @@ from .gemini_dialogue import (
     is_dialogue_format,
     validate_gemini_dialogue_file,
 )
+from .history.repository import DEFAULT_QUERY_LIMIT
 from .local_runtime.contracts import OmniVoiceRequest
 from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
 from .media import (
@@ -231,6 +233,8 @@ def main() -> None:
             validate_cmd(args)
         elif args.command == "list":
             list_cmd(args)
+        elif args.command == "history":
+            history_cmd(args)
     except CliError as exc:
         _emit_error(args, str(exc), exc.code, details=exc.details)
     except SystemExit:
@@ -604,6 +608,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to voice bank catalog.json for omnivoice-local voice listing.",
     )
     lst.add_argument("--json", dest="json_output", action="store_true")
+
+    # --------------- history ---------------
+    hist = subparsers.add_parser(
+        "history", help="Read and import the local SQLite run history (not CWD-bound)."
+    )
+    hist_sub = hist.add_subparsers(dest="history_command")
+    hist_sub.required = True
+
+    hist_list = hist_sub.add_parser("list", help="List run metadata from local history.")
+    hist_list.add_argument("--label", default=None, help="Exact user-label filter.")
+    hist_list.add_argument("--operation", default=None, help="Exact operation filter.")
+    hist_list.add_argument("--status", default=None, help="Exact status filter.")
+    hist_list.add_argument("--limit", type=int, default=DEFAULT_QUERY_LIMIT)
+    hist_list.add_argument("--offset", type=int, default=0)
+    hist_list.add_argument("--json", dest="json_output", action="store_true")
+
+    hist_show = hist_sub.add_parser("show", help="Show one run metadata by UUID or label.")
+    hist_show.add_argument("run", metavar="ID")
+    hist_show.add_argument("--json", dest="json_output", action="store_true")
+
+    hist_import = hist_sub.add_parser("import", help="Import legacy out/<run-id> trees.")
+    hist_import.add_argument("source", metavar="DIR")
+    hist_import.add_argument(
+        "--dry-run", action="store_true", help="Preview an import without writing anything."
+    )
+    hist_import.add_argument("--json", dest="json_output", action="store_true")
 
     return parser
 
@@ -2374,6 +2404,99 @@ def list_cmd(args: argparse.Namespace) -> None:
         _json_ok({"status": "success", **data})
     else:
         print(json.dumps(data, ensure_ascii=False, indent=2))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# history
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def history_cmd(args: argparse.Namespace) -> None:
+    """Dispatch a ``history`` subcommand to its read-only or import handler."""
+    try:
+        if args.history_command == "list":
+            payload = history_commands.list_history(
+                label=args.label,
+                operation=args.operation,
+                status=args.status,
+                limit=args.limit,
+                offset=args.offset,
+            )
+        elif args.history_command == "show":
+            payload = history_commands.show_history(args.run)
+        elif args.history_command == "import":
+            if args.dry_run:
+                payload = history_commands.preview_history_import(args.source)
+            else:
+                payload = history_commands.run_history_import(args.source)
+        else:
+            fail("Unknown history subcommand.", _EXIT_ARGS)
+    except history_commands.HistoryCommandError as exc:
+        fail(str(exc), exc.code, details=exc.details)
+
+    if args.json_output:
+        _json_ok(payload)
+    _print_history(args.history_command, payload)
+
+
+def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
+    if subcommand == "list":
+        database = payload["database"]
+        runs = payload["runs"]
+        if not runs:
+            print(f"No history runs found. Database: {database['path']}")
+            return
+        print(f"History runs ({payload['count']}):")
+        for run in runs:
+            label = run["user_label"] if run["user_label"] is not None else "-"
+            print(
+                f"  {run['run_uuid']}  operation={run['operation']}  label={label}  "
+                f"status={run['status']}  created={run['created_at']}"
+            )
+        return
+
+    if subcommand == "show":
+        run = payload["run"]
+        print(f"Run {run['run_uuid']}")
+        print(f"  operation: {run['operation']}")
+        print(f"  status: {run['status']}")
+        print(f"  label: {run['user_label']}")
+        print(f"  root: {run['run_root']}")
+        print(f"  created: {run['created_at']}")
+        print(f"  updated: {run['updated_at']}")
+        if run["legacy_source_root"]:
+            print(f"  legacy_source_root: {run['legacy_source_root']}")
+        print(
+            f"  parts: {len(payload['parts'])}  attempts: {len(payload['attempts'])}  "
+            f"artifacts: {len(payload['artifacts'])}  text_sources: {len(payload['text_sources'])}"
+        )
+        for attempt in payload["attempts"]:
+            cost = attempt["cost"]
+            currency = cost["currency"] or ""
+            print(
+                f"  attempt {attempt['attempt_uuid']} {attempt['call_type']} "
+                f"status={attempt['status']} cost={cost['amount']} {currency} "
+                f"({cost['source']}, exact={cost['exact_available']})"
+            )
+        return
+
+    if payload["dry_run"]:
+        print(f"Dry run for {payload['source']} (database: {payload['database']['path']})")
+        print(
+            f"  discovered={payload['discovered_count']} "
+            f"importable={payload['importable_count']} "
+            f"already_imported={payload['already_imported_count']} "
+            f"missing_text={payload['missing_text_count']} "
+            f"missing_audio={payload['missing_audio_count']}"
+        )
+        if payload["scan_conflicts"]:
+            print(f"  scan_conflicts: {', '.join(payload['scan_conflicts'])}")
+        return
+    print(f"Imported from {payload['source']} (database: {payload['database']['path']})")
+    print(
+        f"  imported={payload['imported_count']} skipped={payload['skipped_count']} "
+        f"rejected={payload['rejected_count']}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

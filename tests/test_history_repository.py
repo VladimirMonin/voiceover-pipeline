@@ -284,6 +284,26 @@ def test_config_snapshot_redacts_secrets_before_storage(repository, tmp_path):
     assert "X-Amz-Signature" not in raw
 
 
+@pytest.mark.parametrize(
+    "header",
+    [
+        "Authorization: Basic ZmFrZTpmYWtl",
+        "Authorization: Digest ZmFrZTpmYWtl",
+        "Proxy-Authorization: Custom ZmFrZTpmYWtl",
+    ],
+)
+def test_config_snapshot_redacts_authorization_header_value(repository, tmp_path, header):
+    run = repository.create_run(
+        operation="tts",
+        run_root=str(tmp_path),
+        config_snapshot={"note": header, "label": "safe"},
+    )
+
+    stored = repository.get_run(run.run_uuid).config_snapshot
+    assert stored == {"note": history_repository_module.REDACTED_VALUE, "label": "safe"}
+    assert "ZmFrZTpmYWtl" not in json.dumps(stored)  # synthetic "fake:fake"
+
+
 def test_config_snapshot_redacts_google_signed_url(repository, tmp_path):
     sentinel = "SYNTHETIC_SENTINEL"
     snapshot = {
