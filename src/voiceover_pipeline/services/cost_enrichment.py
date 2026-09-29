@@ -9,6 +9,10 @@ Both history lookups are injected as explicit keyword dependencies, so
 ``cli.attach_costs`` can forward its currently bound callables and existing
 monkeypatch targets keep steering this body without importing ``cli``.
 
+The same module also owns the pre-generation provider price-route selection in
+``fetch_pricing_snapshot``, which picks the injected Polza or OpenRouter model
+lookup and itself opens no connection.
+
 The same module also owns the two summaries the observed cost feeds into: the
 late cost metadata copied into the matching trusted state chunk, and the run
 total whose canonical value is a Decimal sum of provider-reported exact strings.
@@ -38,6 +42,28 @@ def generation_source(provider: str) -> str:
         "qwen-local": "qwen-local (free)",
         "omnivoice-local": "omnivoice-local (local model; no billing request)",
     }.get(provider, "unknown")
+
+
+def fetch_pricing_snapshot(
+    provider: str,
+    api_key: str,
+    model: str,
+    *,
+    fetch_polza_pricing,
+    fetch_openrouter_pricing,
+) -> dict | None:
+    """Select the model-price lookup for a provider without doing I/O itself.
+
+    Both lookups are injected as explicit keyword dependencies so
+    ``cli.fetch_pricing_snapshot`` can forward its currently bound callables and
+    existing monkeypatch targets keep steering this body without importing
+    ``cli``. Providers without a price route return ``None`` and issue no request.
+    """
+    if provider in ("polza-chat-audio", "polza-tts"):
+        return fetch_polza_pricing(api_key, model)
+    if provider == "openrouter-tts":
+        return fetch_openrouter_pricing(model)
+    return None
 
 
 def attach_costs(

@@ -1101,3 +1101,89 @@ class TestCostSummaryAndStateMergeService:
         assert str(exc_info.value) == (
             "Cannot persist observed costs: run state has no single completed chunk matching x/9."
         )
+
+
+class TestPricingSnapshotRouting:
+    """``services.cost_enrichment.fetch_pricing_snapshot`` owns the provider routing.
+
+    The CLI keeps a thin wrapper so ``cli.fetch_pricing_snapshot`` stays the
+    patchable paid-preflight seam and forwards its currently bound (and
+    monkeypatched) pricing lookups, but the provider-to-lookup decision itself
+    lives in the service and performs no I/O on its own.
+    """
+
+    def test_service_routes_provider_to_injected_lookup_without_network(self):
+        from voiceover_pipeline.services import cost_enrichment
+
+        calls: list[tuple[str, str, str]] = []
+
+        def fetch_polza_pricing(api_key, model):
+            calls.append(("polza", api_key, model))
+            return {"model": model}
+
+        def fetch_openrouter_pricing(model):
+            calls.append(("openrouter", model, model))
+            return None
+
+        assert cost_enrichment.fetch_pricing_snapshot(
+            "polza-tts",
+            "sk-test",
+            "openai/gpt-4o-mini-tts",
+            fetch_polza_pricing=fetch_polza_pricing,
+            fetch_openrouter_pricing=fetch_openrouter_pricing,
+        ) == {"model": "openai/gpt-4o-mini-tts"}
+        assert cost_enrichment.fetch_pricing_snapshot(
+            "polza-chat-audio",
+            "sk-test",
+            "polza/model",
+            fetch_polza_pricing=fetch_polza_pricing,
+            fetch_openrouter_pricing=fetch_openrouter_pricing,
+        ) == {"model": "polza/model"}
+        assert (
+            cost_enrichment.fetch_pricing_snapshot(
+                "openrouter-tts",
+                "sk-test",
+                "openrouter/model",
+                fetch_polza_pricing=fetch_polza_pricing,
+                fetch_openrouter_pricing=fetch_openrouter_pricing,
+            )
+            is None
+        )
+        assert (
+            cost_enrichment.fetch_pricing_snapshot(
+                "qwen-local",
+                "sk-test",
+                "qwen/model",
+                fetch_polza_pricing=fetch_polza_pricing,
+                fetch_openrouter_pricing=fetch_openrouter_pricing,
+            )
+            is None
+        )
+        assert calls == [
+            ("polza", "sk-test", "openai/gpt-4o-mini-tts"),
+            ("polza", "sk-test", "polza/model"),
+            ("openrouter", "openrouter/model", "openrouter/model"),
+        ]
+
+    def test_cli_wrapper_forwards_currently_bound_pricing_lookups(self, monkeypatch):
+        polza_calls: list[tuple[str, str]] = []
+        openrouter_calls: list[str] = []
+
+        def fake_polza(api_key, model):
+            polza_calls.append((api_key, model))
+            return {"source": "polza"}
+
+        def fake_openrouter(model):
+            openrouter_calls.append(model)
+            return {"source": "openrouter"}
+
+        monkeypatch.setattr(cli, "fetch_polza_model_pricing", fake_polza)
+        monkeypatch.setattr(cli, "fetch_openrouter_model_pricing", fake_openrouter)
+
+        assert cli.fetch_pricing_snapshot("polza-tts", "sk-test", "m") == {"source": "polza"}
+        assert cli.fetch_pricing_snapshot("openrouter-tts", "sk-test", "m") == {
+            "source": "openrouter"
+        }
+        assert cli.fetch_pricing_snapshot("qwen-local", "sk-test", "m") is None
+        assert polza_calls == [("sk-test", "m")]
+        assert openrouter_calls == ["m"]

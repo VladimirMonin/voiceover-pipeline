@@ -6,7 +6,6 @@ import json
 import shutil
 import sys
 import time  # noqa: F401 - shared sleep seam tests patch via cli.time
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -26,21 +25,15 @@ from .commands.split import ScriptNotFoundError, prepare_split_chunks
 from .config import (
     DEFAULT_ASR_COMPUTE,
     DEFAULT_ASR_DEVICE,
-    DEFAULT_ELEVENLABS_VOICE,
     DEFAULT_FALLBACK_VOICE,
     DEFAULT_MODEL,
-    DEFAULT_OPENAI_TTS_VOICE,
-    DEFAULT_OPENROUTER_TTS_VOICE,
     DEFAULT_OUTPUT_DIR,
-    DEFAULT_POLZA_TTS_VOICE,
     DEFAULT_PROVIDER,
-    DEFAULT_QWEN_VOICE,
     DEFAULT_SCRIPT_DIR,
     DEFAULT_TIMING_COMPUTE,
     DEFAULT_TIMING_DEVICE,
     DEFAULT_TIMING_LANGUAGE,
     DEFAULT_TIMING_PROVIDER,
-    DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
     GEMINI_TTS_VOICES,
     OMNIVOICE_DEFAULT_GUIDANCE_SCALE,
@@ -141,15 +134,22 @@ from .services import (
     recovery,
     transcription,
 )
-from .services.prepare import prepare_runtime_chunks, prepare_script_fragments
+from .services.prepare import (
+    PreparationError,
+    bind_omnivoice_dialogue_fingerprints,
+    default_voice,
+    prepare_generation_identity,
+    prepare_runtime_chunks,
+    prepare_script_fragments,
+    resolve_script_format,
+)
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request
-from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
+from .tts_prompting import read_style_prompt_from_file
 from .tts_quality import evaluate_tts_transcript
 from .voiceover_script import (
     VOICEOVER_FORMAT,
     chunks_from_voiceover_report,
-    detect_frontmatter_format,
     validate_voiceover_file,
 )
 
@@ -931,17 +931,8 @@ def _enforce_omnivoice_design_route(args: argparse.Namespace, chunks: list[Scrip
 
 
 def _resolve_script_format(script_path: Path, requested_format: str) -> str:
-    detected_format = detect_frontmatter_format(script_path)
-    script_format = requested_format
-    if (
-        detected_format is not None
-        and script_format == "markdown"
-        and (detected_format == VOICEOVER_FORMAT or is_dialogue_format(detected_format))
-    ):
-        script_format = detected_format
-    if script_format is None:
-        return "markdown"
-    return DIALOGUE_FORMAT if is_dialogue_format(script_format) else script_format
+    """Compatibility wrapper for ``services.prepare.resolve_script_format``."""
+    return resolve_script_format(script_path, requested_format)
 
 
 def generate(args: argparse.Namespace) -> None:
@@ -1194,26 +1185,18 @@ def generate(args: argparse.Namespace) -> None:
 
     _ensure_run_dirs(paths)
 
-    requested_voice = args.voice
-    if gemini_report:
-        args.speaker_voice_map = gemini_report["speaker_voice_map"]
-        args.voice = requested_voice or next(iter(args.speaker_voice_map.values()))
-        if args.provider == "omnivoice-local":
-            chunks = _bind_omnivoice_dialogue_fingerprints(chunks, args.voice_bank_catalog)
-    else:
-        args.speaker_voice_map = {}
-        args.voice = requested_voice or _default_voice(args)
-
-    style_prompt = _resolve_provider_style_prompt(args)
-    if (
-        gemini_report
-        and args.provider != "openrouter-tts"
-        and not args.no_style_prompt
-        and args.style_prompt is None
-        and args.style_prompt_file is None
-    ):
-        style_prompt = gemini_report["style_prompt"]
-    prompt_mode = resolve_prompt_mode(args.provider, args.model)
+    try:
+        generation_identity = prepare_generation_identity(
+            args,
+            chunks,
+            gemini_report,
+            resolve_style_prompt=_resolve_provider_style_prompt,
+        )
+    except PreparationError as exc:
+        fail(str(exc), _EXIT_ARGS)
+    chunks = generation_identity.chunks
+    style_prompt = generation_identity.style_prompt
+    prompt_mode = generation_identity.prompt_mode
     _preflight_dialogue_resume(args, chunks, paths, style_prompt, prompt_mode)
     api_key = read_api_key(args)
     provider_for_generation: Any = build_provider(args, api_key, style_prompt, prompt_mode)
@@ -2907,16 +2890,11 @@ def _omnivoice_voice_identity(args: argparse.Namespace) -> str | None:
 def _bind_omnivoice_dialogue_fingerprints(
     chunks: list[ScriptChunk], catalog: VoiceBankCatalog
 ) -> list[ScriptChunk]:
-    profiles = {profile.id: profile for profile in catalog.profiles}
-    bound: list[ScriptChunk] = []
-    for chunk in chunks:
-        if chunk.voice is None:
-            fail("OmniVoice dialogue turn is missing a voice-bank profile", _EXIT_ARGS)
-        profile = profiles.get(chunk.voice)
-        if profile is None:
-            fail(f"voice '{chunk.voice}' not found in the voice bank", _EXIT_ARGS)
-        bound.append(replace(chunk, voice_fingerprint=profile.reference_sha256))
-    return bound
+    """Compatibility wrapper for ``services.prepare`` fingerprint binding."""
+    try:
+        return bind_omnivoice_dialogue_fingerprints(chunks, catalog)
+    except PreparationError as exc:
+        fail(str(exc), _EXIT_ARGS)
 
 
 def _dialogue_synthesis_identity(
@@ -3128,19 +3106,8 @@ def _public_artifact_projection(result) -> dict[str, Any]:
 
 
 def _default_voice(args: argparse.Namespace) -> str | None:
-    if args.provider == "polza-tts":
-        if args.model and args.model.startswith("elevenlabs/"):
-            return DEFAULT_ELEVENLABS_VOICE
-        return DEFAULT_POLZA_TTS_VOICE
-    if args.provider == "openrouter-tts":
-        if args.model and args.model.startswith("openai/"):
-            return DEFAULT_OPENAI_TTS_VOICE
-        return DEFAULT_OPENROUTER_TTS_VOICE
-    if args.provider == "qwen-local":
-        return DEFAULT_QWEN_VOICE
-    if args.provider == "omnivoice-local":
-        return None
-    return DEFAULT_VOICE
+    """Compatibility wrapper for ``services.prepare.default_voice``."""
+    return default_voice(args)
 
 
 def read_api_key(args: argparse.Namespace) -> str:
@@ -3192,11 +3159,19 @@ def _bind_dialogue_voice_bank_providers(
 
 
 def fetch_pricing_snapshot(provider: str, api_key: str, model: str) -> dict | None:
-    if provider in ("polza-chat-audio", "polza-tts"):
-        return fetch_polza_model_pricing(api_key, model)
-    if provider == "openrouter-tts":
-        return fetch_openrouter_model_pricing(model)
-    return None
+    """Compatibility wrapper for ``services.cost_enrichment.fetch_pricing_snapshot``.
+
+    Forwards the CLI's currently bound (and monkeypatched) pricing lookups, so
+    ``cli.fetch_pricing_snapshot`` stays the patchable paid-preflight seam while
+    the provider-to-lookup selection lives in the service.
+    """
+    return cost_enrichment.fetch_pricing_snapshot(
+        provider,
+        api_key,
+        model,
+        fetch_polza_pricing=fetch_polza_model_pricing,
+        fetch_openrouter_pricing=fetch_openrouter_model_pricing,
+    )
 
 
 def json_safe_metadata(value: Any) -> Any:

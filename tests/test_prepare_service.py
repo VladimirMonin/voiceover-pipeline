@@ -362,6 +362,188 @@ def test_prepare_runtime_chunks_forwards_explicit_mode_reference_and_design() ->
     }
 
 
+def test_prepare_generation_identity_binds_dialogue_cast_voice_and_fingerprints(
+    tmp_path: Path,
+) -> None:
+    from voiceover_pipeline.omnivoice_voice_bank import load_voice_bank
+    from voiceover_pipeline.services.prepare import (
+        PreparedGenerationIdentity,
+        prepare_generation_identity,
+    )
+
+    catalog = load_voice_bank(_build_voice_bank(tmp_path))
+    profile = catalog.profiles[0]
+    chunks = [
+        ScriptChunk(number=1, id="chunk_01", text="Реплика.", speaker="Host", voice=profile.id),
+        ScriptChunk(number=2, id="chunk_02", text="Ответ.", speaker="Guest", voice=profile.id),
+    ]
+    args = _args(
+        provider="omnivoice-local",
+        model="audio-cpp/omnivoice-q8_0",
+        voice=None,
+        no_style_prompt=False,
+        style_prompt=None,
+        style_prompt_file=None,
+        voice_bank_catalog=catalog,
+    )
+    report = {"speaker_voice_map": {"Host": profile.id}, "style_prompt": "cast style"}
+    style_calls: list[argparse.Namespace] = []
+
+    def resolve_style_prompt(resolved_args: argparse.Namespace) -> str | None:
+        style_calls.append(resolved_args)
+        return "resolver style"
+
+    identity = prepare_generation_identity(
+        args, chunks, report, resolve_style_prompt=resolve_style_prompt
+    )
+
+    assert isinstance(identity, PreparedGenerationIdentity)
+    assert style_calls == [args]
+    assert args.voice == profile.id
+    assert args.speaker_voice_map == {"Host": profile.id}
+    assert [chunk.voice_fingerprint for chunk in identity.chunks] == [
+        profile.reference_sha256,
+        profile.reference_sha256,
+    ]
+    assert [chunk.id for chunk in identity.chunks] == ["chunk_01", "chunk_02"]
+    assert identity.style_prompt == "cast style"
+    assert identity.prompt_mode == "none"
+
+
+def test_prepare_generation_identity_rejects_missing_or_unknown_voice_profile(
+    tmp_path: Path,
+) -> None:
+    from voiceover_pipeline.omnivoice_voice_bank import load_voice_bank
+    from voiceover_pipeline.services.prepare import (
+        PreparationError,
+        prepare_generation_identity,
+    )
+
+    catalog = load_voice_bank(_build_voice_bank(tmp_path))
+    args = _args(
+        provider="omnivoice-local",
+        model="audio-cpp/omnivoice-q8_0",
+        voice=None,
+        no_style_prompt=False,
+        style_prompt=None,
+        style_prompt_file=None,
+        voice_bank_catalog=catalog,
+    )
+    report = {"speaker_voice_map": {"Host": "main"}, "style_prompt": "cast style"}
+
+    missing_voice = [
+        ScriptChunk(number=1, id="chunk_01", text="Реплика.", speaker="Host", voice=None)
+    ]
+    with pytest.raises(PreparationError, match="missing a voice-bank profile"):
+        prepare_generation_identity(
+            args, missing_voice, report, resolve_style_prompt=lambda _args: None
+        )
+
+    unknown_voice = [
+        ScriptChunk(number=1, id="chunk_01", text="Реплика.", speaker="Host", voice="ghost")
+    ]
+    with pytest.raises(PreparationError, match="voice 'ghost' not found in the voice bank"):
+        prepare_generation_identity(
+            args, unknown_voice, report, resolve_style_prompt=lambda _args: None
+        )
+
+    import voiceover_pipeline.cli as cli
+
+    with pytest.raises(cli.CliError, match="voice 'ghost' not found in the voice bank") as error:
+        cli._bind_omnivoice_dialogue_fingerprints(unknown_voice, catalog)
+    assert error.value.code == 2
+
+
+def test_prepare_generation_identity_applies_default_voice_and_injected_style_resolver() -> None:
+    from voiceover_pipeline.services.prepare import prepare_generation_identity
+    from voiceover_pipeline.tts_prompting import resolve_prompt_mode
+
+    chunks = _chunks("Первое предложение.")
+    args = _args(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice=None,
+        no_style_prompt=False,
+        style_prompt=None,
+        style_prompt_file=None,
+    )
+    captured: dict[str, argparse.Namespace] = {}
+
+    def resolve_style_prompt(resolved_args: argparse.Namespace) -> str | None:
+        captured["args"] = resolved_args
+        return "resolved style"
+
+    identity = prepare_generation_identity(
+        args, chunks, None, resolve_style_prompt=resolve_style_prompt
+    )
+
+    assert captured["args"] is args
+    assert args.speaker_voice_map == {}
+    assert args.voice == "alloy"
+    assert identity.chunks is chunks
+    assert identity.style_prompt == "resolved style"
+    assert identity.prompt_mode == resolve_prompt_mode("polza-tts", "openai/gpt-4o-mini-tts")
+
+    explicit = _args(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice="ash",
+        no_style_prompt=False,
+        style_prompt=None,
+        style_prompt_file=None,
+    )
+    prepare_generation_identity(explicit, chunks, None, resolve_style_prompt=lambda _args: None)
+    assert explicit.voice == "ash"
+    assert explicit.speaker_voice_map == {}
+
+
+def test_prepare_generation_identity_report_style_only_overrides_non_openrouter() -> None:
+    from voiceover_pipeline.services.prepare import prepare_generation_identity
+
+    chunks = _chunks("Реплика.")
+    report = {"speaker_voice_map": {"Host": "Puck"}, "style_prompt": "cast style"}
+
+    openrouter_args = _args(
+        provider="openrouter-tts",
+        model="google/gemini-3.1-flash-tts-preview",
+        voice="Puck",
+        no_style_prompt=False,
+        style_prompt=None,
+        style_prompt_file=None,
+    )
+    openrouter_identity = prepare_generation_identity(
+        openrouter_args, chunks, report, resolve_style_prompt=lambda _args: "resolver style"
+    )
+    assert openrouter_identity.style_prompt == "resolver style"
+    assert openrouter_args.speaker_voice_map == {"Host": "Puck"}
+
+    polza_args = _args(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice=None,
+        no_style_prompt=False,
+        style_prompt=None,
+        style_prompt_file=None,
+    )
+    polza_identity = prepare_generation_identity(
+        polza_args, chunks, report, resolve_style_prompt=lambda _args: "resolver style"
+    )
+    assert polza_identity.style_prompt == "cast style"
+
+    explicit_style_args = _args(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice=None,
+        no_style_prompt=False,
+        style_prompt="explicit",
+        style_prompt_file=None,
+    )
+    explicit_identity = prepare_generation_identity(
+        explicit_style_args, chunks, report, resolve_style_prompt=lambda _args: "resolver style"
+    )
+    assert explicit_identity.style_prompt == "resolver style"
+
+
 def test_generate_dry_run_forwards_cli_local_prep_binding(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
 ) -> None:
