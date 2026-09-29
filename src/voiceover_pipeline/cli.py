@@ -3,7 +3,6 @@ import glob as glob_mod
 import hashlib
 import importlib.util
 import json
-import os
 import shutil
 import sys
 import time  # noqa: F401 - shared sleep seam tests patch via cli.time
@@ -100,7 +99,6 @@ from .omnivoice_voice_bank import (
     VoiceBankCatalog,
     VoiceBankError,
     load_voice_bank,
-    resolve_bank_profile,
 )
 from .pricing import (
     fetch_openrouter_generation_detail,
@@ -110,10 +108,7 @@ from .pricing import (
 )
 from .providers import (
     OmniVoiceLocalTTSProvider,
-    OpenRouterTTSProvider,
-    PolzaChatAudioProvider,
     PolzaTTSProvider,
-    QwenLocalTTSProvider,
     TTSProvider,
 )
 from .providers.asr_registry import (
@@ -137,7 +132,15 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
-from .services import cost_enrichment, costs, execution, finalization, recovery, transcription
+from .services import (
+    cost_enrichment,
+    costs,
+    execution,
+    finalization,
+    provider_factory,
+    recovery,
+    transcription,
+)
 from .services.prepare import prepare_runtime_chunks, prepare_script_fragments
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request
@@ -1215,16 +1218,11 @@ def generate(args: argparse.Namespace) -> None:
     api_key = read_api_key(args)
     provider_for_generation: Any = build_provider(args, api_key, style_prompt, prompt_mode)
     if args.provider == "omnivoice-local" and gemini_report:
-        catalog = args.voice_bank_catalog
-        if not isinstance(provider_for_generation, OmniVoiceLocalTTSProvider):
-            fail("omnivoice-local dialogue did not build an OmniVoice provider", _EXIT_PROVIDER)
-        providers: dict[str, OmniVoiceLocalTTSProvider] = {}
-        for voice_id in gemini_report["speaker_voice_map"].values():
-            profile, reference_path = resolve_bank_profile(catalog, voice_id)
-            providers[voice_id] = provider_for_generation.for_voice_bank_profile(
-                profile, reference_path
-            )
-        provider_for_generation = providers
+        provider_for_generation = _bind_dialogue_voice_bank_providers(
+            provider_for_generation,
+            args.voice_bank_catalog,
+            gemini_report["speaker_voice_map"],
+        )
     pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
 
     _generate_step(
@@ -3164,88 +3162,33 @@ def read_api_key(args: argparse.Namespace) -> str:
 def build_provider(
     args: argparse.Namespace, api_key: str, style_prompt: str | None, prompt_mode: str
 ) -> TTSProvider:
-    if args.provider == "polza-chat-audio":
-        return PolzaChatAudioProvider(
-            api_key=api_key, model=args.model, voice=args.voice, fallback_voice=args.fallback_voice
-        )
-    if args.provider == "polza-tts":
-        return PolzaTTSProvider(api_key=api_key, model=args.model, voice=args.voice)
-    if args.provider == "openrouter-tts":
-        return OpenRouterTTSProvider(
-            api_key=api_key,
-            model=args.model,
-            voice=args.voice,
-            style_prompt=style_prompt,
-            prompt_mode=prompt_mode,
-        )
-    if args.provider == "qwen-local":
-        instruct = getattr(args, "qwen_instruct", None)
-        provider_kwargs = {
-            "mode": args.mode,
-            "voice": None if args.mode == "design" else args.voice,
-            "instruct": QWEN_INSTRUCT if instruct is None else instruct,
-            "sample_path": args.sample,
-            "sample_text": getattr(args, "sample_text", None) or "",
-        }
-        runtime = os.environ.get("VOICEOVER_QWEN_TTS_RUNTIME", "python").strip()
-        if runtime == "audio-cpp":
-            from .providers.audio_cpp_qwen_tts import AudioCppQwenTTSProvider
+    """Compatibility wrapper for ``services.provider_factory.build_tts_provider``.
 
-            return AudioCppQwenTTSProvider.from_environment(**provider_kwargs)
-        if runtime != "python":
-            fail(
-                "VOICEOVER_QWEN_TTS_RUNTIME must be either 'python' or 'audio-cpp'.",
-                _EXIT_ARGS,
-            )
-        return QwenLocalTTSProvider(
-            **provider_kwargs,
-        )
+    OmniVoice argument validation still runs here before any construction, so
+    ``cli.build_provider`` stays the external entry point and its exact usage
+    errors keep their existing strings and codes. Only the typed configuration
+    errors are translated; the unknown-provider ``RuntimeError`` propagates.
+    """
     if args.provider == "omnivoice-local":
         _validate_omnivoice_options(args)
-        omni_kwargs: dict[str, Any] = {}
-        mode = getattr(args, "mode", "preset")
-        if mode == "auto":
-            omni_kwargs.update({"mode": "auto"})
-        elif mode == "preset":
-            catalog = getattr(args, "voice_bank_catalog", None)
-            profile = getattr(args, "voice_bank_profile", None)
-            if catalog is None:
-                fail(
-                    "omnivoice-local preset mode requires --voice-bank catalog.json",
-                    _EXIT_ARGS,
-                )
-            if profile is None:
-                if not is_dialogue_format(getattr(args, "format", "markdown")):
-                    fail(
-                        "omnivoice-local preset mode requires a resolved voice-bank profile",
-                        _EXIT_ARGS,
-                    )
-                omni_kwargs.update({"mode": "preset"})
-            else:
-                reference_path = resolve_bank_profile(catalog, profile.id)[1]
-                omni_kwargs.update(
-                    {
-                        "mode": "preset",
-                        "voice_bank": (profile, reference_path),
-                    }
-                )
-        elif mode == "clone":
-            omni_kwargs.update(
-                {
-                    "mode": "clone",
-                    "reference_audio_path": args.reference_audio,
-                    "reference_text": args.reference_text,
-                }
-            )
-        elif mode == "design":
-            omni_kwargs.update(
-                {
-                    "mode": "design",
-                    "design_instruction": args.design_instruction,
-                }
-            )
-        return OmniVoiceLocalTTSProvider.from_environment(**omni_kwargs)
-    raise RuntimeError(f"Unsupported provider: {args.provider}")
+    try:
+        return provider_factory.build_tts_provider(args, api_key, style_prompt, prompt_mode)
+    except provider_factory.ProviderConfigurationError as exc:
+        fail(str(exc), _EXIT_ARGS)
+
+
+def _bind_dialogue_voice_bank_providers(
+    provider: Any,
+    catalog: VoiceBankCatalog,
+    speaker_voice_map: dict[str, str],
+) -> dict[str, OmniVoiceLocalTTSProvider]:
+    """Compatibility wrapper for ``services.provider_factory`` dialogue binding."""
+    try:
+        return provider_factory.bind_dialogue_voice_bank_providers(
+            provider, catalog, speaker_voice_map
+        )
+    except provider_factory.DialogueProviderBindingError as exc:
+        fail(str(exc), _EXIT_PROVIDER)
 
 
 def fetch_pricing_snapshot(provider: str, api_key: str, model: str) -> dict | None:
