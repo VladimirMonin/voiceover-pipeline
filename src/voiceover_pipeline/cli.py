@@ -29,6 +29,7 @@ from .asr_longform import (
     uses_long_form_orchestration,
 )
 from .asr_timing_bridge import asr_result_to_timing
+from .commands.split import ScriptNotFoundError, prepare_split_chunks
 from .config import (
     DEFAULT_ASR_COMPUTE,
     DEFAULT_ASR_DEVICE,
@@ -2019,10 +2020,10 @@ def _generate_step(
 
 
 def split_cmd(args: argparse.Namespace) -> None:
-    script = Path(args.script)
-    if not script.exists():
-        fail(f"Script file not found: {script}", _EXIT_ARGS)
-    chunks = split_markdown_by_delimiter(script, args.delimiter)
+    try:
+        chunks = prepare_split_chunks(Path(args.script), args.delimiter)
+    except ScriptNotFoundError as exc:
+        fail(str(exc), _EXIT_ARGS)
     if args.json_output:
         _json_ok(
             {"status": "success", "chunks": [{"id": c.id, "chars": len(c.text)} for c in chunks]}

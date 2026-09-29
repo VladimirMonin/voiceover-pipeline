@@ -59,6 +59,63 @@ def test_split_missing_script():
     assert data["code"] == 2
 
 
+def test_prepare_split_chunks_extracts_filesystem_preparation(tmp_path):
+    from voiceover_pipeline.commands.split import ScriptNotFoundError, prepare_split_chunks
+
+    script = tmp_path / "script.md"
+    script.write_text("alpha******beta******", encoding="utf-8")
+    chunks = prepare_split_chunks(script)
+
+    assert [(c.id, c.text) for c in chunks] == [
+        ("chunk_01", "alpha"),
+        ("chunk_02", "beta"),
+    ]
+    assert [(c.id, len(c.text)) for c in prepare_split_chunks(script, "******")] == [
+        ("chunk_01", 5),
+        ("chunk_02", 4),
+    ]
+
+    missing = tmp_path / "missing.md"
+    with pytest.raises(ScriptNotFoundError, match="Script file not found"):
+        prepare_split_chunks(missing)
+
+
+def test_split_json_contract_is_exact_and_invalid_path_preserved():
+    code, data = cli_json("split", "--script", str(fixture_path("smoke_test.md")), "--json")
+    assert code == 0
+    assert data == {
+        "status": "success",
+        "chunks": [
+            {"id": "chunk_01", "chars": 254},
+            {"id": "chunk_02", "chars": 116},
+        ],
+    }
+
+    missing = fixture_path("missing.md")
+    code, data = cli_json("split", "--script", str(missing), "--json")
+    assert code == 2
+    assert data == {
+        "status": "error",
+        "error": f"Script file not found: {missing}",
+        "code": 2,
+    }
+
+
+def test_split_text_output_and_invalid_path_stderr():
+    from conftest import run_cli
+
+    proc = run_cli("split", "--script", str(fixture_path("smoke_test.md")))
+    assert proc.returncode == 0
+    assert proc.stdout.splitlines() == ["chunk_01: 254 chars", "chunk_02: 116 chars"]
+    assert proc.stderr == ""
+
+    missing = fixture_path("missing.md")
+    proc = run_cli("split", "--script", str(missing))
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert proc.stderr == f"Error: Script file not found: {missing}\n"
+
+
 def test_list_providers():
     code, data = cli_json("list", "providers", "--json")
     assert code == 0
