@@ -45,7 +45,6 @@ from .config import (
     DEFAULT_TIMING_COMPUTE,
     DEFAULT_TIMING_DEVICE,
     DEFAULT_TIMING_LANGUAGE,
-    DEFAULT_TIMING_MODEL,
     DEFAULT_TIMING_PROVIDER,
     DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
@@ -129,7 +128,6 @@ from .providers.asr_registry import (
     list_asr_provider_specs,
 )
 from .providers.audio_cpp_omnivoice_tts import omnivoice_local_dependency_probe
-from .providers.base import TranscriptionProvider
 from .retry import is_retryable_error
 from .run_state import (
     ATTEMPT_FAILED,
@@ -1854,72 +1852,15 @@ def _verify_dialogue_turns_before_concat(
     paths,
 ) -> dict[str, Any] | None:
     """Transcribe and strictly verify every dialogue turn before final concat."""
-    provider_id = getattr(args, "tts_quality_provider", None)
-    if provider_id is None:
-        return None
-
-    artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
-    receipt_path = paths.output_root / "tts_quality.json"
-    aggregate: dict[str, Any] = {
-        "artifact_type": "voiceover-dialogue-tts-quality-receipt",
-        "status": "running",
-        "passed": False,
-        "provider": provider_id,
-        "model": getattr(args, "tts_quality_model", None),
-        "turn_count": len(chunks),
-        "turns": [],
-        "human_listening_required": True,
-    }
-    atomic_write_json(receipt_path, aggregate)
-
-    for chunk in chunks:
-        artifact = artifacts_by_number.get(chunk.number)
-        if artifact is None:
-            aggregate["status"] = "quality_failed"
-            aggregate["failure_reason"] = "missing_turn_artifact"
-            atomic_write_json(receipt_path, aggregate)
-            fail(
-                f"Dialogue TTS quality gate failed: turn {chunk.number} has no audio artifact.",
-                _EXIT_QUALITY,
-                details=aggregate,
-            )
-        audio_path = paths.chunks_dir / artifact.file
-        transcript, asr_provider, asr_model, asr_runtime, asr_revision = (
-            _transcribe_dialogue_quality_audio(args, audio_path)
-        )
-        quality = evaluate_tts_transcript(
-            expected_text=chunk.text,
-            actual_transcript=transcript,
-            minimum_similarity=1.0,
-            maximum_missing_ratio=0.0,
-            maximum_unexpected_ratio=0.0,
-            maximum_repeated_ngram_excess=0,
-            strip_audio_tags=True,
-        )
-        turn_receipt = quality.public_receipt(
-            audio_sha256=_sha256_file(audio_path),
-            asr_provider=asr_provider,
-            asr_model=asr_model,
-            asr_runtime=asr_runtime,
-            asr_model_revision=asr_revision,
-        )
-        turn_receipt["turn_index"] = chunk.number
-        aggregate["turns"].append(turn_receipt)
-        if not quality.passed:
-            aggregate["status"] = "quality_failed"
-            aggregate["failed_turn"] = chunk.number
-            atomic_write_json(receipt_path, aggregate)
-            fail(
-                f"Dialogue TTS quality gate failed for turn {chunk.number}; final concat was not created.",
-                _EXIT_QUALITY,
-                details=aggregate,
-            )
-        atomic_write_json(receipt_path, aggregate)
-
-    aggregate["status"] = "success"
-    aggregate["passed"] = True
-    atomic_write_json(receipt_path, aggregate)
-    return aggregate
+    return transcription.verify_dialogue_turns_before_concat(
+        args=args,
+        chunks=chunks,
+        chunk_artifacts=chunk_artifacts,
+        paths=paths,
+        transcribe_quality_audio=_transcribe_dialogue_quality_audio,
+        sha256_file=_sha256_file,
+        fail_quality=lambda message, receipt: fail(message, _EXIT_QUALITY, details=receipt),
+    )
 
 
 def run_timings(args: argparse.Namespace) -> None:
@@ -2970,7 +2911,6 @@ def _extract_timings(
     word_timestamps=False,
     quiet=False,
 ):
-    provider: TranscriptionProvider
     if timing_provider == "openrouter-whisper":
         fail(
             "openrouter-whisper does NOT return segment or word-level timestamps. "
@@ -2983,28 +2923,13 @@ def _extract_timings(
             "For plain transcription (text only, no timings), use OpenRouter directly.",
             _EXIT_PROVIDER,
         )
-    elif timing_provider == "groq-whisper":
-        from .providers.groq_whisper import GroqWhisperProvider
 
-        effective_model = model or "whisper-large-v3-turbo"
-        provider = GroqWhisperProvider(model=effective_model)
-    elif timing_provider == "xai-stt":
-        from .providers.xai_stt import XAISttProvider
-
-        effective_model = model or "grok-stt"
-        provider = XAISttProvider(model=effective_model)
-    else:
-        from .providers.faster_whisper import FasterWhisperProvider
-
-        effective_model = model or DEFAULT_TIMING_MODEL
-        provider = FasterWhisperProvider(
-            model_size=effective_model,
-            device=device,
-            compute_type=compute_type,
-        )
-
-    timing = provider.transcribe(
+    timing = transcription.transcribe_timing_audio(
         audio_path=audio_path,
+        timing_provider=timing_provider,
+        model=model,
+        device=device,
+        compute_type=compute_type,
         language=language,
         word_timestamps=word_timestamps,
         quiet=quiet,

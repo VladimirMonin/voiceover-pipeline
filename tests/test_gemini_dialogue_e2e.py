@@ -258,3 +258,106 @@ def test_omnivoice_dialogue_validation_accepts_admitted_bank_profiles(tmp_path):
         "omni-female-neutral-01",
         "omni-male-deep-01",
     ]
+
+
+def _dialogue_gate_fixture(tmp_path):
+    import argparse
+
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.models import ChunkArtifact, ScriptChunk
+
+    paths = build_run_paths(tmp_path / "out", "google/gemini-3.1-flash-tts-preview", "gate")
+    paths.chunks_dir.mkdir(parents=True)
+    turns = ["Первая реплика.", "Вторая реплика."]
+    chunks = [
+        ScriptChunk(number=number, id=f"turn_{number:04d}", text=text)
+        for number, text in enumerate(turns, 1)
+    ]
+    for chunk in chunks:
+        (paths.chunks_dir / f"{chunk.id}.mp3").write_bytes(f"audio-{chunk.number}".encode())
+    artifacts = [
+        ChunkArtifact(
+            number=chunk.number,
+            id=chunk.id,
+            file=f"{chunk.id}.mp3",
+            duration_ms=1000,
+            duration_sec=1.0,
+            start_ms=0,
+            end_ms=1000,
+            text_characters=len(chunk.text),
+            transcript=None,
+            client_path=None,
+            generation_id=None,
+        )
+        for chunk in chunks
+    ]
+    args = argparse.Namespace(tts_quality_provider="fixture-asr", tts_quality_model="fixture-model")
+    return args, chunks, artifacts, paths, turns
+
+
+def test_dialogue_quality_gate_service_writes_exact_success_receipt(tmp_path):
+    import json
+
+    from voiceover_pipeline.services import transcription
+
+    args, chunks, artifacts, paths, turns = _dialogue_gate_fixture(tmp_path)
+    transcripts = iter(turns)
+
+    def transcribe_quality_audio(_args, _audio_path):
+        return (next(transcripts), "fixture-asr", "fixture-model", "fixture-runtime", None)
+
+    receipt = transcription.verify_dialogue_turns_before_concat(
+        args=args,
+        chunks=chunks,
+        chunk_artifacts=artifacts,
+        paths=paths,
+        transcribe_quality_audio=transcribe_quality_audio,
+        sha256_file=lambda path: f"sha-{path.name}",
+        fail_quality=lambda message, _receipt: pytest.fail(message),
+    )
+
+    assert receipt["status"] == "success"
+    assert receipt["passed"] is True
+    assert receipt["provider"] == "fixture-asr"
+    assert receipt["turn_count"] == 2
+    assert [turn["turn_index"] for turn in receipt["turns"]] == [1, 2]
+    assert receipt["turns"][0]["audio_sha256"] == "sha-turn_0001.mp3"
+    assert all(turn["passed"] for turn in receipt["turns"])
+    written = json.loads((paths.output_root / "tts_quality.json").read_text(encoding="utf-8"))
+    assert written["status"] == "success"
+    assert written["passed"] is True
+
+
+def test_dialogue_quality_gate_service_fails_closed_before_remaining_turns(tmp_path):
+    from voiceover_pipeline.services import transcription
+
+    args, chunks, artifacts, paths, _turns = _dialogue_gate_fixture(tmp_path)
+    transcribed = []
+    seen_receipts = []
+
+    def transcribe_quality_audio(_args, audio_path):
+        transcribed.append(audio_path)
+        return ("Совсем другой текст.", "fixture-asr", "fixture-model", "fixture-runtime", None)
+
+    class QualityStop(Exception):
+        pass
+
+    def fail_quality(message, receipt):
+        seen_receipts.append(receipt)
+        raise QualityStop(message)
+
+    with pytest.raises(QualityStop, match="turn 1"):
+        transcription.verify_dialogue_turns_before_concat(
+            args=args,
+            chunks=chunks,
+            chunk_artifacts=artifacts,
+            paths=paths,
+            transcribe_quality_audio=transcribe_quality_audio,
+            sha256_file=lambda _path: "sha",
+            fail_quality=fail_quality,
+        )
+
+    assert len(transcribed) == 1
+    assert seen_receipts[0]["status"] == "quality_failed"
+    assert seen_receipts[0]["passed"] is False
+    assert seen_receipts[0]["failed_turn"] == 1

@@ -142,6 +142,76 @@ def test_legacy_timing_manifest_remains_byte_compatible_when_provider_is_absent(
     assert "provider" not in build_timing_manifest(legacy, duration_ms=2000)
 
 
+def test_timing_provider_selection_and_transcribe_belong_to_transcription_service(monkeypatch):
+    from pathlib import Path
+
+    from voiceover_pipeline.config import DEFAULT_TIMING_MODEL
+    from voiceover_pipeline.providers import faster_whisper, groq_whisper, xai_stt
+    from voiceover_pipeline.services import transcription
+
+    calls: list[tuple[str, dict]] = []
+
+    class FakeTimingProvider:
+        def __init__(self, **kwargs):
+            calls.append(("init", kwargs))
+
+        def transcribe(self, **kwargs):
+            calls.append(("transcribe", kwargs))
+            return "timing-result"
+
+    monkeypatch.setattr(faster_whisper, "FasterWhisperProvider", FakeTimingProvider)
+    monkeypatch.setattr(groq_whisper, "GroqWhisperProvider", FakeTimingProvider)
+    monkeypatch.setattr(xai_stt, "XAISttProvider", FakeTimingProvider)
+
+    result = transcription.transcribe_timing_audio(
+        audio_path=Path("part.mp3"),
+        timing_provider="faster-whisper",
+        model=None,
+        device="cpu",
+        compute_type="int8",
+        language="ru",
+        word_timestamps=True,
+        quiet=True,
+    )
+
+    assert result == "timing-result"
+    assert calls[0] == (
+        "init",
+        {"model_size": DEFAULT_TIMING_MODEL, "device": "cpu", "compute_type": "int8"},
+    )
+    assert calls[1] == (
+        "transcribe",
+        {
+            "audio_path": Path("part.mp3"),
+            "language": "ru",
+            "word_timestamps": True,
+            "quiet": True,
+        },
+    )
+
+    calls.clear()
+    transcription.transcribe_timing_audio(
+        audio_path=Path("part.mp3"),
+        timing_provider="groq-whisper",
+        model=None,
+        device="cpu",
+        compute_type="int8",
+        language="ru",
+    )
+    assert calls[0] == ("init", {"model": "whisper-large-v3-turbo"})
+
+    calls.clear()
+    transcription.transcribe_timing_audio(
+        audio_path=Path("part.mp3"),
+        timing_provider="xai-stt",
+        model="grok-custom",
+        device="cpu",
+        compute_type="int8",
+        language="ru",
+    )
+    assert calls[0] == ("init", {"model": "grok-custom"})
+
+
 def test_generic_asr_timing_route_writes_existing_artifacts_without_replacing_faster_whisper(
     tmp_path, monkeypatch
 ):
