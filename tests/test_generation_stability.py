@@ -3218,6 +3218,166 @@ def test_pending_raw_recovery_bounds_path_format_and_digest():
     assert pending_raw_recovery(url_id)["generation_id"] is None
 
 
+def test_recovery_service_prefers_saved_raw_over_known_media(tmp_path):
+    """A marker holding both a raw receipt and a media id rebuilds locally first.
+
+    The recovery service is read-only and keeps the CLI's paid precedence: saved
+    raw bytes need no provider request, so they win over a known media task id.
+    """
+    from voiceover_pipeline.run_state import (
+        begin_chunk_attempt,
+        initial_state,
+        raw_audio_relative_path,
+        record_media_task_accepted,
+        record_raw_audio_saved,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services import recovery
+
+    run_root = tmp_path / "out" / "raw-precedence"
+    chunks_dir = run_root / "chunks"
+    chunks_dir.mkdir(parents=True)
+    script = fixture_path("smoke_test.md")
+    chunks = split_markdown_by_delimiter(script, "******")
+    model = "elevenlabs/text-to-speech-turbo-2-5"
+    voice = "Rachel"
+    state = initial_state(
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        script_path=script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id="raw-precedence",
+    )
+    first = chunks[0]
+    begin_chunk_attempt(state, chunk_id=first.id, number=first.number)
+    record_media_task_accepted(state, task_id="task-1", chunk_id=first.id, number=first.number)
+    relative = raw_audio_relative_path(first.id, "mp3")
+    raw_path = run_root / relative
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(b"paid-mp3")
+    record_raw_audio_saved(
+        state,
+        chunk_id=first.id,
+        number=first.number,
+        audio_format="mp3",
+        relative_path=relative,
+        sha256=hashlib.sha256(b"paid-mp3").hexdigest(),
+        generation_id="gen-1",
+    )
+
+    attempts = recovery.recoverable_paid_attempts(
+        state,
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+        run_root=run_root,
+    )
+    assert attempts[first.number]["kind"] == "raw"
+    assert attempts[first.number]["raw_path"] == relative
+    # The media fallback exists on its own, so the raw branch above is a choice.
+    media = recovery.recoverable_media_attempts(
+        state,
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+    )
+    assert media[first.number]["kind"] == "media"
+
+
+def test_recovery_service_fails_closed_on_corrupt_raw_or_changed_identity(tmp_path):
+    """A replaced raw file or a changed identity yields no recoverable attempt.
+
+    The service only reads bounded state and files, so an empty result is the
+    same documented block the CLI keeps; no provider request can follow.
+    """
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.run_state import (
+        begin_chunk_attempt,
+        initial_state,
+        pending_raw_recovery,
+        raw_audio_relative_path,
+        record_raw_audio_saved,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services import recovery
+
+    run_root = tmp_path / "out" / "raw-fail-closed"
+    chunks_dir = run_root / "chunks"
+    chunks_dir.mkdir(parents=True)
+    script = fixture_path("smoke_test.md")
+    chunks = split_markdown_by_delimiter(script, "******")
+    model = "openai/gpt-4o-mini-tts"
+    voice = "ash"
+    state = initial_state(
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        script_path=script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id="raw-fail-closed",
+    )
+    first = chunks[0]
+    begin_chunk_attempt(state, chunk_id=first.id, number=first.number)
+    relative = raw_audio_relative_path(first.id, "mp3")
+    raw_path = run_root / relative
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(b"paid-mp3")
+    record_raw_audio_saved(
+        state,
+        chunk_id=first.id,
+        number=first.number,
+        audio_format="mp3",
+        relative_path=relative,
+        sha256=hashlib.sha256(b"paid-mp3").hexdigest(),
+        generation_id="gen-1",
+    )
+
+    def attempts(**overrides):
+        kwargs = {
+            "provider": "polza-tts",
+            "model": model,
+            "voice": voice,
+            "chunks": chunks,
+            "chunks_dir": chunks_dir,
+            "run_root": run_root,
+        }
+        kwargs.update(overrides)
+        return recovery.recoverable_paid_attempts(state, **kwargs)
+
+    assert attempts()[first.number]["kind"] == "raw"
+    # A replaced raw file no longer matches its receipt digest.
+    raw_path.write_bytes(b"replaced")
+    assert attempts() == {}
+    assert (
+        cli._recoverable_paid_attempts(
+            state,
+            provider="polza-tts",
+            model=model,
+            voice=voice,
+            chunks=chunks,
+            chunks_dir=chunks_dir,
+            run_root=run_root,
+        )
+        == {}
+    )
+    assert pending_raw_recovery(state) is not None
+    # A changed provider, model, voice, or script is not the stored attempt.
+    raw_path.write_bytes(b"paid-mp3")
+    assert attempts(model="openai/gpt-4o-mini-tts-v2") == {}
+    assert attempts(voice="nova") == {}
+    assert attempts(provider="polza-chat-audio") == {}
+    assert attempts(chunks=list(reversed(chunks))) == {}
+    # A synchronous ``/audio/speech`` model can never hold a media task id.
+    assert recovery.known_media_recovery(state) is None
+
+
 def test_status_marks_unconfirmed_paid_submit_as_not_resumable(tmp_path):
     """A blocked run reports can_resume false with a bounded machine reason."""
     from voiceover_pipeline.run_state import atomic_write_json

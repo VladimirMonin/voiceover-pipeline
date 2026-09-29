@@ -146,7 +146,6 @@ from .run_state import (
     completed_numbers,
     initial_state,
     load_state,
-    pending_media_recovery,
     pending_raw_recovery,
     raw_audio_relative_path,
     record_chunk_attempt_outcome,
@@ -159,8 +158,9 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
-from .services import costs
+from .services import costs, recovery
 from .services.prepare import prepare_run
+from .services.recovery import _PAID_SUBMIT_TTS_PROVIDERS
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request, validate_result_capabilities
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
@@ -1333,13 +1333,8 @@ _ATTACHED_COST_STATE_FIELDS = (
 
 
 def _state_entry_number(entry: dict[str, Any]) -> int | None:
-    number = entry.get("number")
-    if number is None:
-        return None
-    try:
-        return int(number)
-    except (TypeError, ValueError):
-        return None
+    """Compatibility wrapper for ``services.recovery.state_entry_number``."""
+    return recovery.state_entry_number(entry)
 
 
 def _merge_attached_costs_into_state(state: dict[str, Any], artifacts: list[ChunkArtifact]) -> None:
@@ -3065,11 +3060,6 @@ def _has_paid_chunk_audio(paths) -> bool:
     return paths.chunks_dir.exists() and any(paths.chunks_dir.glob("chunk_*.mp3"))
 
 
-# Providers whose TTS call is a paid network submit. A failure after the request
-# was sent may still have been accepted and billed, so the outer retry must not
-# re-send it and a resume must not resubmit an unconfirmed attempt.
-_PAID_SUBMIT_TTS_PROVIDERS = frozenset({"polza-tts", "polza-chat-audio", "openrouter-tts"})
-
 _PAID_SUBMIT_UNCONFIRMED_ERROR_CODE = "PAID_SUBMIT_UNCONFIRMED"
 
 # Machine reason reported by ``status --json`` for a run whose resume is blocked.
@@ -3167,88 +3157,32 @@ def _unconfirmed_paid_attempt_in_existing_run(paths) -> dict[str, Any] | None:
 
 
 def _polza_media_route_model(model: object) -> bool:
-    """Whether a Polza TTS model submits through the async ``/media`` route.
-
-    Only the ElevenLabs ``elevenlabs/`` models POST to ``/media`` and can hold a
-    recoverable task id; every other model uses the synchronous ``/audio/speech``
-    route, so a marker next to it can never be an async media task and keeps the
-    documented paid-submit block.
-    """
-    return isinstance(model, str) and model.startswith("elevenlabs/")
+    """Compatibility wrapper for ``services.recovery.polza_media_route_model``."""
+    return recovery.polza_media_route_model(model)
 
 
 def _known_media_recovery(state: dict[str, Any] | None) -> dict[str, Any] | None:
-    """Return the bounded recovery marker of a known paid Polza media submit.
-
-    Only a paid media run whose model uses the ``/media`` route and whose stored
-    id is still a bounded opaque token can be finished with GET calls, and a
-    marker next to a completed entry for the same chunk is stale evidence rather
-    than a task to recover.
-    """
-    if not isinstance(state, dict) or state.get("provider") != "polza-tts":
-        return None
-    if not _polza_media_route_model(state.get("model")):
-        return None
-    recovery = pending_media_recovery(state)
-    if recovery is None or recovery["number"] in completed_numbers(state):
-        return None
-    return recovery
+    """Compatibility wrapper for ``services.recovery.known_media_recovery``."""
+    return recovery.known_media_recovery(state)
 
 
 def _preceding_chunks_ready(
     prior_ids: dict[int, str], chunks_dir: Path, completed: set[int], number: int
 ) -> bool:
-    """Whether every earlier chunk is state-completed with its MP3 still on disk.
-
-    A missing earlier MP3 would be regenerated into a new paid submit, which
-    must not collide with a stored paid attempt, so recovery is refused until
-    the run is genuinely contiguous up to this chunk. The file name follows the
-    chunk id, which is ``chunk_NN`` for narration and ``turn_NNNN`` for dialogue.
-    """
-    for earlier in range(1, number):
-        if earlier not in completed:
-            return False
-        chunk_id = prior_ids.get(earlier)
-        if not isinstance(chunk_id, str) or not (chunks_dir / f"{chunk_id}.mp3").exists():
-            return False
-    return True
+    """Compatibility wrapper for ``services.recovery.preceding_chunks_ready``."""
+    return recovery.preceding_chunks_ready(prior_ids, chunks_dir, completed, number)
 
 
 def _state_completed_chunk_ids(state: dict[str, Any] | None) -> dict[int, str]:
-    """Map completed state-chunk numbers to their stored ids for resume checks."""
-    ids: dict[int, str] = {}
-    if not isinstance(state, dict):
-        return ids
-    for entry in state.get("chunks", []):
-        if not isinstance(entry, dict) or entry.get("status") != "completed":
-            continue
-        number = _state_entry_number(entry)
-        chunk_id = entry.get("id")
-        if number is not None and isinstance(chunk_id, str):
-            ids[number] = chunk_id
-    return ids
+    """Compatibility wrapper for ``services.recovery.state_completed_chunk_ids``."""
+    return recovery.state_completed_chunk_ids(state)
 
 
 def _known_raw_recovery(
     state: dict[str, Any] | None, run_root: Path, chunks_dir: Path
 ) -> dict[str, Any] | None:
-    """Return the bounded raw receipt of a saved paid audio attempt, if usable.
-
-    Raw recovery applies to every paid provider: the bytes were saved before any
-    conversion, so a resume rebuilds the chunk locally with no POST and no GET.
-    A marker next to a completed entry is stale evidence, and a missing or
-    digest-mismatched raw file fails closed so the caller keeps the documented
-    paid-submit block instead of resubmitting.
-    """
-    if not isinstance(state, dict) or state.get("provider") not in _PAID_SUBMIT_TTS_PROVIDERS:
-        return None
-    recovery = pending_raw_recovery(state)
-    if recovery is None or recovery["number"] in completed_numbers(state):
-        return None
-    raw_path = run_root / recovery["raw_path"]
-    if not raw_path.is_file() or _sha256_file(raw_path) != recovery["raw_sha256"]:
-        return None
-    return recovery
+    """Compatibility wrapper for ``services.recovery.known_raw_recovery``."""
+    return recovery.known_raw_recovery(state, run_root, chunks_dir)
 
 
 def _recoverable_raw_attempts(
@@ -3261,39 +3195,16 @@ def _recoverable_raw_attempts(
     chunks_dir: Path,
     run_root: Path,
 ) -> dict[int, dict[str, Any]]:
-    """Map chunk number to the saved raw audio this exact command may rebuild.
-
-    The raw bytes count only while the whole identity still matches — same
-    provider, model, voice, and script — the receipt is bound to one of that
-    script's chunks, the file exists with the recorded digest, and every earlier
-    chunk is finished. Every other marker keeps the documented block.
-    """
-    if provider not in _PAID_SUBMIT_TTS_PROVIDERS:
-        return {}
-    if not isinstance(state, dict):
-        return {}
-    if state.get("provider") != provider or state.get("model") != model:
-        return {}
-    if state.get("voice") != voice:
-        return {}
-    if state.get("script_hash") != script_hash(chunks):
-        return {}
-    recovery = _known_raw_recovery(state, run_root, chunks_dir)
-    if recovery is None:
-        return {}
-    completed = completed_numbers(state)
-    prior_ids = {chunk.number: chunk.id for chunk in chunks}
-    for chunk in chunks:
-        if chunk.number in completed:
-            continue
-        if chunk.id == recovery["id"] and chunk.number == recovery["number"]:
-            if not _preceding_chunks_ready(prior_ids, chunks_dir, completed, chunk.number):
-                return {}
-            return {chunk.number: {**recovery, "kind": "raw"}}
-        # The stored attempt belongs to a later chunk while this one is still
-        # unfinished, so it is not the attempt that was in flight.
-        return {}
-    return {}
+    """Compatibility wrapper for ``services.recovery.recoverable_raw_attempts``."""
+    return recovery.recoverable_raw_attempts(
+        state,
+        provider=provider,
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+        run_root=run_root,
+    )
 
 
 def _recoverable_paid_attempts(
@@ -3306,14 +3217,8 @@ def _recoverable_paid_attempts(
     chunks_dir: Path,
     run_root: Path,
 ) -> dict[int, dict[str, Any]]:
-    """Map chunk number to the paid attempt this exact command may recover.
-
-    Saved raw audio takes precedence over a known media task id: it needs no
-    provider request at all, so a chunk that somehow holds both is rebuilt
-    locally. Every other marker keeps the documented PAID_SUBMIT_UNCONFIRMED
-    block.
-    """
-    raw = _recoverable_raw_attempts(
+    """Compatibility wrapper for ``services.recovery.recoverable_paid_attempts``."""
+    return recovery.recoverable_paid_attempts(
         state,
         provider=provider,
         model=model,
@@ -3321,16 +3226,6 @@ def _recoverable_paid_attempts(
         chunks=chunks,
         chunks_dir=chunks_dir,
         run_root=run_root,
-    )
-    if raw:
-        return raw
-    return _recoverable_media_attempts(
-        state,
-        provider=provider,
-        model=model,
-        voice=voice,
-        chunks=chunks,
-        chunks_dir=chunks_dir,
     )
 
 
@@ -3343,42 +3238,15 @@ def _recoverable_media_attempts(
     chunks: list[ScriptChunk],
     chunks_dir: Path,
 ) -> dict[int, dict[str, Any]]:
-    """Map chunk number to the paid media attempt this exact command may recover.
-
-    Resume may reuse a stored paid media id only while the whole identity still
-    matches — same provider, model, voice, and script — and the marker is bound
-    to one of that script's chunks. Every other marker keeps the documented
-    PAID_SUBMIT_UNCONFIRMED block, and the chunk is finished with GET calls only.
-    """
-    if provider != "polza-tts":
-        return {}
-    if not isinstance(state, dict):
-        return {}
-    if state.get("provider") != provider or state.get("model") != model:
-        return {}
-    if state.get("voice") != voice:
-        return {}
-    if state.get("script_hash") != script_hash(chunks):
-        return {}
-    recovery = _known_media_recovery(state)
-    if recovery is None:
-        return {}
-    completed = completed_numbers(state)
-    prior_ids = {chunk.number: chunk.id for chunk in chunks}
-    for chunk in chunks:
-        if chunk.number in completed:
-            continue
-        if chunk.id == recovery["id"] and chunk.number == recovery["number"]:
-            # A missing earlier MP3 must be regenerated first; that would
-            # overwrite this paid marker, so block before key/provider work.
-            if not _preceding_chunks_ready(prior_ids, chunks_dir, completed, chunk.number):
-                return {}
-            return {chunk.number: {**recovery, "kind": "media"}}
-        # The stored attempt belongs to a later chunk while this one is still
-        # unfinished, so it is not the attempt that was in flight. Keeping the
-        # documented block is safer than overwriting a known paid id.
-        return {}
-    return {}
+    """Compatibility wrapper for ``services.recovery.recoverable_media_attempts``."""
+    return recovery.recoverable_media_attempts(
+        state,
+        provider=provider,
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+    )
 
 
 def _paid_submit_attempt_status(error: BaseException) -> str:

@@ -581,6 +581,91 @@ def test_direct_cost_kwargs_cli_wrapper_delegates_to_service():
     assert _media_observed_cost({"cost": 0.3}) == costs.media_observed_cost({"cost": 0.3})
 
 
+def test_recovery_service_status_alignment_and_cli_wrappers(tmp_path):
+    """The recovery service matches the CLI wrappers and ``status --json``.
+
+    A saved raw receipt is resumable with no provider request, so the service
+    reports it, the old CLI wrappers delegate to the service, and ``status
+    --json`` reports the same run as resumable without echoing the receipt.
+    """
+    import hashlib
+
+    from voiceover_pipeline.cli import _known_raw_recovery, _recoverable_paid_attempts
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        raw_audio_relative_path,
+        record_raw_audio_saved,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services import recovery
+
+    run_id = "recovery-service-status"
+    run_dir = tmp_path / "out" / run_id
+    chunks_dir = run_dir / "chunks"
+    chunks_dir.mkdir(parents=True)
+    script = fixture_path("smoke_test.md")
+    chunks = split_markdown_by_delimiter(script, "******")
+    model = "openai/gpt-4o-mini-tts"
+    voice = "ash"
+    state = initial_state(
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        script_path=script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=run_id,
+    )
+    first = chunks[0]
+    begin_chunk_attempt(state, chunk_id=first.id, number=first.number)
+    relative = raw_audio_relative_path(first.id, "mp3")
+    raw_path = run_dir / relative
+    raw_path.parent.mkdir(parents=True)
+    raw_path.write_bytes(b"paid-mp3")
+    record_raw_audio_saved(
+        state,
+        chunk_id=first.id,
+        number=first.number,
+        audio_format="mp3",
+        relative_path=relative,
+        sha256=hashlib.sha256(b"paid-mp3").hexdigest(),
+        generation_id="gen-1",
+    )
+    atomic_write_json(run_dir / "run_state.json", state)
+
+    service_receipt = recovery.known_raw_recovery(state, run_dir, chunks_dir)
+    assert service_receipt is not None
+    assert _known_raw_recovery(state, run_dir, chunks_dir) == service_receipt
+    assert _recoverable_paid_attempts(
+        state,
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+        run_root=run_dir,
+    ) == recovery.recoverable_paid_attempts(
+        state,
+        provider="polza-tts",
+        model=model,
+        voice=voice,
+        chunks=chunks,
+        chunks_dir=chunks_dir,
+        run_root=run_dir,
+    )
+
+    code, data = cli_json(
+        "status", "--output-dir", str(tmp_path / "out"), "--run-id", run_id, "--json"
+    )
+
+    assert code == 0
+    assert data["can_resume"] is True
+    assert data["resume_block_reason"] is None
+    assert "paid-mp3" not in json.dumps(data)
+
+
 def test_gemini_prompt_mode_in_manifest_is_none():
     from voiceover_pipeline.tts_prompting import resolve_prompt_mode
 
