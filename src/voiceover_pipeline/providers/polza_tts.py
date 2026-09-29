@@ -1,5 +1,7 @@
 import base64
+import re
 import time
+from collections.abc import Callable
 from decimal import Decimal
 
 import requests
@@ -14,6 +16,24 @@ from voiceover_pipeline.providers.base import TTSProvider
 _MEDIA_POLL_INTERVAL = 5
 _MEDIA_POLL_MAX = 60
 
+# A validated task id is spliced into the GET path ``/media/<id>`` and a
+# completed generation id is reported to callers, so only opaque token
+# characters are accepted. Anything that could change the target endpoint
+# (slash, query, scheme, dot traversal, whitespace) fails closed before any
+# request, and a non-token id is never echoed into an error or report.
+_MEDIA_SAFE_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _safe_media_id(value: object) -> str | None:
+    """Return a bounded opaque id, or None when the value is not one."""
+    if isinstance(value, str) and _MEDIA_SAFE_ID_PATTERN.fullmatch(value) is not None:
+        return value
+    return None
+
+
+MediaTaskAcceptedCallback = Callable[[str], None]
+MediaCompletedCallback = Callable[[str, dict | None, str | None], None]
+
 
 class PolzaTTSProvider(TTSProvider):
     provider_id = "polza-tts"
@@ -26,6 +46,8 @@ class PolzaTTSProvider(TTSProvider):
         base_url: str = POLZA_BASE_URL,
         response_format: str = DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
         timeout_seconds: int = 240,
+        on_media_task_accepted: MediaTaskAcceptedCallback | None = None,
+        on_media_completed: MediaCompletedCallback | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -33,6 +55,8 @@ class PolzaTTSProvider(TTSProvider):
         self.base_url = base_url.rstrip("/")
         self.response_format = response_format
         self.timeout_seconds = timeout_seconds
+        self.on_media_task_accepted = on_media_task_accepted
+        self.on_media_completed = on_media_completed
 
     @property
     def _is_elevenlabs(self) -> bool:
@@ -119,7 +143,9 @@ class PolzaTTSProvider(TTSProvider):
             timeout=self.timeout_seconds,
         )
         if submit.status_code >= 400:
-            raise RuntimeError(f"HTTP {submit.status_code}: {submit.text}")
+            # The raw error body can echo the request or a signed URL, so only
+            # the bounded HTTP status is reported.
+            raise RuntimeError(f"HTTP {submit.status_code}")
 
         submit_json = submit.json()
         task_id = submit_json.get("id")
@@ -128,8 +154,62 @@ class PolzaTTSProvider(TTSProvider):
                 f"Polza Media response missing 'id'. Keys: {list(submit_json.keys())}"
             )
 
-        result = self._poll_media(task_id, chunk_id)
-        audio_bytes, usage, generation_id = result
+        task_id = self._validate_media_task_id(task_id)
+        if self.on_media_task_accepted is not None:
+            # The accepted id is paid for, so it is persisted before any poll or
+            # download. A persistence failure must propagate instead of
+            # continuing into requests that could send a second paid POST.
+            self.on_media_task_accepted(task_id)
+
+        return self._complete_media_task(task_id, text, chunk_id)
+
+    def recover_media_task(self, task_id: str, text: str, chunk_id: str) -> SynthesisResult:
+        """Finish an already accepted media task with GET calls only.
+
+        The id is validated as a safe opaque token and then polled and
+        downloaded through GET requests; this never submits a new task, so a
+        known paid id cannot be billed twice.
+        """
+        validated_id = self._validate_media_task_id(task_id)
+        return self._complete_media_task(validated_id, text, chunk_id)
+
+    def _complete_media_task(self, task_id: str, text: str, chunk_id: str) -> SynthesisResult:
+        data, usage, generation_id = self._poll_media(task_id)
+        # The completed payload's id is untrusted; drop anything that is not a
+        # bounded opaque token so a URL from the provider cannot be reported as
+        # the generation id. The known safe task id stays the fallback below.
+        generation_id = _safe_media_id(generation_id)
+        if self.on_media_completed is not None:
+            # A completed task already carries its exact usage cost. Report it
+            # before the signed-URL download, which can fail on its own.
+            self.on_media_completed(task_id, usage, generation_id)
+        audio_bytes = self._extract_media_audio(data, chunk_id)
+        return self._build_media_result(
+            text=text,
+            task_id=task_id,
+            audio_bytes=audio_bytes,
+            usage=usage,
+            generation_id=generation_id,
+        )
+
+    @staticmethod
+    def _validate_media_task_id(task_id: object) -> str:
+        validated = _safe_media_id(task_id)
+        if validated is None:
+            # A fixed message keeps an untrusted value (for example a signed URL
+            # from provider output or tampered state) out of the error report.
+            raise ValueError("Polza Media task id is not a safe opaque token.")
+        return validated
+
+    def _build_media_result(
+        self,
+        *,
+        text: str,
+        task_id: str,
+        audio_bytes: bytes,
+        usage: dict | None,
+        generation_id: str | None,
+    ) -> SynthesisResult:
         return SynthesisResult(
             audio_bytes=audio_bytes,
             audio_format="mp3",
@@ -144,7 +224,7 @@ class PolzaTTSProvider(TTSProvider):
             },
         )
 
-    def _poll_media(self, task_id: str, chunk_id: str) -> tuple[bytes, dict | None, str | None]:
+    def _poll_media(self, task_id: str) -> tuple[object, dict | None, str | None]:
         for attempt in range(_MEDIA_POLL_MAX):
             time.sleep(_MEDIA_POLL_INTERVAL)
             response = requests.get(
@@ -153,7 +233,7 @@ class PolzaTTSProvider(TTSProvider):
                 timeout=30,
             )
             if response.status_code >= 400:
-                raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
+                raise RuntimeError(f"HTTP {response.status_code}")
 
             # The completed payload carries usage cost; keep unquoted numbers
             # exact. The submit response above stays plain JSON.
@@ -161,14 +241,13 @@ class PolzaTTSProvider(TTSProvider):
             status = js.get("status") or js.get("state")
 
             if status == "completed":
-                data = js.get("data")
-                usage = js.get("usage")
-                gen_id = js.get("id")
-                return self._extract_media_audio(data, chunk_id), usage, gen_id
+                return js.get("data"), js.get("usage"), js.get("id")
 
             if status == "failed":
-                error = js.get("error")
-                raise RuntimeError(f"Polza Media task {task_id} failed: {error}")
+                # The provider error payload is untrusted and may carry a signed
+                # URL or request text, so it is not echoed; the validated task
+                # id is a bounded opaque token and stays for correlation.
+                raise RuntimeError(f"Polza Media task {task_id} failed.")
 
         raise RuntimeError(
             f"Polza Media task {task_id} still pending after {_MEDIA_POLL_MAX * _MEDIA_POLL_INTERVAL}s"
@@ -186,10 +265,21 @@ class PolzaTTSProvider(TTSProvider):
                 f"Polza Media response missing audio URL. data={type(data).__name__}"
             )
 
-        dl = requests.get(url, timeout=120)
+        try:
+            dl = requests.get(url, timeout=120)
+        except requests.Timeout:
+            # The signed download URL can appear inside the requests exception
+            # text. Re-raise the same retryable class from a constant message so
+            # the URL never reaches a log or report.
+            raise requests.Timeout("Audio download timed out.") from None
+        except requests.ConnectionError:
+            raise requests.ConnectionError("Audio download connection failed.") from None
+        except requests.RequestException:
+            raise requests.RequestException("Audio download failed.") from None
+
         if dl.status_code >= 400:
-            raise RuntimeError(f"Failed to download audio from {url}: HTTP {dl.status_code}")
+            raise RuntimeError(f"Failed to download audio: HTTP {dl.status_code}")
         if not dl.content:
-            raise RuntimeError(f"Downloaded empty audio from {url}")
+            raise RuntimeError("Downloaded empty audio.")
 
         return dl.content

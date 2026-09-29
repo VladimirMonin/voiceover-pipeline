@@ -108,6 +108,7 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 - **OpenAI TTS:** `--voice alloy` (дефолт), ответ — JSON с base64 MP3
 - **ElevenLabs:** `--voice Rachel` (дефолт), async `/media` — submit → poll (до 5 мин) → download
+- **ElevenLabs resume:** принятый `/media` task ID сохраняется до poll, поэтому после сбоя `--resume` при совпадении provider/model/voice/script и наличии более ранних MP3 доводит ту же часть GET-запросами без второго платного POST; маркер без ID по-прежнему блокирует `--resume`/`--overwrite`
 - Единый `POLZA_API_KEY` для обоих polza-провайдеров
 - Style prompt НЕ используется для Polza TTS (не поддерживается endpoint)
 

@@ -795,13 +795,15 @@ def test_paid_chat_audio_submit_timeout_never_retries(tmp_path, monkeypatch):
     assert state["pending_attempt"]["id"] == "chunk_01"
 
 
-def test_paid_media_poll_failure_makes_no_second_submit(tmp_path, monkeypatch):
-    """A known media task id that cannot be polled is not re-submitted.
+def test_paid_media_poll_failure_makes_no_second_submit(tmp_path, monkeypatch, capsys):
+    """A known media task id is stored before the first poll and never re-submitted.
 
-    Only the submit POST is counted: the poll runs after the paid request was
-    accepted, so the outer retry must not send it again. Recovering that known id
-    is a later slice; this run fails closed instead.
+    The accepted id is on disk before the first GET, so the failed poll leaves a
+    marker that a later ``--resume`` finishes with GET calls only: the paid
+    submit is counted once and is not repeated for that chunk.
     """
+    import sys
+
     import voiceover_pipeline.cli as cli
     import voiceover_pipeline.providers.polza_tts as polza_tts
     from voiceover_pipeline.artifacts import build_run_paths
@@ -811,16 +813,16 @@ def test_paid_media_poll_failure_makes_no_second_submit(tmp_path, monkeypatch):
     patch_generation_io(monkeypatch)
     monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
     posts: list[str] = []
+    state_at_first_poll: list[dict] = []
 
     def submit(url, **_kwargs):
         posts.append(url)
-        response = requests.Response()
-        response.status_code = 200
-        response.encoding = "utf-8"
-        response._content = b'{"id": "task-1", "status": "pending"}'
-        return response
+        return _raw_json_response('{"id": "task-1", "status": "pending"}')
 
     def poll_timeout(*_args, **_kwargs):
+        state_at_first_poll.append(
+            json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+        )
         raise requests.Timeout("read timed out")
 
     monkeypatch.setattr(polza_tts.requests, "post", submit)
@@ -842,15 +844,169 @@ def test_paid_media_poll_failure_makes_no_second_submit(tmp_path, monkeypatch):
     assert error.value.code == 30
     assert posts == [f"{polza_tts.POLZA_BASE_URL}/media"]
     state_path = paths.output_root / "run_state.json"
+    # Persisted before the first poll: the accepted id is already in the marker.
+    assert state_at_first_poll[0]["pending_attempt"]["remote_task_id"] == "task-1"
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["pending_attempt"]["status"] == "outcome_unknown"
-    assert "task-1" not in json.dumps(state["pending_attempt"])
+    assert state["pending_attempt"]["remote_task_id"] == "task-1"
 
-    resume_args = _paid_submit_args(
-        tmp_path, "paid-media-poll", resume=True, model=args.model, voice=args.voice
+    signed_url = "https://cdn.example.com/paid.mp3?token=sk-live-secret-12345"
+
+    def resume_get(url, **_kwargs):
+        if url.endswith("/media/task-1"):
+            return _raw_json_response(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "data": {"url": signed_url},
+                        "usage": {"cost_rub": 0.3},
+                    }
+                )
+            )
+        return _raw_json_response("recovered-audio")
+
+    monkeypatch.setattr(polza_tts.requests, "get", resume_get)
+    built: list[str] = []
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: "sk-test")
+    monkeypatch.setattr(cli, "fetch_pricing_snapshot", lambda *_args: None)
+    monkeypatch.setattr(
+        cli,
+        "build_provider",
+        lambda *_args, **_kwargs: (
+            built.append("built")
+            or PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice)
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            args.provider,
+            "--model",
+            args.model,
+            "--voice",
+            args.voice,
+            "--script",
+            str(args.script),
+            "--output-dir",
+            str(args.output_dir),
+            "--run-id",
+            args.run_id,
+            "--limit-chunks",
+            "1",
+            "--resume",
+            "--json",
+        ],
     )
 
-    with pytest.raises(cli.CliError, match="unconfirmed paid submit") as resume_error:
+    with pytest.raises(SystemExit) as resume_exit:
+        cli.main()
+
+    assert resume_exit.value.code == 0
+    assert built == ["built"]
+    # The whole resume used GET calls: the paid submit was not sent again.
+    assert posts == [f"{polza_tts.POLZA_BASE_URL}/media"]
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "pending_attempt" not in resumed
+    assert resumed["chunks"][0]["id"] == "chunk_01"
+    assert resumed["chunks"][0]["cost_exact"] == "0.3"
+    assert signed_url not in state_path.read_text(encoding="utf-8")
+    assert "sk-live-secret-12345" not in capsys.readouterr().out
+
+
+def test_paid_media_download_timeout_keeps_exact_cost_for_get_only_recovery(tmp_path, monkeypatch):
+    """A completed paid usage cost survives a failed signed-URL download.
+
+    The completed poll reports the billed cost before the download, so the
+    marker keeps that exact amount when the download times out. A resume then
+    finishes the same task with GET calls only, and a completion payload without
+    usage still leaves the observed cost on the saved chunk.
+    """
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.providers.polza_tts as polza_tts
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    posts: list[str] = []
+    state_before_download: list[dict] = []
+    signed_url = "https://cdn.example.com/paid.mp3?token=sk-live-secret-12345"
+
+    def submit(url, **_kwargs):
+        posts.append(url)
+        return _raw_json_response('{"id": "task-1", "status": "pending"}')
+
+    def get_before_resume(url, **_kwargs):
+        if url.endswith("/media/task-1"):
+            return _raw_json_response(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "data": {"url": signed_url},
+                        "usage": {"cost_rub": 0.3},
+                    }
+                )
+            )
+        state_before_download.append(
+            json.loads((paths.output_root / "run_state.json").read_text(encoding="utf-8"))
+        )
+        raise requests.Timeout("read timed out")
+
+    monkeypatch.setattr(polza_tts.requests, "post", submit)
+    monkeypatch.setattr(polza_tts.requests, "get", get_before_resume)
+
+    args = _paid_submit_args(
+        tmp_path, "paid-media-download", model="elevenlabs/text-to-speech-turbo-2-5", voice="Rachel"
+    )
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:1]
+
+    with pytest.raises(cli.CliError, match="Failed to synthesize chunk_01") as error:
+        cli._generate_step(
+            args,
+            PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert error.value.code == 30
+    assert posts == [f"{polza_tts.POLZA_BASE_URL}/media"]
+    # The exact cost was already in the marker when the download was attempted.
+    assert state_before_download[0]["pending_attempt"]["cost_exact"] == "0.3"
+    state_path = paths.output_root / "run_state.json"
+    marker = json.loads(state_path.read_text(encoding="utf-8"))["pending_attempt"]
+    assert marker["status"] == "outcome_unknown"
+    assert marker["remote_task_id"] == "task-1"
+    assert marker["cost"] == 0.3
+    assert marker["cost_exact"] == "0.3"
+
+    def resume_get(url, **_kwargs):
+        # The recovered completion payload omits usage on purpose.
+        if url.endswith("/media/task-1"):
+            return _raw_json_response(
+                json.dumps({"status": "completed", "data": {"url": signed_url}})
+            )
+        return _raw_json_response("recovered-audio")
+
+    monkeypatch.setattr(polza_tts.requests, "get", resume_get)
+    resume_args = _paid_submit_args(
+        tmp_path, "paid-media-download", resume=True, model=args.model, voice=args.voice
+    )
+
+    with pytest.raises(SystemExit) as resume_exit:
         cli._generate_step(
             resume_args,
             PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice),
@@ -864,8 +1020,381 @@ def test_paid_media_poll_failure_makes_no_second_submit(tmp_path, monkeypatch):
             "auto",
         )
 
-    assert resume_error.value.code == 30
+    assert resume_exit.value.code == 0
     assert len(posts) == 1
+    resumed = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "pending_attempt" not in resumed
+    assert resumed["chunks"][0]["cost"] == 0.3
+    assert resumed["chunks"][0]["cost_exact"] == "0.3"
+    assert resumed["chunks"][0]["cost_rub_exact"] == "0.3"
+
+
+@pytest.mark.parametrize(
+    ("case_name", "overrides", "remote_task_id"),
+    [
+        ("untrusted_id", {}, "https://cdn.example.com/paid.mp3?token=sk-live-secret-12345"),
+        ("mismatched_identity", {"model": "elevenlabs/text-to-speech-turbo-2-5"}, "task-1"),
+        ("other_provider", {"provider": "polza-chat-audio"}, "task-1"),
+    ],
+)
+def test_media_recovery_marker_mismatch_blocks_resume_before_provider_work(
+    tmp_path, monkeypatch, capsys, case_name, overrides, remote_task_id
+):
+    """Only a matching, bounded media id may skip the paid-submit block.
+
+    A tampered id, another provider/model/voice/script, or any other marker keeps
+    the documented PAID_SUBMIT_UNCONFIRMED failure before any key read, provider
+    build, pricing lookup, or network request.
+    """
+    import sys
+
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    args = make_args(tmp_path, run_id=f"paid-recovery-{case_name}", resume=True)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    begin_chunk_attempt(state, chunk_id=chunks[0].id, number=chunks[0].number)
+    if remote_task_id == "task-1":
+        record_media_task_accepted(
+            state, task_id=remote_task_id, chunk_id=chunks[0].id, number=chunks[0].number
+        )
+    else:
+        # The writer refuses this id, so it is written directly the way an
+        # edited state file can hold it.
+        state["pending_attempt"]["remote_task_id"] = remote_task_id
+    for key, value in overrides.items():
+        state[key] = value
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    key_reads: list[str] = []
+    built: list[str] = []
+    priced: list[str] = []
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: key_reads.append("key") or "sk-test")
+    monkeypatch.setattr(
+        cli, "build_provider", lambda *_args, **_kwargs: built.append("built") or FakeProvider()
+    )
+    monkeypatch.setattr(
+        cli, "fetch_pricing_snapshot", lambda *_args: priced.append("priced") or None
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            args.provider,
+            "--model",
+            args.model,
+            "--voice",
+            args.voice,
+            "--script",
+            str(args.script),
+            "--output-dir",
+            str(args.output_dir),
+            "--run-id",
+            args.run_id,
+            "--resume",
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 30
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert payload["details"]["chunk_id"] == "chunk_01"
+    assert key_reads == []
+    assert built == []
+    assert priced == []
+    assert "sk-live-secret-12345" not in json.dumps(payload)
+
+
+def test_media_recovery_marker_for_later_chunk_keeps_the_paid_block(tmp_path, monkeypatch, capsys):
+    """A stored attempt that is not the in-flight chunk is not resumed.
+
+    The marker names ``chunk_02`` while ``chunk_01`` is still unfinished, so it
+    cannot be the paid attempt that was in flight. Overwriting it could pay for
+    ``chunk_02`` twice, so the documented block wins before any provider work.
+    """
+    import sys
+
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    args = make_args(tmp_path, run_id="paid-recovery-later-chunk", resume=True)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    second = chunks[1]
+    begin_chunk_attempt(state, chunk_id=second.id, number=second.number)
+    record_media_task_accepted(state, task_id="task-2", chunk_id=second.id, number=second.number)
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    key_reads: list[str] = []
+    built: list[str] = []
+    priced: list[str] = []
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: key_reads.append("key") or "sk-test")
+    monkeypatch.setattr(
+        cli, "build_provider", lambda *_args, **_kwargs: built.append("built") or FakeProvider()
+    )
+    monkeypatch.setattr(
+        cli, "fetch_pricing_snapshot", lambda *_args: priced.append("priced") or None
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            args.provider,
+            "--model",
+            args.model,
+            "--voice",
+            args.voice,
+            "--script",
+            str(args.script),
+            "--output-dir",
+            str(args.output_dir),
+            "--run-id",
+            args.run_id,
+            "--resume",
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 30
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["details"] == {
+        "error_code": "PAID_SUBMIT_UNCONFIRMED",
+        "chunk_id": "chunk_02",
+        "chunk_number": 2,
+        "attempt_status": "submitting",
+    }
+    assert key_reads == []
+    assert built == []
+    assert priced == []
+
+
+def test_recovery_marker_for_other_chunk_survives_missing_completed_audio(tmp_path, monkeypatch):
+    """An in-flight marker is not overwritten when an earlier chunk lost its audio.
+
+    State says ``chunk_01`` completed but its file is gone, so the fresh submit
+    for it would erase the stored ``chunk_02`` paid id. The documented block wins
+    before that write, and the marker keeps its accepted id.
+    """
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.providers.polza_tts as polza_tts
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="paid-recovery-missing-audio", resume=True)
+    args.model = "elevenlabs/text-to-speech-turbo-2-5"
+    args.voice = "Rachel"
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    state["chunks"] = [
+        {"status": "completed", "number": 1, "id": "chunk_01", "file": "chunk_01.mp3"}
+    ]
+    state["completed_count"] = 1
+    second = chunks[1]
+    begin_chunk_attempt(state, chunk_id=second.id, number=second.number)
+    record_media_task_accepted(state, task_id="task-2", chunk_id=second.id, number=second.number)
+    state_path = paths.output_root / "run_state.json"
+    atomic_write_json(state_path, state)
+
+    posts: list[str] = []
+    monkeypatch.setattr(polza_tts.requests, "post", lambda url, **_kw: posts.append(url))
+
+    with pytest.raises(cli.CliError, match="unconfirmed paid submit") as error:
+        cli._generate_step(
+            args,
+            PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice),
+            "ffmpeg",
+            "ffprobe",
+            chunks,
+            "sk-test",
+            None,
+            paths,
+            None,
+            "auto",
+        )
+
+    assert error.value.code == 30
+    assert error.value.details["chunk_id"] == "chunk_02"
+    assert posts == []
+    kept = json.loads(state_path.read_text(encoding="utf-8"))
+    assert kept["pending_attempt"]["remote_task_id"] == "task-2"
+
+
+def test_non_media_model_fake_id_blocks_resume_and_status(tmp_path, monkeypatch, capsys):
+    """A paid marker on the ``/audio/speech`` route is never a media recovery.
+
+    ``openai/gpt-4o-mini-tts`` submits synchronously, so a stored
+    ``remote_task_id`` cannot name an async media task. ``--resume`` and
+    ``status`` must both keep the documented paid-submit block instead of
+    issuing GET ``/media/task-1`` or promising a resume.
+    """
+    import sys
+
+    import voiceover_pipeline.cli as cli
+    import voiceover_pipeline.providers.polza_tts as polza_tts
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.providers.polza_tts import PolzaTTSProvider
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    args = make_args(tmp_path, run_id="non-media-fake-id", resume=True)
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    begin_chunk_attempt(state, chunk_id=chunks[0].id, number=chunks[0].number)
+    record_media_task_accepted(
+        state, task_id="task-1", chunk_id=chunks[0].id, number=chunks[0].number
+    )
+    atomic_write_json(paths.output_root / "run_state.json", state)
+
+    key_reads: list[str] = []
+    built: list[str] = []
+    priced: list[str] = []
+    media_gets: list[str] = []
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: key_reads.append("key") or "sk-test")
+    monkeypatch.setattr(
+        cli, "fetch_pricing_snapshot", lambda *_args: priced.append("priced") or None
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_provider",
+        lambda *_args, **_kwargs: (
+            built.append("built")
+            or PolzaTTSProvider(api_key="sk-test", model=args.model, voice=args.voice)
+        ),
+    )
+    monkeypatch.setattr(
+        polza_tts.requests,
+        "get",
+        lambda url, **_kwargs: media_gets.append(url) or _raw_json_response("{}"),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            args.provider,
+            "--model",
+            args.model,
+            "--voice",
+            args.voice,
+            "--script",
+            str(args.script),
+            "--output-dir",
+            str(args.output_dir),
+            "--run-id",
+            args.run_id,
+            "--resume",
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 30
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert key_reads == []
+    assert built == []
+    assert priced == []
+    assert media_gets == []
+
+    code, data = cli_json(
+        "status",
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        args.run_id,
+        "--json",
+    )
+    assert code == 0
+    assert data["can_resume"] is False
+    assert data["resume_block_reason"] == "paid_submit_unconfirmed"
 
 
 def test_paid_chunk_write_failure_blocks_resubmit(tmp_path, monkeypatch):
@@ -2162,6 +2691,52 @@ def test_attempt_marker_bounds_number_and_drops_id_without_it():
     assert marker(1_000_000, chunk_id="chunk_1000000")["id"] == "chunk_1000000"
 
 
+def test_pending_media_recovery_requires_bound_chunk_and_opaque_id():
+    """Only a marker bound to its generated chunk with an opaque id is reusable."""
+    from voiceover_pipeline.run_state import (
+        begin_chunk_attempt,
+        pending_media_recovery,
+        record_media_observed_cost,
+        record_media_task_accepted,
+    )
+
+    state: dict = {}
+    begin_chunk_attempt(state, chunk_id="chunk_01", number=1)
+    assert pending_media_recovery(state) is None
+
+    with pytest.raises(ValueError, match="different chunk"):
+        record_media_task_accepted(state, task_id="task-1", chunk_id="chunk_02", number=2)
+    with pytest.raises(ValueError, match="opaque"):
+        record_media_task_accepted(
+            state,
+            task_id="https://cdn.example.com/paid.mp3?token=sk-live-secret",
+            chunk_id="chunk_01",
+            number=1,
+        )
+
+    record_media_task_accepted(state, task_id="task-1", chunk_id="chunk_01", number=1)
+    record_media_observed_cost(state, cost=0.3, cost_exact="0.3")
+    recovery = pending_media_recovery(state)
+    assert recovery == {
+        "id": "chunk_01",
+        "number": 1,
+        "status": "submitting",
+        "remote_task_id": "task-1",
+        "cost": 0.3,
+        "cost_exact": "0.3",
+    }
+    # A later completion payload without usage does not erase the observed cost.
+    record_media_observed_cost(state, cost=None, cost_exact=None)
+    assert pending_media_recovery(state)["cost_exact"] == "0.3"
+
+    marker = state["pending_attempt"]
+    tampered = {"pending_attempt": {**marker, "remote_task_id": "signed/url?token=secret"}}
+    assert pending_media_recovery(tampered) is None
+    # The id must be the generated form for its own number to be recoverable.
+    mismatched_form = {"pending_attempt": {**marker, "id": "chunk_07", "number": 1}}
+    assert pending_media_recovery(mismatched_form) is None
+
+
 def test_status_marks_unconfirmed_paid_submit_as_not_resumable(tmp_path):
     """A blocked run reports can_resume false with a bounded machine reason."""
     from voiceover_pipeline.run_state import atomic_write_json
@@ -2196,6 +2771,238 @@ def test_status_marks_unconfirmed_paid_submit_as_not_resumable(tmp_path):
     assert code == 0
     assert data["can_resume"] is False
     assert data["resume_block_reason"] == "paid_submit_unconfirmed"
+
+
+def test_status_reports_known_media_attempt_as_resumable(tmp_path):
+    """A stored bounded media id keeps the paid marker resumable.
+
+    That chunk is finished with GET calls only, so ``status`` does not report the
+    unconfirmed block and never echoes the stored task id.
+    """
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    run_dir = tmp_path / "out" / "paid-media-status"
+    (run_dir / "chunks").mkdir(parents=True)
+    script = fixture_path("smoke_test.md")
+    chunks = split_markdown_by_delimiter(script, "******")
+    state = initial_state(
+        provider="polza-tts",
+        model="elevenlabs/text-to-speech-turbo-2-5",
+        voice="Rachel",
+        script_path=script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id="paid-media-status",
+    )
+    begin_chunk_attempt(state, chunk_id=chunks[0].id, number=chunks[0].number)
+    record_media_task_accepted(
+        state, task_id="task-1", chunk_id=chunks[0].id, number=chunks[0].number
+    )
+    atomic_write_json(run_dir / "run_state.json", state)
+
+    code, data = cli_json(
+        "status",
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "paid-media-status",
+        "--json",
+    )
+
+    assert code == 0
+    assert data["can_resume"] is True
+    assert data["resume_block_reason"] is None
+    assert "task-1" not in json.dumps(data)
+
+
+def test_status_chunk2_media_recovery_requires_preceding_chunk_on_disk(
+    tmp_path, monkeypatch, capsys
+):
+    """A stored chunk_02 task stays resumable only when chunk_01 is truly done.
+
+    ``--resume`` regenerates an earlier chunk whose state entry says completed
+    while its MP3 is missing, and that paid submit would collide with the stored
+    chunk_02 id. ``status`` must report the same paid-submit block instead of
+    promising a resume, and a completed chunk_01 with its MP3 present resumes.
+    """
+    import sys
+
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    run_id = "media-status-predecessor"
+    run_dir = tmp_path / "out" / run_id
+    (run_dir / "chunks").mkdir(parents=True)
+    script = fixture_path("smoke_test.md")
+    chunks = split_markdown_by_delimiter(script, "******")
+    state = initial_state(
+        provider="polza-tts",
+        model="elevenlabs/text-to-speech-turbo-2-5",
+        voice="Rachel",
+        script_path=script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=run_id,
+    )
+    second = chunks[1]
+    begin_chunk_attempt(state, chunk_id=second.id, number=second.number)
+    record_media_task_accepted(state, task_id="task-2", chunk_id=second.id, number=second.number)
+    state_path = run_dir / "run_state.json"
+    atomic_write_json(state_path, state)
+
+    def status():
+        return cli_json(
+            "status", "--output-dir", str(tmp_path / "out"), "--run-id", run_id, "--json"
+        )
+
+    # chunk_01 was never completed, so the stored chunk_02 task is not next.
+    code, data = status()
+    assert code == 0
+    assert data["can_resume"] is False
+    assert data["resume_block_reason"] == "paid_submit_unconfirmed"
+
+    # chunk_01 looks completed in state but its MP3 is gone.
+    state["chunks"] = [
+        {"status": "completed", "number": 1, "id": "chunk_01", "file": "chunk_01.mp3"}
+    ]
+    state["completed_count"] = 1
+    atomic_write_json(state_path, state)
+    code, data = status()
+    assert code == 0
+    assert data["can_resume"] is False
+    assert data["resume_block_reason"] == "paid_submit_unconfirmed"
+
+    # The real generate preflight must agree before key/provider/pricing work.
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: pytest.fail("key read before block"))
+    monkeypatch.setattr(cli, "build_provider", lambda *_args: pytest.fail("provider built"))
+    monkeypatch.setattr(
+        cli, "fetch_pricing_snapshot", lambda *_args: pytest.fail("pricing fetched")
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            "polza-tts",
+            "--model",
+            "elevenlabs/text-to-speech-turbo-2-5",
+            "--voice",
+            "Rachel",
+            "--script",
+            str(script),
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--run-id",
+            run_id,
+            "--resume",
+            "--json",
+        ],
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+    assert exit_info.value.code == 30
+    assert json.loads(capsys.readouterr().out)["details"]["error_code"] == (
+        "PAID_SUBMIT_UNCONFIRMED"
+    )
+
+    # chunk_01 completed with its MP3 present lets chunk_02 recover.
+    (run_dir / "chunks" / "chunk_01.mp3").write_bytes(b"mp3")
+    code, data = status()
+    assert code == 0
+    assert data["can_resume"] is True
+    assert data["resume_block_reason"] is None
+
+
+def test_overwrite_stays_blocked_for_known_media_id_marker(tmp_path, monkeypatch, capsys):
+    """--overwrite never deletes a run that holds any paid attempt marker."""
+    import sys
+
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.run_state import (
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+        record_media_task_accepted,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    args = make_args(tmp_path, run_id="paid-media-overwrite")
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")
+    state = initial_state(
+        provider=args.provider,
+        model=args.model,
+        voice=args.voice,
+        script_path=args.script,
+        chunks=chunks,
+        script_format="markdown",
+        run_id=args.run_id,
+    )
+    begin_chunk_attempt(state, chunk_id=chunks[0].id, number=chunks[0].number)
+    record_media_task_accepted(
+        state, task_id="task-1", chunk_id=chunks[0].id, number=chunks[0].number
+    )
+    state_path = paths.output_root / "run_state.json"
+    atomic_write_json(state_path, state)
+
+    built: list[str] = []
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: "sk-test")
+    monkeypatch.setattr(cli, "fetch_pricing_snapshot", lambda *_args: None)
+    monkeypatch.setattr(
+        cli, "build_provider", lambda *_args, **_kwargs: built.append("built") or FakeProvider()
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "voiceover-pipeline",
+            "generate",
+            "--provider",
+            args.provider,
+            "--model",
+            args.model,
+            "--voice",
+            args.voice,
+            "--script",
+            str(args.script),
+            "--output-dir",
+            str(args.output_dir),
+            "--run-id",
+            args.run_id,
+            "--overwrite",
+            "--confirm-delete-paid-audio",
+            "--json",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main()
+
+    assert exit_info.value.code == 30
+    payload = json.loads(capsys.readouterr().out)
+    assert "unconfirmed paid submit" in payload["error"]
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert built == []
+    assert paths.output_root.exists()
+    assert "pending_attempt" in json.loads(state_path.read_text(encoding="utf-8"))
 
 
 @pytest.mark.parametrize(

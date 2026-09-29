@@ -292,7 +292,7 @@ voiceover list timing-providers --json
 | Папка существует + `--overwrite` + `pending_attempt` (неподтверждённый платный submit) | Ошибка exit code 30 даже с `--confirm-delete-paid-audio`; нужен другой `--run-id` |
 | Папка существует + `--overwrite` + `run_state.json` не-объект или нечитаем | Ошибка exit code 30: состояние не доказывает отсутствие платного submit |
 | Папка существует + `--skip-existing` | Вернуть `status: skipped`, не менять файлы |
-| Папка существует + `--resume` | Продолжить с первого несохранённого chunk; блокируется, пока есть `pending_attempt` |
+| Папка существует + `--resume` | Продолжить с первого несохранённого chunk; блокируется, пока есть `pending_attempt` (кроме известной paid media задачи, см. ниже) |
 | Папка существует без флагов | Ошибка exit code 30 |
 
 ### Платный submit и маркер `pending_attempt`
@@ -302,16 +302,28 @@ voiceover list timing-providers --json
   завершает запуск с exit code 30 без автоматического повтора.
 - Перед submit CLI пишет маркер `pending_attempt` в `run_state.json` и удаляет
   его вместе с сохранением части. Маркер содержит только `id`/`number`, стадию
-  (`submitting`, `outcome_unknown`, `failed`) и время.
-- Пока маркер присутствует, `--resume` и `--overwrite` закрыты (exit code 30,
-  `details.error_code = "PAID_SUBMIT_UNCONFIRMED"`); для новой явной попытки
-  используется другой `--run-id`. В диагностику попадает только `id` вида
-  `chunk_*`/`turn_*`; другой `id` (URL, текст запроса, секрет) репортится как
-  `null`.
+  (`submitting`, `outcome_unknown`, `failed`), время и — на ElevenLabs `/media`
+  маршруте — ограниченный opaque `remote_task_id` и уже наблюдённую стоимость.
+- Пока маркер присутствует, `--overwrite` закрыт всегда (exit code 30),
+  а `--resume` закрыт тем же кодом, кроме известной paid media задачи (см.
+  ниже); `details.error_code = "PAID_SUBMIT_UNCONFIRMED"`. Для новой явной
+  попытки используется другой `--run-id`. В диагностику попадает только `id`
+  вида `chunk_*`/`turn_*`; другой `id` (URL, текст запроса, секрет) репортится
+  как `null`.
+- Исключение для `--resume`: единственная известная paid media задача
+  ElevenLabs `/media` провайдера `polza-tts`. Если маркер хранит принятый
+  `remote_task_id` и command совпадает по provider/model/voice/script, а все
+  более ранние `chunk_*.mp3` уже на диске, CLI доводит первую незавершённую
+  часть GET-запросами (poll + download) без второго платного POST, а маркер
+  снимается вместе с сохранением части. Во всех остальных случаях `--resume`
+  остаётся закрыт.
 - Флаги `--resume` и `--overwrite` нельзя использовать вместе: CLI отклоняет их
   до удаления папки и до сети (exit code 2).
 - `status --json` сообщает `can_resume: false` и `resume_block_reason:
-  "paid_submit_unconfirmed"` для такого запуска.
+  "paid_submit_unconfirmed"` для такого запуска, кроме валидной известной
+  media-задачи с более ранними MP3 на диске (тогда `can_resume: true`).
+  `status` не знает будущую identity вызова, поэтому `can_resume: true` не
+  гарантирует, что конкретный следующий `--resume` пройдёт.
 - `polza-chat-audio` не делает автоматический второй POST с `--fallback-voice`;
   выбор другого голоса требует нового явного запуска.
 

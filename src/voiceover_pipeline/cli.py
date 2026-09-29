@@ -147,7 +147,10 @@ from .run_state import (
     completed_numbers,
     initial_state,
     load_state,
+    pending_media_recovery,
     record_chunk_attempt_outcome,
+    record_media_observed_cost,
+    record_media_task_accepted,
     script_hash,
     state_chunks_as_artifacts,
     unconfirmed_attempt,
@@ -1140,14 +1143,26 @@ def generate(args: argparse.Namespace) -> None:
         # any optional quality/timing preflight, key read, provider build, identity
         # check, or pricing I/O: the documented PAID_SUBMIT_UNCONFIRMED envelope
         # cannot be replaced by a key or dependency error, and no request may leave.
-        # ``--skip-existing`` keeps its precedence and reports an existing folder as
-        # skipped without loading run state. The same guard runs inside
-        # ``_generate_step`` for direct callers.
+        # The one exception is a paid Polza media submit whose accepted id is stored
+        # and still matches this exact provider/model/voice/script chunk: that chunk
+        # is finished with GET calls only, so no new POST can be billed. Every other
+        # marker keeps the block. ``--skip-existing`` keeps its precedence and
+        # reports an existing folder as skipped without loading run state. The same
+        # guard runs inside ``_generate_step`` for direct callers.
         pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
         if pending_attempt is not None:
-            _reject_unconfirmed_paid_resume(
-                pending_attempt, GenerationLogger(paths.output_root / LOG_FILE)
-            )
+            resume_state, _state_unreadable = _load_status_state(paths.output_root / STATE_FILE)
+            if not _recoverable_media_attempts(
+                resume_state,
+                provider=args.provider,
+                model=args.model,
+                voice=args.voice or _default_voice(args),
+                chunks=chunks,
+                chunks_dir=paths.chunks_dir,
+            ):
+                _reject_unconfirmed_paid_resume(
+                    pending_attempt, GenerationLogger(paths.output_root / LOG_FILE)
+                )
 
     if (
         is_dialogue_format(script_format)
@@ -1353,6 +1368,56 @@ def _merge_attached_costs_into_state(state: dict[str, Any], artifacts: list[Chun
                 entry[field] = value
 
 
+def _media_observed_cost(usage: Any) -> tuple[float | None, str | None]:
+    """Project the completed media payload's billed cost through ``observed_cost``.
+
+    Only the recognized cost fields are read; a missing or unparseable value is
+    unknown, so an arbitrary usage field never becomes a cost.
+    """
+    if not isinstance(usage, dict):
+        return None, None
+    value = usage.get("cost_rub")
+    if value is None:
+        value = usage.get("cost")
+    if value is None:
+        return None, None
+    return observed_cost(value)
+
+
+def _bind_polza_media_attempt(
+    provider: PolzaTTSProvider,
+    *,
+    state: dict[str, Any],
+    state_path: Path,
+    logger: GenerationLogger,
+    chunk: ScriptChunk,
+) -> None:
+    """Bind the marker-persisting callbacks for this paid media chunk.
+
+    ``on_media_task_accepted`` stores the accepted id atomically before the
+    first poll or download, and ``on_media_completed`` stores the exact cost the
+    completed poll reported before the signed-URL download, which can fail on
+    its own. Both write only bounded marker fields, and both writes are what let
+    a later ``--resume`` finish this chunk with GET calls instead of a POST.
+    """
+
+    def on_accepted(task_id: str) -> None:
+        record_media_task_accepted(state, task_id=task_id, chunk_id=chunk.id, number=chunk.number)
+        atomic_write_json(state_path, state)
+        logger.event("info", "remote_accepted", chunk=chunk.number, id=chunk.id, task_id=task_id)
+
+    def on_completed(_task_id: str, usage: dict | None, _generation_id: str | None) -> None:
+        cost, cost_exact = _media_observed_cost(usage)
+        if cost is None:
+            return
+        record_media_observed_cost(state, cost=cost, cost_exact=cost_exact)
+        atomic_write_json(state_path, state)
+        logger.event("info", "cost_observed", chunk=chunk.number, id=chunk.id, cost=cost)
+
+    provider.on_media_task_accepted = on_accepted
+    provider.on_media_completed = on_completed
+
+
 def _generate_step(
     args,
     provider,
@@ -1387,12 +1452,26 @@ def _generate_step(
         else None
     )
     state = load_state(state_path)
+    # A paid media submit on the ElevenLabs ``/media`` route whose accepted id
+    # is stored can only be finished with GET calls, so this exact command may
+    # resume it instead of failing closed. Every other marker keeps the
+    # unconfirmed block below.
+    recoverable_attempts: dict[int, dict[str, Any]] = {}
     if state and args.resume:
         if state.get("script_hash") != current_hash:
             logger.event("error", "resume_rejected", reason="script_hash_mismatch")
             fail(
                 "Cannot resume: script chunks do not match the previous run_state.json.",
                 _EXIT_PROVIDER,
+            )
+        if isinstance(provider, PolzaTTSProvider) and _polza_media_route_model(provider.model):
+            recoverable_attempts = _recoverable_media_attempts(
+                state,
+                provider=args.provider,
+                model=args.model,
+                voice=args.voice,
+                chunks=chunks,
+                chunks_dir=paths.chunks_dir,
             )
         if dialogue_run:
             if "synthesis_identity" not in state:
@@ -1409,7 +1488,7 @@ def _generate_step(
                 logger.event("error", "resume_rejected", reason="voice_identity_mismatch")
                 fail("Cannot resume: voice identity changed.", _EXIT_PROVIDER)
         pending_attempt = unconfirmed_attempt(state)
-        if pending_attempt is not None:
+        if pending_attempt is not None and not recoverable_attempts:
             _reject_unconfirmed_paid_resume(pending_attempt, logger)
         logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
     elif state and not args.resume:
@@ -1518,7 +1597,15 @@ def _generate_step(
         )
         _emit_json_event(args, "chunk_started", chunk=chunk.number, id=chunk.id)
 
+        recovery = recoverable_attempts.get(chunk.number)
+        if recovery is not None:
+            logger.event("info", "paid_media_recovery", chunk=chunk.number, id=chunk.id)
+
         def synthesize_current_chunk():
+            if recovery is not None:
+                # The paid submit for this chunk already happened, so only GET
+                # calls may finish it; no POST is sent a second time.
+                return provider.recover_media_task(recovery["remote_task_id"], chunk.text, chunk.id)
             selected_provider: Any = provider
             if isinstance(provider, dict):
                 selected_provider = provider[chunk.voice]
@@ -1531,10 +1618,21 @@ def _generate_step(
                     raise
                 return selected_provider.synthesize_chunk(chunk.text, chunk.id)
 
-        if paid_submit:
+        if paid_submit and isinstance(provider, PolzaTTSProvider):
+            _bind_polza_media_attempt(
+                provider, state=state, state_path=state_path, logger=logger, chunk=chunk
+            )
+        if paid_submit and recovery is None:
+            existing_attempt = unconfirmed_attempt(state)
+            if existing_attempt is not None:
+                # A marker for another chunk holds a known paid attempt that this
+                # write would erase, so fail closed with the documented envelope
+                # instead of risking a second POST for that chunk.
+                _reject_unconfirmed_paid_resume(existing_attempt, logger)
             # The marker is durable before the request leaves, so a crash between
             # this write and the POST resumes as unconfirmed instead of repeating
-            # a possibly billed submit.
+            # a possibly billed submit. A recovered attempt keeps its own marker,
+            # which still binds the accepted id and any observed cost.
             begin_chunk_attempt(state, chunk_id=chunk.id, number=chunk.number)
             atomic_write_json(state_path, state)
             logger.event("info", "paid_submit_started", chunk=chunk.number, id=chunk.id)
@@ -1604,6 +1702,11 @@ def _generate_step(
         end_ms = start_ms + duration_ms
         total_duration_ms = end_ms + (chunk.pause_after_ms if dialogue_run else 0)
 
+        direct_cost_kwargs = _direct_cost_kwargs(args.provider, result)
+        if not direct_cost_kwargs and recovery is not None:
+            # A GET-only recovery can see a completion payload without usage, so
+            # the exact cost stored before the failed download stays observed.
+            direct_cost_kwargs = _recovered_media_cost_kwargs(recovery)
         artifact = ChunkArtifact(
             number=chunk.number,
             id=chunk.id,
@@ -1626,7 +1729,7 @@ def _generate_step(
             runtime_receipt=_public_runtime_receipt(result),
             voice_selection=_public_voice_selection(result),
             voice_session=_public_voice_session(result),
-            **_direct_cost_kwargs(args.provider, result),
+            **direct_cost_kwargs,
         )
         chunk_artifacts_by_number[chunk.number] = artifact
         upsert_completed_chunk(
@@ -2301,8 +2404,9 @@ def status_cmd(args: argparse.Namespace) -> None:
     chunk_files = _continuous_chunk_files(chunks_dir)
     total = int(state.get("chunk_count", len(chunk_files)) if state else len(chunk_files))
     ready = int(state.get("completed_count", len(chunk_files)) if state else len(chunk_files))
+    completed = completed_numbers(state)
     if state:
-        ready = len(completed_numbers(state))
+        ready = len(completed)
     next_chunk = ready + 1 if total == 0 or ready < total else None
     full_audio = _find_full_audio(run_dir)
     timings_json = list(run_dir.glob("*.timings.json"))
@@ -2313,8 +2417,18 @@ def status_cmd(args: argparse.Namespace) -> None:
         can_resume = False
         resume_block_reason = _RUN_STATE_UNREADABLE_RESUME_BLOCK_REASON
     elif unconfirmed_attempt(state) is not None:
-        can_resume = False
-        resume_block_reason = _PAID_SUBMIT_RESUME_BLOCK_REASON
+        # A stored paid media id resumes with GET calls only, but only when every
+        # earlier chunk is genuinely finished: state-completed and still on disk.
+        # A chunk whose MP3 is missing is regenerated, and that paid submit would
+        # collide with the stored id, so status reports the same block --resume
+        # would hit instead of promising a resume.
+        recovery = _known_media_recovery(state)
+        if recovery is None or not all(
+            number in completed and (chunks_dir / f"chunk_{number:02d}.mp3").exists()
+            for number in range(1, recovery["number"])
+        ):
+            can_resume = False
+            resume_block_reason = _PAID_SUBMIT_RESUME_BLOCK_REASON
     data = {
         "status": "success",
         "run_id": args.run_id,
@@ -2975,6 +3089,84 @@ def _unconfirmed_paid_attempt_in_existing_run(paths) -> dict[str, Any] | None:
     return unconfirmed_attempt(state)
 
 
+def _polza_media_route_model(model: object) -> bool:
+    """Whether a Polza TTS model submits through the async ``/media`` route.
+
+    Only the ElevenLabs ``elevenlabs/`` models POST to ``/media`` and can hold a
+    recoverable task id; every other model uses the synchronous ``/audio/speech``
+    route, so a marker next to it can never be an async media task and keeps the
+    documented paid-submit block.
+    """
+    return isinstance(model, str) and model.startswith("elevenlabs/")
+
+
+def _known_media_recovery(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the bounded recovery marker of a known paid Polza media submit.
+
+    Only a paid media run whose model uses the ``/media`` route and whose stored
+    id is still a bounded opaque token can be finished with GET calls, and a
+    marker next to a completed entry for the same chunk is stale evidence rather
+    than a task to recover.
+    """
+    if not isinstance(state, dict) or state.get("provider") != "polza-tts":
+        return None
+    if not _polza_media_route_model(state.get("model")):
+        return None
+    recovery = pending_media_recovery(state)
+    if recovery is None or recovery["number"] in completed_numbers(state):
+        return None
+    return recovery
+
+
+def _recoverable_media_attempts(
+    state: dict[str, Any] | None,
+    *,
+    provider: str,
+    model: str,
+    voice: str | None,
+    chunks: list[ScriptChunk],
+    chunks_dir: Path,
+) -> dict[int, dict[str, Any]]:
+    """Map chunk number to the paid media attempt this exact command may recover.
+
+    Resume may reuse a stored paid media id only while the whole identity still
+    matches — same provider, model, voice, and script — and the marker is bound
+    to one of that script's chunks. Every other marker keeps the documented
+    PAID_SUBMIT_UNCONFIRMED block, and the chunk is finished with GET calls only.
+    """
+    if provider != "polza-tts":
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    if state.get("provider") != provider or state.get("model") != model:
+        return {}
+    if state.get("voice") != voice:
+        return {}
+    if state.get("script_hash") != script_hash(chunks):
+        return {}
+    recovery = _known_media_recovery(state)
+    if recovery is None:
+        return {}
+    completed = completed_numbers(state)
+    for chunk in chunks:
+        if chunk.number in completed:
+            continue
+        if chunk.id == recovery["id"] and chunk.number == recovery["number"]:
+            # A missing earlier MP3 must be regenerated first; that would
+            # overwrite this paid marker, so block before key/provider work.
+            if not all(
+                (chunks_dir / f"chunk_{number:02d}.mp3").exists()
+                for number in range(1, chunk.number)
+            ):
+                return {}
+            return {chunk.number: recovery}
+        # The stored attempt belongs to a later chunk while this one is still
+        # unfinished, so it is not the attempt that was in flight. Keeping the
+        # documented block is safer than overwriting a known paid id.
+        return {}
+    return {}
+
+
 def _paid_submit_attempt_status(error: BaseException) -> str:
     """Label a failed paid attempt from its failure class, not its error text.
 
@@ -3403,6 +3595,31 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _polza_direct_cost_kwargs(cost: float, cost_exact: str | None) -> dict:
+    """Build the Polza direct-cost fields from one observed value pair."""
+    return {
+        "cost": cost,
+        "cost_exact": cost_exact,
+        "cost_currency": "RUB",
+        "cost_rub": cost,
+        "cost_rub_exact": cost_exact,
+        "generation_detail_source": "Polza API usage.cost_rub (direct)",
+    }
+
+
+def _recovered_media_cost_kwargs(recovery: dict[str, Any]) -> dict:
+    """Reuse the exact cost the accepted paid media task already reported.
+
+    The GET-only recovery can read a completion payload without usage, so the
+    bounded cost stored in the attempt marker before the failed download stays
+    the observed amount for the recovered chunk.
+    """
+    cost = recovery.get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return {}
+    return _polza_direct_cost_kwargs(float(cost), recovery.get("cost_exact"))
+
+
 def _direct_cost_kwargs(provider: str, result) -> dict:
     if provider != "polza-tts":
         return {}
@@ -3420,15 +3637,10 @@ def _direct_cost_kwargs(provider: str, result) -> dict:
     if cost is None:
         return {}
     return {
-        "cost": cost,
-        "cost_exact": cost_exact,
-        "cost_currency": "RUB",
-        "cost_rub": cost,
-        "cost_rub_exact": cost_exact,
+        **_polza_direct_cost_kwargs(cost, cost_exact),
         # Project the copied usage only after the exact cost was extracted, so a
         # Decimal from ``parse_float=Decimal`` never reaches run state/manifests.
         "usage": json_safe_metadata(usage),
-        "generation_detail_source": "Polza API usage.cost_rub (direct)",
     }
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -141,6 +143,50 @@ def clear_chunk_attempt(state: dict[str, Any]) -> None:
         state["updated_at"] = utc_now()
 
 
+def record_media_task_accepted(
+    state: dict[str, Any], *, task_id: str, chunk_id: str, number: int
+) -> None:
+    """Store the accepted paid media task id inside the pending attempt marker.
+
+    The id is written before the first poll or audio download, so a later process
+    can finish the same paid task with GET calls instead of a second POST. The
+    call is bound to the chunk the caller is submitting: the marker written by
+    ``begin_chunk_attempt`` must still name that exact chunk, or the id is not
+    stored. Only the bounded opaque id joins the marker; request text, signed
+    URLs, and provider bodies are never stored.
+    """
+    marker = state.get(PENDING_ATTEMPT_FIELD)
+    if not isinstance(marker, dict):
+        raise ValueError("media task accepted without a pending attempt marker")
+    if marker.get("id") != chunk_id or marker.get("number") != number:
+        raise ValueError("media task accepted for a different chunk than the pending attempt")
+    if _bounded_media_task_id(task_id) is None:
+        raise ValueError("media task id is not a bounded opaque token")
+    marker["remote_task_id"] = task_id
+    marker["at"] = utc_now()
+    state["updated_at"] = utc_now()
+
+
+def record_media_observed_cost(
+    state: dict[str, Any], *, cost: float | None, cost_exact: str | None
+) -> None:
+    """Keep the exact cost a completed paid request already reported.
+
+    The completed poll payload carries the billed amount and the download that
+    follows can fail on its own, so the cost is stored before that download. A
+    call without a usable cost leaves an already stored observation in place, so
+    a later GET-only recovery that omits usage cannot erase it.
+    """
+    marker = state.get(PENDING_ATTEMPT_FIELD)
+    if not isinstance(marker, dict) or cost is None:
+        return
+    marker["cost"] = cost
+    if cost_exact is not None:
+        marker["cost_exact"] = cost_exact
+    marker["at"] = utc_now()
+    state["updated_at"] = utc_now()
+
+
 # Largest chunk or turn number a bounded marker may echo back. Chunks and dialogue
 # turns are numbered from 1, so a boolean, non-positive, or larger ``number`` was
 # not written by this repository and is reported as unknown instead of echoed.
@@ -210,6 +256,59 @@ def unconfirmed_attempt(state: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(state, dict) or PENDING_ATTEMPT_FIELD not in state:
         return None
     return _bounded_attempt_marker(state[PENDING_ATTEMPT_FIELD])
+
+
+# A paid media task id becomes part of the GET path ``/media/<id>`` on recovery,
+# so only an opaque token may be stored or reused. ``run_state.json`` is
+# user-editable, so a value that could change the target endpoint (slash, query,
+# scheme, dot traversal, whitespace) is dropped on read and never reaches a
+# request or a report.
+_OPAQUE_TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _bounded_media_task_id(value: Any) -> str | None:
+    """Keep only a bounded opaque paid media task id, else report unknown."""
+    if isinstance(value, str) and _OPAQUE_TASK_ID_PATTERN.fullmatch(value) is not None:
+        return value
+    return None
+
+
+def _bounded_marker_cost(marker: dict[str, Any]) -> tuple[float | None, str | None]:
+    """Project the marker's stored cost onto a finite number and exact string."""
+    cost = marker.get("cost")
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)):
+        return None, None
+    legacy = float(cost)
+    if not math.isfinite(legacy):
+        return None, None
+    return legacy, _exact_cost_string(marker.get("cost_exact"))
+
+
+def pending_media_recovery(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the bounded GET-only recovery data of the persisted paid attempt.
+
+    A paid Polza media submit that returned an id can be finished with GET calls
+    only, so the id and any already observed cost belong in the marker. Only a
+    marker bound to a generated chunk identity *and* holding a bounded opaque
+    task id is usable; a marker without one, or one holding a URL or request
+    text, reports ``None`` so the caller keeps failing closed. The returned
+    mapping adds no unbounded provider value.
+    """
+    bounded_attempt = unconfirmed_attempt(state)
+    if (
+        bounded_attempt is None
+        or bounded_attempt["id"] is None
+        or bounded_attempt["number"] is None
+    ):
+        return None
+    marker = state[PENDING_ATTEMPT_FIELD] if isinstance(state, dict) else None
+    if not isinstance(marker, dict):
+        return None
+    task_id = _bounded_media_task_id(marker.get("remote_task_id"))
+    if task_id is None:
+        return None
+    cost, cost_exact = _bounded_marker_cost(marker)
+    return {**bounded_attempt, "remote_task_id": task_id, "cost": cost, "cost_exact": cost_exact}
 
 
 def _exact_cost_string(value: Any) -> str | None:

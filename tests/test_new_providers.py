@@ -1,9 +1,13 @@
+import base64
 import json
+from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from voiceover_pipeline.config import (
+    POLZA_BASE_URL,
     TTS_PROMPT_MODE_NATIVE,
     TTS_PROMPT_MODE_NONE,
     TTS_PROMPT_MODE_PREFIX,
@@ -224,6 +228,360 @@ class TestPolzaTTSProvider:
         usage = result.raw_metadata["usage_direct"]
         assert isinstance(usage["cost_rub"], Decimal)
         assert usage["cost_rub"] == Decimal("0.1234567890123456789")
+
+
+class TestPolzaMediaProviderBoundary:
+    """Accepted media tasks stay recoverable with GET-only requests.
+
+    A media POST that was accepted is already paid for, so the provider reports
+    the validated id through ``on_media_task_accepted`` before any poll or
+    download, and completing that known id later must never issue a second POST.
+    """
+
+    POST_TARGET = "voiceover_pipeline.providers.polza_tts.requests.post"
+    GET_TARGET = "voiceover_pipeline.providers.polza_tts.requests.get"
+    SLEEP_TARGET = "voiceover_pipeline.providers.polza_tts.time.sleep"
+
+    @staticmethod
+    def _provider(
+        model: str = "elevenlabs/text-to-speech-turbo-2-5",
+        voice: str = "Rachel",
+        **callbacks,
+    ) -> PolzaTTSProvider:
+        return PolzaTTSProvider(api_key="sk-test", model=model, voice=voice, **callbacks)
+
+    @staticmethod
+    def _json_response(
+        body: bytes, status_code: int = 200, headers: dict | None = None
+    ) -> requests.Response:
+        response = requests.Response()
+        response.status_code = status_code
+        response.encoding = "utf-8"
+        response._content = body
+        if headers:
+            response.headers.update(headers)
+        return response
+
+    def test_accepted_task_id_is_reported_before_poll_and_post_is_sent_once(self):
+        accepted: list[str] = []
+        gets_when_accepted: list[int] = []
+        submit = self._json_response(b'{"id": "task-1", "status": "pending"}')
+
+        def poll_timeout(*_args, **_kwargs):
+            raise requests.Timeout("read timed out")
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET, return_value=submit) as mock_post:
+                with patch(self.GET_TARGET, side_effect=poll_timeout) as mock_get:
+
+                    def on_accepted(task_id: str) -> None:
+                        accepted.append(task_id)
+                        gets_when_accepted.append(mock_get.call_count)
+
+                    with pytest.raises(requests.Timeout):
+                        self._provider(on_media_task_accepted=on_accepted).synthesize_chunk(
+                            "Hello", "chunk_01"
+                        )
+
+        assert accepted == ["task-1"]
+        assert gets_when_accepted == [0]
+        assert mock_post.call_count == 1
+        assert mock_get.call_count == 1
+
+    def test_recover_media_task_polls_and_downloads_without_post(self):
+        poll = self._json_response(
+            b'{"id": "task-1", "status": "completed", '
+            b'"data": [{"url": "https://s3.polza.ai/fake.mp3"}], '
+            b'"usage": {"cost_rub": 0.1234567890123456789}}'
+        )
+        download = self._json_response(b"fake-elevenlabs-audio")
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET) as mock_post:
+                with patch(self.GET_TARGET, side_effect=[poll, download]) as mock_get:
+                    result = self._provider().recover_media_task("task-1", "Hello", "chunk_01")
+
+        mock_post.assert_not_called()
+        assert mock_get.call_args_list[0].args[0] == f"{POLZA_BASE_URL}/media/task-1"
+        assert mock_get.call_count == 2
+        assert result.audio_bytes == b"fake-elevenlabs-audio"
+        assert result.audio_format == "mp3"
+        assert result.transcript == "Hello"
+        assert result.generation_id == "task-1"
+        assert result.client_path == "requests"
+        usage = result.raw_metadata["usage_direct"]
+        assert isinstance(usage["cost_rub"], Decimal)
+        assert usage["cost_rub"] == Decimal("0.1234567890123456789")
+
+    def test_recovered_completed_task_surfaces_usage_before_download_failure(self):
+        completed: list[tuple[str, dict | None, str | None]] = []
+        gets_when_completed: list[int] = []
+        poll = self._json_response(
+            b'{"id": "task-1", "status": "completed", '
+            b'"data": [{"url": "https://s3.polza.ai/signed-secret.mp3"}], '
+            b'"usage": {"cost_rub": 0.5}}'
+        )
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET) as mock_post:
+                with patch(
+                    self.GET_TARGET,
+                    side_effect=[poll, requests.Timeout("read timed out")],
+                ) as mock_get:
+
+                    def on_completed(task_id, usage, generation_id) -> None:
+                        gets_when_completed.append(mock_get.call_count)
+                        completed.append((task_id, usage, generation_id))
+
+                    provider = self._provider(on_media_completed=on_completed)
+                    with pytest.raises(requests.Timeout):
+                        provider.recover_media_task("task-1", "Hello", "chunk_01")
+
+        mock_post.assert_not_called()
+        assert gets_when_completed == [1]
+        assert len(completed) == 1
+        task_id, usage, generation_id = completed[0]
+        assert task_id == "task-1"
+        assert generation_id == "task-1"
+        assert usage == {"cost_rub": Decimal("0.5")}
+        assert "s3.polza.ai" not in repr(completed)
+        assert "signed-secret" not in repr(completed)
+
+    def test_initial_route_surfaces_completed_task_without_signed_url(self):
+        completed: list[tuple[str, dict | None, str | None]] = []
+        submit = self._json_response(b'{"id": "task-1", "status": "pending"}')
+        poll = self._json_response(
+            b'{"id": "task-1", "status": "completed", '
+            b'"data": [{"url": "https://s3.polza.ai/signed.mp3"}], '
+            b'"usage": {"cost_rub": 0.25}}'
+        )
+        download = self._json_response(b"fake-elevenlabs-audio")
+
+        def on_completed(task_id, usage, generation_id) -> None:
+            completed.append((task_id, usage, generation_id))
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET, return_value=submit) as mock_post:
+                with patch(self.GET_TARGET, side_effect=[poll, download]) as mock_get:
+                    result = self._provider(on_media_completed=on_completed).synthesize_chunk(
+                        "Hello", "chunk_01"
+                    )
+
+        assert mock_post.call_count == 1
+        assert mock_get.call_count == 2
+        assert completed == [("task-1", {"cost_rub": Decimal("0.25")}, "task-1")]
+        assert "s3.polza.ai" not in repr(completed)
+        assert result.audio_bytes == b"fake-elevenlabs-audio"
+        assert result.generation_id == "task-1"
+
+    @pytest.mark.parametrize(
+        "unsafe_task_id",
+        [
+            "",
+            "task-1/extra",
+            "task-1?status=completed",
+            "../../etc/passwd",
+            "https://evil.example/media/1",
+            "task 1",
+        ],
+    )
+    def test_recover_media_task_rejects_unsafe_task_id_before_any_request(self, unsafe_task_id):
+        with patch(self.POST_TARGET) as mock_post:
+            with patch(self.GET_TARGET) as mock_get:
+                with pytest.raises(ValueError, match="safe opaque token"):
+                    self._provider().recover_media_task(unsafe_task_id, "Hello", "chunk_01")
+
+        mock_post.assert_not_called()
+        mock_get.assert_not_called()
+
+    def test_submit_response_with_unsafe_task_id_fails_closed(self):
+        accepted: list[str] = []
+        submit = self._json_response(b'{"id": "../escape", "status": "pending"}')
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET, return_value=submit) as mock_post:
+                with patch(self.GET_TARGET) as mock_get:
+                    with pytest.raises(ValueError, match="safe opaque token"):
+                        self._provider(on_media_task_accepted=accepted.append).synthesize_chunk(
+                            "Hello", "chunk_01"
+                        )
+
+        assert mock_post.call_count == 1
+        assert accepted == []
+        mock_get.assert_not_called()
+
+    def test_persistence_failure_propagates_without_poll_or_second_post(self):
+        submit = self._json_response(b'{"id": "task-1", "status": "pending"}')
+
+        def on_accepted(_task_id: str) -> None:
+            raise OSError("state directory is read-only")
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET, return_value=submit) as mock_post:
+                with patch(self.GET_TARGET) as mock_get:
+                    with pytest.raises(OSError, match="read-only"):
+                        self._provider(on_media_task_accepted=on_accepted).synthesize_chunk(
+                            "Hello", "chunk_01"
+                        )
+
+        assert mock_post.call_count == 1
+        mock_get.assert_not_called()
+
+    TOKEN = "X-Amz-Signature=deadbeefcafe"
+    SIGNED_URL = f"https://s3.polza.ai/audio.mp3?{TOKEN}"
+
+    @staticmethod
+    def _completed_body(url: str, *, generation_id: str = "task-1", cost: float = 0.5) -> bytes:
+        return json.dumps(
+            {
+                "id": generation_id,
+                "status": "completed",
+                "data": [{"url": url}],
+                "usage": {"cost_rub": cost},
+            },
+            separators=(",", ":"),
+        ).encode()
+
+    def test_unsafe_task_id_error_does_not_echo_signed_url(self):
+        with patch(self.POST_TARGET) as mock_post:
+            with patch(self.GET_TARGET) as mock_get:
+                with pytest.raises(ValueError) as excinfo:
+                    self._provider().recover_media_task(self.SIGNED_URL, "Hello", "chunk_01")
+
+        assert self.TOKEN not in str(excinfo.value)
+        assert "s3.polza.ai" not in repr(excinfo.value)
+        assert "safe opaque token" in str(excinfo.value)
+        mock_post.assert_not_called()
+        mock_get.assert_not_called()
+
+    def test_submit_error_body_does_not_echo_signed_url(self):
+        submit = self._json_response(
+            json.dumps(
+                {"error": f"bad request at {self.SIGNED_URL}"}, separators=(",", ":")
+            ).encode(),
+            status_code=400,
+        )
+        with patch(self.POST_TARGET, return_value=submit) as mock_post:
+            with patch(self.GET_TARGET) as mock_get:
+                with pytest.raises(RuntimeError) as excinfo:
+                    self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert self.TOKEN not in str(excinfo.value)
+        assert "s3.polza.ai" not in str(excinfo.value)
+        assert str(excinfo.value) == "HTTP 400"
+        assert mock_post.call_count == 1
+        mock_get.assert_not_called()
+
+    def test_poll_http_error_body_does_not_echo_signed_url(self):
+        submit = self._json_response(b'{"id": "task-1", "status": "pending"}')
+        poll = self._json_response(
+            json.dumps({"error": f"upstream {self.SIGNED_URL}"}, separators=(",", ":")).encode(),
+            status_code=500,
+        )
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET, return_value=submit):
+                with patch(self.GET_TARGET, return_value=poll) as mock_get:
+                    with pytest.raises(RuntimeError) as excinfo:
+                        self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert self.TOKEN not in str(excinfo.value)
+        assert "s3.polza.ai" not in str(excinfo.value)
+        assert str(excinfo.value) == "HTTP 500"
+        assert mock_get.call_count == 1
+
+    def test_failed_status_payload_does_not_echo_signed_url(self):
+        submit = self._json_response(b'{"id": "task-1", "status": "pending"}')
+        poll = self._json_response(
+            json.dumps(
+                {"id": "task-1", "status": "failed", "error": f"broke at {self.SIGNED_URL}"},
+                separators=(",", ":"),
+            ).encode()
+        )
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET, return_value=submit):
+                with patch(self.GET_TARGET, return_value=poll) as mock_get:
+                    with pytest.raises(RuntimeError) as excinfo:
+                        self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert self.TOKEN not in str(excinfo.value)
+        assert "s3.polza.ai" not in str(excinfo.value)
+        assert "task-1" in str(excinfo.value)
+        assert mock_get.call_count == 1
+
+    def test_signed_url_download_timeout_does_not_echo_url(self):
+        poll = self._json_response(self._completed_body(self.SIGNED_URL))
+        download = requests.Timeout(f"HTTPSConnectionPool read timed out for {self.SIGNED_URL}")
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET) as mock_post:
+                with patch(self.GET_TARGET, side_effect=[poll, download]) as mock_get:
+                    with pytest.raises(requests.Timeout) as excinfo:
+                        self._provider().recover_media_task("task-1", "Hello", "chunk_01")
+
+        assert self.TOKEN not in str(excinfo.value)
+        assert "s3.polza.ai" not in str(excinfo.value)
+        assert mock_get.call_count == 2
+        mock_post.assert_not_called()
+
+    @pytest.mark.parametrize("status_code,body", [(403, b"AccessDenied"), (200, b"")])
+    def test_download_failure_does_not_echo_signed_url(self, status_code, body):
+        poll = self._json_response(self._completed_body(self.SIGNED_URL))
+        download = self._json_response(body, status_code=status_code)
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET) as mock_post:
+                with patch(self.GET_TARGET, side_effect=[poll, download]) as mock_get:
+                    with pytest.raises(RuntimeError) as excinfo:
+                        self._provider().recover_media_task("task-1", "Hello", "chunk_01")
+
+        assert self.TOKEN not in str(excinfo.value)
+        assert "s3.polza.ai" not in str(excinfo.value)
+        assert mock_get.call_count == 2
+        mock_post.assert_not_called()
+
+    def test_malicious_completed_generation_id_is_not_exposed(self):
+        reported: list[tuple] = []
+        poll = self._json_response(
+            self._completed_body("https://s3.polza.ai/real.mp3", generation_id=self.SIGNED_URL)
+        )
+        download = self._json_response(b"fake-elevenlabs-audio")
+
+        with patch(self.SLEEP_TARGET, return_value=None):
+            with patch(self.POST_TARGET) as mock_post:
+                with patch(self.GET_TARGET, side_effect=[poll, download]) as mock_get:
+                    result = self._provider(
+                        on_media_completed=lambda *args: reported.append(args)
+                    ).recover_media_task("task-1", "Hello", "chunk_01")
+
+        mock_post.assert_not_called()
+        assert mock_get.call_count == 2
+        assert reported == [("task-1", {"cost_rub": Decimal("0.5")}, None)]
+        assert self.TOKEN not in repr(reported)
+        assert "s3.polza.ai" not in repr(reported)
+        assert result.generation_id == "task-1"
+        assert result.audio_bytes == b"fake-elevenlabs-audio"
+
+    def test_openai_speech_route_never_invokes_media_callbacks(self):
+        accepted: list[str] = []
+        completed: list[tuple] = []
+        audio_b64 = base64.b64encode(b"fake-audio").decode()
+        body = json.dumps(
+            {"audio": audio_b64, "contentType": "audio/mpeg"}, separators=(",", ":")
+        ).encode()
+        response = self._json_response(body, headers={"X-Generation-Id": "gen-123"})
+
+        with patch(self.POST_TARGET, return_value=response) as mock_post:
+            result = self._provider(
+                model="openai/gpt-4o-mini-tts",
+                voice="ash",
+                on_media_task_accepted=accepted.append,
+                on_media_completed=lambda *args: completed.append(args),
+            ).synthesize_chunk("Hello", "chunk_01")
+
+        assert mock_post.call_args[0][0] == f"{POLZA_BASE_URL}/audio/speech"
+        assert accepted == []
+        assert completed == []
+        assert result.generation_id == "gen-123"
 
 
 class TestPolzaChatAudioProviderSinglePaidSubmit:
