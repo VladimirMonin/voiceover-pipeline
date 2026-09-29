@@ -4,20 +4,22 @@ This module owns everything after the CLI has resolved one ASR request: it
 builds the request from parsed arguments, selects the runtime backend, probes
 that backend, constructs the provider, invokes it through the optional long-form
 orchestrator, validates the returned result, and invokes the dialogue-quality
-route. It also owns the timing-provider invocation for the legacy timings route
-and the per-turn dialogue-quality gate that runs before the final concat. The
-CLI keeps argument validation, provider-spec lookup, the unsupported-timing
-guard, and the fail-envelope translation, and forwards its currently bound
-callables so the existing monkeypatch seams keep steering these bodies without
-importing ``cli``.
+route. It also owns the generic ASR timing request/bridge and the timing-provider
+invocation for the legacy timings route, plus the per-turn dialogue-quality gate
+that runs before the final concat. The CLI keeps argument validation,
+provider-spec lookup, the unsupported-timing guard, and the fail-envelope
+translation, and forwards its currently bound callables so the existing
+monkeypatch seams keep steering these bodies without importing ``cli``.
 """
 
 import argparse
 import os
+import shutil
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn, cast
 
+from ..asr_timing_bridge import asr_result_to_timing
 from ..config import DEFAULT_ASR_COMPUTE, DEFAULT_ASR_DEVICE, DEFAULT_TIMING_MODEL
 from ..local_runtime.transports.audio_cpp_cli import NATIVE_AUDIO_CPP_EXECUTABLE_ENV
 from ..models import (
@@ -147,6 +149,47 @@ def transcribe_asr_request(
         if capability_error is not None:
             raise ASRCapabilityError(capability_error)
     return result
+
+
+def transcribe_generic_asr_timing(
+    spec: ASRProviderSpec,
+    *,
+    audio_path: Path,
+    model: str | None,
+    device: str,
+    compute: str,
+    language: str | None,
+    mp3_duration_ms: Callable[[str, Path], int],
+) -> TimingResult:
+    """Run one generic ASR timing request and bridge its result into timings.
+
+    The CLI validates provider options and probes the spec dependency before this
+    point. This body then builds the word-timestamp request, invokes the spec
+    factory exactly once through ``transcribe_asr_request``, requires ``ffprobe``
+    for the authoritative source duration, and converts the result through
+    ``asr_result_to_timing``. The duration callable is injected by the CLI so the
+    existing ``mp3_duration_ms`` and ``shutil.which`` seams keep steering these
+    bodies.
+    """
+    model_id = model or next((item["id"] for item in spec.models if item.get("default")), None)
+    request = ASRRequest(
+        audio_path=audio_path,
+        model_id=model_id,
+        language=language,
+        device=device,
+        compute=compute,
+        timestamp_mode="word",
+    )
+    result = transcribe_asr_request(spec.factory(), spec, request)
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        raise RuntimeError("FFprobe is required to validate generic ASR timestamp bounds")
+    source_duration_s = mp3_duration_ms(ffprobe_path, audio_path) / 1000
+    return asr_result_to_timing(
+        result,
+        source_audio=str(audio_path.resolve()),
+        source_duration_s=source_duration_s,
+    )
 
 
 def transcribe_dialogue_quality_audio(

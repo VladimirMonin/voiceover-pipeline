@@ -268,3 +268,116 @@ def test_generic_asr_timing_route_writes_existing_artifacts_without_replacing_fa
     assert captured[0].timestamp_mode == "word"
     assert manifest["provider"] == "fixture-asr"
     assert (tmp_path / "fixture.srt").exists()
+
+
+def _fixture_asr_spec(factory):
+    from voiceover_pipeline.models import ASRCapabilities
+    from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth, ASRProviderSpec
+
+    return ASRProviderSpec(
+        provider_id="fixture-asr",
+        description="Fixture ASR",
+        factory=factory,
+        models=(
+            {"id": "default-model", "default": True},
+            {"id": "other-model"},
+        ),
+        capabilities=ASRCapabilities(
+            batch_audio=True,
+            forced_language=True,
+            word_timestamps=True,
+            forced_alignment=True,
+            device_modes=("cpu",),
+            compute_modes=("float32",),
+        ),
+        dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
+    )
+
+
+def test_generic_asr_timing_service_builds_default_word_request_and_duration_in_order(
+    tmp_path, monkeypatch
+):
+    from voiceover_pipeline.models import ASRRequest
+    from voiceover_pipeline.providers.base import ASRProvider
+    from voiceover_pipeline.services import transcription
+
+    audio = tmp_path / "fixture.wav"
+    audio.write_bytes(b"fixture")
+    events: list[str] = []
+    captured: list[ASRRequest] = []
+
+    class FixtureProvider(ASRProvider):
+        provider_id = "fixture-asr"
+
+        def __init__(self):
+            events.append("factory")
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            events.append("asr")
+            captured.append(request)
+            return _result(origin="forced", duration_s=None)
+
+    spec = _fixture_asr_spec(FixtureProvider)
+    monkeypatch.setattr(transcription.shutil, "which", lambda command: "ffprobe")
+
+    def record_duration(ffprobe, source):
+        events.append("duration")
+        assert ffprobe == "ffprobe"
+        assert source == audio
+        return 2000
+
+    timing = transcription.transcribe_generic_asr_timing(
+        spec,
+        audio_path=audio,
+        model=None,
+        device="cpu",
+        compute="float32",
+        language="ru",
+        mp3_duration_ms=record_duration,
+    )
+
+    assert events == ["factory", "asr", "duration"]
+    assert captured[0].model_id == "default-model"
+    assert captured[0].timestamp_mode == "word"
+    assert captured[0].audio_path == audio
+    assert captured[0].language == "ru"
+    assert captured[0].device == "cpu"
+    assert captured[0].compute == "float32"
+    assert timing.provider == "fixture-asr"
+    assert timing.source_audio == str(audio.resolve())
+
+
+def test_generic_asr_timing_service_requires_ffprobe_after_provider_runs(tmp_path, monkeypatch):
+    from voiceover_pipeline.models import ASRRequest
+    from voiceover_pipeline.providers.base import ASRProvider
+    from voiceover_pipeline.services import transcription
+
+    audio = tmp_path / "fixture.wav"
+    audio.write_bytes(b"fixture")
+    events: list[str] = []
+
+    class FixtureProvider(ASRProvider):
+        provider_id = "fixture-asr"
+
+        def __init__(self):
+            events.append("factory")
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            events.append("asr")
+            return _result(origin="forced")
+
+    spec = _fixture_asr_spec(FixtureProvider)
+    monkeypatch.setattr(transcription.shutil, "which", lambda command: None)
+
+    with pytest.raises(RuntimeError, match="FFprobe is required to validate generic ASR"):
+        transcription.transcribe_generic_asr_timing(
+            spec,
+            audio_path=audio,
+            model=None,
+            device="cpu",
+            compute="float32",
+            language="ru",
+            mp3_duration_ms=lambda ffprobe, source: 2000,
+        )
+
+    assert events == ["factory", "asr"]

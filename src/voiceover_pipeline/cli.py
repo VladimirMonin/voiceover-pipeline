@@ -23,7 +23,6 @@ from .asr_longform import (
     transcribe_prerecorded_long_form,
     uses_long_form_orchestration,
 )
-from .asr_timing_bridge import asr_result_to_timing
 from .commands.split import ScriptNotFoundError, prepare_split_chunks
 from .config import (
     DEFAULT_ASR_COMPUTE,
@@ -87,7 +86,6 @@ from .media import (
 )
 from .models import (
     ASRContextHints,
-    ASRRequest,
     ASRResult,
     ChunkArtifact,
     ScriptChunk,
@@ -2750,24 +2748,14 @@ def _extract_asr_timings(
     health = spec.dependency_probe()
     if not health.available:
         raise ModuleNotFoundError(health.remediation)
-    model_id = model or next((item["id"] for item in spec.models if item.get("default")), None)
-    request = ASRRequest(
+    timing = transcription.transcribe_generic_asr_timing(
+        spec,
         audio_path=audio_path,
-        model_id=model_id,
-        language=language,
+        model=model,
         device=device,
         compute=compute,
-        timestamp_mode="word",
-    )
-    result = transcription.transcribe_asr_request(spec.factory(), spec, request)
-    ffprobe_path = shutil.which("ffprobe")
-    if ffprobe_path is None:
-        raise RuntimeError("FFprobe is required to validate generic ASR timestamp bounds")
-    source_duration_s = mp3_duration_ms(ffprobe_path, audio_path) / 1000
-    timing = asr_result_to_timing(
-        result,
-        source_audio=str(audio_path.resolve()),
-        source_duration_s=source_duration_s,
+        language=language,
+        mp3_duration_ms=mp3_duration_ms,
     )
     return _write_timing_artifacts(audio_path, output_dir, prefix, timing)
 
