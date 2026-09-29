@@ -3148,7 +3148,9 @@ def _direct_cost_kwargs(provider: str, result) -> dict:
     usage = (result.raw_metadata or {}).get("usage_direct")
     if not isinstance(usage, dict):
         return {}
-    cost_rub = usage.get("cost_rub") or usage.get("cost")
+    cost_rub = usage.get("cost_rub")
+    if cost_rub is None:
+        cost_rub = usage.get("cost")
     if cost_rub is None:
         return {}
     return {

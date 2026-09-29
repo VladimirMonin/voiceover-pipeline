@@ -126,11 +126,17 @@ def cost_from_generation(
         return None, None, None
 
     if provider in ("polza-chat-audio", "polza-tts"):
-        value = generation.get("clientCost") or generation.get("cost")
+        value = generation.get("clientCost")
+        if value is None:
+            value = generation.get("cost")
         return (float(value), str(value), "RUB") if value is not None else (None, None, None)
 
     if provider == "openrouter-tts":
-        value = generation.get("total_cost") or generation.get("cost") or generation.get("usage")
+        value = generation.get("total_cost")
+        if value is None:
+            value = generation.get("cost")
+        if value is None:
+            value = generation.get("usage")
         return (float(value), str(value), "USD") if value is not None else (None, None, None)
 
     return None, None, None

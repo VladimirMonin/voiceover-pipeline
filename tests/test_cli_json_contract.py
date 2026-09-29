@@ -339,6 +339,84 @@ def test_direct_cost_kwargs_populates_for_polza_tts():
     assert kwargs["cost_rub"] == 0.1575
 
 
+def test_direct_cost_kwargs_zero_cost_rub_wins_over_nonzero_cost():
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": 0, "cost": 1.5}},
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["cost"] == 0.0
+    assert kwargs["cost_exact"] == "0"
+    assert kwargs["cost_rub"] == 0.0
+    assert kwargs["cost_rub_exact"] == "0"
+    assert kwargs["cost_currency"] == "RUB"
+
+
+def test_direct_cost_kwargs_zero_cost_rub_without_fallback_cost():
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": 0.0}},
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["cost"] == 0.0
+    assert kwargs["cost_exact"] == "0.0"
+    assert kwargs["cost_currency"] == "RUB"
+
+
+def test_direct_cost_kwargs_falls_back_to_cost_when_cost_rub_missing():
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost": 0.25}},
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["cost"] == 0.25
+    assert kwargs["cost_exact"] == "0.25"
+    assert kwargs["cost_rub"] == 0.25
+    assert kwargs["cost_currency"] == "RUB"
+
+
+def test_direct_cost_kwargs_falls_back_to_cost_when_cost_rub_none():
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": {"cost_rub": None, "cost": 0.25}},
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["cost"] == 0.25
+    assert kwargs["cost_rub"] == 0.25
+    assert kwargs["cost_currency"] == "RUB"
+
+
+def test_direct_cost_kwargs_preserves_usage_and_direct_source():
+    from voiceover_pipeline.cli import _direct_cost_kwargs
+    from voiceover_pipeline.models import SynthesisResult
+
+    usage = {"cost_rub": 0.1575, "cost": 0.1575, "tokens": 12}
+    result = SynthesisResult(
+        audio_bytes=b"fake",
+        audio_format="mp3",
+        raw_metadata={"usage_direct": usage},
+    )
+    kwargs = _direct_cost_kwargs("polza-tts", result)
+    assert kwargs["usage"] == usage
+    assert kwargs["generation_detail_source"] == "Polza API usage.cost_rub (direct)"
+
+
 def test_direct_cost_kwargs_none_for_other_providers():
     from voiceover_pipeline.cli import _direct_cost_kwargs
     from voiceover_pipeline.models import SynthesisResult
