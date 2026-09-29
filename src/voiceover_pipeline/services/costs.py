@@ -3,8 +3,8 @@
 These helpers only reshape values a provider already reported or a recovery
 marker already stored: they never call a provider, touch run state, or reach the
 network. ``cli`` keeps thin wrappers under the former names so existing imports
-and outputs stay identical. Canonical pricing logic and the history lookup stay
-in ``pricing`` and ``cli``.
+and outputs stay identical. The provider-side history lookup lives in
+``services.cost_enrichment`` and canonical pricing stays in ``pricing``.
 """
 
 import math

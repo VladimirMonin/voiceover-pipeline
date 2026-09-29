@@ -80,7 +80,6 @@ from .gemini_dialogue import (
     validate_gemini_dialogue_file,
 )
 from .local_runtime.contracts import OmniVoiceRequest
-from .local_runtime.transports.audio_cpp_cli import NATIVE_AUDIO_CPP_EXECUTABLE_ENV
 from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
 from .media import (
     check_media_tools,
@@ -130,7 +129,7 @@ from .providers.asr_registry import (
     list_asr_provider_specs,
 )
 from .providers.audio_cpp_omnivoice_tts import omnivoice_local_dependency_probe
-from .providers.base import TranscriptionProvider, validate_asr_response
+from .providers.base import TranscriptionProvider
 from .retry import RetryPolicy, is_retryable_error
 from .run_state import (
     ATTEMPT_FAILED,
@@ -149,11 +148,11 @@ from .run_state import (
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
-from .services import cost_enrichment, costs, execution, recovery
+from .services import cost_enrichment, costs, execution, recovery, transcription
 from .services.prepare import prepare_run, prepare_runtime_chunks, prepare_script_fragments
 from .services.recovery import _PAID_SUBMIT_TTS_PROVIDERS
 from .services.synthesis import synthesize_part
-from .services.transcription import build_asr_request, validate_result_capabilities
+from .services.transcription import build_asr_request
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
 from .tts_quality import evaluate_tts_transcript
 from .voiceover_script import (
@@ -1847,54 +1846,27 @@ def _transcribe_result(args: argparse.Namespace) -> tuple[ASRResult, Path]:
 
     _validate_asr_request_options(args, spec, hints)
     request = build_asr_request(args, spec, hints, audio_path)
-    runtime = request.runtime_choice
-    if spec.provider_id == "nemotron-local" and runtime == "audio-cpp":
-        from .providers.audio_cpp_nemotron_asr import audio_cpp_nemotron_asr_dependency_probe
-        from .providers.nemotron_asr_local import nemotron_asr_audio_cpp_provider_factory
-
-        health = audio_cpp_nemotron_asr_dependency_probe()
-        provider_factory = nemotron_asr_audio_cpp_provider_factory
-    elif spec.provider_id == "nemotron-local" and runtime == "python":
-        from .providers.nemotron_asr_local import (
-            nemotron_asr_python_dependency_probe,
-            nemotron_asr_python_provider_factory,
-        )
-
-        health = nemotron_asr_python_dependency_probe()
-        provider_factory = nemotron_asr_python_provider_factory
-    elif runtime == "audio-cpp":
-        if not os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip():
-            fail(
-                f"ASR provider {spec.provider_id} does not support runtime=audio-cpp "
-                "without a native audio.cpp package",
-                _EXIT_MISSING_DEP,
-            )
-        health = spec.dependency_probe()
-        provider_factory = spec.factory
-    else:
-        health = spec.dependency_probe()
-        provider_factory = spec.factory
-    if not health.available:
-        fail(health.remediation, _EXIT_MISSING_DEP)
-
-    provider = provider_factory()
     try:
-        raw_result = (
-            transcribe_prerecorded_long_form(provider, request)
-            if uses_long_form_orchestration(spec.provider_id)
-            else provider.transcribe(request)
+        provider = transcription.resolve_asr_provider(spec, request)
+    except transcription.ASRDependencyUnavailableError as exc:
+        fail(str(exc), _EXIT_MISSING_DEP)
+    try:
+        result = transcription.transcribe_asr_request(
+            provider,
+            spec,
+            request,
+            long_form=uses_long_form_orchestration(spec.provider_id),
+            long_form_transcribe=transcribe_prerecorded_long_form,
+            capability_check=True,
         )
-        result = validate_asr_response(request, raw_result)
     except LongFormASRMediaError as exc:
         fail(str(exc), _EXIT_NO_FFMPEG)
     except ModuleNotFoundError as exc:
         fail(f"Missing dependency for ASR provider {spec.provider_id}: {exc}", _EXIT_MISSING_DEP)
+    except transcription.ASRCapabilityError as exc:
+        fail(str(exc), _EXIT_PROVIDER)
     except Exception as exc:
         fail(f"ASR provider {spec.provider_id} failed: {exc}", _EXIT_PROVIDER)
-
-    capability_error = validate_result_capabilities(result, spec)
-    if capability_error is not None:
-        fail(capability_error, _EXIT_PROVIDER)
 
     return result, audio_path
 
@@ -1969,39 +1941,10 @@ def _transcribe_dialogue_quality_audio(
     args: argparse.Namespace, audio_path: Path
 ) -> tuple[str, str, str | None, str, str | None]:
     """Return transcript plus content-free ASR identity for a quality check."""
-    provider_id = args.tts_quality_provider
-    if provider_id == "xai-stt":
-        from .providers.xai_stt import XAISttProvider
-
-        provider = XAISttProvider(model=args.tts_quality_model or "grok-stt")
-        timing = provider.transcribe(
-            audio_path=audio_path,
-            language=args.tts_quality_language or "ru",
-            word_timestamps=False,
-            quiet=True,
-        )
-        transcript = " ".join(segment.text for segment in timing.segments).strip()
-        return transcript, provider_id, provider.model, "cloud-api", None
-
-    transcribe_args = argparse.Namespace(
-        audio=audio_path,
-        provider=provider_id,
-        model=getattr(args, "tts_quality_model", None),
-        language=getattr(args, "tts_quality_language", None),
-        device=getattr(args, "tts_quality_device", DEFAULT_ASR_DEVICE),
-        compute=getattr(args, "tts_quality_compute", DEFAULT_ASR_COMPUTE),
-        runtime=getattr(args, "tts_quality_runtime", "auto"),
-        context=None,
-        context_file=None,
-        word_timestamps=False,
-    )
-    result, _ = _transcribe_result(transcribe_args)
-    return (
-        result.transcript,
-        result.provider_id,
-        result.model_id,
-        result.execution.runtime,
-        result.execution.model_revision,
+    return transcription.transcribe_dialogue_quality_audio(
+        args=args,
+        audio_path=audio_path,
+        transcribe_result=_transcribe_result,
     )
 
 
@@ -3103,7 +3046,7 @@ def _extract_asr_timings(
         compute=compute,
         timestamp_mode="word",
     )
-    result = validate_asr_response(request, spec.factory().transcribe(request))
+    result = transcription.transcribe_asr_request(spec.factory(), spec, request)
     ffprobe_path = shutil.which("ffprobe")
     if ffprobe_path is None:
         raise RuntimeError("FFprobe is required to validate generic ASR timestamp bounds")

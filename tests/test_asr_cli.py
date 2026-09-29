@@ -946,3 +946,133 @@ def test_transcribe_provider_identity_mismatch_keeps_exit_code_and_message(monke
         cli.transcribe_cmd(args)
 
     assert error.value.code == 30
+
+
+def test_transcribe_asr_request_runs_direct_long_form_and_capability_check():
+    from voiceover_pipeline.services import transcription
+
+    request = ASRRequest(
+        audio_path=Path("audio.wav"),
+        model_id="fixture-model",
+        language="ru",
+        device="cpu",
+        compute="float32",
+    )
+    spec = _fixture_spec()
+    provider = FixtureASRProvider()
+
+    direct = transcription.transcribe_asr_request(provider, spec, request)
+    assert direct.transcript == "fixture transcript"
+
+    long_form_calls: list[tuple[object, ASRRequest]] = []
+
+    def long_form_transcribe(supplied_provider, supplied_request):
+        long_form_calls.append((supplied_provider, supplied_request))
+        return direct
+
+    orchestrated = transcription.transcribe_asr_request(
+        provider,
+        spec,
+        request,
+        long_form=True,
+        long_form_transcribe=long_form_transcribe,
+    )
+    assert orchestrated is direct
+    assert long_form_calls == [(provider, request)]
+
+    class ForeignProvider(ASRProvider):
+        provider_id = "fixture-local"
+
+        def transcribe(self, request: ASRRequest) -> ASRResult:
+            return ASRResult(
+                transcript="fixture transcript",
+                provider_id="someone-else",
+                model_id="fixture-model",
+                execution=ASRExecutionReceipt(runtime="fixture-runtime"),
+            )
+
+    foreign = ForeignProvider()
+    unchecked = transcription.transcribe_asr_request(foreign, spec, request)
+    assert unchecked.provider_id == "someone-else"
+    with pytest.raises(transcription.ASRCapabilityError) as error:
+        transcription.transcribe_asr_request(foreign, spec, request, capability_check=True)
+    assert str(error.value) == "ASR provider fixture-local returned provider ID someone-else"
+
+
+def test_resolve_asr_provider_is_typed_and_keeps_factory_outside_invocation_boundary():
+    from voiceover_pipeline.services import transcription
+
+    request = ASRRequest(audio_path=Path("audio.wav"), device="cpu", compute="float32")
+
+    unavailable = _fixture_spec(available=False)
+    with pytest.raises(transcription.ASRDependencyUnavailableError) as error:
+        transcription.resolve_asr_provider(unavailable, request)
+    assert str(error.value) == "Install the approved optional ASR runtime."
+
+    selected: list[str] = []
+    lazy_spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=lambda: selected.append("factory") or FixtureASRProvider(),
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True, device_modes=("cpu",), compute_modes=("float32",)
+        ),
+        dependency_probe=lambda: (
+            selected.append("probe") or ASRDependencyHealth(available=True, remediation="")
+        ),
+    )
+    resolved = transcription.resolve_asr_provider(lazy_spec, request)
+    assert isinstance(resolved, FixtureASRProvider)
+    assert selected == ["probe", "factory"]
+
+    class FactoryBoom(RuntimeError):
+        pass
+
+    def boom_factory():
+        raise FactoryBoom("factory exploded")
+
+    factory_spec = ASRProviderSpec(
+        provider_id="fixture-local",
+        description="Offline fixture provider",
+        factory=boom_factory,
+        models=({"id": "fixture-model", "default": True},),
+        capabilities=ASRCapabilities(
+            batch_audio=True, device_modes=("cpu",), compute_modes=("float32",)
+        ),
+        dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
+    )
+    with pytest.raises(FactoryBoom, match="factory exploded"):
+        transcription.resolve_asr_provider(factory_spec, request)
+
+
+def test_transcribe_dialogue_quality_audio_delegates_to_bound_transcribe_result():
+    from voiceover_pipeline.services import transcription
+
+    audio_path = Path("turn-0001.mp3")
+    seen: list[argparse.Namespace] = []
+
+    def bound_transcribe(transcribe_args):
+        seen.append(transcribe_args)
+        return (
+            ASRResult(
+                transcript="fixture transcript",
+                provider_id="fixture-local",
+                model_id="fixture-model",
+                execution=ASRExecutionReceipt(runtime="fixture-runtime", model_revision="rev-1"),
+            ),
+            transcribe_args.audio,
+        )
+
+    args = argparse.Namespace(
+        tts_quality_provider="fixture-local",
+        tts_quality_model=None,
+        tts_quality_language=None,
+    )
+
+    assert transcription.transcribe_dialogue_quality_audio(
+        args=args, audio_path=audio_path, transcribe_result=bound_transcribe
+    ) == ("fixture transcript", "fixture-local", "fixture-model", "fixture-runtime", "rev-1")
+    assert seen[0].provider == "fixture-local"
+    assert seen[0].audio == audio_path
+    assert seen[0].device == "cpu"
