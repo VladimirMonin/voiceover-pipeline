@@ -12,6 +12,16 @@ from .models import ChunkArtifact, ScriptChunk
 STATE_FILE = "run_state.json"
 LOG_FILE = "generation.log"
 
+# Stage of a paid chunk attempt that a later process must not repeat blindly.
+PENDING_ATTEMPT_FIELD = "pending_attempt"
+ATTEMPT_SUBMITTING = "submitting"
+ATTEMPT_OUTCOME_UNKNOWN = "outcome_unknown"
+ATTEMPT_FAILED = "failed"
+
+# Stages a writer of this module can store. Any other value is reported as
+# unknown instead of being echoed back into diagnostics.
+_PENDING_ATTEMPT_STATUSES = frozenset({ATTEMPT_SUBMITTING, ATTEMPT_OUTCOME_UNKNOWN, ATTEMPT_FAILED})
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -90,6 +100,116 @@ def completed_numbers(state: dict[str, Any] | None) -> set[int]:
         and item.get("status") == "completed"
         and item.get("number") is not None
     }
+
+
+def begin_chunk_attempt(state: dict[str, Any], *, chunk_id: str, number: int) -> None:
+    """Record that a paid submit for this chunk is about to be sent.
+
+    The marker is written before the provider call, so a process that dies
+    between the write and the request resumes as unconfirmed instead of
+    repeating a possibly billed submit. Only the chunk identity and stage are
+    stored: request text, signed URLs, and provider error bodies never enter run
+    state.
+    """
+    state[PENDING_ATTEMPT_FIELD] = {
+        "id": chunk_id,
+        "number": number,
+        "status": ATTEMPT_SUBMITTING,
+        "at": utc_now(),
+    }
+    state["updated_at"] = utc_now()
+
+
+def record_chunk_attempt_outcome(state: dict[str, Any], *, status: str) -> None:
+    """Keep the attempt marker but record how the paid attempt ended.
+
+    ``ATTEMPT_OUTCOME_UNKNOWN`` means the paid outcome was not confirmed, so
+    ``ATTEMPT_FAILED`` is the definite case: the provider rejected the request,
+    or its response never became a saved chunk result.
+    """
+    marker = state.get(PENDING_ATTEMPT_FIELD)
+    if not isinstance(marker, dict):
+        return
+    marker["status"] = status
+    marker["at"] = utc_now()
+    state["updated_at"] = utc_now()
+
+
+def clear_chunk_attempt(state: dict[str, Any]) -> None:
+    """Drop the attempt marker once the chunk result is safely persisted."""
+    if state.pop(PENDING_ATTEMPT_FIELD, None) is not None:
+        state["updated_at"] = utc_now()
+
+
+# Largest chunk or turn number a bounded marker may echo back. Chunks and dialogue
+# turns are numbered from 1, so a boolean, non-positive, or larger ``number`` was
+# not written by this repository and is reported as unknown instead of echoed.
+_MAX_ATTEMPT_NUMBER = 1_000_000
+
+
+# Ids this module may echo back are the exact forms it generates: an ordinary
+# chunk ``chunk_01``, a dialogue turn ``turn_0003``, or the single OmniVoice session
+# chunk ``chunk_01_omnivoice_session`` (always number 1). ``run_state.json`` is
+# user-editable, so an id that is not the generated form for the reported number
+# could be a signed URL, request text, or another secret and is dropped instead of
+# being reported. Matching the generated shape exactly rejects near-misses such as
+# ``chunk_sk_live_secret`` even though they share the ``chunk_`` prefix.
+def _bounded_attempt_number(value: Any) -> int | None:
+    """Keep only a positive generated chunk number within the bounded maximum."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        return None
+    return value if 1 <= value <= _MAX_ATTEMPT_NUMBER else None
+
+
+def _bounded_chunk_id(value: Any, number: int | None) -> str | None:
+    """Keep only an id that equals the generated form for this bounded number."""
+    if number is None or not isinstance(value, str):
+        return None
+    if value == f"chunk_{number:02d}" or value == f"turn_{number:04d}":
+        return value
+    if value == "chunk_01_omnivoice_session" and number == 1:
+        return value
+    return None
+
+
+def _bounded_attempt_marker(marker: Any) -> dict[str, Any]:
+    """Project any stored marker onto the bounded fields a caller may report.
+
+    ``run_state.json`` is user-editable, so a marker can be a string, a list, or
+    a dict with unknown values. Only the chunk identity and a known stage survive
+    the projection; request text, signed URLs, and provider error bodies are
+    dropped instead of being echoed into diagnostics. The ``number`` survives only
+    when it is a positive generated number within the bounded maximum, and the
+    ``id`` survives only when it equals the generated form for that number, so a
+    URL, request body, or ``chunk_sk_live_secret`` stored there is reported as
+    ``null``.
+    """
+    if not isinstance(marker, dict):
+        return {"id": None, "number": None, "status": "unknown"}
+    number = _bounded_attempt_number(marker.get("number"))
+    status = marker.get("status")
+    bounded_status = status if isinstance(status, str) else None
+    return {
+        "id": _bounded_chunk_id(marker.get("id"), number),
+        "number": number,
+        "status": bounded_status if bounded_status in _PENDING_ATTEMPT_STATUSES else "unknown",
+    }
+
+
+def unconfirmed_attempt(state: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the persisted paid-attempt marker whenever one is present.
+
+    The marker is written before a paid submit and removed by the same atomic
+    write that stores the finished chunk, so any marker still in run state means
+    the paid outcome was not safely resolved. A marker next to a matching
+    ``completed`` entry is therefore stale or conflicting evidence, not proof
+    that the submit may be repeated, and it blocks resume and overwrite exactly
+    like a malformed marker. The returned marker is a bounded projection that
+    exposes only the chunk identity and stage.
+    """
+    if not isinstance(state, dict) or PENDING_ATTEMPT_FIELD not in state:
+        return None
+    return _bounded_attempt_marker(state[PENDING_ATTEMPT_FIELD])
 
 
 def _exact_cost_string(value: Any) -> str | None:

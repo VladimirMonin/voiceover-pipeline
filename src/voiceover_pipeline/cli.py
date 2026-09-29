@@ -133,18 +133,24 @@ from .providers.asr_registry import (
 )
 from .providers.audio_cpp_omnivoice_tts import omnivoice_local_dependency_probe
 from .providers.base import TranscriptionProvider, validate_asr_response
-from .retry import RetryPolicy, run_with_retry
+from .retry import RetryPolicy, is_retryable_error, run_with_retry
 from .run_state import (
+    ATTEMPT_FAILED,
+    ATTEMPT_OUTCOME_UNKNOWN,
     LOG_FILE,
     STATE_FILE,
     GenerationLogger,
     append_error,
     atomic_write_json,
+    begin_chunk_attempt,
+    clear_chunk_attempt,
     completed_numbers,
     initial_state,
     load_state,
+    record_chunk_attempt_outcome,
     script_hash,
     state_chunks_as_artifacts,
+    unconfirmed_attempt,
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
@@ -954,6 +960,13 @@ def generate(args: argparse.Namespace) -> None:
             "--json and --json-events are mutually exclusive; use one machine output mode.",
             _EXIT_ARGS,
         )
+    if getattr(args, "resume", False) and getattr(args, "overwrite", False):
+        fail(
+            "--resume and --overwrite are mutually exclusive: --resume continues an existing run "
+            "while --overwrite deletes it first. Use --resume to continue, or --overwrite with "
+            "--confirm-delete-paid-audio for an explicitly new run.",
+            _EXIT_ARGS,
+        )
     script_format = _resolve_script_format(args.script, args.format)
     args.format = script_format
     _validate_omnivoice_options(args)
@@ -1122,6 +1135,20 @@ def generate(args: argparse.Namespace) -> None:
             }
         )
 
+    if args.resume and not args.skip_existing and paths.output_root.exists():
+        # A resume whose previous paid submit is unconfirmed must fail closed before
+        # any optional quality/timing preflight, key read, provider build, identity
+        # check, or pricing I/O: the documented PAID_SUBMIT_UNCONFIRMED envelope
+        # cannot be replaced by a key or dependency error, and no request may leave.
+        # ``--skip-existing`` keeps its precedence and reports an existing folder as
+        # skipped without loading run state. The same guard runs inside
+        # ``_generate_step`` for direct callers.
+        pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
+        if pending_attempt is not None:
+            _reject_unconfirmed_paid_resume(
+                pending_attempt, GenerationLogger(paths.output_root / LOG_FILE)
+            )
+
     if (
         is_dialogue_format(script_format)
         and args.provider == "openrouter-tts"
@@ -1160,12 +1187,27 @@ def generate(args: argparse.Namespace) -> None:
                 f"Run folder already exists: {paths.output_root}. Use --resume to continue, --skip-existing, or --overwrite.",
                 _EXIT_PROVIDER,
             )
-        elif _has_paid_chunk_audio(paths) and not args.confirm_delete_paid_audio:
-            fail(
-                "Refusing to delete existing paid chunk audio. Use --resume, or add --confirm-delete-paid-audio with --overwrite.",
-                _EXIT_PROVIDER,
-            )
         if args.overwrite:
+            # The marker check precedes the paid-MP3 confirmation: a run that
+            # already saved one MP3 and later left an unconfirmed attempt must
+            # report the documented PAID_SUBMIT_UNCONFIRMED envelope instead of
+            # the generic paid-audio delete error.
+            pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
+            if pending_attempt is not None:
+                fail(
+                    "Refusing --overwrite: "
+                    f"{paths.output_root} holds an unconfirmed paid submit "
+                    f"({pending_attempt.get('id')}, status {pending_attempt.get('status')}). "
+                    "Keep this run as evidence and use a different --run-id for an explicitly "
+                    "new attempt.",
+                    _EXIT_PROVIDER,
+                    details=_paid_submit_unconfirmed_details(pending_attempt),
+                )
+            if _has_paid_chunk_audio(paths) and not args.confirm_delete_paid_audio:
+                fail(
+                    "Refusing to delete existing paid chunk audio. Use --resume, or add --confirm-delete-paid-audio with --overwrite.",
+                    _EXIT_PROVIDER,
+                )
             _safe_remove_run_dir(paths.output_root, args.output_dir)
 
     _ensure_run_dirs(paths)
@@ -1366,6 +1408,9 @@ def _generate_step(
             if state.get("voice_identity") != current_voice_identity:
                 logger.event("error", "resume_rejected", reason="voice_identity_mismatch")
                 fail("Cannot resume: voice identity changed.", _EXIT_PROVIDER)
+        pending_attempt = unconfirmed_attempt(state)
+        if pending_attempt is not None:
+            _reject_unconfirmed_paid_resume(pending_attempt, logger)
         logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
     elif state and not args.resume:
         logger.event("info", "state_replaced", reason="fresh_run")
@@ -1429,12 +1474,15 @@ def _generate_step(
     total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
     if dialogue_run and chunk_artifacts:
         total_duration_ms += chunk_artifacts[-1].pause_after_ms
-    openrouter_single_attempt = args.provider == "openrouter-tts"
+    paid_submit = args.provider in _PAID_SUBMIT_TTS_PROVIDERS
+    # A paid network submit cannot be repeated automatically: a failure after the
+    # request was sent may still have been accepted and billed. Local providers
+    # keep the documented --retries semantics.
     retry_policy = RetryPolicy(
-        attempts=1 if openrouter_single_attempt else args.retries,
+        attempts=1 if paid_submit else args.retries,
         delay_seconds=args.retry_delay,
         max_delay_seconds=args.retry_max_delay,
-        enabled=not args.no_retry and not openrouter_single_attempt,
+        enabled=not args.no_retry and not paid_submit,
     )
 
     for chunk in chunks:
@@ -1483,6 +1531,13 @@ def _generate_step(
                     raise
                 return selected_provider.synthesize_chunk(chunk.text, chunk.id)
 
+        if paid_submit:
+            # The marker is durable before the request leaves, so a crash between
+            # this write and the POST resumes as unconfirmed instead of repeating
+            # a possibly billed submit.
+            begin_chunk_attempt(state, chunk_id=chunk.id, number=chunk.number)
+            atomic_write_json(state_path, state)
+            logger.event("info", "paid_submit_started", chunk=chunk.number, id=chunk.id)
         try:
             result = run_with_retry(
                 synthesize_current_chunk,
@@ -1492,9 +1547,21 @@ def _generate_step(
                 ),
             )
         except Exception as e:
+            paid_attempt_status: str | None = None
+            if paid_submit:
+                paid_attempt_status = _paid_submit_attempt_status(e)
+                record_chunk_attempt_outcome(state, status=paid_attempt_status)
             append_error(state, chunk_id=chunk.id, message=str(e))
             atomic_write_json(state_path, state)
             logger.event("error", "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
+            if paid_attempt_status is not None:
+                logger.event(
+                    "warn",
+                    "paid_submit_failed",
+                    chunk=chunk.number,
+                    id=chunk.id,
+                    status=paid_attempt_status,
+                )
             _emit_json_event(args, "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
             fail(f"Failed to synthesize {chunk.id}: {e}", _EXIT_PROVIDER)
         logger.event(
@@ -1507,6 +1574,8 @@ def _generate_step(
         try:
             write_audio_as_mp3(ffmpeg_path, result.audio_bytes, result.audio_format, output_path)
         except Exception as e:
+            if paid_submit:
+                record_chunk_attempt_outcome(state, status=ATTEMPT_FAILED)
             append_error(state, chunk_id=chunk.id, message=str(e))
             atomic_write_json(state_path, state)
             logger.event(
@@ -1521,6 +1590,8 @@ def _generate_step(
                 trim_final_silence(ffmpeg_path, ffprobe_path, output_path)
                 logger.event("info", "chunk_trimmed", chunk=chunk.number, id=chunk.id)
             except Exception as e:
+                if paid_submit:
+                    record_chunk_attempt_outcome(state, status=ATTEMPT_FAILED)
                 append_error(state, chunk_id=chunk.id, message=str(e))
                 atomic_write_json(state_path, state)
                 logger.event(
@@ -1567,6 +1638,10 @@ def _generate_step(
             include_text=not dialogue_run,
             include_transcript=not dialogue_run,
         )
+        if paid_submit:
+            # The completed entry and the cleared marker land in the same atomic
+            # write, so a saved chunk always replaces its own attempt marker.
+            clear_chunk_attempt(state)
         atomic_write_json(state_path, state)
         logger.event(
             "info", "chunk_state_saved", chunk=chunk.number, id=chunk.id, state=state_path.name
@@ -2221,7 +2296,7 @@ def status_cmd(args: argparse.Namespace) -> None:
     if args.run_id:
         _validate_run_id(args.run_id)
     run_dir = (Path(args.output_dir) / args.run_id).resolve()
-    state = load_state(run_dir / STATE_FILE)
+    state, state_unreadable = _load_status_state(run_dir / STATE_FILE)
     chunks_dir = run_dir / "chunks"
     chunk_files = _continuous_chunk_files(chunks_dir)
     total = int(state.get("chunk_count", len(chunk_files)) if state else len(chunk_files))
@@ -2233,6 +2308,13 @@ def status_cmd(args: argparse.Namespace) -> None:
     timings_json = list(run_dir.glob("*.timings.json"))
     errors = state.get("errors", []) if state else []
     can_resume = run_dir.exists() and ready < total and bool(state or chunk_files)
+    resume_block_reason = None
+    if state_unreadable:
+        can_resume = False
+        resume_block_reason = _RUN_STATE_UNREADABLE_RESUME_BLOCK_REASON
+    elif unconfirmed_attempt(state) is not None:
+        can_resume = False
+        resume_block_reason = _PAID_SUBMIT_RESUME_BLOCK_REASON
     data = {
         "status": "success",
         "run_id": args.run_id,
@@ -2246,6 +2328,7 @@ def status_cmd(args: argparse.Namespace) -> None:
         "timings_exists": bool(timings_json),
         "errors": errors,
         "can_resume": can_resume,
+        "resume_block_reason": resume_block_reason,
     }
     if args.json_output:
         _json_ok(data)
@@ -2256,6 +2339,8 @@ def status_cmd(args: argparse.Namespace) -> None:
     print(f"Timings: {'yes' if timings_json else 'no'}")
     print(f"Errors: {len(errors)}")
     print(f"Can resume: {'yes' if can_resume else 'no'}")
+    if resume_block_reason is not None:
+        print(f"Resume blocked: {resume_block_reason}")
 
 
 def concat_cmd(args: argparse.Namespace) -> None:
@@ -2787,6 +2872,118 @@ def _preflight_timing_dependency(timing_provider: str = "faster-whisper") -> Non
 
 def _has_paid_chunk_audio(paths) -> bool:
     return paths.chunks_dir.exists() and any(paths.chunks_dir.glob("chunk_*.mp3"))
+
+
+# Providers whose TTS call is a paid network submit. A failure after the request
+# was sent may still have been accepted and billed, so the outer retry must not
+# re-send it and a resume must not resubmit an unconfirmed attempt.
+_PAID_SUBMIT_TTS_PROVIDERS = frozenset({"polza-tts", "polza-chat-audio", "openrouter-tts"})
+
+_PAID_SUBMIT_UNCONFIRMED_ERROR_CODE = "PAID_SUBMIT_UNCONFIRMED"
+
+# Machine reason reported by ``status --json`` for a run whose resume is blocked.
+_PAID_SUBMIT_RESUME_BLOCK_REASON = "paid_submit_unconfirmed"
+
+# Machine reason reported by ``status --json`` when an existing run_state.json
+# cannot prove the run is resumable: invalid JSON, or valid JSON that is not an
+# object. Distinct from an absent state, which stays an ordinary empty run.
+_RUN_STATE_UNREADABLE_RESUME_BLOCK_REASON = "run_state_unreadable"
+
+
+# Bounded marker reported when an existing run cannot prove no paid submit is
+# pending: an unreadable state file, or valid JSON that is not an object.
+_UNKNOWN_PAID_ATTEMPT: dict[str, Any] = {
+    "id": None,
+    "number": None,
+    "status": "unknown",
+}
+
+
+def _paid_submit_unconfirmed_details(marker: dict[str, Any]) -> dict[str, object]:
+    """Bounded, JSON-friendly details for a blocked resume or overwrite."""
+    return {
+        "error_code": _PAID_SUBMIT_UNCONFIRMED_ERROR_CODE,
+        "chunk_id": marker.get("id"),
+        "chunk_number": marker.get("number"),
+        "attempt_status": marker.get("status"),
+    }
+
+
+def _reject_unconfirmed_paid_resume(marker: dict[str, Any], logger: GenerationLogger) -> NoReturn:
+    """Log and fail a resume blocked by an unconfirmed paid submit.
+
+    Shared by the early ``generate`` preflight (which runs before any provider or
+    pricing work) and the ``_generate_step`` guard kept for direct callers, so
+    both report the same bounded ``PAID_SUBMIT_UNCONFIRMED`` details and exit code.
+    """
+    logger.event(
+        "error",
+        "resume_rejected",
+        reason="unconfirmed_paid_submit",
+        chunk=marker.get("number"),
+        id=marker.get("id"),
+        status=marker.get("status"),
+    )
+    fail(
+        f"Cannot resume: chunk {marker.get('id')} has an unconfirmed paid submit "
+        f"({marker.get('status')}). No provider request was sent; repeating that "
+        "submit needs an explicit new run instead of --resume.",
+        _EXIT_PROVIDER,
+        details=_paid_submit_unconfirmed_details(marker),
+    )
+
+
+def _load_status_state(state_path: Path) -> tuple[dict[str, Any] | None, bool]:
+    """Load run state for ``status`` without crashing on unusable content.
+
+    ``run_state.json`` is user-editable. Invalid JSON, or valid JSON that is not
+    an object, carries no trusted run evidence, so it is reported as unreadable
+    instead of raising or being mistaken for an empty, resumable run. An absent
+    file is not unreadable: it stays an ordinary no-state run.
+    """
+    if not state_path.exists():
+        return None, False
+    try:
+        state = load_state(state_path)
+    except (OSError, ValueError):
+        return None, True
+    if not isinstance(state, dict):
+        return None, True
+    return state, False
+
+
+def _unconfirmed_paid_attempt_in_existing_run(paths) -> dict[str, Any] | None:
+    """Return a pending paid-attempt marker found in an existing run folder.
+
+    ``--overwrite`` deletes the run folder, so the marker is checked before any
+    deletion: a run whose paid submit outcome is unconfirmed is evidence to
+    keep, not replaceable scratch space. An unreadable state file also fails
+    closed because it cannot prove that no paid submit is pending. Valid JSON
+    whose top level is not an object (``null``, a list, or a scalar) is treated
+    the same way: it carries no trusted marker and cannot prove the run is safe
+    to delete.
+    """
+    state_path = paths.output_root / STATE_FILE
+    if not state_path.exists():
+        return None
+    try:
+        state = load_state(state_path)
+    except (OSError, ValueError):
+        return dict(_UNKNOWN_PAID_ATTEMPT)
+    if not isinstance(state, dict):
+        return dict(_UNKNOWN_PAID_ATTEMPT)
+    return unconfirmed_attempt(state)
+
+
+def _paid_submit_attempt_status(error: BaseException) -> str:
+    """Label a failed paid attempt from its failure class, not its error text.
+
+    ``outcome_unknown`` covers exactly the failures that used to trigger a retry
+    — timeouts, connection breaks, transient HTTP responses, still-pending media
+    tasks — because they leave the paid outcome unconfirmed. Everything else is a
+    definite failure.
+    """
+    return ATTEMPT_OUTCOME_UNKNOWN if is_retryable_error(error) else ATTEMPT_FAILED
 
 
 def _emit_json_event(args, event: str, **fields) -> None:

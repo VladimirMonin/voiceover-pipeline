@@ -223,7 +223,7 @@ max_chunk_chars: 2000
 - `provider` или `service` — `polza-chat-audio`, `polza-tts`, `openrouter-tts`, `qwen-local`, `omnivoice-local`.
 - `model` — модель выбранного провайдера.
 - `voice` — голос, если провайдер его поддерживает.
-- `fallback_voice` — только для `polza-chat-audio`.
+- `fallback_voice` — принимается только для `polza-chat-audio` ради совместимости; автоматической смены голоса после ошибки нет. Другой голос выбирается явным новым прогоном.
 - `style_prompt` или `prompt` — не поддерживается OpenRouter `/audio/speech`;
   валидатор возвращает `STYLE_PROMPT_IGNORED`, а generate не отправляет его модели.
 - `max_chunk_chars` — настроенный лимит символов на чанк; для `omnivoice-local` с его штатной моделью валидатор показывает локальный лимит 420, если CLI-лимит не задан.

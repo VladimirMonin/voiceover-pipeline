@@ -23,24 +23,17 @@ class PolzaChatAudioProvider(TTSProvider):
         self.api_key = api_key
         self.model = model
         self.voice = voice
+        # ``fallback_voice`` is accepted and kept for constructor compatibility
+        # only. This route is one paid streaming submit: a timeout, a broken
+        # stream, or any other post-submit failure may already have been accepted
+        # and billed, so it is never retried automatically with another voice.
+        # Choosing a different voice requires a new, explicit run.
         self.fallback_voice = fallback_voice
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
 
     def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
-        last_error: Exception | None = None
-        voices = [self.voice]
-        if self.fallback_voice and self.fallback_voice not in voices:
-            voices.append(self.fallback_voice)
-
-        for voice in voices:
-            try:
-                return self._synthesize_with_voice(text=text, chunk_id=chunk_id, voice=voice)
-            except Exception as error:
-                last_error = error
-                print(f"Voice '{voice}' failed for {chunk_id}: {error}")
-
-        raise RuntimeError(f"All voices failed for {chunk_id}: {last_error}")
+        return self._synthesize_with_voice(text=text, chunk_id=chunk_id, voice=self.voice)
 
     def _synthesize_with_voice(self, text: str, chunk_id: str, voice: str) -> SynthesisResult:
         payload = {

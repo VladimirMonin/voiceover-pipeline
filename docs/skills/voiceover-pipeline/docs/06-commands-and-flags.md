@@ -75,18 +75,18 @@
 | `--format` | choice | `markdown` | `markdown`, `voiceover`, `dialogue` или compatibility alias `gemini-dialogue` |
 | `--max-chunk-chars` | int | `2000` | Validation limit для `voiceover` metadata scripts |
 | `--speaker-voice` | repeat | — | Override для Gemini dialogue: `Speaker1=Puck` (можно повторять, по одному на спикера) |
-| `--fallback-voice` | str | `onyx` | Запасной голос для Polza Chat Audio |
+| `--fallback-voice` | str | `onyx` | Принимается Polza Chat Audio только для совместимости: автоматического второго POST другим голосом нет |
 | `--style-prompt` | str | — | Не поддерживается OpenRouter `/audio/speech`; явное значение отклоняется |
 | `--style-prompt-file` | path | — | Не поддерживается OpenRouter `/audio/speech`; явное значение отклоняется |
 | `--no-style-prompt` | flag | false | Совместимый no-op: OpenRouter всегда отправляет verbatim `input` |
 | `--no-trim` | flag | false | Не обрезать финальную тишину |
 | `--json` | flag | false | JSON-вывод в stdout |
 | `--json-events` | flag | false | NDJSON progress events: `chunk_started`, `chunk_saved`, `chunk_failed`, `run_complete` |
-| `--overwrite` | flag | false | Удалить существующую папку прогона |
+| `--overwrite` | flag | false | Удалить существующую папку прогона; взаимоисключающий с `--resume` |
 | `--confirm-delete-paid-audio` | flag | false | Разрешить `--overwrite` удалить существующие `chunk_*.mp3` |
 | `--skip-existing` | flag | false | Пропустить если прогон уже есть |
-| `--resume` | flag | false | Продолжить interrupted run без повторной генерации готовых chunks |
-| `--retries` | int | `3` | Количество попыток на retryable provider error; для `openrouter-tts` всегда 1 |
+| `--resume` | flag | false | Продолжить interrupted run без повторной генерации готовых chunks; взаимоисключающий с `--overwrite` |
+| `--retries` | int | `3` | Попытки на retryable provider error; для `polza-tts`/`polza-chat-audio`/`openrouter-tts` всегда 1 (локальные `qwen-local`/`omnivoice-local` сохраняют прежние значения) |
 | `--retry-delay` | float | `2.0` | Начальная задержка retry в секундах |
 | `--retry-max-delay` | float | `30.0` | Максимальная задержка retry |
 | `--no-retry` | flag | false | Отключить retry |
@@ -286,11 +286,34 @@ voiceover list timing-providers --json
 | Ситуация | Поведение |
 |---|---|
 | Папка не существует | Создать |
+| `--resume` + `--overwrite` вместе | Ошибка exit code 2 до любого удаления: флаги взаимоисключающие |
 | Папка существует + `--overwrite` без chunks | Удалить папку полностью, создать заново |
-| Папка существует + `--overwrite` + chunks | Ошибка без `--confirm-delete-paid-audio` |
+| Папка существует + `--overwrite` + подтверждённые `chunk_*.mp3` | Ошибка без `--confirm-delete-paid-audio` |
+| Папка существует + `--overwrite` + `pending_attempt` (неподтверждённый платный submit) | Ошибка exit code 30 даже с `--confirm-delete-paid-audio`; нужен другой `--run-id` |
+| Папка существует + `--overwrite` + `run_state.json` не-объект или нечитаем | Ошибка exit code 30: состояние не доказывает отсутствие платного submit |
 | Папка существует + `--skip-existing` | Вернуть `status: skipped`, не менять файлы |
-| Папка существует + `--resume` | Продолжить с первого несохранённого chunk |
+| Папка существует + `--resume` | Продолжить с первого несохранённого chunk; блокируется, пока есть `pending_attempt` |
 | Папка существует без флагов | Ошибка exit code 30 |
+
+### Платный submit и маркер `pending_attempt`
+
+- Платные сетевые провайдеры (`polza-tts`, `polza-chat-audio`, `openrouter-tts`)
+  отправляют не более одного POST на часть от CLI; ошибка после отправки
+  завершает запуск с exit code 30 без автоматического повтора.
+- Перед submit CLI пишет маркер `pending_attempt` в `run_state.json` и удаляет
+  его вместе с сохранением части. Маркер содержит только `id`/`number`, стадию
+  (`submitting`, `outcome_unknown`, `failed`) и время.
+- Пока маркер присутствует, `--resume` и `--overwrite` закрыты (exit code 30,
+  `details.error_code = "PAID_SUBMIT_UNCONFIRMED"`); для новой явной попытки
+  используется другой `--run-id`. В диагностику попадает только `id` вида
+  `chunk_*`/`turn_*`; другой `id` (URL, текст запроса, секрет) репортится как
+  `null`.
+- Флаги `--resume` и `--overwrite` нельзя использовать вместе: CLI отклоняет их
+  до удаления папки и до сети (exit code 2).
+- `status --json` сообщает `can_resume: false` и `resume_block_reason:
+  "paid_submit_unconfirmed"` для такого запуска.
+- `polza-chat-audio` не делает автоматический второй POST с `--fallback-voice`;
+  выбор другого голоса требует нового явного запуска.
 
 ## Safe defaults
 

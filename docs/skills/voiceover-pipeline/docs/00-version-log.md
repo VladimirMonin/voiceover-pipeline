@@ -28,7 +28,7 @@
 - Voiceover metadata: `format: voiceover` frontmatter для provider/model/voice/fallback/style_prompt, auto-detect in validate/generate
 - OpenRouter Gemini dialogue: `--format gemini-dialogue`, frontmatter speaker map, inline audio tags, strict UTF-8 byte validation
 - Gemini prompting guide: voice direction skeleton, safe audio tags, emotion recipes, voice selection, chunking limits
-- Stability layer: `run_state.json`, `generation.log`, universal retries, `--resume`, paid-audio overwrite guard, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`, `--json-events`
+- Stability layer: `run_state.json`, `generation.log`, локальные retries (платный TTS — один submit на часть без автоматического fallback), `--resume`, paid-submit attempt marker и overwrite guard, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`, `--json-events`
 - Cloud transcription: 4 провайдера распознавания — `faster-whisper` (локальный), `openrouter-whisper` (текст без таймкодов), `groq-whisper` (сегменты + слова), `xai-stt` (слова + confidence)
 - `list timing-providers` показывает 4 провайдера с `timestamps` полем
 - OpenRouter Whisper: CLI блокирует `timings`/`--with-timings` с exit code 40 (API не возвращает таймкоды)
@@ -51,6 +51,7 @@
 
 | Дата | Изменения |
 |---|---|
+| 2026-09-29 | **Development/unreleased, source-only:** платный TTS записывает attempt marker перед submit, не делает автоматический повтор через retry или fallback voice; неподтверждённый исход блокирует resume/overwrite, локальные retries сохранены. Нет live/paid provider acceptance или заявления о релизе. |
 | 2026-08-31 | **v0.6.1 candidate:** dialogue ASR quality gate удаляет из expected text только непроизносимые audio tags, нормализует `ё/е` и допускает эквивалентное деление ASR-токенов (`OmniVoice` / `Omni Voice`). Реальная лишняя речь и повторы остаются fail-closed. |
 | 2026-08-24 | OpenRouter dialogue переведён на строгий verbatim turn input: style/profile/vibe/labels/соседний текст не попадают в synthesis request. Перед final concat обязателен явный per-turn ASR quality gate с transcript-free receipt; вставки, пропуски и повторы дают exit `60`. |
 | 2026-08-24 | Исторический промежуточный transport fix перевёл Gemini 3.1 Flash TTS на `model`/`input`/`voice`/`response_format="pcm"` и raw audio response. Его prefix-style поведение в тот же день superseded строгим verbatim contract строкой выше; empty и wrapped JSON/data URI/SSE по-прежнему fail closed. |

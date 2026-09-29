@@ -226,6 +226,99 @@ class TestPolzaTTSProvider:
         assert usage["cost_rub"] == Decimal("0.1234567890123456789")
 
 
+class TestPolzaChatAudioProviderSinglePaidSubmit:
+    """The chat-audio route must never send a second paid POST by itself.
+
+    ``fallback_voice`` is a constructor-compatibility argument only: this route
+    is a single paid streaming submit, so a timeout or a broken stream that may
+    already have been accepted and billed is never followed by an automatic
+    request for another voice. Choosing a different voice means a new run.
+    """
+
+    POST_TARGET = "voiceover_pipeline.providers.polza_chat_audio.requests.post"
+
+    @staticmethod
+    def _provider(fallback_voice: str = "onyx"):
+        from voiceover_pipeline.providers.polza_chat_audio import PolzaChatAudioProvider
+
+        return PolzaChatAudioProvider(
+            api_key="sk-test",
+            model="openai/gpt-audio-mini",
+            voice="ash",
+            fallback_voice=fallback_voice,
+        )
+
+    @staticmethod
+    def _streaming_response(lines, status_code: int = 200):
+        response = MagicMock()
+        response.status_code = status_code
+        response.headers = {}
+        response.iter_lines.return_value = [line.encode("utf-8") for line in lines]
+        return response
+
+    def test_constructor_keeps_distinct_fallback_voice(self):
+        provider = self._provider()
+        assert provider.voice == "ash"
+        assert provider.fallback_voice == "onyx"
+
+    def test_timeout_on_first_submit_posts_once_and_propagates(self, capsys):
+        import requests
+
+        posted_voices: list[str] = []
+
+        def post(_url, **kwargs):
+            posted_voices.append(kwargs["json"]["audio"]["voice"])
+            raise requests.Timeout("read timed out")
+
+        with patch(self.POST_TARGET, side_effect=post):
+            with pytest.raises(requests.Timeout):
+                self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert posted_voices == ["ash"]
+        assert capsys.readouterr().out == ""
+
+    def test_post_submit_http_error_posts_once(self):
+        response = MagicMock()
+        response.status_code = 500
+        response.text = "Internal Server Error"
+        response.headers = {}
+
+        with patch(self.POST_TARGET, return_value=response) as mock_post:
+            with pytest.raises(RuntimeError, match="HTTP 500"):
+                self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["audio"]["voice"] == "ash"
+
+    def test_empty_audio_stream_posts_once(self):
+        with patch(
+            self.POST_TARGET, return_value=self._streaming_response(["data: [DONE]"])
+        ) as mock_post:
+            with pytest.raises(RuntimeError, match="without audio chunks"):
+                self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["audio"]["voice"] == "ash"
+
+    def test_primary_voice_success_never_posts_fallback(self):
+        import base64
+
+        audio_b64 = base64.b64encode(b"\x00\x01").decode()
+        chunk = json.dumps(
+            {"choices": [{"delta": {"audio": {"data": audio_b64, "transcript": "Hello"}}}]}
+        )
+        response = self._streaming_response([f"data: {chunk}", "", "data: [DONE]"])
+
+        with patch(self.POST_TARGET, return_value=response) as mock_post:
+            result = self._provider().synthesize_chunk("Hello", "chunk_01")
+
+        assert mock_post.call_count == 1
+        assert mock_post.call_args.kwargs["json"]["audio"]["voice"] == "ash"
+        assert result.audio_bytes == b"\x00\x01"
+        assert result.audio_format == "pcm16"
+        assert result.raw_metadata["voice"] == "ash"
+
+
 class TestOpenRouterTTSProviderOpenAI:
     def test_stale_openai_speech_model_fails_before_billing(self):
         with patch("voiceover_pipeline.providers.openrouter_tts.requests.post") as mock_post:
