@@ -1,20 +1,21 @@
-"""Paid execution loop plus raw-recovery helpers for the CLI entry point.
+"""Paid execution loop, run setup seam, and raw-recovery helpers for the CLI entry point.
 
 This module owns the single prepared-part execution loop: the durable attempt
 marker written before a paid provider submit, the accepted raw audio plus its
 bounded receipt before any FFmpeg step, the conversion/trim/duration/artifact
 sequence, and the completed upsert that clears the marker in the same atomic
-state write. It also persists the paid safety evidence a provider already
-produced (the accepted media task id before the first poll or download, the
-observed cost before the signed-URL download) and rebuilds a chunk from those
-already-paid raw bytes.
+state write. It also owns the pre-loop setup seam that resolves run identity,
+resume evidence, and the retry policy before that loop. It persists the paid
+safety evidence a provider already produced (the accepted media task id before
+the first poll or download, the observed cost before the signed-URL download)
+and rebuilds a chunk from those already-paid raw bytes.
 
-The loop calls the CLI's call-time compatibility and presentation seams through
-an explicit ``PartExecutionHooks`` object rather than importing ``cli``: tests
-patch ``cli.synthesize_part`` and the media functions, and the JSON events,
-retry logging, fail envelope, and progress output stay CLI-owned. The raw
-receipt digest reuses ``services.recovery``'s read-only streaming SHA-256 helper
-rather than duplicating the hashing logic here.
+The setup and loop call the CLI's call-time compatibility and presentation seams
+through explicit hook objects rather than importing ``cli``: tests patch
+``cli.synthesize_part`` and the media functions, and the JSON events, retry
+logging, fail envelope, identity callables, and progress output stay CLI-owned.
+The raw receipt digest reuses ``services.recovery``'s read-only streaming
+SHA-256 helper rather than duplicating the hashing logic here.
 """
 
 from collections.abc import Callable
@@ -22,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
 
+from ..gemini_dialogue import is_dialogue_format
 from ..models import ChunkArtifact, ScriptChunk, SynthesisResult
 from ..providers import PolzaTTSProvider
 from ..retry import RetryPolicy, run_with_retry
@@ -33,18 +35,23 @@ from ..run_state import (
     atomic_write_json,
     begin_chunk_attempt,
     clear_chunk_attempt,
+    completed_numbers,
+    initial_state,
+    load_state,
     pending_raw_recovery,
     raw_audio_relative_path,
     record_chunk_attempt_outcome,
     record_media_observed_cost,
     record_media_task_accepted,
     record_raw_audio_saved,
+    script_hash,
+    state_chunks_as_artifacts,
     unconfirmed_attempt,
     upsert_completed_chunk,
 )
-from . import costs
-from .prepare import PreparedPart, PreparedRun
-from .recovery import _sha256_file
+from . import costs, recovery
+from .prepare import PreparedPart, PreparedRun, prepare_run
+from .recovery import _PAID_SUBMIT_TTS_PROVIDERS, _sha256_file
 
 
 def bind_polza_media_attempt(
@@ -196,6 +203,199 @@ class PartLoopState:
 
     chunk_artifacts_by_number: dict[int, ChunkArtifact]
     total_duration_ms: int
+
+
+@dataclass
+class GenerationSetupHooks:
+    """The CLI's call-time identity, recovery, and failure callables for setup.
+
+    These stay the functions bound in ``cli`` at call time: the voice and
+    dialogue identity builders, the existing-chunk recovery whose body reads the
+    patchable ``cli.mp3_duration_ms``, and the unconfirmed-paid-resume reject keep
+    their CLI behavior, while every provider-side failure still exits through the
+    CLI ``fail`` bound to its provider exit code.
+    """
+
+    voice_identity: Callable[[Any], str | None]
+    dialogue_synthesis_identity: Callable[..., str | None]
+    recover_existing_chunks: Callable[..., None]
+    reject_unconfirmed_paid_resume: Callable[..., NoReturn]
+    fail_provider: Callable[[str], NoReturn]
+
+
+@dataclass
+class GenerationSetup:
+    """Prepared run identity, resume evidence, and retry policy before the loop.
+
+    ``state`` is the run state this seam wrote atomically, and ``loop_state``
+    already carries the resumed artifacts and starting duration, so the CLI only
+    supplies the part-loop hooks and calls ``execute_prepared_parts`` once.
+    """
+
+    state: dict[str, Any]
+    recoverable_attempts: dict[int, dict[str, Any]]
+    dialogue_run: bool
+    paid_submit: bool
+    retry_policy: RetryPolicy
+    prepared: PreparedRun
+    completed: set[int]
+    loop_state: PartLoopState
+
+
+def prepare_generation_state(
+    args,
+    *,
+    chunks: list[ScriptChunk],
+    style_prompt: str | None,
+    prompt_mode: str,
+    paths,
+    ffprobe_path: str,
+    state_path: Path,
+    logger: GenerationLogger,
+    hooks: GenerationSetupHooks,
+) -> GenerationSetup:
+    """Resolve run identity, resume evidence, and retry policy before the part loop.
+
+    This is the former ``cli._generate_step`` pre-loop body: it hashes the exact
+    chunks, builds the voice/dialogue identity through the CLI callables, decides
+    fresh/replaced/resume state (including orphan dialogue audio and every
+    ``--resume`` identity mismatch), collects any recoverable paid attempt, then
+    writes the state atomically. It owns no presentation: identity, recovery,
+    reject, and provider-failure behavior arrive through ``GenerationSetupHooks``,
+    and the ordering of each early guard is unchanged.
+    """
+    current_hash = script_hash(chunks)
+    dialogue_run = is_dialogue_format(getattr(args, "format", "markdown"))
+    current_voice_identity = None if dialogue_run else hooks.voice_identity(args)
+    synthesis_identity = (
+        hooks.dialogue_synthesis_identity(args, style_prompt, prompt_mode, chunks)
+        if dialogue_run
+        else None
+    )
+    state = load_state(state_path)
+    # A paid attempt may be recovered without a new submit when its accepted
+    # response was saved locally (raw bytes on disk) or when a Polza media task
+    # id is stored and can be finished with GET calls. Every other marker keeps
+    # the unconfirmed block below.
+    recoverable_attempts: dict[int, dict[str, Any]] = {}
+    if state and args.resume:
+        if state.get("script_hash") != current_hash:
+            logger.event("error", "resume_rejected", reason="script_hash_mismatch")
+            hooks.fail_provider(
+                "Cannot resume: script chunks do not match the previous run_state.json."
+            )
+        if args.provider in _PAID_SUBMIT_TTS_PROVIDERS:
+            recoverable_attempts = recovery.recoverable_paid_attempts(
+                state,
+                provider=args.provider,
+                model=args.model,
+                voice=args.voice,
+                chunks=chunks,
+                chunks_dir=paths.chunks_dir,
+                run_root=paths.output_root,
+            )
+        if dialogue_run:
+            if "synthesis_identity" not in state:
+                logger.event("error", "resume_rejected", reason="synthesis_identity_missing")
+                hooks.fail_provider(
+                    "Cannot resume: run state predates dialogue synthesis identity; start a fresh run instead of mixing artifacts."
+                )
+            if state.get("synthesis_identity") != synthesis_identity:
+                logger.event("error", "resume_rejected", reason="synthesis_identity_mismatch")
+                hooks.fail_provider("Cannot resume: dialogue synthesis identity changed.")
+        elif "voice_identity" in state and current_voice_identity is not None:
+            if state.get("voice_identity") != current_voice_identity:
+                logger.event("error", "resume_rejected", reason="voice_identity_mismatch")
+                hooks.fail_provider("Cannot resume: voice identity changed.")
+        pending_attempt = unconfirmed_attempt(state)
+        if pending_attempt is not None and not recoverable_attempts:
+            hooks.reject_unconfirmed_paid_resume(pending_attempt, logger)
+        logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
+    elif state and not args.resume:
+        logger.event("info", "state_replaced", reason="fresh_run")
+        state = initial_state(
+            provider=args.provider,
+            model=args.model,
+            voice=args.voice,
+            script_path=args.script,
+            chunks=chunks,
+            script_format=getattr(args, "format", "markdown"),
+            run_id=paths.prefix,
+            limited_to_chunks=getattr(args, "limit_chunks", None),
+            voice_identity=current_voice_identity,
+            synthesis_identity=synthesis_identity,
+        )
+    elif args.resume:
+        state = initial_state(
+            provider=args.provider,
+            model=args.model,
+            voice=args.voice,
+            script_path=args.script,
+            chunks=chunks,
+            script_format=getattr(args, "format", "markdown"),
+            run_id=paths.prefix,
+            limited_to_chunks=getattr(args, "limit_chunks", None),
+            voice_identity=current_voice_identity,
+            synthesis_identity=synthesis_identity,
+        )
+        if dialogue_run:
+            if any(paths.chunks_dir.glob("*.mp3")):
+                logger.event("error", "resume_rejected", reason="orphan_dialogue_audio")
+                hooks.fail_provider(
+                    "Cannot resume: orphan dialogue audio exists without trusted run state."
+                )
+        else:
+            hooks.recover_existing_chunks(
+                state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice
+            )
+            logger.event("info", "resume_recovered", completed=state.get("completed_count", 0))
+    else:
+        state = initial_state(
+            provider=args.provider,
+            model=args.model,
+            voice=args.voice,
+            script_path=args.script,
+            chunks=chunks,
+            script_format=getattr(args, "format", "markdown"),
+            run_id=paths.prefix,
+            limited_to_chunks=getattr(args, "limit_chunks", None),
+            voice_identity=current_voice_identity,
+            synthesis_identity=synthesis_identity,
+        )
+    atomic_write_json(state_path, state)
+
+    chunk_artifacts: list[ChunkArtifact] = (
+        state_chunks_as_artifacts(state, paths.chunks_dir) if args.resume else []
+    )
+    chunk_artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
+    completed = completed_numbers(state)
+    total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
+    if dialogue_run and chunk_artifacts:
+        total_duration_ms += chunk_artifacts[-1].pause_after_ms
+    paid_submit = args.provider in _PAID_SUBMIT_TTS_PROVIDERS
+    # A paid network submit cannot be repeated automatically: a failure after the
+    # request was sent may still have been accepted and billed. Local providers
+    # keep the documented --retries semantics.
+    retry_policy = RetryPolicy(
+        attempts=1 if paid_submit else args.retries,
+        delay_seconds=args.retry_delay,
+        max_delay_seconds=args.retry_max_delay,
+        enabled=not args.no_retry and not paid_submit,
+    )
+    prepared = prepare_run(args, chunks, style_prompt, prompt_mode)
+    return GenerationSetup(
+        state=state,
+        recoverable_attempts=recoverable_attempts,
+        dialogue_run=dialogue_run,
+        paid_submit=paid_submit,
+        retry_policy=retry_policy,
+        prepared=prepared,
+        completed=completed,
+        loop_state=PartLoopState(
+            chunk_artifacts_by_number=chunk_artifacts_by_number,
+            total_duration_ms=total_duration_ms,
+        ),
+    )
 
 
 def execute_prepared_parts(

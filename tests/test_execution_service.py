@@ -13,6 +13,7 @@ import hashlib
 import json
 from types import SimpleNamespace
 
+import pytest
 from conftest import fixture_path
 
 
@@ -463,3 +464,235 @@ def test_execute_prepared_parts_rebuilds_recovered_raw_without_a_provider_submit
     assert loop_state.chunk_artifacts_by_number[chunk.number].cost_exact == "0.3"
     log_text = (run_dir / "generation.log").read_text(encoding="utf-8")
     assert "paid_raw_recovery" in log_text
+
+
+def _generation_setup_hooks(execution, **overrides):
+    """Build the generation-setup hooks with safe defaults for one focused call."""
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("unexpected generation-setup hook call")
+
+    fields = {
+        "voice_identity": lambda _args: None,
+        "dialogue_synthesis_identity": lambda *_args, **_kwargs: None,
+        "recover_existing_chunks": unexpected,
+        "reject_unconfirmed_paid_resume": unexpected,
+        "fail_provider": unexpected,
+    }
+    fields.update(overrides)
+    return execution.GenerationSetupHooks(**fields)
+
+
+def test_prepare_generation_state_keeps_identity_and_paid_policy_in_order(tmp_path):
+    """A fresh run resolves identity, prepared parts, and paid retry policy before the loop.
+
+    The setup seam computes the voice identity through the CLI callable, wraps the
+    exact chunks into prepared parts in order, and derives the one-attempt disabled
+    retry policy for a paid provider while a local provider keeps its retry budget.
+    """
+    from voiceover_pipeline.run_state import GenerationLogger
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services import execution
+
+    run_dir = _run_dir(tmp_path, "prepare-fresh")
+    chunks = split_markdown_by_delimiter(fixture_path("smoke_test.md"), "******")[:2]
+    args = argparse.Namespace(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice="ash",
+        script=fixture_path("smoke_test.md"),
+        format="markdown",
+        limit_chunks=None,
+        retries=3,
+        retry_delay=0,
+        retry_max_delay=0,
+        no_retry=False,
+        resume=False,
+    )
+    state_path = run_dir / "run_state.json"
+    logger = GenerationLogger(run_dir / "generation.log")
+    identity_calls: list[argparse.Namespace] = []
+
+    setup = execution.prepare_generation_state(
+        args,
+        chunks=chunks,
+        style_prompt="calm",
+        prompt_mode="auto",
+        paths=SimpleNamespace(
+            output_root=run_dir, chunks_dir=run_dir / "chunks", prefix="prepare-fresh"
+        ),
+        ffprobe_path="ffprobe",
+        state_path=state_path,
+        logger=logger,
+        hooks=_generation_setup_hooks(
+            execution,
+            voice_identity=lambda received: identity_calls.append(received) or "voice-identity",
+        ),
+    )
+
+    assert identity_calls == [args]
+    assert setup.dialogue_run is False
+    assert setup.paid_submit is True
+    assert setup.retry_policy.attempts == 1
+    assert setup.retry_policy.enabled is False
+    assert setup.completed == set()
+    assert setup.recoverable_attempts == {}
+    assert setup.loop_state.chunk_artifacts_by_number == {}
+    assert setup.loop_state.total_duration_ms == 0
+    assert [part.chunk for part in setup.prepared.parts] == chunks
+    assert [part.voice for part in setup.prepared.parts] == [chunk.voice for chunk in chunks]
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+    assert persisted["voice_identity"] == "voice-identity"
+    assert persisted["completed_count"] == 0
+    assert setup.state["voice_identity"] == "voice-identity"
+
+    # A non-paid local provider keeps the requested retry budget.
+    local_dir = _run_dir(tmp_path, "prepare-local")
+    args.provider = "qwen-local"
+    local_setup = execution.prepare_generation_state(
+        args,
+        chunks=chunks[:1],
+        style_prompt=None,
+        prompt_mode="auto",
+        paths=SimpleNamespace(
+            output_root=local_dir, chunks_dir=local_dir / "chunks", prefix="prepare-local"
+        ),
+        ffprobe_path="ffprobe",
+        state_path=local_dir / "run_state.json",
+        logger=GenerationLogger(local_dir / "generation.log"),
+        hooks=_generation_setup_hooks(execution),
+    )
+
+    assert local_setup.paid_submit is False
+    assert local_setup.retry_policy.attempts == 3
+    assert local_setup.retry_policy.enabled is True
+
+
+def test_prepare_generation_state_blocks_unconfirmed_resume_and_orphan_dialogue(tmp_path):
+    """Setup refuses an unconfirmed paid resume and orphan dialogue before any state write.
+
+    A stored unconfirmed paid marker reaches the CLI reject hook with the bounded
+    marker and logger and never rewrites run state; a dialogue resume with orphan
+    audio and no trusted state reaches the provider-failure hook before any run
+    state is written.
+    """
+    from voiceover_pipeline.run_state import (
+        GenerationLogger,
+        atomic_write_json,
+        begin_chunk_attempt,
+        initial_state,
+    )
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+    from voiceover_pipeline.services import execution
+
+    class Rejected(Exception):
+        pass
+
+    chunks = split_markdown_by_delimiter(fixture_path("smoke_test.md"), "******")[:1]
+    run_dir = _run_dir(tmp_path, "prepare-unconfirmed")
+    args = argparse.Namespace(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice="ash",
+        script=fixture_path("smoke_test.md"),
+        format="markdown",
+        limit_chunks=None,
+        retries=3,
+        retry_delay=0,
+        retry_max_delay=0,
+        no_retry=False,
+        resume=True,
+    )
+    state = initial_state(
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        voice="ash",
+        script_path=fixture_path("smoke_test.md"),
+        chunks=chunks,
+        script_format="markdown",
+        run_id="prepare-unconfirmed",
+    )
+    begin_chunk_attempt(state, chunk_id=chunks[0].id, number=chunks[0].number)
+    state_path = run_dir / "run_state.json"
+    atomic_write_json(state_path, state)
+    before = state_path.read_text(encoding="utf-8")
+    rejected: list[tuple[dict, object]] = []
+
+    def reject(marker, logger):
+        rejected.append((marker, logger))
+        raise Rejected
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("setup must not continue after a blocked resume")
+
+    with pytest.raises(Rejected):
+        execution.prepare_generation_state(
+            args,
+            chunks=chunks,
+            style_prompt=None,
+            prompt_mode="auto",
+            paths=SimpleNamespace(
+                output_root=run_dir, chunks_dir=run_dir / "chunks", prefix="prepare-unconfirmed"
+            ),
+            ffprobe_path="ffprobe",
+            state_path=state_path,
+            logger=GenerationLogger(run_dir / "generation.log"),
+            hooks=_generation_setup_hooks(
+                execution,
+                reject_unconfirmed_paid_resume=reject,
+                recover_existing_chunks=unexpected,
+                fail_provider=unexpected,
+            ),
+        )
+
+    assert len(rejected) == 1
+    marker, _logger = rejected[0]
+    assert marker["id"] == chunks[0].id
+    assert marker["status"] == "submitting"
+    assert state_path.read_text(encoding="utf-8") == before
+
+    # A dialogue resume with orphan audio and no trusted state fails through the
+    # provider-failure hook before any run state is written.
+    orphan_dir = _run_dir(tmp_path, "prepare-orphan")
+    (orphan_dir / "chunks" / "turn_0001.mp3").write_bytes(b"orphan")
+    orphan_args = argparse.Namespace(
+        provider="openrouter-tts",
+        model="google/gemini-3.1-flash-tts-preview",
+        voice="Kore",
+        script=fixture_path("smoke_test.md"),
+        format="dialogue",
+        limit_chunks=None,
+        retries=3,
+        retry_delay=0,
+        retry_max_delay=0,
+        no_retry=False,
+        resume=True,
+    )
+    failures: list[str] = []
+
+    def fail_provider(message):
+        failures.append(message)
+        raise Rejected
+
+    with pytest.raises(Rejected):
+        execution.prepare_generation_state(
+            orphan_args,
+            chunks=chunks,
+            style_prompt=None,
+            prompt_mode="auto",
+            paths=SimpleNamespace(
+                output_root=orphan_dir, chunks_dir=orphan_dir / "chunks", prefix="prepare-orphan"
+            ),
+            ffprobe_path="ffprobe",
+            state_path=orphan_dir / "run_state.json",
+            logger=GenerationLogger(orphan_dir / "generation.log"),
+            hooks=_generation_setup_hooks(
+                execution,
+                dialogue_synthesis_identity=lambda *_args, **_kwargs: "dialogue-identity",
+                fail_provider=fail_provider,
+            ),
+        )
+
+    assert len(failures) == 1
+    assert "orphan dialogue audio" in failures[0]
+    assert not (orphan_dir / "run_state.json").exists()

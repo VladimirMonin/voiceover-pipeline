@@ -130,7 +130,7 @@ from .providers.asr_registry import (
 )
 from .providers.audio_cpp_omnivoice_tts import omnivoice_local_dependency_probe
 from .providers.base import TranscriptionProvider
-from .retry import RetryPolicy, is_retryable_error
+from .retry import is_retryable_error
 from .run_state import (
     ATTEMPT_FAILED,
     ATTEMPT_OUTCOME_UNKNOWN,
@@ -140,17 +140,14 @@ from .run_state import (
     append_error,
     atomic_write_json,
     completed_numbers,
-    initial_state,
     load_state,
     script_hash,
-    state_chunks_as_artifacts,
     unconfirmed_attempt,
     upsert_completed_chunk,
 )
 from .script_splitter import split_markdown_by_delimiter
 from .services import cost_enrichment, costs, execution, recovery, transcription
-from .services.prepare import prepare_run, prepare_runtime_chunks, prepare_script_fragments
-from .services.recovery import _PAID_SUBMIT_TTS_PROVIDERS
+from .services.prepare import prepare_runtime_chunks, prepare_script_fragments
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request
 from .tts_prompting import read_style_prompt_from_file, resolve_prompt_mode
@@ -1405,133 +1402,35 @@ def _generate_step(
     )
     _emit_json_event(args, "run_started", run_id=paths.prefix, chunks=len(chunks))
 
-    current_hash = script_hash(chunks)
-    dialogue_run = is_dialogue_format(getattr(args, "format", "markdown"))
-    current_voice_identity = None if dialogue_run else _omnivoice_voice_identity(args)
-    synthesis_identity = (
-        _dialogue_synthesis_identity(args, style_prompt, prompt_mode, chunks)
-        if dialogue_run
-        else None
+    setup = execution.prepare_generation_state(
+        args,
+        chunks=chunks,
+        style_prompt=style_prompt,
+        prompt_mode=prompt_mode,
+        paths=paths,
+        ffprobe_path=ffprobe_path,
+        state_path=state_path,
+        logger=logger,
+        hooks=execution.GenerationSetupHooks(
+            # The setup seam runs in ``services.execution``; these are the
+            # CLI-bound identity, recovery, and failure callables tests patch.
+            voice_identity=_omnivoice_voice_identity,
+            dialogue_synthesis_identity=_dialogue_synthesis_identity,
+            recover_existing_chunks=_recover_existing_chunks,
+            reject_unconfirmed_paid_resume=_reject_unconfirmed_paid_resume,
+            fail_provider=lambda message: fail(message, _EXIT_PROVIDER),
+        ),
     )
-    state = load_state(state_path)
-    # A paid attempt may be recovered without a new submit when its accepted
-    # response was saved locally (raw bytes on disk) or when a Polza media task
-    # id is stored and can be finished with GET calls. Every other marker keeps
-    # the unconfirmed block below.
-    recoverable_attempts: dict[int, dict[str, Any]] = {}
-    if state and args.resume:
-        if state.get("script_hash") != current_hash:
-            logger.event("error", "resume_rejected", reason="script_hash_mismatch")
-            fail(
-                "Cannot resume: script chunks do not match the previous run_state.json.",
-                _EXIT_PROVIDER,
-            )
-        if args.provider in _PAID_SUBMIT_TTS_PROVIDERS:
-            recoverable_attempts = _recoverable_paid_attempts(
-                state,
-                provider=args.provider,
-                model=args.model,
-                voice=args.voice,
-                chunks=chunks,
-                chunks_dir=paths.chunks_dir,
-                run_root=paths.output_root,
-            )
-        if dialogue_run:
-            if "synthesis_identity" not in state:
-                logger.event("error", "resume_rejected", reason="synthesis_identity_missing")
-                fail(
-                    "Cannot resume: run state predates dialogue synthesis identity; start a fresh run instead of mixing artifacts.",
-                    _EXIT_PROVIDER,
-                )
-            if state.get("synthesis_identity") != synthesis_identity:
-                logger.event("error", "resume_rejected", reason="synthesis_identity_mismatch")
-                fail("Cannot resume: dialogue synthesis identity changed.", _EXIT_PROVIDER)
-        elif "voice_identity" in state and current_voice_identity is not None:
-            if state.get("voice_identity") != current_voice_identity:
-                logger.event("error", "resume_rejected", reason="voice_identity_mismatch")
-                fail("Cannot resume: voice identity changed.", _EXIT_PROVIDER)
-        pending_attempt = unconfirmed_attempt(state)
-        if pending_attempt is not None and not recoverable_attempts:
-            _reject_unconfirmed_paid_resume(pending_attempt, logger)
-        logger.event("info", "resume_detected", completed=state.get("completed_count", 0))
-    elif state and not args.resume:
-        logger.event("info", "state_replaced", reason="fresh_run")
-        state = initial_state(
-            provider=args.provider,
-            model=args.model,
-            voice=args.voice,
-            script_path=args.script,
-            chunks=chunks,
-            script_format=getattr(args, "format", "markdown"),
-            run_id=paths.prefix,
-            limited_to_chunks=getattr(args, "limit_chunks", None),
-            voice_identity=current_voice_identity,
-            synthesis_identity=synthesis_identity,
-        )
-    elif args.resume:
-        state = initial_state(
-            provider=args.provider,
-            model=args.model,
-            voice=args.voice,
-            script_path=args.script,
-            chunks=chunks,
-            script_format=getattr(args, "format", "markdown"),
-            run_id=paths.prefix,
-            limited_to_chunks=getattr(args, "limit_chunks", None),
-            voice_identity=current_voice_identity,
-            synthesis_identity=synthesis_identity,
-        )
-        if dialogue_run:
-            if any(paths.chunks_dir.glob("*.mp3")):
-                logger.event("error", "resume_rejected", reason="orphan_dialogue_audio")
-                fail(
-                    "Cannot resume: orphan dialogue audio exists without trusted run state.",
-                    _EXIT_PROVIDER,
-                )
-        else:
-            _recover_existing_chunks(
-                state, chunks, paths.chunks_dir, ffprobe_path, args.model, args.voice
-            )
-            logger.event("info", "resume_recovered", completed=state.get("completed_count", 0))
-    else:
-        state = initial_state(
-            provider=args.provider,
-            model=args.model,
-            voice=args.voice,
-            script_path=args.script,
-            chunks=chunks,
-            script_format=getattr(args, "format", "markdown"),
-            run_id=paths.prefix,
-            limited_to_chunks=getattr(args, "limit_chunks", None),
-            voice_identity=current_voice_identity,
-            synthesis_identity=synthesis_identity,
-        )
-    atomic_write_json(state_path, state)
+    state = setup.state
+    prepared = setup.prepared
+    paid_submit = setup.paid_submit
+    retry_policy = setup.retry_policy
+    dialogue_run = setup.dialogue_run
+    recoverable_attempts = setup.recoverable_attempts
+    completed = setup.completed
+    loop_state = setup.loop_state
+    chunk_artifacts_by_number = loop_state.chunk_artifacts_by_number
 
-    chunk_artifacts: list[ChunkArtifact] = (
-        state_chunks_as_artifacts(state, paths.chunks_dir) if args.resume else []
-    )
-    chunk_artifacts_by_number = {artifact.number: artifact for artifact in chunk_artifacts}
-    completed = completed_numbers(state)
-    total_duration_ms = max((artifact.end_ms for artifact in chunk_artifacts), default=0)
-    if dialogue_run and chunk_artifacts:
-        total_duration_ms += chunk_artifacts[-1].pause_after_ms
-    paid_submit = args.provider in _PAID_SUBMIT_TTS_PROVIDERS
-    # A paid network submit cannot be repeated automatically: a failure after the
-    # request was sent may still have been accepted and billed. Local providers
-    # keep the documented --retries semantics.
-    retry_policy = RetryPolicy(
-        attempts=1 if paid_submit else args.retries,
-        delay_seconds=args.retry_delay,
-        max_delay_seconds=args.retry_max_delay,
-        enabled=not args.no_retry and not paid_submit,
-    )
-    prepared = prepare_run(args, chunks, style_prompt, prompt_mode)
-
-    loop_state = execution.PartLoopState(
-        chunk_artifacts_by_number=chunk_artifacts_by_number,
-        total_duration_ms=total_duration_ms,
-    )
     hooks = execution.PartExecutionHooks(
         # The loop runs in ``services.execution``; these are the CLI-bound
         # callables existing tests patch and the CLI presentation seams.
