@@ -131,7 +131,7 @@ from .providers.asr_registry import (
 )
 from .providers.audio_cpp_omnivoice_tts import omnivoice_local_dependency_probe
 from .providers.base import TranscriptionProvider, validate_asr_response
-from .retry import RetryPolicy, is_retryable_error, run_with_retry
+from .retry import RetryPolicy, is_retryable_error
 from .run_state import (
     ATTEMPT_FAILED,
     ATTEMPT_OUTCOME_UNKNOWN,
@@ -140,13 +140,9 @@ from .run_state import (
     GenerationLogger,
     append_error,
     atomic_write_json,
-    begin_chunk_attempt,
-    clear_chunk_attempt,
     completed_numbers,
     initial_state,
     load_state,
-    pending_raw_recovery,
-    record_chunk_attempt_outcome,
     script_hash,
     state_chunks_as_artifacts,
     unconfirmed_attempt,
@@ -1533,225 +1529,45 @@ def _generate_step(
     )
     prepared = prepare_run(args, chunks, style_prompt, prompt_mode)
 
-    for part in prepared.parts:
-        chunk = part.chunk
-        output_path = paths.chunks_dir / f"{chunk.id}.mp3"
-        if chunk.number in completed and output_path.exists():
-            if dialogue_run:
-                completed_artifact = chunk_artifacts_by_number.get(chunk.number)
-                if (
-                    completed_artifact is None
-                    or completed_artifact.audio_sha256 is None
-                    or completed_artifact.audio_sha256 != _sha256_file(output_path)
-                ):
-                    logger.event("error", "resume_rejected", reason="dialogue_audio_hash_mismatch")
-                    fail(
-                        "Cannot resume: dialogue audio does not match the trusted run state.",
-                        _EXIT_PROVIDER,
-                    )
-            logger.event(
-                "info",
-                "chunk_skipped_resume",
-                chunk=chunk.number,
-                id=chunk.id,
-                file=output_path.name,
-            )
-            _emit_json_event(
-                args, "chunk_skipped", chunk=chunk.number, id=chunk.id, reason="resume"
-            )
-            continue
-        if not args.json_output:
-            print(f"Generating {chunk.id}/{len(chunks):02d}: {output_path.name}")
-        logger.event(
-            "info", "chunk_started", chunk=chunk.number, id=chunk.id, file=output_path.name
-        )
-        _emit_json_event(args, "chunk_started", chunk=chunk.number, id=chunk.id)
-
-        recovery = recoverable_attempts.get(chunk.number)
-        if recovery is not None:
-            recovery_event = (
-                "paid_raw_recovery" if recovery.get("kind") == "raw" else "paid_media_recovery"
-            )
-            logger.event("info", recovery_event, chunk=chunk.number, id=chunk.id)
-
-        def synthesize_current_chunk():
-            if recovery is not None:
-                if recovery.get("kind") == "raw":
-                    # The paid bytes are already on disk, so this rebuilds the
-                    # chunk with no provider request at all.
-                    return _raw_recovery_result(args, chunk, paths.output_root, recovery)
-                # The paid submit for this chunk already happened, so only GET
-                # calls may finish it; no POST is sent a second time.
-                return provider.recover_media_task(recovery["remote_task_id"], chunk.text, chunk.id)
-            return synthesize_part(provider, part)
-
-        if paid_submit and isinstance(provider, PolzaTTSProvider):
-            _bind_polza_media_attempt(
-                provider, state=state, state_path=state_path, logger=logger, chunk=chunk
-            )
-        if paid_submit and recovery is None:
-            existing_attempt = unconfirmed_attempt(state)
-            if existing_attempt is not None:
-                # A marker for another chunk holds a known paid attempt that this
-                # write would erase, so fail closed with the documented envelope
-                # instead of risking a second POST for that chunk.
-                _reject_unconfirmed_paid_resume(existing_attempt, logger)
-            # The marker is durable before the request leaves, so a crash between
-            # this write and the POST resumes as unconfirmed instead of repeating
-            # a possibly billed submit. A recovered attempt keeps its own marker,
-            # which still binds the accepted id and any observed cost.
-            begin_chunk_attempt(state, chunk_id=chunk.id, number=chunk.number)
-            atomic_write_json(state_path, state)
-            logger.event("info", "paid_submit_started", chunk=chunk.number, id=chunk.id)
-        try:
-            result = run_with_retry(
-                synthesize_current_chunk,
-                policy=retry_policy,
-                on_retry=lambda attempt, error, delay: _log_retry(
-                    logger, args, chunk, attempt, error, delay
-                ),
-            )
-        except Exception as e:
-            paid_attempt_status: str | None = None
-            if paid_submit:
-                paid_attempt_status = _paid_submit_attempt_status(e)
-                record_chunk_attempt_outcome(state, status=paid_attempt_status)
-            append_error(state, chunk_id=chunk.id, message=str(e))
-            atomic_write_json(state_path, state)
-            logger.event("error", "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
-            if paid_attempt_status is not None:
-                logger.event(
-                    "warn",
-                    "paid_submit_failed",
-                    chunk=chunk.number,
-                    id=chunk.id,
-                    status=paid_attempt_status,
-                )
-            _emit_json_event(args, "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e))
-            fail(f"Failed to synthesize {chunk.id}: {e}", _EXIT_PROVIDER)
-        logger.event(
-            "info",
-            "chunk_provider_response",
-            chunk=chunk.number,
-            id=chunk.id,
-            generation_id=result.generation_id,
-        )
-        if paid_submit:
-            try:
-                _persist_paid_raw_audio(
-                    result,
-                    state=state,
-                    state_path=state_path,
-                    paths=paths,
-                    chunk=chunk,
-                    logger=logger,
-                )
-            except Exception as e:
-                # The paid bytes could not be persisted, so the outcome stays
-                # unconfirmed and no second POST may be sent; the marker is kept
-                # as evidence and the error is reported honestly.
-                record_chunk_attempt_outcome(state, status=ATTEMPT_OUTCOME_UNKNOWN)
-                append_error(state, chunk_id=chunk.id, message=str(e))
-                atomic_write_json(state_path, state)
-                logger.event(
-                    "error", "chunk_raw_save_failed", chunk=chunk.number, id=chunk.id, error=str(e)
-                )
-                _emit_json_event(
-                    args, "chunk_failed", chunk=chunk.number, id=chunk.id, error=str(e)
-                )
-                fail(f"Failed to save raw paid audio {chunk.id}: {e}", _EXIT_OUTPUT)
-        try:
-            write_audio_as_mp3(ffmpeg_path, result.audio_bytes, result.audio_format, output_path)
-        except Exception as e:
-            if paid_submit and pending_raw_recovery(state) is None:
-                # Without a saved raw receipt the paid response is lost, so the
-                # attempt is a definite failure; with one it stays recoverable.
-                record_chunk_attempt_outcome(state, status=ATTEMPT_FAILED)
-            append_error(state, chunk_id=chunk.id, message=str(e))
-            atomic_write_json(state_path, state)
-            logger.event(
-                "error", "chunk_write_failed", chunk=chunk.number, id=chunk.id, error=str(e)
-            )
-            fail(f"Failed to write chunk audio {output_path}: {e}", _EXIT_OUTPUT)
-        logger.event(
-            "info", "chunk_file_saved", chunk=chunk.number, id=chunk.id, file=output_path.name
-        )
-        if not args.no_trim:
-            try:
-                trim_final_silence(ffmpeg_path, ffprobe_path, output_path)
-                logger.event("info", "chunk_trimmed", chunk=chunk.number, id=chunk.id)
-            except Exception as e:
-                if paid_submit and pending_raw_recovery(state) is None:
-                    record_chunk_attempt_outcome(state, status=ATTEMPT_FAILED)
-                append_error(state, chunk_id=chunk.id, message=str(e))
-                atomic_write_json(state_path, state)
-                logger.event(
-                    "error", "chunk_trim_failed", chunk=chunk.number, id=chunk.id, error=str(e)
-                )
-                fail(f"Failed to trim chunk audio {output_path}: {e}", _EXIT_OUTPUT)
-
-        duration_ms = mp3_duration_ms(ffprobe_path, output_path)
-        start_ms = total_duration_ms
-        end_ms = start_ms + duration_ms
-        total_duration_ms = end_ms + (chunk.pause_after_ms if dialogue_run else 0)
-
-        direct_cost_kwargs = _direct_cost_kwargs(args.provider, result)
-        if not direct_cost_kwargs and recovery is not None:
-            # A recovered attempt can see a completion payload without usage, so
-            # the exact cost stored before the failed download stays observed.
-            direct_cost_kwargs = _recovered_attempt_cost_kwargs(recovery)
-        artifact = ChunkArtifact(
-            number=chunk.number,
-            id=chunk.id,
-            file=output_path.name,
-            duration_ms=duration_ms,
-            duration_sec=round(duration_ms / 1000, 3),
-            start_ms=start_ms,
-            end_ms=end_ms,
-            text_characters=len(chunk.text),
-            transcript=None if dialogue_run else result.transcript,
-            client_path=result.client_path,
-            generation_id=result.generation_id,
-            speaker=chunk.speaker,
-            voice=part.voice or prepared.voice,
-            voice_fingerprint=chunk.voice_fingerprint,
-            turn_index=chunk.number if dialogue_run else None,
-            speech_duration_ms=duration_ms if dialogue_run else None,
-            audio_sha256=_sha256_file(output_path) if dialogue_run else None,
-            pause_after_ms=chunk.pause_after_ms,
-            runtime_receipt=_public_runtime_receipt(result),
-            voice_selection=_public_voice_selection(result),
-            voice_session=_public_voice_session(result),
-            **direct_cost_kwargs,
-        )
-        chunk_artifacts_by_number[chunk.number] = artifact
-        upsert_completed_chunk(
-            state,
-            artifact=artifact,
-            model=args.model,
-            voice=part.voice or prepared.voice,
-            text=chunk.text,
-            include_text=not dialogue_run,
-            include_transcript=not dialogue_run,
-        )
-        if paid_submit:
-            # The completed entry and the cleared marker land in the same atomic
-            # write, so a saved chunk always replaces its own attempt marker.
-            clear_chunk_attempt(state)
-        atomic_write_json(state_path, state)
-        logger.event(
-            "info", "chunk_state_saved", chunk=chunk.number, id=chunk.id, state=state_path.name
-        )
-        _emit_json_event(
-            args,
-            "chunk_saved",
-            chunk=chunk.number,
-            id=chunk.id,
-            file=output_path.name,
-            duration_ms=duration_ms,
-        )
-        if not args.json_output:
-            print(f"Saved {output_path.name}: {duration_ms} ms")
+    loop_state = execution.PartLoopState(
+        chunk_artifacts_by_number=chunk_artifacts_by_number,
+        total_duration_ms=total_duration_ms,
+    )
+    hooks = execution.PartExecutionHooks(
+        # The loop runs in ``services.execution``; these are the CLI-bound
+        # callables existing tests patch and the CLI presentation seams.
+        synthesize_part=synthesize_part,
+        write_audio_as_mp3=write_audio_as_mp3,
+        trim_final_silence=trim_final_silence,
+        mp3_duration_ms=mp3_duration_ms,
+        fail_provider=lambda message: fail(message, _EXIT_PROVIDER),
+        fail_output=lambda message: fail(message, _EXIT_OUTPUT),
+        emit_json_event=_emit_json_event,
+        log_retry=_log_retry,
+        reject_unconfirmed_paid_resume=_reject_unconfirmed_paid_resume,
+        paid_submit_attempt_status=_paid_submit_attempt_status,
+        public_projection=_public_artifact_projection,
+        progress=print,
+    )
+    execution.execute_prepared_parts(
+        args=args,
+        prepared=prepared,
+        chunks=chunks,
+        paths=paths,
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
+        state=state,
+        state_path=state_path,
+        logger=logger,
+        provider=provider,
+        paid_submit=paid_submit,
+        retry_policy=retry_policy,
+        recoverable_attempts=recoverable_attempts,
+        dialogue_run=dialogue_run,
+        completed=completed,
+        loop_state=loop_state,
+        hooks=hooks,
+    )
 
     chunk_artifacts = [
         chunk_artifacts_by_number[number] for number in sorted(chunk_artifacts_by_number)
@@ -3681,6 +3497,19 @@ def _public_voice_session(result) -> dict[str, object] | None:
     ):
         raise RuntimeError("Local TTS provider returned an invalid public voice session")
     return dict(session)
+
+
+def _public_artifact_projection(result) -> dict[str, Any]:
+    """The three public OmniVoice projection fields for one saved chunk artifact.
+
+    Bundled as the single call-time seam the moved part loop uses, so the exact
+    validation and output shape of each projection stays in ``cli``.
+    """
+    return {
+        "runtime_receipt": _public_runtime_receipt(result),
+        "voice_selection": _public_voice_selection(result),
+        "voice_session": _public_voice_session(result),
+    }
 
 
 def _default_voice(args: argparse.Namespace) -> str | None:

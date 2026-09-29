@@ -4604,3 +4604,56 @@ def test_synthesize_part_selects_the_cast_provider_and_tolerates_legacy_signatur
 
     with pytest.raises(TypeError, match="internal provider failure"):
         synthesize_part(provider, legacy_part)
+
+
+def test_generate_step_routes_media_hooks_through_patched_cli_functions(tmp_path, monkeypatch):
+    """The extracted part loop still calls the CLI-bound media and duration functions.
+
+    ``write_audio_as_mp3``, ``trim_final_silence``, and ``mp3_duration_ms`` are
+    patched on ``cli`` throughout the suite; the moved loop must invoke those
+    exact callables in the same per-chunk order so existing patches keep
+    controlling conversion, trimming, and timing.
+    """
+    import voiceover_pipeline.cli as cli
+    from voiceover_pipeline.artifacts import build_run_paths
+    from voiceover_pipeline.script_splitter import split_markdown_by_delimiter
+
+    patch_generation_io(monkeypatch)
+    args = make_args(tmp_path, run_id="media-hook-parity")
+    args.no_trim = False
+    paths = build_run_paths(args.output_dir, args.model, args.run_id)
+    paths.chunks_dir.mkdir(parents=True)
+    chunks = split_markdown_by_delimiter(args.script, "******")[:2]
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+
+    def write_hook(_ffmpeg, _audio, _fmt, path):
+        calls.append(("write", path.name))
+        path.write_bytes(b"mp3")
+
+    def trim_hook(_ffmpeg, _ffprobe, path):
+        calls.append(("trim", path.name))
+
+    def duration_hook(_ffprobe, path):
+        calls.append(("duration", path.name))
+        return 1000
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", write_hook)
+    monkeypatch.setattr(cli, "trim_final_silence", trim_hook)
+    monkeypatch.setattr(cli, "mp3_duration_ms", duration_hook)
+
+    with pytest.raises(SystemExit) as exit_info:
+        cli._generate_step(
+            args, FakeProvider(), "ffmpeg", "ffprobe", chunks, "key", None, paths, None, "auto"
+        )
+
+    assert exit_info.value.code == 0
+    assert calls == [
+        ("write", "chunk_01.mp3"),
+        ("trim", "chunk_01.mp3"),
+        ("duration", "chunk_01.mp3"),
+        ("write", "chunk_02.mp3"),
+        ("trim", "chunk_02.mp3"),
+        ("duration", "chunk_02.mp3"),
+        ("duration", paths.full_mp3.name),
+    ]

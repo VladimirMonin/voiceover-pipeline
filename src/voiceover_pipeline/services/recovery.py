@@ -6,7 +6,8 @@ id finished with GET calls only. They only read bounded run state and
 already-written files — they never import ``cli``, call a provider, reach the
 network, or mutate run state. ``cli`` keeps thin wrappers under the former names
 so existing call sites, imports, and monkeypatches stay identical, and the paid
-marker write before the request plus every provider call still live in ``cli``.
+marker write before the request plus every provider call live in
+``services.execution``'s part loop.
 """
 
 import hashlib

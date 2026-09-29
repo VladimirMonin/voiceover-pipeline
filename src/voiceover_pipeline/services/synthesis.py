@@ -12,8 +12,8 @@ def synthesize_part(provider: Any, part: PreparedPart) -> SynthesisResult:
 
     Only provider selection and the existing OpenRouter ``voice`` argument are
     handled here. Paid attempt markers, recovery, retry policy, cost accounting,
-    and media conversion stay in the CLI caller so no second executor exists for
-    a paid synthesis.
+    and media conversion stay in the ``services.execution`` part loop that calls
+    this function, so no second executor exists for a paid synthesis.
     """
     selected_provider: Any = provider
     if isinstance(provider, dict):
