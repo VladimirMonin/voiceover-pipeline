@@ -3,6 +3,7 @@ import glob as glob_mod
 import hashlib
 import importlib.util
 import json
+import os
 import shutil
 import sys
 import time  # noqa: F401 - shared sleep seam tests patch via cli.time
@@ -52,6 +53,7 @@ from .config import (
     POLZA_TTS_MODELS,
     PROVIDER_DEFAULT_MODELS,
     QWEN_INSTRUCT,
+    QWEN_LANGUAGE,
     QWEN_MODEL_BASE,
     QWEN_MODEL_CUSTOMVOICE,
     QWEN_MODEL_VOICE_DESIGN,
@@ -173,6 +175,7 @@ from .services.prepare import (
     PreparationError,
     PreparedRun,
     bind_omnivoice_dialogue_fingerprints,
+    build_qwen_clone_identity,
     default_voice,
     prepare_generation_identity,
     prepare_run,
@@ -1382,7 +1385,9 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     turn's required local quality gate before the final concat. A second dialogue
     route, the existing ``omnivoice-local`` preset two-profile bank script, is
     likewise admitted with the default trimming semantics and records no quality
-    gate. Every other dialogue route -- every ``polza-tts`` dialogue -- and every
+    gate. The ordinary non-dialogue ``qwen-local`` clone mode is admitted as a
+    local route with the default trimming semantics and no timing or quality step.
+    Every other dialogue route -- every ``polza-tts`` dialogue -- and every
     dialogue option mixture (``--no-trim``, ``--with-timings``) stays on the
     legacy executor.
     """
@@ -1390,6 +1395,8 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         return _native_dialogue_route_eligible(args)
     if script_format != "markdown":
         return False
+    if getattr(args, "provider", None) == "qwen-local":
+        return _native_qwen_clone_route_eligible(args)
     quality_provider = getattr(args, "tts_quality_provider", None)
     if quality_provider is not None and quality_provider not in (
         native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
@@ -1408,6 +1415,37 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         # the legacy executor until its paid-submit contract is confirmed.
         return getattr(args, "timing_provider", "faster-whisper") == "faster-whisper"
     return True
+
+
+def _qwen_tts_runtime() -> str:
+    """Return the selected Qwen TTS runtime, exactly as the provider factory reads it."""
+    return os.environ.get("VOICEOVER_QWEN_TTS_RUNTIME", "python").strip()
+
+
+def _native_qwen_clone_route_eligible(args: argparse.Namespace) -> bool:
+    """Whether this command is the admitted local Qwen clone native route.
+
+    Only the ordinary non-dialogue ``qwen-local`` clone mode with a reference
+    sample, the default trimming semantics, and no integrated timing or quality
+    step is admitted. The ``preset``/``auto``/``design`` modes, ``--no-trim``,
+    ``--with-timings``, a quality provider, and an unrecognized
+    ``VOICEOVER_QWEN_TTS_RUNTIME`` value all keep the legacy executor, because the
+    native route records the mode and runtime as part of its clone identity.
+    """
+    if getattr(args, "mode", None) != "clone":
+        return False
+    if getattr(args, "model", None) != QWEN_MODEL_BASE:
+        return False
+    if getattr(args, "no_trim", False):
+        return False
+    if getattr(args, "with_timings", False):
+        return False
+    if getattr(args, "tts_quality_provider", None):
+        return False
+    sample = getattr(args, "sample", None)
+    if not isinstance(sample, str) or not sample.strip():
+        return False
+    return _qwen_tts_runtime() in ("python", "audio-cpp")
 
 
 def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
@@ -1523,8 +1561,8 @@ def _run_native_route(
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an admitted native "
-            "polza-tts, openrouter-tts, or local OmniVoice dialogue run may continue it; "
-            "choose a different --run-id for other options.",
+            "polza-tts, openrouter-tts, local Qwen clone, or local OmniVoice dialogue run may "
+            "continue it; choose a different --run-id for other options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
         )
@@ -1563,8 +1601,27 @@ def _run_native_route(
     except PreparationError as exc:
         fail(str(exc), _EXIT_ARGS)
     chunks = generation_identity.chunks
+    qwen_clone_identity = None
+    if args.provider == "qwen-local":
+        # The clone reference is read and hashed here, before the snapshot, so a
+        # missing sample fails as a usage error and the committed identity always
+        # carries a locator and digest this run actually read.
+        try:
+            qwen_clone_identity = build_qwen_clone_identity(
+                model=args.model,
+                sample_path=args.sample,
+                sample_text=getattr(args, "sample_text", None) or "",
+                runtime=_qwen_tts_runtime(),
+                language=QWEN_LANGUAGE,
+            )
+        except PreparationError as exc:
+            fail(str(exc), _EXIT_ARGS)
     prepared = prepare_run(
-        args, chunks, generation_identity.style_prompt, generation_identity.prompt_mode
+        args,
+        chunks,
+        generation_identity.style_prompt,
+        generation_identity.prompt_mode,
+        qwen_clone_identity=qwen_clone_identity,
     )
     provider_cache: list[Any] = []
 
@@ -3342,16 +3399,47 @@ def _build_native_omnivoice_dialogue_provider(prepared: PreparedRun, api_key: st
     return _bind_dialogue_voice_bank_providers(base, catalog, cast)
 
 
+def _build_native_qwen_clone_provider(prepared: PreparedRun) -> Any:
+    """Rebuild the local Qwen clone provider for a reconstructed run.
+
+    The committed clone identity supplies the reference locator and text and the
+    selected mode, so the provider re-reads the exact sample the run committed to.
+    The executor already proved the sample still matches the committed digest and
+    size, and the runtime is available offline, before any local model runs, so this
+    only reconstructs the already-admitted route. A run without a committed clone
+    identity cannot be resumed and fails closed.
+    """
+    identity = prepared.qwen_clone_identity
+    if identity is None:
+        fail(
+            "this local Qwen clone run records no clone identity; refusing to resume it.",
+            _EXIT_PROVIDER,
+        )
+    identity_args = argparse.Namespace(
+        provider="qwen-local",
+        model=prepared.model,
+        voice=prepared.voice,
+        mode=identity.mode,
+        sample=identity.sample_path,
+        sample_text=identity.sample_text,
+        qwen_instruct=prepared.style_prompt,
+    )
+    api_key = read_api_key(identity_args)
+    return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
+
+
 def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     """Build the provider a reconstructed native run needs, lazily from its snapshot.
 
     ``history resume`` and ``history sync`` recover the provider identity from the
-    committed snapshot, so an admitted ``polza-tts``, ``openrouter-tts``, or
-    ``omnivoice-local`` provider is built from those stored values only. The API key
-    is read when the executor first calls the factory -- for a fresh unattempted
-    submit or a known-id GET recovery -- and never for an export repair or a local
-    raw rebuild.
+    committed snapshot, so an admitted ``polza-tts``, ``openrouter-tts``,
+    ``omnivoice-local``, or ``qwen-local`` provider is built from those stored values
+    only. The API key is read when the executor first calls the factory -- for a
+    fresh unattempted submit or a known-id GET recovery -- and never for an export
+    repair or a local raw rebuild.
     """
+    if prepared.provider == "qwen-local":
+        return _build_native_qwen_clone_provider(prepared)
     identity_args = argparse.Namespace(
         provider=prepared.provider, model=prepared.model, voice=prepared.voice
     )

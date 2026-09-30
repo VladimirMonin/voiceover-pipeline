@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import importlib.util
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +15,94 @@ from voiceover_pipeline.config import (
 from voiceover_pipeline.local_runtime.contracts import RuntimeChoice
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
+
+QWEN_LOCAL_PYTHON_RUNTIME = "python"
+QWEN_LOCAL_AUDIO_CPP_RUNTIME = "audio-cpp"
+# The only cache file the python runtime needs to prove a model was fetched once,
+# so the probe never downloads and never constructs the model itself.
+_QWEN_LOCAL_CACHE_INDICATORS = ("config.json",)
+_QWEN_LOCAL_MISSING_PACKAGE = "missing_package"
+_QWEN_LOCAL_CACHE_UNVERIFIABLE = "cache_unverifiable"
+_QWEN_LOCAL_MODEL_NOT_CACHED = "model_not_cached"
+_QWEN_LOCAL_UNKNOWN_RUNTIME = "unknown_runtime"
+
+
+@dataclass(frozen=True)
+class QwenLocalTTSAvailability:
+    """Whether the local Qwen TTS runtime for a model can run without a download."""
+
+    available: bool
+    reason_code: str | None = None
+    remediation: str = ""
+
+
+def qwen_local_tts_availability(runtime: str, model: str) -> QwenLocalTTSAvailability:
+    """Report whether the local Qwen TTS runtime and model are usable offline.
+
+    The probe only inspects the installed package and the local Hugging Face cache;
+    it never constructs the model and never downloads. The ``audio-cpp`` runtime
+    delegates to its own dependency probe (installed package plus container command
+    and model package). A caller uses this to fail closed before the first local
+    synthesis when the runtime or its cached model is unavailable, so the route
+    enforces "no implicit model download".
+    """
+    if runtime == QWEN_LOCAL_AUDIO_CPP_RUNTIME:
+        from voiceover_pipeline.providers.audio_cpp_qwen_tts import (
+            qwen_tts_audio_cpp_dependency_probe,
+        )
+
+        health = qwen_tts_audio_cpp_dependency_probe()
+        return QwenLocalTTSAvailability(
+            available=health.available,
+            reason_code=health.reason_code,
+            remediation=health.remediation,
+        )
+    if runtime != QWEN_LOCAL_PYTHON_RUNTIME:
+        return QwenLocalTTSAvailability(
+            available=False,
+            reason_code=_QWEN_LOCAL_UNKNOWN_RUNTIME,
+            remediation="qwen-local runtime must be 'python' or 'audio-cpp'.",
+        )
+    if importlib.util.find_spec("qwen_tts") is None or importlib.util.find_spec("torch") is None:
+        return QwenLocalTTSAvailability(
+            available=False,
+            reason_code=_QWEN_LOCAL_MISSING_PACKAGE,
+            remediation=(
+                "the qwen_tts runtime is not installed; install the approved local Qwen "
+                "runtime before requesting a local Qwen clone."
+            ),
+        )
+    if Path(model).expanduser().is_dir():
+        # A caller may point at an already-downloaded local model directory; that
+        # needs no cache lookup and no download.
+        return QwenLocalTTSAvailability(available=True)
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ModuleNotFoundError:
+        return QwenLocalTTSAvailability(
+            available=False,
+            reason_code=_QWEN_LOCAL_CACHE_UNVERIFIABLE,
+            remediation=(
+                "the Hugging Face cache client is unavailable, so the local qwen-local model "
+                "cannot be verified without a download."
+            ),
+        )
+    for filename in _QWEN_LOCAL_CACHE_INDICATORS:
+        try:
+            cached = try_to_load_from_cache(model, filename)
+        except Exception:
+            cached = None
+        if not isinstance(cached, str) or not Path(cached).is_file():
+            return QwenLocalTTSAvailability(
+                available=False,
+                reason_code=_QWEN_LOCAL_MODEL_NOT_CACHED,
+                remediation=(
+                    f"the local qwen-local model {model!r} is not cached; download it "
+                    "explicitly before requesting a local Qwen clone (no implicit download "
+                    "is performed)."
+                ),
+            )
+    return QwenLocalTTSAvailability(available=True)
 
 
 class QwenLocalTTSProvider(TTSProvider):

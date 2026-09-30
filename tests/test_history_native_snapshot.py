@@ -11,10 +11,11 @@ rejection of a secret-looking identity, rejection of a sparse, reordered, or
 malformed chunk identity, rejection of a supplied empty style prompt before any
 insert, refusal to join a caller's open transaction, acceptance
 of the allowlisted routes (including the local OmniVoice preset dialogue with its
-committed voice-bank identity), and fail-closed rejection of every other route
-(OmniVoice preset/clone/design, Qwen preset/clone/design, Polza chat-audio, and an
-unknown provider) before any write even when the provider, ids, and fingerprints
-all look valid.
+committed voice-bank identity, and the local Qwen clone with its committed clone
+identity), and fail-closed rejection of every other route (OmniVoice
+preset/clone/design, a Qwen route without a clone identity, Polza chat-audio, and
+an unknown provider) before any write even when the provider, ids, and
+fingerprints all look valid.
 """
 
 import hashlib
@@ -45,6 +46,7 @@ from voiceover_pipeline.services.prepare import (
     OmniVoiceVoiceBankIdentity,
     PreparedPart,
     PreparedRun,
+    QwenCloneVoiceIdentity,
 )
 
 _DEFAULT_SCRIPT_TEXT = "Первый.\n\nВторой."
@@ -203,8 +205,8 @@ _UNKNOWN_PROVIDER = "acme-tts-9000"
 
 
 def _single_chunk_prepared(*, provider, model, voice="voice_a"):
-    """A valid-looking single-part run for a route whose resume identity this
-    foundation does not persist, so the provider allowlist alone decides it."""
+    """A valid-looking single-part run for a route whose route-specific identity
+    block is absent, so the allowlist and identity rules alone decide it."""
     chunk = ScriptChunk(number=1, id="chunk_01", text="Одиночный текст.", voice=voice)
     return PreparedRun(
         provider=provider,
@@ -722,6 +724,77 @@ def test_omnivoice_dialogue_route_is_accepted_and_reconstructable(repository, tm
     ]
     assert snapshot["parts"][0]["cast_voice"] == "voice_a"
     assert snapshot["parts"][0]["voice_fingerprint"] == _OMNIVOICE_REFERENCE_SHA
+
+
+_QWEN_CLONE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+
+def _qwen_clone_prepared():
+    """A valid-looking local Qwen clone run with its committed clone identity."""
+    chunk = ScriptChunk(number=1, id="chunk_01", text="Одиночный текст.", voice="clone")
+    parts = (PreparedPart(chunk=chunk, voice=chunk.voice),)
+    return PreparedRun(
+        provider="qwen-local",
+        model=_QWEN_CLONE_MODEL,
+        voice="clone",
+        style_prompt=None,
+        prompt_mode="plain",
+        parts=parts,
+        qwen_clone_identity=QwenCloneVoiceIdentity(
+            mode="clone",
+            model=_QWEN_CLONE_MODEL,
+            sample_path="/tmp/sample.wav",
+            sample_sha256="a" * 64,
+            sample_size=1234,
+            sample_text="reference text",
+            runtime="python",
+            language="Russian",
+        ),
+    )
+
+
+def test_qwen_clone_route_is_accepted_and_reconstructable(repository, tmp_path):
+    prepared = _qwen_clone_prepared()
+
+    result = _persist(repository, prepared, tmp_path / "runs" / "qwen-clone")
+
+    snapshot = result.run.config_snapshot
+    assert snapshot["provider"] == "qwen-local"
+    assert snapshot["model"] == _QWEN_CLONE_MODEL
+    assert snapshot["voice"] == "clone"
+    assert snapshot["qwen_clone"] == {
+        "mode": "clone",
+        "model": _QWEN_CLONE_MODEL,
+        "sample_path": "/tmp/sample.wav",
+        "sample_sha256": "a" * 64,
+        "sample_size": 1234,
+        "sample_text": "reference text",
+        "runtime": "python",
+        "language": "Russian",
+    }
+    # The clone identity participates in the run fingerprint, so a changed
+    # reference text produces a different identity.
+    assert prepared.qwen_clone_identity is not None
+    variant = replace(
+        prepared,
+        qwen_clone_identity=replace(
+            prepared.qwen_clone_identity, sample_text="different reference"
+        ),
+    )
+    other = _persist(repository, variant, tmp_path / "runs" / "qwen-clone-b")
+    assert other.fingerprint != result.fingerprint
+
+
+def test_qwen_clone_identity_mismatch_is_rejected_before_write(repository, tmp_path):
+    # A committed clone identity whose model disagrees with the run model would let
+    # a resume synthesize with an identity the run never captured.
+    prepared = replace(_qwen_clone_prepared(), model="Qwen/Qwen3-TTS-12Hz-1.7B-Other")
+
+    with pytest.raises(NativeSnapshotValidationError) as excinfo:
+        _persist(repository, prepared, tmp_path / "runs" / "qwen-clone-mismatch")
+
+    assert str(excinfo.value) == _UNSUPPORTED_TTS_ROUTE_REJECTED
+    assert _row_count(repository, "runs") == 0
 
 
 def test_unknown_provider_is_rejected_without_echoing_the_identifier(repository, tmp_path):

@@ -1,6 +1,7 @@
 """Bounded script preparation and prepared speech parts for one CLI generation run."""
 
 import argparse
+import hashlib
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -158,12 +159,99 @@ class OmniVoiceVoiceBankIdentity:
 
 
 @dataclass(frozen=True)
+class QwenCloneVoiceIdentity:
+    """The immutable clone inputs one local Qwen clone run commits to.
+
+    The standard run identity already covers the run's ``provider``, ``voice``
+    (``"clone"``), and ``model``; this block adds the clone-specific nonsecret
+    inputs that also change the synthesized bytes: the canonical absolute sample
+    locator and its byte digest/size (never the sample bytes themselves), the exact
+    reference text (empty means the runtime's x-vector-only clone), and the runtime
+    and language knobs. Storing them lets a later resume prove it would clone the
+    exact same reference with the same runtime instead of guessing.
+    """
+
+    mode: str
+    model: str
+    sample_path: str
+    sample_sha256: str
+    sample_size: int
+    sample_text: str
+    runtime: str
+    language: str
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "model": self.model,
+            "sample_path": self.sample_path,
+            "sample_sha256": self.sample_sha256,
+            "sample_size": self.sample_size,
+            "sample_text": self.sample_text,
+            "runtime": self.runtime,
+            "language": self.language,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "QwenCloneVoiceIdentity":
+        if not isinstance(payload, Mapping):
+            raise ValueError("qwen clone identity must be a mapping")
+        fields = {
+            key: payload.get(key)
+            for key in ("mode", "model", "sample_path", "sample_sha256", "runtime", "language")
+        }
+        if any(not isinstance(value, str) or not value for value in fields.values()):
+            raise ValueError("qwen clone identity fields must be non-empty strings")
+        sample_size = payload.get("sample_size")
+        if isinstance(sample_size, bool) or not isinstance(sample_size, int) or sample_size < 0:
+            raise ValueError("qwen clone identity sample_size must be a non-negative integer")
+        sample_text = payload.get("sample_text")
+        if not isinstance(sample_text, str):
+            raise ValueError("qwen clone identity sample_text must be a string")
+        return cls(**fields, sample_size=sample_size, sample_text=sample_text)  # type: ignore[arg-type]
+
+
+QWEN_CLONE_MODE = "clone"
+
+
+def build_qwen_clone_identity(
+    *, model: str, sample_path: str, sample_text: str, runtime: str, language: str
+) -> QwenCloneVoiceIdentity:
+    """Capture one ``qwen-local`` clone run's immutable reference identity.
+
+    The sample file is read once, here, so its bytes are hashed without ever being
+    copied into the snapshot. A missing or unreadable reference raises
+    :class:`PreparationError` before any provider or model exists, so a native run
+    can never snapshot an identity whose bytes it does not have.
+    """
+    path = Path(sample_path).expanduser()
+    try:
+        resolved = path.resolve()
+        data = resolved.read_bytes()
+    except OSError as exc:
+        raise PreparationError(
+            "qwen-local clone mode requires a readable --sample reference audio file."
+        ) from exc
+    return QwenCloneVoiceIdentity(
+        mode=QWEN_CLONE_MODE,
+        model=model,
+        sample_path=str(resolved),
+        sample_sha256=hashlib.sha256(data).hexdigest(),
+        sample_size=len(data),
+        sample_text=sample_text,
+        runtime=runtime,
+        language=language,
+    )
+
+
+@dataclass(frozen=True)
 class PreparedRun:
     """Run-scoped provider identity plus the ordered parts to synthesize.
 
     ``voice`` is the run-level voice the CLI already resolved; a part without
     its own cast voice falls back to it. ``voice_bank_identity`` is present only
-    for the admitted ``omnivoice-local`` preset dialogue route.
+    for the admitted ``omnivoice-local`` preset dialogue route, and
+    ``qwen_clone_identity`` only for the admitted ``qwen-local`` clone route.
     """
 
     provider: str
@@ -173,6 +261,7 @@ class PreparedRun:
     prompt_mode: str
     parts: tuple[PreparedPart, ...]
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
+    qwen_clone_identity: QwenCloneVoiceIdentity | None = None
 
 
 def default_voice(args: argparse.Namespace) -> str | None:
@@ -330,8 +419,15 @@ def prepare_run(
     chunks: Sequence[ScriptChunk],
     style_prompt: str | None,
     prompt_mode: str,
+    *,
+    qwen_clone_identity: QwenCloneVoiceIdentity | None = None,
 ) -> PreparedRun:
-    """Wrap the already-resolved run identity and chunks without changing them."""
+    """Wrap the already-resolved run identity and chunks without changing them.
+
+    ``qwen_clone_identity`` is supplied only by the admitted local Qwen clone
+    route, which has already read and hashed its reference sample; every other
+    caller leaves it ``None``.
+    """
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
     if args.provider == "omnivoice-local" and is_dialogue_format(
         getattr(args, "format", "markdown")
@@ -355,6 +451,7 @@ def prepare_run(
         prompt_mode=prompt_mode,
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
         voice_bank_identity=voice_bank_identity,
+        qwen_clone_identity=qwen_clone_identity,
     )
 
 

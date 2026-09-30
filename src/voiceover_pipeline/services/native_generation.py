@@ -8,8 +8,9 @@ routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing
 processing, either its synchronous ``/audio/speech`` model or its async
 ``elevenlabs/`` ``/media`` model, the synchronous ``openrouter-tts`` route, and
 the validated ``openrouter-tts`` Gemini two-speaker dialogue route, and the
-``omnivoice-local`` preset two-profile bank dialogue route -- and their
-recovery decisions. Two orthogonal integrated steps are admitted for that same
+``omnivoice-local`` preset two-profile bank dialogue route, and the ordinary
+non-dialogue ``qwen-local`` clone route -- and their recovery decisions. Two
+orthogonal integrated steps are admitted for that same
 ordinary route: the recorded silence-trimming semantics (``--no-trim`` vs the
 default trim) and one local post-audio step -- either local ``faster-whisper``
 timings or, separately, a local ASR quality verification.
@@ -72,8 +73,9 @@ Contract:
 
 Known limits: this slice admits the non-dialogue ``polza-tts`` and
 ``openrouter-tts`` routes with the recorded trimming/timing/quality semantics in
-the snapshot, the validated ``openrouter-tts`` Gemini dialogue route, and the
-``omnivoice-local`` preset two-profile bank dialogue route. The
+the snapshot, the validated ``openrouter-tts`` Gemini dialogue route, the
+``omnivoice-local`` preset two-profile bank dialogue route, and the ordinary
+non-dialogue ``qwen-local`` clone route. The
 crash window between a synchronous raw receipt and its database link (covered by
 local reconciliation) is the only place a synchronous observed cost cannot be
 rebuilt, because the receipt carries no cost. Cloud ASR, cloud timing, the other
@@ -166,7 +168,12 @@ from ..models import ASRResult, RunPaths, ScriptChunk, SynthesisResult
 from ..run_state import LOG_FILE, GenerationLogger
 from ..tts_quality import TTSQualityResult, evaluate_tts_transcript
 from . import costs
-from .prepare import OmniVoiceVoiceBankIdentity, PreparedPart, PreparedRun
+from .prepare import (
+    OmniVoiceVoiceBankIdentity,
+    PreparedPart,
+    PreparedRun,
+    QwenCloneVoiceIdentity,
+)
 from .recovery import polza_media_route_model
 from .synthesis import synthesize_part
 
@@ -206,6 +213,10 @@ _ERROR_SYNTHESIS_FAILED = "NATIVE_SYNTHESIS_FAILED"
 _ERROR_LOCAL_SYNTHESIS_FAILED = "NATIVE_LOCAL_SYNTHESIS_FAILED"
 _ERROR_LOCAL_RAW_EVIDENCE_INVALID = "NATIVE_LOCAL_RAW_EVIDENCE_INVALID"
 _ERROR_LOCAL_REFERENCE_UNAVAILABLE = "NATIVE_LOCAL_REFERENCE_UNAVAILABLE"
+# The installed local runtime or its cached model for an admitted local route is
+# unavailable offline; the probe runs before the first local synthesis so the
+# route never downloads a model implicitly.
+_ERROR_LOCAL_MODEL_UNAVAILABLE = "NATIVE_LOCAL_MODEL_UNAVAILABLE"
 _ERROR_CONVERSION_FAILED = "NATIVE_CONVERSION_FAILED"
 _ERROR_ASSEMBLY_FAILED = "NATIVE_ASSEMBLY_FAILED"
 _ERROR_EXPORT_FAILED = "NATIVE_EXPORT_FAILED"
@@ -1218,10 +1229,10 @@ class _Executor:
         self.chunks = chunks
         self.script_format = script_format
         self.dialogue = is_dialogue_format(script_format)
-        # The admitted local route is the ``omnivoice-local`` preset dialogue: it
-        # has no paid POST and its per-turn quality gate is the OpenRouter-only
-        # rule, so the two are tracked separately from a generic dialogue run.
-        self.local = prepared.provider == "omnivoice-local"
+        # The admitted local routes have no paid POST and no paid-marker guard: the
+        # ``omnivoice-local`` preset dialogue and the ``qwen-local`` clone route. Each
+        # reserves its own cost-free ``local_tts_chunk`` attempt per real invocation.
+        self.local = prepared.provider in {"omnivoice-local", "qwen-local"}
         self.dialogue_quality_gate = self.dialogue and prepared.provider == "openrouter-tts"
         self.script_path = script_path
         self.output_options = output_options
@@ -1625,6 +1636,83 @@ class _Executor:
             ) from exc
         self._revision = run.revision
         self.logger.event("info", "chunk_state_saved", chunk=part.number, id=part.chunk_id)
+
+    def _has_pending_local_synthesis(self) -> bool:
+        """Whether any local part still needs a real local model invocation.
+
+        A part with a verified converted chunk, or a part whose raw bytes are
+        already linked (so it only needs a local FFmpeg rebuild), needs no model.
+        """
+        for item in _collect_evidence(self.view):
+            if item.local_raw_artifact is not None:
+                continue
+            if _verified_chunk_file(item, self.run_root, self.hooks.sha256_file) is not None:
+                continue
+            return True
+        return False
+
+    def preflight_local_synthesis(self) -> None:
+        """Fail closed before the first local model call when its inputs are gone.
+
+        Only the admitted ``qwen-local`` clone route needs this: its reference
+        sample is an external file and its runtime is selected by the environment,
+        so before any local model runs the executor proves the sample still matches
+        the committed digest and size, the runtime still matches the committed
+        identity, and the installed runtime plus its cached model are available
+        without a download. It runs only when a real local invocation is pending and
+        only when this execution may start new synthesis (``generate`` and
+        ``history resume``; never ``history sync``), so a completed-run export repair
+        and a local raw rebuild neither read the reference nor probe the runtime.
+        """
+        if self.prepared.provider != "qwen-local":
+            return
+        if not self.paid_submit_allowed or not self._has_pending_local_synthesis():
+            return
+        self._preflight_qwen_clone_identity()
+
+    def _preflight_qwen_clone_identity(self) -> None:
+        """Verify the committed clone reference and runtime before any local model."""
+        identity = self.prepared.qwen_clone_identity
+        if not isinstance(identity, QwenCloneVoiceIdentity):
+            raise NativeGenerationError(
+                "this local Qwen clone run records no clone identity; refusing to run the "
+                "local model.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_LOCAL_REFERENCE_UNAVAILABLE,
+            )
+        sample = Path(identity.sample_path)
+        try:
+            unchanged = (
+                sample.is_file()
+                and sample.stat().st_size == identity.sample_size
+                and self.hooks.sha256_file(sample) == identity.sample_sha256
+            )
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            raise NativeGenerationError(
+                "the local clone reference audio is missing or changed; refusing to run the "
+                "local model.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_LOCAL_REFERENCE_UNAVAILABLE,
+            )
+        current_runtime = os.environ.get("VOICEOVER_QWEN_TTS_RUNTIME", "python").strip()
+        if current_runtime != identity.runtime:
+            raise NativeGenerationError(
+                "the local clone runtime changed since this run was prepared; refusing to "
+                "run the local model.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_LOCAL_REFERENCE_UNAVAILABLE,
+            )
+        from ..providers.qwen_local import qwen_local_tts_availability
+
+        availability = qwen_local_tts_availability(identity.runtime, identity.model)
+        if not availability.available:
+            raise NativeGenerationError(
+                availability.remediation or "the local qwen-local runtime or model is unavailable.",
+                code=_EXIT_MISSING_DEP,
+                error_code=_ERROR_LOCAL_MODEL_UNAVAILABLE,
+            )
 
     def _run_local_parts(self, evidence: list[_PartEvidence]) -> None:
         """Execute or recover every local part, stopping before any inconsistent gap.
@@ -3237,6 +3325,7 @@ def execute_native_tts(
     )
     executor.preflight_timing()
     executor.preflight_quality()
+    executor.preflight_local_synthesis()
     executor.run_parts()
     executor.ensure_complete()
     executor.ensure_timing()
@@ -3366,6 +3455,27 @@ def _stored_voice_bank_identity(config: dict[str, Any]) -> OmniVoiceVoiceBankIde
         ) from exc
 
 
+def _stored_qwen_clone_identity(config: dict[str, Any]) -> QwenCloneVoiceIdentity | None:
+    """Return the committed clone identity, or ``None`` when the run has none.
+
+    The verified view already guarantees the committed block parses, so this only
+    narrows the type; a run without one (every non-qwen route) reports ``None`` and
+    its reconstruction stays exactly as before.
+    """
+    value = config.get("qwen_clone")
+    if value is None:
+        return None
+    try:
+        return QwenCloneVoiceIdentity.from_payload(value)
+    except ValueError as exc:
+        raise NativeGenerationError(
+            "the committed snapshot qwen clone identity is malformed; refusing to "
+            "reconstruct the run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        ) from exc
+
+
 def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
     """Rebuild one committed native run's synthesis inputs from its verified view.
 
@@ -3399,6 +3509,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
     ]
     model = _stored_identity_str(config, "model")
     voice_bank_identity = _stored_voice_bank_identity(config)
+    qwen_clone_identity = _stored_qwen_clone_identity(config)
     prepared = PreparedRun(
         provider=_stored_identity_str(config, "provider"),
         model=model,
@@ -3407,6 +3518,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         prompt_mode=_stored_identity_str(config, "prompt_mode"),
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
         voice_bank_identity=voice_bank_identity,
+        qwen_clone_identity=qwen_clone_identity,
     )
     run_root = Path(view.run.run_root)
     paths = build_run_paths(run_root.parent, model, run_root.name)

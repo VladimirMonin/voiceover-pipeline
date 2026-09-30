@@ -63,7 +63,12 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ScriptChunk
-from ..services.prepare import OmniVoiceVoiceBankIdentity, PreparedPart, PreparedRun
+from ..services.prepare import (
+    OmniVoiceVoiceBankIdentity,
+    PreparedPart,
+    PreparedRun,
+    QwenCloneVoiceIdentity,
+)
 from .native_snapshot import (
     _is_generated_chunk_id,
     _normalize_run_root,
@@ -107,6 +112,10 @@ _RUN_IDENTITY_CONFLICT = (
 _VOICE_BANK_CONFLICT = (
     "native resume identity conflict: the omnivoice-local voice-bank catalog or referenced "
     "profile settings changed"
+)
+_QWEN_CLONE_CONFLICT = (
+    "native resume identity conflict: the qwen-local clone reference sample, reference text, "
+    "mode, model, runtime, or language changed"
 )
 _PART_COUNT_CONFLICT = "native resume identity conflict: part count changed"
 _PART_ORDER_CONFLICT = (
@@ -175,6 +184,11 @@ def _require_prepared(prepared: object) -> PreparedRun:
     if voice_bank is not None and not isinstance(voice_bank, OmniVoiceVoiceBankIdentity):
         raise NativeResumeValidationError(
             "prepared voice-bank identity must be None or an OmniVoiceVoiceBankIdentity"
+        )
+    qwen_clone = prepared.qwen_clone_identity
+    if qwen_clone is not None and not isinstance(qwen_clone, QwenCloneVoiceIdentity):
+        raise NativeResumeValidationError(
+            "prepared qwen clone identity must be None or a QwenCloneVoiceIdentity"
         )
     return prepared
 
@@ -291,6 +305,14 @@ def preflight_native_tts_resume(
     )
     if committed_voice_bank != candidate_voice_bank:
         raise NativeResumeIdentityConflictError(_VOICE_BANK_CONFLICT)
+    committed_qwen_clone = config.get("qwen_clone")
+    candidate_qwen_clone = (
+        None
+        if candidate.qwen_clone_identity is None
+        else candidate.qwen_clone_identity.to_payload()
+    )
+    if committed_qwen_clone != candidate_qwen_clone:
+        raise NativeResumeIdentityConflictError(_QWEN_CLONE_CONFLICT)
 
     if len(candidate.parts) != len(view.parts):
         raise NativeResumeIdentityConflictError(_PART_COUNT_CONFLICT)
@@ -307,6 +329,7 @@ def preflight_native_tts_resume(
         voice_identity=candidate_voice_identity,
         synthesis_identity=candidate_synthesis_identity,
         voice_bank=candidate_voice_bank,
+        qwen_clone=candidate_qwen_clone,
     )
     for position, part in enumerate(candidate.parts, start=1):
         chunk = part.chunk
