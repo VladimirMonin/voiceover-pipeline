@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -437,6 +438,23 @@ def _sidecar_path(target: Path, suffix: str) -> Path:
     return target.with_name(target.name + suffix)
 
 
+# SQLite's WAL shared-memory index is at least this many bytes. A missing or
+# smaller ``-shm`` cannot be reused as-is, so a read-only open would have to
+# create or repair it, which a read must never do.
+_WAL_INDEX_MIN_BYTES = 32768
+
+
+def _wal_index_usable(shm_path: Path) -> bool:
+    """Whether an existing WAL shared-memory index can be reused read-only."""
+    if shm_path.is_symlink():
+        return False
+    try:
+        status = shm_path.stat()
+    except OSError:
+        return False
+    return stat.S_ISREG(status.st_mode) and status.st_size >= _WAL_INDEX_MIN_BYTES
+
+
 def _reject_symlinked_database(path: Path) -> None:
     """Refuse a database reached through a symlinked file or home directory.
 
@@ -518,7 +536,8 @@ def connect_readonly_consistent(
       is opened ``mode=ro`` over the WAL and the committed frames are read, and a
       run another process just committed is never missed. A live ``-wal``/``-shm``
       pair is reused as it is: this reader never deletes and never overwrites a
-      sidecar.
+      sidecar. A ``-wal`` without a reusable ``-shm`` is refused rather than
+      opened, because a read-only SQLite open would create that sidecar.
 
     A hot ``-journal`` (an unclean non-WAL rollback) is refused because the main
     file may be mid-rollback, and a symlinked database, home directory, or sidecar
@@ -552,6 +571,15 @@ def connect_readonly_consistent(
         )
     if not _sidecar_path(target, "-wal").exists():
         return connect_readonly(target, migrations=migrations)
+    # A ``-wal`` with no reusable ``-shm`` means the shared-memory index is gone
+    # (a crashed or read-only-closed writer). A ``mode=ro`` open would create or
+    # rebuild that sidecar, so refuse instead of mutating a read: the caller can
+    # still fall back to a quiescent immutable read once the WAL is checkpointed.
+    if not _wal_index_usable(_sidecar_path(target, "-shm")):
+        raise HistoryDatabaseReadOnlyError(
+            f"history database {target} has a write-ahead log but no reusable shared-memory "
+            "index; refusing to open it read-only rather than create a sidecar"
+        )
     connection = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=2.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
@@ -561,6 +589,23 @@ def connect_readonly_consistent(
         connection.close()
         raise
     return connection
+
+
+def readonly_schema_is_empty(connection: sqlite3.Connection) -> bool:
+    """Whether a validated read-only connection holds the empty (v0, zero-table) schema.
+
+    :func:`connect_readonly` and :func:`connect_readonly_consistent` accept a
+    genuinely empty history database -- no tables and ``user_version`` 0 -- so a
+    reader that queries a table this schema does not define can treat the database
+    as having no rows instead of failing as unreadable. ``_validate_schema``
+    accepts zero tables only at ``user_version`` 0, and only a connection it has
+    already validated reaches this helper, so a connection holding any table is
+    not empty and a foreign, corrupt, or newer database never gets here.
+    """
+    row = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' LIMIT 1"
+    ).fetchone()
+    return row is None
 
 
 class HistoryDatabase:

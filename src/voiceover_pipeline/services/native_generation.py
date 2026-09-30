@@ -147,6 +147,11 @@ from ..history.native_view import (
     NativeViewError,
     load_native_tts_view,
 )
+from ..history.paid_transcription import (
+    PaidTranscriptionError,
+    committed_paid_run_for_root,
+    paid_local_evidence,
+)
 from ..history.paths import HistoryPathsError, history_database_path
 from ..history.raw_receipt import (
     PaidRawReceipt,
@@ -799,17 +804,68 @@ def _find_native_run(
     return (native[0] if native else None), True
 
 
+def _committed_paid_owner(repository: HistoryRepository, canonical_root: str) -> str | None:
+    """Return the paid run that already committed this root, or ``None``.
+
+    The early CLI ownership read can miss a paid run committed after it, and
+    :func:`_fresh_run_root_available` sees only local evidence, so a paid submit
+    whose post-commit descriptor write failed would be invisible. This re-read runs
+    inside the acquired run lock, before any root creation, provider, or deletion,
+    and fails closed with a bounded paid-ownership error when the binding cannot be
+    resolved to zero or one run.
+    """
+    try:
+        return committed_paid_run_for_root(repository, canonical_root)
+    except (PaidTranscriptionError, HistoryDatabaseError, sqlite3.Error, OSError) as exc:
+        error_code = getattr(exc, "error_code", "PAID_TIMING_OWNERSHIP_MISMATCH")
+        raise NativeGenerationError(
+            "the run directory's paid timing ownership could not be verified; refusing to start "
+            "a native run over it.",
+            code=_EXIT_PROVIDER,
+            error_code=str(error_code),
+        ) from None
+
+
+def _refuse_paid_owned_root(repository: HistoryRepository, run_root: Path) -> None:
+    """Refuse a paid-owned run root before the logger or any native writer touches it.
+
+    The early CLI ownership read can run before a paid reservation commits, and the
+    generation logger's constructor creates the run directory, so the locked native
+    route re-reads here before the logger, the chunks, or any provider. A paid root
+    is refused whether it is bound only by a committed database row (a failed
+    descriptor write) or by local paid evidence. The paid check precedes every
+    native-owner read, because a root can carry a committed native run *and* a
+    committed paid run; that conflict must fail closed instead of letting a native
+    resume write over the paid evidence. A root owned by native history alone is
+    unaffected.
+    """
+    canonical_root = str(run_root.resolve())
+    if _committed_paid_owner(repository, canonical_root) is not None or paid_local_evidence(
+        run_root
+    ):
+        raise NativeGenerationError(
+            "the run directory is owned by a paid timing run; refusing to start a native run "
+            "over its output root.",
+            code=_EXIT_PROVIDER,
+            error_code="PAID_TIMING_OUTPUT_OWNED",
+        )
+
+
 def _fresh_run_root_available(run_root: Path) -> bool:
     """Whether a fresh native run may claim this root without another writer's state.
 
     The early ownership resolution already routes a native-owned root away from a
-    fresh start; this is the re-check under the run lock. If a concurrent legacy
-    or native writer created local state between the early decision and this
+    fresh start; this is the re-check under the run lock. If a concurrent legacy,
+    paid, or native writer created local state between the early decision and this
     point, the root is refused instead of letting a second writer interleave one
-    directory. Any descriptor, native run state, or paid raw receipt, and any
-    legacy ``run_state.json``, counts as another writer's state.
+    directory. Any native descriptor, native run state, paid-timing descriptor or
+    raw body, or legacy ``run_state.json`` counts as another writer's state.
     """
-    return not _native_local_evidence(run_root) and not (run_root / "run_state.json").exists()
+    return (
+        not _native_local_evidence(run_root)
+        and not paid_local_evidence(run_root)
+        and not (run_root / "run_state.json").exists()
+    )
 
 
 def resolve_native_ownership(
@@ -3311,6 +3367,11 @@ def execute_native_tts(
             code=_EXIT_PROVIDER,
             error_code=_ERROR_HISTORY_RUN_MISMATCH,
         )
+    # The paid-owner refusal precedes the fresh-root test, so it applies to a resume
+    # of an already-committed native run as well: a root that carries both a native
+    # run and a committed paid run has two owners, and this writer must not touch the
+    # paid run's evidence. Every caller reaches it before any directory is created.
+    _refuse_paid_owned_root(repository, run_root)
     if existing is None and not _fresh_run_root_available(run_root):
         raise NativeGenerationError(
             "the run directory already carries local run state; refusing to start a "
@@ -3437,17 +3498,20 @@ def run_native_generation(
 ) -> NativeGenerationSummary:
     """Hold the run lock and the history database around one native execution.
 
-    The generation logger is constructed here, after the run lock is taken, so the
-    native route creates no file in the run root before the lock and the ownership
-    recheck inside :func:`execute_native_tts`. ``local_timing_allowed`` and
-    ``local_quality_allowed`` are threaded to :func:`execute_native_tts` so an
-    explicit resume may run the pending local timing or quality verification while
-    ``history sync`` never runs a local model.
+    The writable history database is opened and the committed paid owner is re-read
+    before the generation logger, whose constructor creates the run directory, so a
+    paid root raced past the early guard is refused before anything in the root is
+    created or touched. The ownership recheck inside :func:`execute_native_tts`
+    stays as defense in depth. ``local_timing_allowed`` and ``local_quality_allowed``
+    are threaded to :func:`execute_native_tts` so an explicit resume may run the
+    pending local timing or quality verification while ``history sync`` never runs a
+    local model.
     """
     try:
         with acquire_run_lock(paths.output_root):
-            logger = GenerationLogger(paths.output_root / LOG_FILE)
             with _open_writable_history(database_path) as repository:
+                _refuse_paid_owned_root(repository, paths.output_root)
+                logger = GenerationLogger(paths.output_root / LOG_FILE)
                 return execute_native_tts(
                     repository=repository,
                     run_root=paths.output_root,

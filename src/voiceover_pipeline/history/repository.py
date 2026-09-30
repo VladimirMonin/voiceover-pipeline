@@ -1210,6 +1210,62 @@ class HistoryRepository:
             self._insert_attempt(record)
         return record
 
+    def set_paid_transcription_attempt_status(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        call_type: str,
+        expected_status: str,
+        status: str,
+        usage: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> AttemptRecord:
+        """Compare-and-swap one paid-transcription attempt's status.
+
+        This is the single status transition for a paid cloud transcription
+        attempt. It is a guarded ``UPDATE`` on exactly ``run_uuid``,
+        ``attempt_uuid``, ``call_type``, and ``expected_status``, so a concurrent
+        writer or a mismatched attempt is refused instead of moved. ``usage`` is a
+        bounded non-secret provenance mapping stored as JSON; ``error`` is a fixed
+        code text. The call joins an open :meth:`transaction` when the caller has
+        one, so it commits or rolls back with the caller's other writes.
+
+        Raises :class:`HistoryPaidAttemptConflictError` when the guarded write
+        affects no row (the attempt is missing, is another call type, or is no
+        longer at ``expected_status``).
+        """
+        _require_uuid(run_uuid, "run_uuid")
+        _require_uuid(attempt_uuid, "attempt_uuid")
+        _require_identity_field(call_type, "call_type")
+        _require_identity_field(expected_status, "expected_status")
+        _require_identity_field(status, "status")
+        now = utc_now()
+        with self.transaction():
+            cursor = self._connection.execute(
+                "UPDATE attempts SET status = ?, usage_json = COALESCE(?, usage_json), "
+                "error = ?, updated_at = ? "
+                "WHERE run_uuid = ? AND attempt_uuid = ? AND call_type = ? AND status = ?",
+                (
+                    status,
+                    None if usage is None else _dump_json(usage),
+                    error,
+                    now,
+                    run_uuid,
+                    attempt_uuid,
+                    call_type,
+                    expected_status,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise HistoryPaidAttemptConflictError(
+                    f"attempt {attempt_uuid!r} is not {expected_status!r} for run {run_uuid!r}"
+                )
+            row = self._connection.execute(
+                "SELECT * FROM attempts WHERE attempt_uuid = ?", (attempt_uuid,)
+            ).fetchone()
+            return _row_to_attempt(row)
+
     def reserve_paid_tts_attempt(
         self,
         run_uuid: str,
@@ -2913,6 +2969,23 @@ class HistoryRepository:
             "SELECT * FROM runs WHERE run_root = ? "
             "ORDER BY created_at DESC, run_uuid DESC LIMIT ? OFFSET ?",
             (run_root, limit, offset),
+        ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
+    def find_runs_by_root_origin(self, run_root: str, operation_origin: str) -> list[RunRecord]:
+        """Return every run at ``run_root`` carrying one operation origin.
+
+        The predicate is the exact ``run_root`` plus the origin stored in the
+        bounded snapshot, evaluated in SQL with no limit or offset, so an
+        ownership lookup can never miss an older matching run behind newer
+        unrelated rows at the same root. The caller resolves how many matches it
+        accepts.
+        """
+        rows = self._connection.execute(
+            "SELECT * FROM runs WHERE run_root = ? "
+            "AND json_extract(config_snapshot, '$.operation_origin') = ? "
+            "ORDER BY created_at DESC, run_uuid DESC",
+            (run_root, operation_origin),
         ).fetchall()
         return [_row_to_run(row) for row in rows]
 

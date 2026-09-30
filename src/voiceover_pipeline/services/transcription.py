@@ -33,7 +33,7 @@ from ..models import (
     TimingResult,
 )
 from ..providers.asr_registry import ASRProviderSpec, get_asr_provider_spec
-from ..providers.base import ASRProvider, TranscriptionProvider, validate_asr_response
+from ..providers.base import ASRProvider, validate_asr_response
 from ..run_state import atomic_write_json
 from ..tts_quality import evaluate_tts_transcript
 
@@ -297,6 +297,7 @@ def transcribe_timing_audio(
     word_timestamps: bool = False,
     quiet: bool = False,
     local_files_only: bool = False,
+    on_raw_response: Callable[[bytes, str], None] | None = None,
 ) -> TimingResult:
     """Select the timing provider and run one timestamped transcription.
 
@@ -306,45 +307,47 @@ def transcribe_timing_audio(
     point because it cannot return real timestamps. ``local_files_only`` is
     forwarded to the local faster-whisper adapter so the native timing route can
     forbid an implicit model download; cloud providers ignore it.
+    ``on_raw_response`` is forwarded to a cloud adapter only, so its successful
+    response body can be persisted before the fallible JSON parse; a local route
+    has no provider response to hand back and ignores it.
     """
-    provider: TranscriptionProvider
-    local_provider: Any | None = None
     if timing_provider == "groq-whisper":
         from ..providers.groq_whisper import GroqWhisperProvider
 
-        effective_model = model or "whisper-large-v3-turbo"
-        provider = GroqWhisperProvider(model=effective_model)
-    elif timing_provider == "xai-stt":
-        from ..providers.xai_stt import XAISttProvider
-
-        effective_model = model or "grok-stt"
-        provider = XAISttProvider(model=effective_model)
-    else:
-        from ..providers.faster_whisper import FasterWhisperProvider
-
-        effective_model = model or DEFAULT_TIMING_MODEL
-        local_provider = FasterWhisperProvider(
-            model_size=effective_model,
-            device=device,
-            compute_type=compute_type,
-        )
-        provider = local_provider
-
-    if local_provider is not None:
-        # Only the local adapter understands ``local_files_only``; passing it to a
-        # cloud adapter would be an unexpected keyword argument.
-        return local_provider.transcribe(
+        groq = GroqWhisperProvider(model=model or "whisper-large-v3-turbo")
+        return groq.transcribe(
             audio_path=audio_path,
             language=language,
             word_timestamps=word_timestamps,
             quiet=quiet,
-            local_files_only=local_files_only,
+            on_raw_response=on_raw_response,
         )
-    return provider.transcribe(
+    if timing_provider == "xai-stt":
+        from ..providers.xai_stt import XAISttProvider
+
+        xai = XAISttProvider(model=model or "grok-stt")
+        return xai.transcribe(
+            audio_path=audio_path,
+            language=language,
+            word_timestamps=word_timestamps,
+            quiet=quiet,
+            on_raw_response=on_raw_response,
+        )
+    from ..providers.faster_whisper import FasterWhisperProvider
+
+    local_provider = FasterWhisperProvider(
+        model_size=model or DEFAULT_TIMING_MODEL,
+        device=device,
+        compute_type=compute_type,
+    )
+    # Only the local adapter understands ``local_files_only``; it has no provider
+    # response to hand back, so a cloud ``on_raw_response`` sink is not applicable.
+    return local_provider.transcribe(
         audio_path=audio_path,
         language=language,
         word_timestamps=word_timestamps,
         quiet=quiet,
+        local_files_only=local_files_only,
     )
 
 

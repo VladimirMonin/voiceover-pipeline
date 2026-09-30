@@ -222,6 +222,22 @@ session на прогон. `format: dialogue` создаёт один bound bank
 | `--overwrite` | flag | false | Перезаписать |
 | `--skip-existing` | flag | false | Пропустить |
 
+Облачный standalone `timings --timing-provider groq-whisper|xai-stt` сохраняется
+в канонической истории через платный boundary: читаемый source валидируется,
+маркер-попытка (`submitting`) с identity запроса и привязкой к каноническому
+output-root коммитится **до** multipart POST, тело успешного ответа с приватным
+receipt пишется в `raw/` **до** парсинга, transcript и timing-артефакты — после
+(atomic). Владение привязано к output-root: свежий вызов или `--overwrite`
+против уже принадлежащего платному прогону root завершается
+`PAID_TIMING_OUTPUT_OWNED` до удаления/POST (точный untruncated lookup по
+`run_root`+origin, нечитаемая БД — fail-closed; явно другой `--run-id` — отдельное
+решение). Guard двусторонний: `generate` не трогает paid-owned root, а `timings`
+не трогает native-owned root. Цена unknown (`null`); сбой/таймаут POST оставляет попытку
+`submitting` (без автоматического повтора), сохранённое тело воспроизводится
+локально (`history resume`) без второго POST, а crash-окно после записи тела
+reconcile-ится той же попыткой. Этот маршрут требует включённой истории (иначе
+`PAID_TIMING_HISTORY_REQUIRED` до запроса).
+
 ## `list voices` — JSON контракт
 
 ```powershell
@@ -453,6 +469,14 @@ UUID) из его снимка и запускают тот же executor, чт�
 GET-ами, а на unattempted части или неподтверждённом submit блокирует без
 POST/GET и без чтения ключа. Оба держат тот же run lock; неизвестный/legacy
 UUID и отсутствующая БД не создают ничего, `--overwrite` не принимается.
+Подтверждённый платный `timings`-прогон обрабатывается теми же глаголами без
+провайдера: `sync` только читает durable-состояние через read-only consistent
+view (без migrate/sidecar) и никогда не reconcile-ит, а `resume` берёт тот же
+output-root lock и локально воспроизводит сохранённое raw-тело либо
+reconcile-ит проверенную receipt+тело пару после crash-окна (без второго POST),
+или fail-closed завершается `PAID_SUBMIT_UNCONFIRMED`, пока попытка `submitting`.
+Источник (path/size/SHA) проверяется до parse и публикации; symlink-лист артефакта
+не разворачивается.
 Подробности — в [Agent CLI Contract](../../../agent-cli-contract.md).
 
 Заданный `VOICEOVER_HOME` должен быть абсолютным (иначе exit `2`); без него

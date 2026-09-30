@@ -8,6 +8,7 @@ API reference: https://console.groq.com/docs/speech-to-text
 
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,89 @@ _AUDIO_FORMAT_MAP = {
     ".mpeg": "mpeg",
     ".mpga": "mpga",
 }
+
+
+def parse_groq_timing_result(
+    result: dict[str, Any],
+    *,
+    model: str,
+    language: str,
+    word_timestamps: bool,
+    audio_path: Path,
+) -> TimingResult:
+    """Convert one Groq ``verbose_json`` body into a :class:`TimingResult`.
+
+    This is a pure function of the already-received provider payload, so a stored
+    raw response can be replayed locally with no second POST. It preserves the
+    provider's own segment spans and records an honest ``timestamp_basis``:
+    ``provider_segment_timestamps`` when the provider returned segments, and
+    ``fallback_full_text`` for the single-span fallback.
+    """
+    full_text = result.get("text", "").strip()
+    language_detected = result.get("language", language or "")
+
+    segments: list[TimingSegment] = []
+    raw_segments = result.get("segments", [])
+
+    if raw_segments:
+        for seg in raw_segments:
+            seg_id = seg.get("id", 0)
+            start_sec = seg.get("start", 0.0)
+            end_sec = seg.get("end", 0.0)
+            seg_text = seg.get("text", "").strip()
+            start_ms = round(start_sec * 1000)
+            end_ms = round(end_sec * 1000)
+            duration_ms = end_ms - start_ms
+
+            words_list = None
+            raw_words = seg.get("words", [])
+            if word_timestamps and raw_words:
+                words_list = [
+                    {
+                        "word": w.get("word", "").strip(),
+                        "start_ms": round(w.get("start", 0) * 1000),
+                        "end_ms": round(w.get("end", 0) * 1000),
+                    }
+                    for w in raw_words
+                ]
+
+            segments.append(
+                TimingSegment(
+                    id=seg_id,
+                    start_sec=round(start_sec, 3),
+                    end_sec=round(end_sec, 3),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    duration_ms=duration_ms,
+                    text=seg_text,
+                    words=words_list,
+                )
+            )
+    else:
+        # Fallback: single segment from full text (shouldn't happen often)
+        duration_ms = round((result.get("duration", 0) or 0) * 1000)
+        segments = [
+            TimingSegment(
+                id=0,
+                start_sec=0.0,
+                end_sec=round(duration_ms / 1000, 3),
+                start_ms=0,
+                end_ms=duration_ms,
+                duration_ms=duration_ms,
+                text=full_text,
+                words=None,
+            )
+        ]
+
+    return TimingResult(
+        segments=segments,
+        model=model,
+        backend="groq-whisper",
+        provider="groq-whisper",
+        language=language_detected,
+        source_audio=str(audio_path.resolve()),
+        timestamp_basis=("provider_segment_timestamps" if raw_segments else "fallback_full_text"),
+    )
 
 
 class GroqWhisperProvider(TranscriptionProvider):
@@ -69,6 +153,7 @@ class GroqWhisperProvider(TranscriptionProvider):
         language: str = "ru",
         word_timestamps: bool = False,
         quiet: bool = False,
+        on_raw_response: Callable[[bytes, str], None] | None = None,
     ) -> TimingResult:
         audio_path = Path(audio_path)
         if not audio_path.exists():
@@ -130,6 +215,12 @@ class GroqWhisperProvider(TranscriptionProvider):
             detail = resp.text[:500]
             raise RuntimeError(f"Groq API error {resp.status_code}: {detail}")
 
+        if on_raw_response is not None:
+            # Hand the exact successful response body to the caller before the
+            # fallible JSON parse, so a paid request can persist its private raw
+            # evidence first. A callback failure propagates and stops the parse.
+            on_raw_response(resp.content, resp.headers.get("Content-Type", "") or "")
+
         result = resp.json()
 
         if not quiet:
@@ -138,68 +229,10 @@ class GroqWhisperProvider(TranscriptionProvider):
                 file=sys.stderr,
             )
 
-        full_text = result.get("text", "").strip()
-        language_detected = result.get("language", language or "")
-
-        # Parse verbose_json segments
-        segments: list[TimingSegment] = []
-        raw_segments = result.get("segments", [])
-
-        if raw_segments:
-            for seg in raw_segments:
-                seg_id = seg.get("id", 0)
-                start_sec = seg.get("start", 0.0)
-                end_sec = seg.get("end", 0.0)
-                seg_text = seg.get("text", "").strip()
-                start_ms = round(start_sec * 1000)
-                end_ms = round(end_sec * 1000)
-                duration_ms = end_ms - start_ms
-
-                words_list = None
-                raw_words = seg.get("words", [])
-                if word_timestamps and raw_words:
-                    words_list = [
-                        {
-                            "word": w.get("word", "").strip(),
-                            "start_ms": round(w.get("start", 0) * 1000),
-                            "end_ms": round(w.get("end", 0) * 1000),
-                        }
-                        for w in raw_words
-                    ]
-
-                segments.append(
-                    TimingSegment(
-                        id=seg_id,
-                        start_sec=round(start_sec, 3),
-                        end_sec=round(end_sec, 3),
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        duration_ms=duration_ms,
-                        text=seg_text,
-                        words=words_list,
-                    )
-                )
-        else:
-            # Fallback: single segment from full text (shouldn't happen often)
-            duration_ms = round((result.get("duration", 0) or 0) * 1000)
-            segments = [
-                TimingSegment(
-                    id=0,
-                    start_sec=0.0,
-                    end_sec=round(duration_ms / 1000, 3),
-                    start_ms=0,
-                    end_ms=duration_ms,
-                    duration_ms=duration_ms,
-                    text=full_text,
-                    words=None,
-                )
-            ]
-
-        return TimingResult(
-            segments=segments,
+        return parse_groq_timing_result(
+            result,
             model=self.model,
-            backend="groq-whisper",
-            provider=self.provider_id,
-            language=language_detected,
-            source_audio=str(audio_path.resolve()),
+            language=language,
+            word_timestamps=word_timestamps,
+            audio_path=audio_path,
         )

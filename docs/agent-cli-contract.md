@@ -743,9 +743,11 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
 Локальные маршруты `transcribe` (`qwen-local`, `nemotron-local`), `timings` с
 `--asr-provider` и локальный `--timing-provider faster-whisper`, а также
 `verify-tts` записывают наблюдаемый результат в каноническую SQLite-историю по
-умолчанию. Это **фрагмент** S05: облачные timing-маршруты (`groq-whisper`,
-`xai-stt`, `openrouter-whisper`) и будущий облачный ASR остаются legacy и ничего
-не сохраняют до подтверждённого paid-submit контракта (S01/S07).
+умолчанию. Это **фрагмент** S05: локальные timing-маршруты и облачный
+`timings --timing-provider groq-whisper|xai-stt` сохранены (см. ниже), а
+`openrouter-whisper` (не даёт реальных таймстемпов), облачный dialogue-QA
+(`xai-stt`) и будущий облачный ASR остаются legacy и ничего не сохраняют до
+подтверждённого paid-submit контракта (S01/S07).
 
 - Управление — `settings.toml` в текущем каталоге: `[history] enabled = false`
   отключает запись полностью, и команда работает как раньше, не создавая дом,
@@ -797,6 +799,80 @@ voiceover timings --audio recording.wav --asr-provider qwen-local --output-dir o
 voiceover verify-tts --audio out/prod/full.mp3 --expected-file script.md --provider qwen-local --json
 voiceover history list --operation asr --json
 voiceover history show <run-uuid> --json
+```
+
+### Облачный `timings` (`groq-whisper` / `xai-stt`) — платный boundary (фрагмент S05)
+
+Standalone `voiceover timings --timing-provider groq-whisper|xai-stt` теперь
+сохраняет прогон в канонической истории и защищает единственный платный POST:
+
+- **Маркер до POST.** Сначала валидируется читаемый regular source
+  (канонический путь, размер, SHA-256), затем коммитится строка run с identity
+  запроса (provider, model, language, timestamp granularity, формат) и попытка
+  `status="submitting"`; `run_root` — это канонический output-root прогона, а не
+  сгенерированный history UUID. Провайдер вызывается только после успешного
+  коммита; сбой коммита означает **ноль** запросов.
+- **Один владелец на output-root.** Свежий вызов `timings` или `--overwrite`
+  против уже принадлежащего платному прогону root (включая `submitting` и
+  `completed`) fail-closed завершается `PAID_TIMING_OUTPUT_OWNED` **до**
+  удаления, чтения ключа и POST: владение привязано к каноническому output-root
+  (exact, untruncated lookup по `run_root` + платному origin, а не скан newest-N,
+  плюс приватный descriptor `.voiceover-paid-timing.json`). Отсутствующий
+  descriptor уступает committed-строке, а нечитаемая/чужая/новая/неоднозначная
+  БД завершается fail-closed, а не считается unowned. Все writer'ы делят одно
+  пространство канонического root, поэтому guard двусторонний под тем же run
+  lock: `generate` (native и legacy) отклоняет paid-owned root и его
+  descriptor/committed-строку/raw-evidence до выбора, удаления, чтения ключа и
+  POST, а маршрут `timings` так же отклоняет native-history-owned root. Явно
+  другой `--run-id`/output-dir — отдельное платное решение; `history
+  resume`/`sync` работают по UUID этого прогона. Один cross-process run lock на
+  output-root удерживается через ownership, reservation, POST, persistence и
+  публикацию.
+- **Сырой ответ до парсинга.** Сначала приватный receipt, затем точное тело
+  успешного ответа пишутся в `raw/<attempt>.body` (оба fsync/atomic) и только
+  потом линкуется артефакт `provider_raw_response` (`managed_relative`,
+  sha256/size) и попытка переходит в `raw_saved` — одной DB-транзакцией. Если
+  запись/линковка не удалась, попытка остаётся `submitting`, parse не выполняется.
+- **Crash-reconciliation.** Receipt публикуется **до** тела, поэтому crash сразу
+  после замены тела оставляет проверяемую пару; явный `history resume`
+  восстанавливает ту же попытку (`submitting → raw_saved`) и локально
+  воспроизводит тело (**0 POST**). Reconciliation принимает ровно нуль или один
+  совпадающий stored raw-артефакт, а каждый replay проверяет тот же артефакт
+  (attempt, managed path, обязательные size/hash) против receipt/тела, а не
+  выбирает первую строку; `history sync` никогда не reconcile-ит, а
+  mismatch/missing/tampered/oversized/symlink/дубликат/чужой receipt или тело
+  остаются заблокированы.
+- **Завершение.** После успеха записываются transcript (`asr_transcript`), ссылки
+  на `<prefix>.timings.json`/`.srt` (публикуются atomic temp-replace внутри
+  проверенного output-root) и provenance (`timestamp_basis`:
+  `provider_segment_timestamps`, `derived_from_provider_words` или
+  `fallback_full_text`), попытка переходит в `completed`, run закрывается одной
+  транзакцией; пропавший обязательный артефакт завершает прогон fail-closed.
+- **Источник и путь.** Продолжение проверяет источник (path/size/SHA) **до**
+  parse/ffprobe/публикации; замена/удаление источника отказывает в recovery и
+  сохраняет raw. Symlink-лист артефакта не разворачивается, source внутри
+  удаляемого output-subtree запрещает удаление.
+- **Безопасность при неопределённости.** Сбой/таймаут POST оставляет попытку
+  `submitting` — никакой автоматический retry, resume или sync не сделает второй
+  POST. `history resume`/`sync` читают состояние только через read-only
+  consistent view (без migrate, journal-switch и sidecar): `-wal` без пригодного
+  `-shm` отклоняется, а не открывается (чтение не создаёт sidecar), и
+  run/attempt/artifact-выборки идут в одной явной deferred read-транзакции,
+  поэтому вклинившийся commit writer'а не рвёт снимок; повреждённая или
+  несовместимая БД — fixed error, а не «unknown UUID», и нечитаемая/непригодная
+  БД не трактуется как unowned перед удалением.
+- **Деньги и приватность.** Цена всегда `null` (unknown), remote id не
+  выдумывается. Сырое тело и transcript приватны и не попадают в
+  `--json`/`history show`/`costs`; `history costs` видит облачную попытку как
+  unknown (`completeness: partial`), не как локальную.
+- **Требуется history.** Если `settings.toml` отключает историю, команда
+  fail-closed завершается с `PAID_TIMING_HISTORY_REQUIRED` **до** запроса,
+  удаления и чтения ключа.
+
+```bash
+voiceover timings --audio recording.wav --timing-provider groq-whisper --output-dir out --run-id rec --json
+voiceover history resume <run-uuid> --json   # локальный replay без второго POST
+voiceover history sync <run-uuid> --json     # только чтение, модель не запускается
 ```
 
 ## `verify-tts` — fail-closed quality gate

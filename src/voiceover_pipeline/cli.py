@@ -72,6 +72,7 @@ from .gemini_dialogue import (
     is_dialogue_format,
     validate_gemini_dialogue_file,
 )
+from .history import paid_transcription as paid_transcription_history
 from .history.locking import HistoryRunLockedError, acquire_run_lock
 from .history.native_asr import (
     ARTIFACT_ROLE_QUALITY_RECEIPT,
@@ -95,6 +96,7 @@ from .history.native_asr import (
 )
 from .history.repository import (
     DEFAULT_QUERY_LIMIT,
+    RUN_STATUS_COMPLETED,
     TEXT_COMPLETENESS_COMPLETE,
     TEXT_COMPLETENESS_INCOMPLETE,
     TEXT_KIND_ASR_CONTEXT,
@@ -1215,6 +1217,11 @@ def generate(args: argparse.Namespace) -> None:
             _EXIT_PROVIDER,
             details={"error_code": native_ownership.error_code or "NATIVE_OWNERSHIP_UNVERIFIABLE"},
         )
+    # The paid timings route owns the same canonical output root namespace. A
+    # committed paid run -- pending or completed, even one whose descriptor write
+    # failed -- or its local evidence means this directory belongs to that paid
+    # submit, so no generate route may select, overwrite, or admit it.
+    _reject_paid_owned_root_for_generate(paths)
     if native_ownership.route == "native_existing" or (
         _native_route_eligible(args, script_format) and not paths.output_root.exists()
     ):
@@ -1288,6 +1295,7 @@ def generate(args: argparse.Namespace) -> None:
         # Re-resolve with the WAL-consistent reader and fail closed, rather than let
         # the legacy writer create, resume, overwrite, or delete a native-owned root.
         _reject_native_owned_root_for_legacy(paths)
+        _reject_paid_owned_root_for_generate(paths)
 
         if paths.output_root.exists():
             if args.skip_existing:
@@ -1670,6 +1678,31 @@ def _reject_native_owned_root_for_legacy(paths) -> None:
         _EXIT_PROVIDER,
         details={"error_code": decision.error_code or "NATIVE_OWNERSHIP_UNVERIFIABLE"},
     )
+
+
+def _reject_paid_owned_root_for_generate(paths) -> None:
+    """Fail closed when a root the generate writer is about to touch is paid-owned.
+
+    The paid timings route binds ownership to the same canonical output root, so a
+    committed paid timing run -- still ``submitting`` or completed -- or a paid
+    timing ownership descriptor/local evidence means the directory belongs to that
+    paid submit. A generate route must not select it, overwrite it, or freshly
+    admit it, because a second paid submit or a deleted raw response is not
+    recoverable. This runs under the shared run-root lock so a concurrent paid
+    writer cannot commit between the ownership read and the generate write.
+    """
+    try:
+        ownership = paid_transcription_history.resolve_paid_timing_ownership(paths.output_root)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_PROVIDER, details={"error_code": exc.error_code})
+    if ownership.owned:
+        fail(
+            "This run directory is owned by a paid timing run; a generate invocation or "
+            "--overwrite cannot replace its paid evidence. Use `history resume`/`history "
+            "sync` with its UUID, or choose a different --run-id.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TIMING_OUTPUT_OWNED", "run_uuid": ownership.run_uuid},
+        )
 
 
 def _run_native_route(
@@ -2655,6 +2688,112 @@ def _timings_history_save(
     )
 
 
+_PAID_TIMING_PROVIDERS = frozenset({"groq-whisper", "xai-stt"})
+
+# The adapter default model each paid timing provider uses when the caller omits
+# ``--model``; kept in sync with ``services.transcription.transcribe_timing_audio``.
+_PAID_TIMING_DEFAULT_MODELS = {"groq-whisper": "whisper-large-v3-turbo", "xai-stt": "grok-stt"}
+
+
+def _history_configured_enabled() -> bool:
+    """Whether canonical history is enabled, failing closed on a bad setting."""
+    try:
+        return bool(settings_module.load_history_settings().enabled)
+    except Exception:
+        return False
+
+
+def _paid_timing_model(timing_provider: str, model: str | None) -> str:
+    """Return the effective model a paid timing request will send."""
+    return model or _PAID_TIMING_DEFAULT_MODELS.get(timing_provider, "")
+
+
+def _paid_timing_request_options(timing_provider: str, word_timestamps: bool) -> dict[str, Any]:
+    """Return the exact provider request shape the adapter will send."""
+    if timing_provider == "groq-whisper":
+        granularities = ["segment", "word"] if word_timestamps else ["segment"]
+        return {"response_format": "verbose_json", "timestamp_granularities": granularities}
+    return {"format": "true"}
+
+
+def _reserve_paid_timing(
+    args: argparse.Namespace, audio_path: Path, output_dir: Path, run_id: str
+) -> paid_transcription_history.PaidTranscriptionReservation:
+    """Commit the paid timing attempt marker before the adapter may POST."""
+    provider = args.timing_provider
+    request = paid_transcription_history.PaidTranscriptionRequest(
+        call_type=paid_transcription_history.ATTEMPT_CALL_TYPE_PAID_TIMING,
+        provider=provider,
+        model=_paid_timing_model(provider, args.model),
+        language=args.language,
+        word_timestamps=bool(args.word_timestamps),
+        source_audio=audio_path,
+        output_root=output_dir,
+        request_options={
+            **_paid_timing_request_options(provider, bool(args.word_timestamps)),
+            "timestamp_granularity": "word" if args.word_timestamps else "segment",
+            "output_dir": str(output_dir),
+            "output_prefix": run_id,
+        },
+        user_label=run_id,
+    )
+    try:
+        return paid_transcription_history.reserve_paid_transcription(request)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+
+
+def _complete_paid_timing(
+    reservation: paid_transcription_history.PaidTranscriptionReservation, files: dict[str, str]
+) -> None:
+    """Record the observed transcript and timing artifacts and close the run."""
+    manifest = json.loads(Path(files["timings_json"]).read_text(encoding="utf-8"))
+    segments = manifest.get("segments") or []
+    transcript = " ".join(str(segment.get("text") or "") for segment in segments).strip()
+    artifacts = (
+        AsrHistoryArtifact(
+            role=ARTIFACT_ROLE_TIMINGS_JSON,
+            path=Path(files["timings_json"]),
+            mime="application/json",
+            media_metadata={
+                "timestamp_basis": manifest.get("timestamp_basis") or "unknown",
+                "segment_count": len(segments),
+                "total_duration_ms": manifest.get("total_duration_ms"),
+            },
+        ),
+        AsrHistoryArtifact(
+            role=ARTIFACT_ROLE_SRT,
+            path=Path(files["srt"]),
+            mime="application/x-subrip",
+        ),
+    )
+    text_sources = (
+        AsrHistoryText(
+            kind=TEXT_KIND_ASR_TRANSCRIPT,
+            content=transcript,
+            language=manifest.get("language") or None,
+            text_completeness=_transcript_completeness(transcript),
+        ),
+    )
+    metadata = {
+        "timestamp_basis": manifest.get("timestamp_basis") or "unknown",
+        "segment_count": len(segments),
+        "total_duration_ms": manifest.get("total_duration_ms"),
+        "backend": manifest.get("backend"),
+        "cost_known": False,
+    }
+    try:
+        paid_transcription_history.complete_paid_transcription(
+            reservation,
+            artifacts=artifacts,
+            text_sources=text_sources,
+            result_metadata=metadata,
+            required_artifact_roles=(ARTIFACT_ROLE_TIMINGS_JSON, ARTIFACT_ROLE_SRT),
+        )
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+
+
 def run_timings(args: argparse.Namespace) -> None:
     try:
         check_media_tools()
@@ -2667,37 +2806,194 @@ def run_timings(args: argparse.Namespace) -> None:
         _validate_run_id(args.run_id)
     _validate_output_dir(args.output_dir)
     run_id = args.run_id or audio_path.stem
-    output_dir = (Path(args.output_dir) / run_id).resolve()
+    # Keep the user-supplied output leaf lexically, before ``resolve()`` follows
+    # it. A symlinked leaf is refused here instead of being silently redirected to
+    # whatever target it points at, and the same locator is rechecked under the
+    # run lock before any reservation or publication.
+    lexical_output = Path(args.output_dir).expanduser() / run_id
+    _reject_symlinked_output_leaf(lexical_output)
+    output_dir = lexical_output.resolve()
 
-    if output_dir.exists():
-        if args.skip_existing:
-            timing_json = output_dir / f"{run_id}.timings.json"
-            srt_path = output_dir / f"{run_id}.srt"
-            files = {"timings_json": str(timing_json), "srt": str(srt_path)}
-            if args.json_output:
-                _json_ok(
-                    {
-                        "status": "skipped",
-                        "reason": "output dir exists",
-                        "run_id": run_id,
-                        "files": files,
-                    }
-                )
-            else:
-                print(f"Skipping: output dir exists: {output_dir}")
-            return
-        if not args.overwrite:
-            fail(
-                f"Output dir exists: {output_dir}. Use --overwrite or --skip-existing.",
-                _EXIT_PROVIDER,
+    cloud_timing = (
+        not args.asr_provider
+        and getattr(args, "timing_provider", "faster-whisper") in _PAID_TIMING_PROVIDERS
+    )
+    if cloud_timing:
+        _run_cloud_timing(args, audio_path, lexical_output, output_dir, run_id)
+        return
+    _run_local_timings(args, audio_path, lexical_output, output_dir, run_id)
+
+
+def _reject_symlinked_output_leaf(output_leaf: Path) -> None:
+    """Refuse a user-supplied output leaf that is a symlink, before it is followed."""
+    if output_leaf.is_symlink():
+        fail(
+            "Refusing to use a symlinked timings output directory.",
+            _EXIT_OUTPUT,
+            details={"error_code": "PAID_TIMING_OWNERSHIP_UNVERIFIABLE"},
+        )
+
+
+def _guard_foreign_timings_root(output_leaf: Path) -> None:
+    """Fail closed when a timings output root belongs to another route's writer.
+
+    Ownership is bound to the canonical output root, so *every* fresh timings
+    invocation -- including ``--overwrite`` -- against a paid-owned root (a still
+    ``submitting`` run or a completed one), or against a native-history-owned
+    root, stops before any deletion, key access, or POST. The caller resuming or
+    syncing keeps using that run's UUID; the lexical leaf is checked first so a
+    leaf swapped to a symlink after the command started is refused rather than
+    followed to a fresh target.
+    """
+    _reject_symlinked_output_leaf(output_leaf)
+    try:
+        ownership = paid_transcription_history.resolve_paid_timing_ownership(output_leaf)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+    if ownership.owned:
+        fail(
+            "This output directory is owned by a paid timing run; a fresh invocation or "
+            "--overwrite cannot replace it. Use `history resume`/`history sync` with its "
+            "UUID, or choose a different --run-id.",
+            _EXIT_OUTPUT,
+            details={"error_code": "PAID_TIMING_OUTPUT_OWNED", "run_uuid": ownership.run_uuid},
+        )
+    try:
+        native_decision = native_generation.resolve_native_ownership(output_leaf)
+    except native_generation.NativeGenerationError as exc:
+        fail(str(exc), exc.code, details={"error_code": exc.error_code})
+    if native_decision.route != "legacy":
+        fail(
+            "This output directory is owned by native history; a timings run cannot replace "
+            "its committed run or local evidence. Choose a different --run-id.",
+            _EXIT_OUTPUT,
+            details={
+                "error_code": native_decision.error_code or "NATIVE_TIMING_OUTPUT_OWNED",
+                "run_uuid": native_decision.run_uuid,
+            },
+        )
+
+
+def _reject_source_inside_output(audio_path: Path, output_dir: Path) -> None:
+    """Refuse to delete an output directory that contains the source audio."""
+    try:
+        resolved_audio = audio_path.resolve()
+        resolved_output = output_dir.resolve()
+        resolved_audio.relative_to(resolved_output)
+    except ValueError:
+        return
+    fail(
+        f"Refusing to remove output directory {resolved_output}: the source audio is inside it.",
+        _EXIT_OUTPUT,
+        details={"error_code": "PAID_SOURCE_INSIDE_OUTPUT"},
+    )
+
+
+def _handle_timings_output_dir(
+    args: argparse.Namespace, output_dir: Path, run_id: str, audio_path: Path
+) -> bool:
+    """Handle an already-existing timings output dir; return True when handled.
+
+    ``--skip-existing`` reports the existing run and stops. Without ``--overwrite``
+    an existing directory is a usage error. With ``--overwrite`` the source audio
+    is proven not to live inside the directory before it is removed.
+    """
+    if not output_dir.exists():
+        return False
+    if args.skip_existing:
+        timing_json = output_dir / f"{run_id}.timings.json"
+        srt_path = output_dir / f"{run_id}.srt"
+        files = {"timings_json": str(timing_json), "srt": str(srt_path)}
+        if args.json_output:
+            _json_ok(
+                {
+                    "status": "skipped",
+                    "reason": "output dir exists",
+                    "run_id": run_id,
+                    "files": files,
+                }
             )
-        _safe_remove_run_dir(output_dir, args.output_dir)
+        print(f"Skipping: output dir exists: {output_dir}")
+        return True
+    if not args.overwrite:
+        fail(
+            f"Output dir exists: {output_dir}. Use --overwrite or --skip-existing.",
+            _EXIT_PROVIDER,
+        )
+    _reject_source_inside_output(audio_path, output_dir)
+    _safe_remove_run_dir(output_dir, args.output_dir)
+    return False
 
+
+def _print_timings_result(
+    args: argparse.Namespace,
+    files: dict[str, str],
+    timing: dict[str, Any],
+    history_block: dict[str, Any] | None,
+    persistence_ok: bool,
+) -> None:
+    if args.json_output:
+        payload: dict[str, Any] = {
+            "status": "success" if persistence_ok else "partial",
+            "files": files,
+            "segment_count": timing["segment_count"],
+            "duration_ms": timing["total_duration_ms"],
+        }
+        if history_block is not None:
+            payload["history"] = history_block
+        print(json.dumps(payload, ensure_ascii=False))
+    else:
+        print(f"Timings JSON: {files['timings_json']}")
+        print(f"SRT: {files['srt']}")
+        print(f"Segments: {timing['segment_count']}")
+    if not persistence_ok:
+        _report_persistence_failure(json_output=args.json_output)
+    if args.json_output:
+        sys.exit(_EXIT_OK)
+
+
+def _run_local_timings(
+    args: argparse.Namespace,
+    audio_path: Path,
+    output_leaf: Path,
+    output_dir: Path,
+    run_id: str,
+) -> None:
+    """Run a local (or legacy cloud) timings route under the shared run lock.
+
+    The local route deletes and writes the canonical output root, so it holds the
+    same cross-process run lock the paid and native routes take. Ownership is
+    re-resolved under that lock, so a paid reservation committed after the early
+    lexical check -- even with ``--overwrite`` -- is never deleted or overwritten.
+    The local history writer takes no lock of its own, so this does not double-lock.
+    """
+    try:
+        with acquire_run_lock(output_dir):
+            _run_local_timings_locked(args, audio_path, output_leaf, output_dir, run_id)
+    except HistoryRunLockedError:
+        fail(
+            "Another process is already writing this timings run directory; refusing to run "
+            "two writers for one output root.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TIMING_RUN_LOCKED"},
+        )
+
+
+def _run_local_timings_locked(
+    args: argparse.Namespace,
+    audio_path: Path,
+    output_leaf: Path,
+    output_dir: Path,
+    run_id: str,
+) -> None:
+    """Body of the local timings route, already holding the output-root lock."""
+    _guard_foreign_timings_root(output_leaf)
+    if _handle_timings_output_dir(args, output_dir, run_id, audio_path):
+        return
     try:
         output_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         fail(f"Failed to create output directory {output_dir}: {e}", _EXIT_OUTPUT)
-
     try:
         if args.asr_provider:
             timing = _extract_asr_timings(
@@ -2723,6 +3019,8 @@ def run_timings(args: argparse.Namespace) -> None:
                 word_timestamps=args.word_timestamps,
                 quiet=args.json_output,
             )
+    except CliError:
+        raise
     except ModuleNotFoundError as exc:
         fail(
             f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
@@ -2736,25 +3034,111 @@ def run_timings(args: argparse.Namespace) -> None:
         "srt": str(output_dir / f"{run_id}.srt"),
     }
     save = _persist_history(lambda: _timings_history_save(args, audio_path, files))
-    history_block = save.metadata()
-    if args.json_output:
-        payload: dict[str, Any] = {
-            "status": "success" if (save.saved or not save.active) else "partial",
-            "files": files,
-            "segment_count": timing["segment_count"],
-            "duration_ms": timing["total_duration_ms"],
-        }
-        if history_block is not None:
-            payload["history"] = history_block
-        print(json.dumps(payload, ensure_ascii=False))
-    else:
-        print(f"Timings JSON: {files['timings_json']}")
-        print(f"SRT: {files['srt']}")
-        print(f"Segments: {timing['segment_count']}")
-    if history_block is not None and not save.saved:
-        _report_persistence_failure(json_output=args.json_output)
-    if args.json_output:
-        sys.exit(_EXIT_OK)
+    persistence_ok = save.saved or not save.active
+    _print_timings_result(args, files, timing, save.metadata(), persistence_ok)
+
+
+def _run_cloud_timing(
+    args: argparse.Namespace,
+    audio_path: Path,
+    output_leaf: Path,
+    output_dir: Path,
+    run_id: str,
+) -> None:
+    """Run the standalone paid cloud timing route under the shared run lock.
+
+    The history-disabled and readable-source checks run before any lock, directory
+    creation, deletion, or key access. The canonical output root's cross-process
+    lock is then held across ownership selection, reservation, POST, persistence,
+    and publication, so two invocations can never issue two paid submits. The
+    lexical output leaf is rechecked under that lock so a leaf swapped to a
+    symlink after the command started is refused rather than redirected.
+    """
+    if not _history_configured_enabled():
+        fail(
+            "Cloud timing providers require canonical history so their paid-submit marker "
+            "can be committed before the request; history is disabled in settings.toml.",
+            _EXIT_OUTPUT,
+            details={"error_code": "PAID_TIMING_HISTORY_REQUIRED"},
+        )
+    try:
+        source_identity = paid_transcription_history.require_readable_source(audio_path)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_ARGS, details={"error_code": exc.error_code})
+    try:
+        with acquire_run_lock(output_dir):
+            _run_cloud_timing_locked(
+                args, audio_path, output_leaf, output_dir, run_id, source_identity
+            )
+    except HistoryRunLockedError:
+        fail(
+            "Another process is already writing this timings run directory; refusing to run "
+            "two writers for one output root.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TIMING_RUN_LOCKED"},
+        )
+
+
+def _run_cloud_timing_locked(
+    args: argparse.Namespace,
+    audio_path: Path,
+    output_leaf: Path,
+    output_dir: Path,
+    run_id: str,
+    source_identity: tuple[str, int, str],
+) -> None:
+    """Body of the paid cloud timing route, already holding the output-root lock."""
+    _guard_foreign_timings_root(output_leaf)
+    if _handle_timings_output_dir(args, output_dir, run_id, audio_path):
+        return
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        fail(f"Failed to create output directory {output_dir}: {e}", _EXIT_OUTPUT)
+
+    reservation = _reserve_paid_timing(args, audio_path, output_dir, run_id)
+    raw_sink = lambda body, content_type: (  # noqa: E731 - bound once for the adapter sink
+        paid_transcription_history.record_paid_transcription_raw(
+            reservation, body=body, content_type=content_type
+        )
+    )
+    artifact_writer = lambda audio, out, prefix, timing: _write_paid_timing_artifacts(  # noqa: E731
+        audio, out, prefix, timing, source_identity
+    )
+    try:
+        timing = _extract_timings(
+            audio_path=audio_path,
+            output_dir=output_dir,
+            prefix=run_id,
+            timing_provider=args.timing_provider,
+            model=args.model,
+            device=args.device,
+            compute_type=args.compute or DEFAULT_TIMING_COMPUTE,
+            language=args.language,
+            word_timestamps=args.word_timestamps,
+            quiet=args.json_output,
+            on_raw_response=raw_sink,
+            artifact_writer=artifact_writer,
+        )
+    except CliError:
+        raise
+    except ModuleNotFoundError as exc:
+        fail(
+            f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
+            _EXIT_MISSING_DEP,
+        )
+    except Exception as exc:
+        # A cloud POST that failed or timed out leaves the attempt marker in
+        # ``submitting``; the command reports the failure and never resubmits.
+        fail(f"Whisper timing failed: {exc}", _EXIT_WHISPER)
+
+    files = {
+        "timings_json": str(output_dir / f"{run_id}.timings.json"),
+        "srt": str(output_dir / f"{run_id}.srt"),
+    }
+    _complete_paid_timing(reservation, files)
+    history_block: dict[str, Any] | None = {"saved": True, "run_uuid": reservation.run_uuid}
+    _print_timings_result(args, files, timing, history_block, True)
 
 
 def status_cmd(args: argparse.Namespace) -> None:
@@ -3430,8 +3814,17 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
         return
 
     if subcommand in ("resume", "sync"):
-        files = payload["files"]
         verb = "Resumed" if subcommand == "resume" else "Synced"
+        if payload.get("operation") == OPERATION_TIMINGS:
+            print(f"{verb} timings run {payload['run_uuid']} (revision {payload['revision']})")
+            print(f"  status: {payload['status']}")
+            files = payload.get("files") or {}
+            if files.get("timings_json"):
+                print(f"  Timings JSON: {files['timings_json']}")
+            if files.get("srt"):
+                print(f"  SRT: {files['srt']}")
+            return
+        files = payload["files"]
         print(f"{verb} run {payload['run_uuid']} (revision {payload['revision']})")
         print(f"  Full MP3: {files['full_mp3']}")
         print(f"  Run manifest: {files['run_json']}")
@@ -3694,6 +4087,199 @@ def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
 
 
+def _paid_output_root(
+    state: paid_transcription_history.PaidTranscriptionState,
+) -> Path | None:
+    """Return the canonical output root a paid timing run recorded, or ``None``."""
+    value = state.snapshot.get("output_root")
+    if isinstance(value, str) and value:
+        return Path(value)
+    options = state.snapshot.get("request_options")
+    if isinstance(options, dict):
+        fallback = options.get("output_dir")
+        if isinstance(fallback, str) and fallback:
+            return Path(fallback)
+    return None
+
+
+def _paid_timing_files(state: paid_transcription_history.PaidTranscriptionState) -> dict[str, str]:
+    """Return the timings/SRT paths one paid timing run recorded, or an empty map."""
+    options = state.snapshot.get("request_options")
+    opts = options if isinstance(options, dict) else {}
+    output_dir_value = opts.get("output_dir")
+    prefix = opts.get("output_prefix")
+    if isinstance(output_dir_value, str) and isinstance(prefix, str):
+        output_dir = Path(output_dir_value)
+        return {
+            "timings_json": str(output_dir / f"{prefix}.timings.json"),
+            "srt": str(output_dir / f"{prefix}.srt"),
+        }
+    return {}
+
+
+def _paid_timing_payload(
+    state: paid_transcription_history.PaidTranscriptionState, mode: str
+) -> dict[str, Any]:
+    completed = state.status == RUN_STATUS_COMPLETED
+    return {
+        "dry_run": False,
+        "mode": mode,
+        "run_uuid": state.run_uuid,
+        "revision": state.revision,
+        "operation": OPERATION_TIMINGS,
+        "status": state.status,
+        "complete": completed,
+        "files": _paid_timing_files(state),
+    }
+
+
+def _paid_transcription_history_command(
+    args: argparse.Namespace, mode: str
+) -> dict[str, Any] | None:
+    """Handle ``history resume``/``sync`` for one paid cloud-timing run.
+
+    Returns ``None`` only when the UUID is not a paid transcription timing run, so
+    the ordinary native-TTS reader handles it unchanged; a corrupt, unreadable, or
+    otherwise malformed paid run fails closed with its own fixed error instead of
+    being reclassified as “not this handler.” ``history sync`` never touches a
+    provider, a model, or a writer. ``history resume`` holds the same canonical
+    output-root lock, reloads the state after acquiring it, reconciles a crash
+    window the receipt validates, and otherwise replays the exact attempt's stored
+    response locally (no second POST); while the attempt stays an unconfirmed
+    ``submitting`` marker it fails closed with ``PAID_SUBMIT_UNCONFIRMED``.
+    """
+    try:
+        state = paid_transcription_history.load_paid_transcription_state(args.run)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        if exc.error_code in (
+            "PAID_TRANSCRIPTION_NOT_FOUND",
+            "PAID_TRANSCRIPTION_NOT_PAID",
+        ):
+            # Unknown or non-paid UUIDs dispatch onward to the native-TTS reader.
+            return None
+        fail(str(exc), _EXIT_PROVIDER, details={"error_code": exc.error_code})
+    if state.operation != OPERATION_TIMINGS:
+        return None
+    if mode == "sync" or state.status == RUN_STATUS_COMPLETED:
+        return _paid_timing_payload(state, mode)
+    output_root = _paid_output_root(state)
+    if output_root is None:
+        fail(
+            "Refusing to resume: this paid timing run does not record its output location.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TRANSCRIPTION_UNSUPPORTED"},
+        )
+    try:
+        with acquire_run_lock(output_root):
+            fresh = paid_transcription_history.load_paid_transcription_state(state.run_uuid)
+            return _resume_paid_timing(fresh, output_root)
+    except HistoryRunLockedError:
+        fail(
+            "Another process is already writing this paid timing run directory; refusing to "
+            "resume two writers for one output root.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TIMING_RUN_LOCKED"},
+        )
+
+
+def _resume_paid_timing(
+    state: paid_transcription_history.PaidTranscriptionState, output_root: Path
+) -> dict[str, Any]:
+    """Replay or reconcile one paid timing run under the already-held run lock."""
+    if state.status == RUN_STATUS_COMPLETED:
+        return _paid_timing_payload(state, "resume")
+    files = _paid_timing_files(state)
+    if state.attempt_status == "submitting":
+        try:
+            recovered = paid_transcription_history.recover_paid_transcription_after_crash(
+                state.run_uuid
+            )
+        except paid_transcription_history.PaidTranscriptionError:
+            recovered = None
+        if recovered is None:
+            fail(
+                "Refusing to resume: this paid timing request has an unconfirmed submit; a "
+                "new attempt is never made automatically.",
+                _EXIT_PROVIDER,
+                details={"error_code": _PAID_SUBMIT_UNCONFIRMED_ERROR_CODE},
+            )
+        state = paid_transcription_history.load_paid_transcription_state(state.run_uuid)
+    if not state.raw_saved:
+        fail(
+            "Refusing to resume: this paid timing run has no saved response to replay.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TRANSCRIPTION_UNSUPPORTED"},
+        )
+    _replay_paid_timing(state, files, output_root)
+    payload = _paid_timing_payload(state, "resume")
+    payload["complete"] = True
+    payload["status"] = RUN_STATUS_COMPLETED
+    return payload
+
+
+def _replay_paid_timing(
+    state: paid_transcription_history.PaidTranscriptionState,
+    files: dict[str, str],
+    output_root: Path,
+) -> None:
+    """Re-parse the saved raw response and republish the timing artifacts."""
+    if not files:
+        fail(
+            "Refusing to replay: this paid timing run does not record its output location.",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TRANSCRIPTION_UNSUPPORTED"},
+        )
+    try:
+        audio_path = paid_transcription_history.verify_source_identity(state.snapshot)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+    try:
+        body = paid_transcription_history.read_paid_transcription_raw(state.run_uuid)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+    try:
+        raw = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        fail(
+            f"The saved paid timing response is not valid JSON: {exc}",
+            _EXIT_PROVIDER,
+            details={"error_code": "PAID_TRANSCRIPTION_UNSUPPORTED"},
+        )
+    snapshot = state.snapshot
+    language = snapshot.get("language") or ""
+    word_timestamps = bool(snapshot.get("word_timestamps_requested"))
+    if state.provider == "groq-whisper":
+        from .providers.groq_whisper import parse_groq_timing_result
+
+        timing = parse_groq_timing_result(
+            raw,
+            model=state.model,
+            language=str(language),
+            word_timestamps=word_timestamps,
+            audio_path=audio_path,
+        )
+    else:
+        from .providers.xai_stt import parse_xai_timing_result
+
+        timing = parse_xai_timing_result(
+            raw,
+            model=state.model,
+            language=str(language),
+            word_timestamps=word_timestamps,
+            audio_path=audio_path,
+        )
+    output_dir = output_root
+    prefix = Path(files["timings_json"]).name[: -len(".timings.json")]
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        source_identity = paid_transcription_history.require_readable_source(audio_path)
+        _write_paid_timing_artifacts(audio_path, output_dir, prefix, timing, source_identity)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+    reservation = paid_transcription_history.reservation_from_state(state)
+    _complete_paid_timing(reservation, files)
+
+
 def _history_native_command(args: argparse.Namespace, mode: str) -> dict[str, Any]:
     """Resume or sync one committed native TTS run from its stored snapshot.
 
@@ -3709,6 +4295,9 @@ def _history_native_command(args: argparse.Namespace, mode: str) -> dict[str, An
     submit and never runs a local model, so a missing timing or verification stays
     incomplete (``quality.complete`` is ``false``) for an explicit resume.
     """
+    paid_payload = _paid_transcription_history_command(args, mode)
+    if paid_payload is not None:
+        return paid_payload
     view = history_commands.load_native_history_view(args.run)
     try:
         ffmpeg_path, ffprobe_path = check_media_tools()
@@ -4106,6 +4695,45 @@ def _extract_asr_timings(
     return _write_timing_artifacts(audio_path, output_dir, prefix, timing)
 
 
+def _write_paid_timing_artifacts(audio_path, output_dir, prefix, timing, source_identity):
+    """Publish the paid timing artifacts atomically after re-checking the source.
+
+    The paid route re-verifies the source audio immediately after the provider
+    response and before probing or publishing, so a mid-request replacement never
+    yields a transcript with misleading provenance. Each artifact is written via
+    an fsynced temporary file and an atomic replacement inside the validated
+    output root, so an attacker-planted symlink leaf is never followed.
+    """
+    try:
+        verified_source = paid_transcription_history.require_readable_source(audio_path)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+    if verified_source != tuple(source_identity):
+        fail(
+            "The source audio changed during the paid timing request; refusing to publish "
+            "misleading timing provenance.",
+            _EXIT_OUTPUT,
+            details={"error_code": "PAID_SOURCE_CHANGED"},
+        )
+    ffprobe_path = shutil.which("ffprobe")
+    duration_ms = (
+        mp3_duration_ms(ffprobe_path, audio_path)
+        if ffprobe_path
+        else sum(seg.duration_ms for seg in timing.segments)
+    )
+    manifest = build_timing_manifest(timing, duration_ms)
+    srt_text = build_srt(timing)
+    paid_transcription_history.atomic_write_artifact(
+        output_dir,
+        f"{prefix}.timings.json",
+        (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"),
+    )
+    paid_transcription_history.atomic_write_artifact(
+        output_dir, f"{prefix}.srt", srt_text.encode("utf-8")
+    )
+    return {"segment_count": len(timing.segments), "total_duration_ms": duration_ms}
+
+
 def _extract_timings(
     audio_path,
     output_dir,
@@ -4117,6 +4745,8 @@ def _extract_timings(
     language,
     word_timestamps=False,
     quiet=False,
+    on_raw_response=None,
+    artifact_writer=None,
 ):
     if timing_provider == "openrouter-whisper":
         fail(
@@ -4140,10 +4770,14 @@ def _extract_timings(
         language=language,
         word_timestamps=word_timestamps,
         quiet=quiet,
+        on_raw_response=on_raw_response,
     )
 
+    writer = artifact_writer or _write_timing_artifacts
     try:
-        result = _write_timing_artifacts(audio_path, output_dir, prefix, timing)
+        result = writer(audio_path, output_dir, prefix, timing)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
     except Exception as e:
         fail(f"Failed to write timing artifacts: {e}", _EXIT_OUTPUT)
 

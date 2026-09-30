@@ -92,6 +92,12 @@ class TimingResult:
     compute_type: str = ""
     language: str = ""
     source_audio: str = ""
+    # Honest, provider-reported provenance of the returned spans. A cloud adapter
+    # sets ``provider_segment_timestamps`` for its own segment spans,
+    # ``derived_from_provider_words`` when it synthesized segments from provider
+    # word spans, and ``fallback_full_text`` for a single span covering the whole
+    # clip; a local adapter may leave it empty.
+    timestamp_basis: str = ""
 
 
 ASRAlignmentOrigin = Literal["native", "forced", "chunked"]

@@ -600,42 +600,6 @@ def test_timings_faster_whisper_persists_provider_segment_provenance(
     assert _rows(asr_home, "SELECT content FROM text_sources")[0]["content"] == TRANSCRIPT
 
 
-def test_timings_cloud_route_stays_legacy_and_persists_nothing(tmp_path, monkeypatch, capsys):
-    home = tmp_path / "home"
-    home.mkdir(mode=0o700)
-    monkeypatch.setenv("VOICEOVER_HOME", str(home))
-    audio = _audio(tmp_path)
-    timing = TimingResult(
-        segments=[
-            TimingSegment(
-                id=1,
-                start_sec=0.0,
-                end_sec=1.0,
-                start_ms=0,
-                end_ms=1000,
-                duration_ms=1000,
-                text=TRANSCRIPT,
-            )
-        ],
-        model="grok-stt",
-        backend="xai-stt",
-        provider="xai-stt",
-        device="",
-        compute_type="",
-        language="ru",
-    )
-    monkeypatch.setattr(transcription, "transcribe_timing_audio", lambda **_kwargs: timing)
-
-    code = _run_timings(monkeypatch, audio, tmp_path, extra=("--timing-provider", "xai-stt"))
-
-    assert code == 0
-    data = json.loads(capsys.readouterr().out)
-    assert data["status"] == "success"
-    assert "history" not in data
-    assert Path(data["files"]["timings_json"]).is_file()
-    assert not (home / "history.sqlite3").exists()
-
-
 def test_timings_text_only_asr_is_refused_before_any_timing_artifact(
     asr_home, tmp_path, monkeypatch, capsys
 ):

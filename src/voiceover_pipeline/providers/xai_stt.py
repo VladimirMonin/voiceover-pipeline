@@ -8,6 +8,7 @@ API reference: https://docs.x.ai/developers/model-capabilities/audio/speech-to-t
 
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,106 @@ _AUDIO_FORMAT_MAP = {
     ".mpeg": "mpeg",
     ".mpga": "mpga",
 }
+
+
+def parse_xai_timing_result(
+    result: dict[str, Any],
+    *,
+    model: str,
+    language: str,
+    word_timestamps: bool,
+    audio_path: Path,
+) -> TimingResult:
+    """Convert one xAI STT body into a :class:`TimingResult`.
+
+    Pure function of the already-received payload, so a stored raw response can be
+    replayed locally with no second POST. xAI returns word spans, not segments, so
+    the pseudo-segments are grouped from the provider words and the honest
+    ``timestamp_basis`` is ``derived_from_provider_words``; the single-span
+    fallback is ``fallback_full_text``.
+    """
+    full_text = result.get("text", "").strip()
+    language_detected = result.get("language", language or "")
+
+    raw_words = result.get("words", [])
+    segments: list[TimingSegment] = []
+
+    if raw_words:
+        # Group words into pseudo-segments based on pauses
+        # Start a new segment when gap > 0.5s
+        current_words: list[dict[str, Any]] = []
+        segment_start = raw_words[0].get("start", 0.0)
+        last_end = segment_start
+        seg_id = 0
+
+        def flush(end: float) -> None:
+            seg_text = " ".join(cw.get("text", "").strip() for cw in current_words)
+            start_ms = round(segment_start * 1000)
+            end_ms = round(end * 1000)
+            segments.append(
+                TimingSegment(
+                    id=seg_id,
+                    start_sec=round(segment_start, 3),
+                    end_sec=round(end, 3),
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    duration_ms=end_ms - start_ms,
+                    text=seg_text,
+                    words=[
+                        {
+                            "word": cw.get("text", "").strip(),
+                            "start_ms": round(cw.get("start", 0) * 1000),
+                            "end_ms": round(cw.get("end", 0) * 1000),
+                            "confidence": cw.get("confidence"),
+                        }
+                        for cw in current_words
+                    ]
+                    if word_timestamps
+                    else None,
+                )
+            )
+
+        for w in raw_words:
+            w_start = w.get("start", 0.0)
+            # New segment if gap > 0.5s
+            if current_words and (w_start - last_end) > 0.5:
+                flush(current_words[-1].get("end", last_end))
+                seg_id += 1
+                current_words = []
+                segment_start = w_start
+
+            current_words.append(w)
+            last_end = w.get("end", w_start)
+
+        # Flush last segment
+        if current_words:
+            flush(current_words[-1].get("end", last_end))
+
+    # Fallback: single segment from full text
+    if not segments:
+        duration_ms = round((result.get("duration", 0) or 0) * 1000)
+        segments = [
+            TimingSegment(
+                id=0,
+                start_sec=0.0,
+                end_sec=round(duration_ms / 1000, 3),
+                start_ms=0,
+                end_ms=duration_ms,
+                duration_ms=duration_ms,
+                text=full_text,
+                words=None,
+            )
+        ]
+
+    return TimingResult(
+        segments=segments,
+        model=model,
+        backend="grok-stt",
+        provider="xai-stt",
+        language=language_detected or language or "",
+        source_audio=str(audio_path.resolve()),
+        timestamp_basis=("derived_from_provider_words" if raw_words else "fallback_full_text"),
+    )
 
 
 class XAISttProvider(TranscriptionProvider):
@@ -67,6 +168,7 @@ class XAISttProvider(TranscriptionProvider):
         language: str = "ru",
         word_timestamps: bool = False,
         quiet: bool = False,
+        on_raw_response: Callable[[bytes, str], None] | None = None,
     ) -> TimingResult:
         audio_path = Path(audio_path)
         if not audio_path.exists():
@@ -111,6 +213,12 @@ class XAISttProvider(TranscriptionProvider):
             detail = resp.text[:500]
             raise RuntimeError(f"xAI STT API error {resp.status_code}: {detail}")
 
+        if on_raw_response is not None:
+            # Hand the exact successful response body to the caller before the
+            # fallible JSON parse, so a paid request can persist its private raw
+            # evidence first. A callback failure propagates and stops the parse.
+            on_raw_response(resp.content, resp.headers.get("Content-Type", "") or "")
+
         result = resp.json()
 
         if not quiet:
@@ -120,108 +228,10 @@ class XAISttProvider(TranscriptionProvider):
                 file=sys.stderr,
             )
 
-        full_text = result.get("text", "").strip()
-        language_detected = result.get("language", language or "")
-
-        # Parse word-level data into segments
-        raw_words = result.get("words", [])
-        segments: list[TimingSegment] = []
-
-        if raw_words:
-            # Group words into pseudo-segments based on pauses
-            # Start a new segment when gap > 0.5s
-            current_words: list[dict[str, Any]] = []
-            segment_start = raw_words[0].get("start", 0.0)
-            last_end = segment_start
-            seg_id = 0
-
-            for w in raw_words:
-                w_start = w.get("start", 0.0)
-                # New segment if gap > 0.5s
-                if current_words and (w_start - last_end) > 0.5:
-                    seg_text = " ".join(cw.get("text", "").strip() for cw in current_words)
-                    seg_end = current_words[-1].get("end", last_end)
-                    start_ms = round(segment_start * 1000)
-                    end_ms = round(seg_end * 1000)
-                    segments.append(
-                        TimingSegment(
-                            id=seg_id,
-                            start_sec=round(segment_start, 3),
-                            end_sec=round(seg_end, 3),
-                            start_ms=start_ms,
-                            end_ms=end_ms,
-                            duration_ms=end_ms - start_ms,
-                            text=seg_text,
-                            words=[
-                                {
-                                    "word": cw.get("text", "").strip(),
-                                    "start_ms": round(cw.get("start", 0) * 1000),
-                                    "end_ms": round(cw.get("end", 0) * 1000),
-                                    "confidence": cw.get("confidence"),
-                                }
-                                for cw in current_words
-                            ]
-                            if word_timestamps
-                            else None,
-                        )
-                    )
-                    seg_id += 1
-                    current_words = []
-                    segment_start = w_start
-
-                current_words.append(w)
-                last_end = w.get("end", w_start)
-
-            # Flush last segment
-            if current_words:
-                seg_text = " ".join(cw.get("text", "").strip() for cw in current_words)
-                seg_end = current_words[-1].get("end", last_end)
-                start_ms = round(segment_start * 1000)
-                end_ms = round(seg_end * 1000)
-                segments.append(
-                    TimingSegment(
-                        id=seg_id,
-                        start_sec=round(segment_start, 3),
-                        end_sec=round(seg_end, 3),
-                        start_ms=start_ms,
-                        end_ms=end_ms,
-                        duration_ms=end_ms - start_ms,
-                        text=seg_text,
-                        words=[
-                            {
-                                "word": cw.get("text", "").strip(),
-                                "start_ms": round(cw.get("start", 0) * 1000),
-                                "end_ms": round(cw.get("end", 0) * 1000),
-                                "confidence": cw.get("confidence"),
-                            }
-                            for cw in current_words
-                        ]
-                        if word_timestamps
-                        else None,
-                    )
-                )
-
-        # Fallback: single segment from full text
-        if not segments:
-            duration_ms = round((result.get("duration", 0) or 0) * 1000)
-            segments = [
-                TimingSegment(
-                    id=0,
-                    start_sec=0.0,
-                    end_sec=round(duration_ms / 1000, 3),
-                    start_ms=0,
-                    end_ms=duration_ms,
-                    duration_ms=duration_ms,
-                    text=full_text,
-                    words=None,
-                )
-            ]
-
-        return TimingResult(
-            segments=segments,
+        return parse_xai_timing_result(
+            result,
             model=self.model,
-            backend="grok-stt",
-            provider=self.provider_id,
-            language=language_detected or language or "",
-            source_audio=str(audio_path.resolve()),
+            language=language,
+            word_timestamps=word_timestamps,
+            audio_path=audio_path,
         )

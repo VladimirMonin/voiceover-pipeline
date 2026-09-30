@@ -755,6 +755,33 @@ def test_connect_readonly_consistent_reads_past_a_stale_empty_wal(tmp_path):
     ]
 
 
+def test_connect_readonly_consistent_refuses_wal_without_usable_shm(tmp_path):
+    """A ``-wal`` with no reusable ``-shm`` is refused, creating no sidecar.
+
+    Opening a WAL database ``mode=ro`` would create or rebuild the shared-memory
+    index, so a read must refuse a missing or undersized one instead of mutating
+    the home.
+    """
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as database:
+        database.migrate()
+        _insert_run(database, "run-1", "/tmp/run-1")
+    wal_path = database_path.with_name(database_path.name + "-wal")
+    shm_path = database_path.with_name(database_path.name + "-shm")
+    wal_path.write_bytes(b"")
+
+    before = sorted(path.name for path in tmp_path.iterdir())
+    with pytest.raises(HistoryDatabaseReadOnlyError):
+        connect_readonly_consistent(database_path)
+    assert sorted(path.name for path in tmp_path.iterdir()) == before
+    assert not shm_path.exists()
+
+    shm_path.write_bytes(b"\x00" * 16)
+    with pytest.raises(HistoryDatabaseReadOnlyError):
+        connect_readonly_consistent(database_path)
+    assert shm_path.read_bytes() == b"\x00" * 16
+
+
 def test_connect_readonly_rejects_corrupt_database(tmp_path):
     database_path = tmp_path / "history.sqlite3"
     database_path.write_bytes(b"not a database at all")

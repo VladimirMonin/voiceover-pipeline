@@ -140,6 +140,7 @@ def build_timing_manifest(timing: TimingResult, duration_ms: int) -> dict[str, A
             "device": timing.device,
             "compute_type": timing.compute_type,
             "language": timing.language,
+            "timestamp_basis": timing.timestamp_basis or None,
             "total_duration_ms": duration_ms,
             "total_duration_sec": round(duration_ms / 1000, 3),
             "segment_count": len(timing.segments),

@@ -131,10 +131,16 @@ description: >
    `--timing-provider`) и `verify-tts` сохраняют наблюдаемый результат в приватную
    SQLite-историю по умолчанию; `history list --operation asr|timings|verify`,
    `history show <uuid>`, `history costs` читают только метаданные (текст остаётся
-   приватным, `has_content: true`). Отключить запись: `settings.toml` рядом с CWD
-   с `[history] enabled = false`. Если сохранение не удалось, `--json` даёт
-   `status: "partial"` и `history.error_code = "HISTORY_PERSISTENCE_FAILED"` с
-   exit `50` — результат не потерян, но и не объявлен сохранённым.
+   приватным, `has_content: true`). Облачный standalone `timings
+   --timing-provider groq-whisper|xai-stt` тоже сохраняется через платный boundary
+   (маркер до POST, приватное raw-тело+receipt до парсинга, unknown-цена, владение
+   привязано к output-root — свежий `--overwrite` того же root завершается
+   `PAID_TIMING_OUTPUT_OWNED` до POST; и наоборот, `generate` не трогает
+   paid-owned root, а `timings` — native-owned root). Отключить
+   запись: `settings.toml` рядом с CWD с `[history] enabled = false` (облачный
+   `timings` тогда fail-closed до запроса). Если сохранение не удалось, `--json`
+   даёт `status: "partial"` и `history.error_code = "HISTORY_PERSISTENCE_FAILED"`
+   с exit `50` — результат не потерян, но и не объявлен сохранённым.
 9. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
    В receipt проверь `execution_source`: source kind, revision/dirty и package-tree SHA-256.
 
