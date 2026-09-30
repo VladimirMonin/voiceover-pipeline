@@ -60,6 +60,7 @@ from .repository import (
     PATH_KIND_EXTERNAL_ABSOLUTE,
     RUN_STATUS_COMPLETED,
     TEXT_COMPLETENESS_COMPLETE,
+    TEXT_KIND_ASR_TRANSCRIPT,
     Cost,
     HistoryRepository,
 )
@@ -246,6 +247,22 @@ def _resolve_parent_run(repository: HistoryRepository, parent_run_root: Path | N
 
 def _write_run(repository: HistoryRepository, save: AsrHistorySave, run_uuid: str) -> None:
     """Write run, attempt, artifacts, and text sources inside one transaction."""
+    snapshot = dict(save.config_snapshot)
+    observed = snapshot.get("observed_spans")
+    timed_source_index: int | None = None
+    timed_source_uuid: str | None = None
+    if isinstance(observed, dict):
+        matching_sources = [
+            index
+            for index, text in enumerate(save.text_sources)
+            if text.kind == TEXT_KIND_ASR_TRANSCRIPT
+            and sha256_text(text.content) == observed.get("source_text_sha256")
+        ]
+        if len(matching_sources) != 1:
+            raise ValueError("observed ASR timing needs one exact canonical transcript")
+        timed_source_index = matching_sources[0]
+        timed_source_uuid = str(uuid.uuid4())
+        snapshot["observed_spans"] = {**observed, "text_source_uuid": timed_source_uuid}
     with repository.transaction():
         parent_uuid = _resolve_parent_run(repository, save.parent_run_root)
         run = repository.create_run(
@@ -254,7 +271,7 @@ def _write_run(repository: HistoryRepository, save: AsrHistorySave, run_uuid: st
             status=RUN_STATUS_COMPLETED,
             user_label=save.user_label,
             parent_uuid=parent_uuid,
-            config_snapshot=save.config_snapshot,
+            config_snapshot=snapshot,
             run_uuid=run_uuid,
         )
         attempt = repository.add_attempt(
@@ -266,8 +283,20 @@ def _write_run(repository: HistoryRepository, save: AsrHistorySave, run_uuid: st
             usage=save.attempt_usage,
             cost=Cost.unknown(),
         )
+        long_form = save.config_snapshot.get("long_form")
+        expected_source_hash = (
+            long_form.get("source_sha256") if isinstance(long_form, dict) else None
+        )
+        if expected_source_hash is not None and save.source_audio is None:
+            raise ValueError("long-form source audio evidence is missing")
         if save.source_audio is not None:
             availability, size, digest, resolved = _file_evidence(save.source_audio)
+            # The long-form extractor attested these source bytes after all
+            # chunks. A later mutation before history save must not produce a
+            # completed run whose snapshot and source artifact attest different
+            # files; rollback keeps the provider transcript available to the CLI.
+            if expected_source_hash is not None and digest != expected_source_hash:
+                raise ValueError("long-form source audio changed before history persistence")
             repository.add_artifact(
                 run.run_uuid,
                 role=ARTIFACT_ROLE_SOURCE_AUDIO,
@@ -296,7 +325,7 @@ def _write_run(repository: HistoryRepository, save: AsrHistorySave, run_uuid: st
                 sha256=digest,
                 media_metadata=artifact.media_metadata,
             )
-        for text in save.text_sources:
+        for index, text in enumerate(save.text_sources):
             repository.add_text_source(
                 run.run_uuid,
                 kind=text.kind,
@@ -305,6 +334,7 @@ def _write_run(repository: HistoryRepository, save: AsrHistorySave, run_uuid: st
                 content_hash=sha256_text(text.content),
                 language=text.language,
                 text_completeness=text.text_completeness,
+                text_source_uuid=timed_source_uuid if index == timed_source_index else None,
             )
 
 

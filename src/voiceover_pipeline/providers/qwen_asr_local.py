@@ -5,6 +5,9 @@ import os
 import sys
 import threading
 import types
+import warnings
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -17,26 +20,64 @@ from voiceover_pipeline.models import (
 )
 from voiceover_pipeline.providers.asr_registry import ASRDependencyHealth, ASRProviderSpec
 from voiceover_pipeline.providers.base import ASRProvider, validate_asr_response
+from voiceover_pipeline.settings import SettingsError, load_qwen_asr_local_settings
 
 QWEN_ASR_PROVIDER_ID = "qwen-local"
 QWEN_ASR_MODEL_ID = "Qwen/Qwen3-ASR-0.6B"
+QWEN_ASR_LARGE_MODEL_ID = "Qwen/Qwen3-ASR-1.7B"
 QWEN_FORCED_ALIGNER_MODEL_ID = "Qwen/Qwen3-ForcedAligner-0.6B"
-QWEN_ASR_STORAGE_ROOT: Final = Path("/media/v/storage/voiceover-pipeline/qwen-asr")
-QWEN_ASR_MODEL_PATH: Final = QWEN_ASR_STORAGE_ROOT / "models" / "Qwen3-ASR-0.6B"
-QWEN_FORCED_ALIGNER_MODEL_PATH: Final = (
-    QWEN_ASR_STORAGE_ROOT / "models" / "Qwen3-ForcedAligner-0.6B"
-)
-QWEN_ASR_CACHE_DIR: Final = QWEN_ASR_STORAGE_ROOT / "huggingface-cache"
+
+# Each selectable model owns exactly one on-disk directory name, so a selected
+# size resolves only its own weights and can never be served by another size's
+# directory.
+QWEN_ASR_MODEL_DIRECTORY_NAMES: Final = {
+    QWEN_ASR_MODEL_ID: "Qwen3-ASR-0.6B",
+    QWEN_ASR_LARGE_MODEL_ID: "Qwen3-ASR-1.7B",
+}
+QWEN_ASR_MODELS_DIRECTORY_NAME: Final = "models"
+QWEN_ASR_CACHE_DIRECTORY_NAME: Final = "huggingface-cache"
+QWEN_ASR_FORCED_ALIGNER_DIRECTORY_NAME: Final = "Qwen3-ForcedAligner-0.6B"
+# The one implicit asset root the project used before paths were configurable. It
+# stays a documented, warned fallback rather than the only accepted location.
+QWEN_ASR_LEGACY_STORAGE_ROOT: Final = Path("/media/v/storage/voiceover-pipeline/qwen-asr")
+
+QWEN_ASR_MODELS_ROOT_ENV: Final = "VOICEOVER_QWEN_ASR_MODELS_ROOT"
+QWEN_ASR_CACHE_DIR_ENV: Final = "VOICEOVER_QWEN_ASR_CACHE_DIR"
+QWEN_ASR_REVISION_ENV: Final = "VOICEOVER_QWEN_ASR_REVISION"
+
 QWEN_ASR_INSTALL_REMEDIATION = (
     "qwen-asr runtime is unavailable. Install an approved qwen-asr runtime before retrying."
 )
 QWEN_ASR_STORAGE_REMEDIATION = (
-    "Qwen local assets are unavailable under /media/v/storage. "
-    "Install the approved Qwen ASR model and cache there before retrying."
+    "Qwen local ASR weights or cache for the selected model are unavailable. Install the "
+    "approved Qwen3-ASR weights and cache under the configured models root "
+    "(VOICEOVER_QWEN_ASR_MODELS_ROOT or settings.toml [asr.qwen_local] models_root) or under "
+    "the legacy /media/v/storage/voiceover-pipeline/qwen-asr layout before retrying."
+)
+QWEN_ASR_REVISION_REMEDIATION = (
+    "The configured Qwen3-ASR revision is unavailable: the resolved weights directory must be the "
+    "matching Hugging Face snapshot. The models root (VOICEOVER_QWEN_ASR_MODELS_ROOT or "
+    "settings.toml [asr.qwen_local] models_root) is the parent of models/<selected-name>, so make "
+    "that selected-name directory the matching snapshot or clear VOICEOVER_QWEN_ASR_REVISION / "
+    "settings.toml [asr.qwen_local] revision before retrying."
+)
+QWEN_ASR_IDENTITY_REMEDIATION = (
+    "The resolved Qwen3-ASR weights directory does not match the selected model. Point "
+    "models/<selected-name> under the models root at that model's own weights directory or at its "
+    "matching Hugging Face snapshot before retrying."
+)
+QWEN_ASR_ASSET_CHANGE_REMEDIATION = (
+    "The local Qwen3-ASR weights or cache configuration changed after the model was loaded. "
+    "Keep one asset configuration for the whole run and retry with a fresh process."
+)
+QWEN_ASR_LEGACY_STORAGE_WARNING = (
+    "Qwen local ASR is using the legacy /media/v/storage/voiceover-pipeline/qwen-asr asset "
+    "root. Set VOICEOVER_QWEN_ASR_MODELS_ROOT or settings.toml [asr.qwen_local] models_root "
+    "to an explicit location."
 )
 QWEN_FORCED_ALIGNER_INSTALL_REMEDIATION = (
     "Qwen word timestamps require Qwen3-ForcedAligner-0.6B. "
-    "Install the approved official aligner under /media/v/storage before retrying."
+    "Install the approved official aligner under the configured models root before retrying."
 )
 _QWEN_LANGUAGE_NAMES = {
     "de": "German",
@@ -44,6 +85,180 @@ _QWEN_LANGUAGE_NAMES = {
     "es": "Spanish",
     "ru": "Russian",
 }
+
+
+class QwenASRLegacyStorageWarning(UserWarning):
+    """The implicit legacy /media/v/storage Qwen ASR asset root is still in use."""
+
+
+@dataclass(frozen=True)
+class QwenASRLocalAssets:
+    """The resolved local directories, revision, and selection identity for one model.
+
+    ``revision`` is the configured pin, ``observed_revision`` is the revision the
+    resolved weights path itself declares (an HF snapshot directory name, or
+    ``None``), and ``selection_verified`` records whether that resolved path
+    provably belongs to the selected model.
+    """
+
+    model_id: str
+    model_path: Path
+    forced_aligner_path: Path
+    cache_dir: Path
+    resolved_model_path: Path
+    resolved_forced_aligner_path: Path
+    resolved_cache_dir: Path
+    revision: str | None
+    observed_revision: str | None
+    selection_verified: bool
+    legacy_storage_root: bool
+
+
+_legacy_storage_warning_emitted = False
+
+
+def _first_configured_string(*candidates: str | None) -> str | None:
+    """Return the first non-blank candidate, so an environment value wins over settings."""
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
+
+def _first_configured_path(*candidates: str | None) -> Path | None:
+    value = _first_configured_string(*candidates)
+    return None if value is None else Path(value).expanduser()
+
+
+def _warn_legacy_storage_root() -> None:
+    """Warn once per process that the implicit legacy asset root is being used."""
+    global _legacy_storage_warning_emitted
+    if _legacy_storage_warning_emitted:
+        return
+    _legacy_storage_warning_emitted = True
+    warnings.warn(QWEN_ASR_LEGACY_STORAGE_WARNING, QwenASRLegacyStorageWarning, stacklevel=3)
+
+
+def _hf_repository_directory_name(model_id: str) -> str:
+    """Return the ``models--<org>--<name>`` directory name Hugging Face uses."""
+    return "models--" + model_id.replace("/", "--")
+
+
+def _resolve_local_weights_identity(
+    model_id: str, model_path: Path
+) -> tuple[Path, str | None, bool]:
+    """Return the exact resolved target, its revision, and selection proof.
+
+    A weights directory that is the direct child of a ``snapshots`` directory *is*
+    that snapshot: it declares its own directory name as its revision and proves
+    the selection only when its ``models--<org>--<name>`` parent matches the
+    selected model. Any other layout declares no revision and proves the selection
+    only when the resolved directory name equals the selected model's own
+    directory name, so an alias into another size's directory or snapshot is
+    refused instead of being assumed.
+    """
+    resolved = model_path.expanduser().resolve()
+    if resolved.parent.name == "snapshots":
+        return (
+            resolved,
+            resolved.name,
+            resolved.parent.parent.name == _hf_repository_directory_name(model_id),
+        )
+    return resolved, None, resolved.name == QWEN_ASR_MODEL_DIRECTORY_NAMES[model_id]
+
+
+def _admitted_asset_targets(assets: QwenASRLocalAssets) -> tuple[Path, Path, Path]:
+    """Return the canonical weights, aligner, and cache targets of one admission.
+
+    These targets were captured by the resolver itself, alongside the identity
+    proof, not re-resolved after admission. Retargeting an alias before or during
+    the runtime load therefore cannot change the admitted weights or receipt.
+    """
+    return (
+        assets.resolved_model_path,
+        assets.resolved_forced_aligner_path,
+        assets.resolved_cache_dir,
+    )
+
+
+def _assets_identity(assets: QwenASRLocalAssets) -> tuple[Path, Path, Path, str | None]:
+    """Return the canonical asset identity a cached model must keep matching."""
+    return (*_admitted_asset_targets(assets), assets.revision)
+
+
+def resolve_qwen_asr_local_assets(
+    model_id: str, *, environ: Mapping[str, str] | None = None
+) -> QwenASRLocalAssets:
+    """Resolve one selected model's weights directory, cache, revision, and identity.
+
+    Only paths are computed: nothing is loaded, downloaded, or created. The
+    explicit ``VOICEOVER_QWEN_ASR_*`` environment variables win over the
+    ``[asr.qwen_local]`` settings, and the documented legacy storage root is the
+    last fallback. An unknown model id raises ``ValueError`` instead of resolving
+    to another model's directory.
+    """
+    directory_name = QWEN_ASR_MODEL_DIRECTORY_NAMES.get(model_id)
+    if directory_name is None:
+        raise ValueError(f"Unknown local Qwen ASR model: {model_id}")
+    active_environ = os.environ if environ is None else environ
+    settings = load_qwen_asr_local_settings()
+    configured_root = _first_configured_path(
+        active_environ.get(QWEN_ASR_MODELS_ROOT_ENV), settings.models_root
+    )
+    models_root = QWEN_ASR_LEGACY_STORAGE_ROOT if configured_root is None else configured_root
+    cache_dir = _first_configured_path(
+        active_environ.get(QWEN_ASR_CACHE_DIR_ENV), settings.cache_dir
+    )
+    models_dir = models_root / QWEN_ASR_MODELS_DIRECTORY_NAME
+    model_path = models_dir / directory_name
+    forced_aligner_path = models_dir / QWEN_ASR_FORCED_ALIGNER_DIRECTORY_NAME
+    effective_cache_dir = cache_dir or models_root / QWEN_ASR_CACHE_DIRECTORY_NAME
+    resolved_model_path, observed_revision, selection_verified = _resolve_local_weights_identity(
+        model_id, model_path
+    )
+    return QwenASRLocalAssets(
+        model_id=model_id,
+        model_path=model_path,
+        forced_aligner_path=forced_aligner_path,
+        cache_dir=effective_cache_dir,
+        resolved_model_path=resolved_model_path,
+        resolved_forced_aligner_path=forced_aligner_path.expanduser().resolve(),
+        resolved_cache_dir=effective_cache_dir.expanduser().resolve(),
+        revision=_first_configured_string(
+            active_environ.get(QWEN_ASR_REVISION_ENV), settings.revision
+        ),
+        observed_revision=observed_revision,
+        selection_verified=selection_verified,
+        legacy_storage_root=configured_root is None,
+    )
+
+
+def admit_qwen_asr_local_assets(
+    model_id: str, *, timestamp_mode: str = "none", environ: Mapping[str, str] | None = None
+) -> QwenASRLocalAssets:
+    """Return the selected model's assets, or fail closed before any model load.
+
+    The check runs before the ``qwen_asr``/``torch`` import and before any
+    ``from_pretrained`` call, and it never downloads. Missing weights or cache, a
+    resolved path that does not prove the selected model, a configured revision
+    the resolved weights cannot prove, and a missing forced aligner for a
+    word-timestamp request each raise ``ModuleNotFoundError`` with a fixed
+    remediation. Using the legacy asset root also emits one deprecation warning.
+    An unknown model id raises ``ValueError``, and an unreadable ``settings.toml``
+    raises :class:`SettingsError`.
+    """
+    assets = resolve_qwen_asr_local_assets(model_id, environ=environ)
+    if assets.legacy_storage_root:
+        _warn_legacy_storage_root()
+    if not assets.resolved_model_path.is_dir() or not assets.resolved_cache_dir.is_dir():
+        raise ModuleNotFoundError(QWEN_ASR_STORAGE_REMEDIATION)
+    if not assets.selection_verified:
+        raise ModuleNotFoundError(QWEN_ASR_IDENTITY_REMEDIATION)
+    if assets.revision is not None and assets.observed_revision != assets.revision:
+        raise ModuleNotFoundError(QWEN_ASR_REVISION_REMEDIATION)
+    if timestamp_mode == "word" and not assets.resolved_forced_aligner_path.is_dir():
+        raise ModuleNotFoundError(QWEN_FORCED_ALIGNER_INSTALL_REMEDIATION)
+    return assets
 
 
 class _LazyNagisaModule(types.ModuleType):
@@ -88,7 +303,50 @@ def _prepare_qwen_asr_import() -> None:
         sys.modules["nagisa"] = _LazyNagisaModule(spec)
 
 
+def _qwen_python_runtime_health() -> ASRDependencyHealth | None:
+    """Return the install failure when the Python runtime cannot import, else ``None``."""
+    try:
+        _prepare_qwen_asr_import()
+        importlib.import_module("qwen_asr")
+        importlib.import_module("torch")
+    except ModuleNotFoundError:
+        return ASRDependencyHealth(available=False, remediation=QWEN_ASR_INSTALL_REMEDIATION)
+    return None
+
+
+def qwen_asr_python_dependency_probe(model_id: str | None = None) -> ASRDependencyHealth:
+    """Probe only the Python route; a selected model is admitted alone when known.
+
+    Nothing is constructed or downloaded: the runtime package must import and,
+    when ``model_id`` is given, that model must pass the same admission a real
+    request uses. Without a selected model the probe reports available when any
+    selectable model is usable, and otherwise the last admission failure.
+    """
+    runtime_health = _qwen_python_runtime_health()
+    if runtime_health is not None:
+        return runtime_health
+    candidates = (model_id,) if model_id is not None else tuple(QWEN_ASR_MODEL_DIRECTORY_NAMES)
+    failure: Exception | None = None
+    for candidate in candidates:
+        try:
+            admit_qwen_asr_local_assets(candidate)
+        except (ModuleNotFoundError, SettingsError, ValueError) as exc:
+            failure = exc
+            continue
+        return ASRDependencyHealth(available=True, remediation="")
+    return ASRDependencyHealth(
+        available=False,
+        remediation=str(failure) if failure is not None else QWEN_ASR_STORAGE_REMEDIATION,
+    )
+
+
 def qwen_asr_dependency_probe() -> ASRDependencyHealth:
+    """Report whether the selected local Qwen3 ASR runtime can run without a download.
+
+    When an audio.cpp install is configured the probe reports that runtime's
+    health; otherwise it reports the Python route's health, with no model
+    constructed and no download.
+    """
     if (
         os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip()
         or os.environ.get("VOICEOVER_AUDIO_CPP_CONTAINER_IMAGE", "").strip()
@@ -98,31 +356,13 @@ def qwen_asr_dependency_probe() -> ASRDependencyHealth:
         )
 
         return audio_cpp_qwen_asr_dependency_probe()
-    try:
-        _prepare_qwen_asr_import()
-        importlib.import_module("qwen_asr")
-        importlib.import_module("torch")
-    except ModuleNotFoundError:
-        return ASRDependencyHealth(available=False, remediation=QWEN_ASR_INSTALL_REMEDIATION)
-    if not QWEN_ASR_MODEL_PATH.is_dir() or not QWEN_ASR_CACHE_DIR.is_dir():
-        return ASRDependencyHealth(available=False, remediation=QWEN_ASR_STORAGE_REMEDIATION)
-    return ASRDependencyHealth(available=True, remediation="")
+    return qwen_asr_python_dependency_probe()
 
 
 def _qwen_language_name(language: str | None) -> str | None:
     if language is None:
         return None
     return _QWEN_LANGUAGE_NAMES.get(language.casefold(), language)
-
-
-def _admit_local_qwen_storage(*, timestamp_mode: str) -> tuple[Path, Path | None]:
-    if not QWEN_ASR_MODEL_PATH.is_dir() or not QWEN_ASR_CACHE_DIR.is_dir():
-        raise ModuleNotFoundError(QWEN_ASR_STORAGE_REMEDIATION)
-    if timestamp_mode != "word":
-        return QWEN_ASR_MODEL_PATH, None
-    if not QWEN_FORCED_ALIGNER_MODEL_PATH.is_dir():
-        raise ModuleNotFoundError(QWEN_FORCED_ALIGNER_INSTALL_REMEDIATION)
-    return QWEN_ASR_MODEL_PATH, QWEN_FORCED_ALIGNER_MODEL_PATH
 
 
 class QwenLocalASRProvider(ASRProvider):
@@ -133,6 +373,9 @@ class QwenLocalASRProvider(ASRProvider):
     def __init__(self) -> None:
         self._model: Any | None = None
         self._loaded_model_id: str | None = None
+        self._loaded_model_revision: str | None = None
+        self._loaded_model_path: str | None = None
+        self._loaded_assets_identity: tuple[Path, Path, Path, str | None] | None = None
         self._loaded_device: str | None = None
         self._loaded_compute: str | None = None
         self._loaded_with_forced_aligner = False
@@ -140,50 +383,72 @@ class QwenLocalASRProvider(ASRProvider):
         self._runtime_version: str | None = None
 
     def _load_model(self, request: ASRRequest) -> None:
-        model_path, forced_aligner_path = _admit_local_qwen_storage(
-            timestamp_mode=request.timestamp_mode
-        )
+        model_id = request.model_id or QWEN_ASR_MODEL_ID
+        assets = admit_qwen_asr_local_assets(model_id, timestamp_mode=request.timestamp_mode)
+        # Capture the admitted canonical targets once, before importing or calling
+        # the runtime, so the load and the receipt use the exact weights, aligner,
+        # and cache that admission verified rather than a later alias resolution.
+        model_target, aligner_target, cache_target = _admitted_asset_targets(assets)
         _prepare_qwen_asr_import()
         import qwen_asr
         import torch
         from qwen_asr import Qwen3ASRModel
 
-        model_id = request.model_id or QWEN_ASR_MODEL_ID
         resolved_compute = request.compute
         if resolved_compute == "auto":
             resolved_compute = "bfloat16" if request.device == "cuda" else "float32"
         dtype = getattr(torch, resolved_compute)
 
         load_options: dict[str, object] = {
-            "cache_dir": str(QWEN_ASR_CACHE_DIR),
+            "cache_dir": str(cache_target),
             "device_map": request.device,
             "dtype": dtype,
             "local_files_only": True,
         }
         if request.timestamp_mode == "word":
-            assert forced_aligner_path is not None
-            load_options["forced_aligner"] = str(forced_aligner_path)
+            load_options["forced_aligner"] = str(aligner_target)
             load_options["forced_aligner_kwargs"] = {
-                "cache_dir": str(QWEN_ASR_CACHE_DIR),
+                "cache_dir": str(cache_target),
                 "device_map": request.device,
                 "dtype": dtype,
                 "local_files_only": True,
             }
         try:
-            self._model = Qwen3ASRModel.from_pretrained(str(model_path), **load_options)
+            self._model = Qwen3ASRModel.from_pretrained(str(model_target), **load_options)
         except (OSError, RuntimeError, ValueError) as exc:
             if request.timestamp_mode == "word":
                 raise ModuleNotFoundError(QWEN_FORCED_ALIGNER_INSTALL_REMEDIATION) from exc
             raise
         self._loaded_model_id = model_id
+        # The observed snapshot revision is the effective one; the configured pin
+        # stays admission-only. A plain directory with no pin reports ``None``.
+        self._loaded_model_revision = assets.observed_revision
+        # Record the same admitted canonical target the model loaded from, never a
+        # fresh resolution of an alias that may have been retargeted during the call.
+        self._loaded_model_path = str(model_target)
+        self._loaded_assets_identity = (model_target, aligner_target, cache_target, assets.revision)
         self._loaded_device = request.device
         self._loaded_compute = request.compute
         self._loaded_with_forced_aligner = request.timestamp_mode == "word"
         self._resolved_compute = resolved_compute
         self._runtime_version = getattr(qwen_asr, "__version__", None)
 
+    def _require_unchanged_assets(self, model_id: str) -> None:
+        """Fail closed when the asset configuration changed after a load.
+
+        A cached model must keep serving the weights it loaded; silently reusing
+        it after the configured root, cache, or revision changed would run the
+        wrong model. Re-resolving only compares configured paths, so the error is
+        raised before any runtime call instead of swapping weights mid-run.
+        """
+        current = resolve_qwen_asr_local_assets(model_id)
+        if self._loaded_assets_identity != _assets_identity(current):
+            raise ModuleNotFoundError(QWEN_ASR_ASSET_CHANGE_REMEDIATION)
+
     def transcribe(self, request: ASRRequest) -> ASRResult:
         model_id = request.model_id or QWEN_ASR_MODEL_ID
+        if self._model is not None and self._loaded_model_id == model_id:
+            self._require_unchanged_assets(model_id)
         if (
             self._model is None
             or self._loaded_model_id != model_id
@@ -226,6 +491,8 @@ class QwenLocalASRProvider(ASRProvider):
             execution=ASRExecutionReceipt(
                 runtime="qwen-asr",
                 runtime_version=self._runtime_version,
+                model_revision=self._loaded_model_revision,
+                model_path=self._loaded_model_path,
                 resolved_device=request.device,
                 resolved_compute=self._resolved_compute or request.compute,
             ),
@@ -325,11 +592,29 @@ def qwen_asr_provider_factory() -> ASRProvider:
     return QwenLocalASRProvider()
 
 
+def qwen_asr_python_provider_factory() -> ASRProvider:
+    """Explicit Python route; never selects the native audio.cpp package."""
+    return QwenLocalASRProvider()
+
+
+def qwen_asr_audio_cpp_provider_factory() -> ASRProvider:
+    """Explicit native route; never falls back to the Python runtime."""
+    from voiceover_pipeline.providers.audio_cpp_qwen_asr import AudioCppQwenASRProvider
+
+    return AudioCppQwenASRProvider.from_environment()
+
+
 QWEN_ASR_PROVIDER_SPEC = ASRProviderSpec(
     provider_id=QWEN_ASR_PROVIDER_ID,
-    description="Local Qwen3 ASR with runtime-selected optional forced alignment.",
+    description=(
+        "Local Qwen3 ASR with selectable 0.6B/1.7B weights and runtime-selected "
+        "optional forced alignment."
+    ),
     factory=qwen_asr_provider_factory,
-    models=({"id": QWEN_ASR_MODEL_ID, "default": True},),
+    models=(
+        {"id": QWEN_ASR_MODEL_ID, "default": True},
+        {"id": QWEN_ASR_LARGE_MODEL_ID},
+    ),
     capabilities=ASRCapabilities(
         batch_audio=True,
         forced_language=True,

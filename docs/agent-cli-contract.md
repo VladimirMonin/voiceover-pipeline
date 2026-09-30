@@ -1592,13 +1592,13 @@ voiceover transcribe `
   file — аргументная ошибка (exit code `2`), причём до lookup provider. Значение
   не попадает в стандартный receipt и в JSON-вывод.
 - `--runtime auto|python|audio-cpp` (default `auto`) — явный запрос маршрута
-  ASR runtime. Explicit `--runtime audio-cpp` для всех зарегистрированных
-  provider-ов сейчас fail closed с exit code `2` до dependency probe и factory:
-  native audio.cpp path ещё не реализован как выбираемый CLI-маршрут, и CLI
-  отказывается от fallback на другой runtime. `auto` и `python` принимаются,
-  но фактический выбор runtime остаётся прежним (env-driven через
-  `VOICEOVER_AUDIO_CPP_BINARY` и т.п.); `--runtime` сам по себе маршрут не
-  переключает.
+  ASR runtime. `auto` остаётся env-driven (`VOICEOVER_AUDIO_CPP_BINARY` и т.п.) и
+  сам маршрут не переключает. Оба зарегистрированных provider-а (`qwen-local`,
+  `nemotron-local`) чтут явный выбор детерминированно: `--runtime python` берёт
+  их Python route, `--runtime audio-cpp` — native route, и при ошибке не
+  переключаются на другой runtime. Explicit `audio-cpp` требует настроенного
+  native audio.cpp package (и CUDA для Qwen) и иначе fail closed до factory;
+  детали — в разделах провайдеров.
 - Публичных флагов `--prompt`, `--glossary` или числового phrase
   boost нет. В API typed `ASRContextHints` различает `context_text`, glossary
   profile/digest/selected terms, `ASRPhraseHint` с силой `mild|normal|strong` и
@@ -1606,8 +1606,9 @@ voiceover transcribe `
 - `timestamp_mode: "none"` означает обычный text-only ответ adapter. `segments`
   или `words` появляются только при заявленных provider capabilities;
   timestamps имеют origin `native`, `forced` или `chunked`. `chunked` —
-  консервативный span внешнего long-form фрагмента, а не claim о native/forced
-  word alignment. Text-only ответ не допускается к SRT.
+  маркер внешней long-form оркестрации, а не claim о native/forced word
+  alignment; text-only long-form сегменты при этом не несут acoustic span.
+  Text-only ответ не допускается к SRT.
 
 ```json
 {
@@ -1625,6 +1626,7 @@ voiceover transcribe `
     "runtime": "...",
     "runtime_version": "...",
     "model_revision": null,
+    "model_path": null,
     "device": "cpu",
     "compute": "auto",
     "measurements": {}
@@ -1652,10 +1654,29 @@ final tail). Один provider instance вызывается последова�
 typed request options на каждом фрагменте.
 `duration_s` такого результата равен длительности исходника, а
 `execution.long_form` добавляет проверяемые `source_duration_s`,
-`covered_duration_s`, `processed_duration_s`, `coverage_verified` и manifest
-каждого фрагмента (`input_*`, измеренный `output_duration_s`, его delta и
-допуск, `output_status`, `coverage_*`, status и counts). Для decoded
-MP3/codec seek-timebase границы допускается только bounded 0.10 s delta
+`covered_duration_s`, `processed_duration_s`, `source_sha256`,
+`coverage_verified` и manifest каждого фрагмента (`input_*`, измеренный
+`output_duration_s`, его delta и допуск, `output_sha256`, `output_status`,
+`coverage_*`, status и counts). Границы покрытия (`coverage_*`) остаются
+техническим доказательством в `execution.long_form`, а не acoustic span:
+text-only long-form сегменты не получают `start_s`/`end_s`, word-timed
+сегменты несут наблюдаемые границы удержанных слов, а провайдерские
+segment-времена сохраняются только когда их текст доказуемо отображается в
+удержанный транскрипт. `source_sha256` — хэш исходного аудио, а
+`output_sha256` — хэш извлечённого фрагмента; изменение исходника во время
+выполнения fail-closed. Все фрагменты обязаны совпадать по provider, model,
+runtime, `model_revision` и `model_path`; расхождение отклоняется до merge.
+Локальный `transcribe` сохраняет в каноническом SQLite snapshot `observed_spans`:
+`origin`, единицу `ms`, model/path/revision, UUID ровно сохранённого текстового
+источника, SHA-256 его транскрипта и целочисленные
+`char_start/char_end/start_ms/end_ms` только для наблюдаемых слов или
+provider-сегментов с `native`/`forced` origin. При сохранении long-form history
+хэш исходного аудио сравнивается с `source_sha256` его receipt: если файл
+изменился после распознавания, завершённый run с противоречивыми SHA не пишется.
+Неизвестный либо `chunked` span остаётся `null`, а внешний coverage не
+превращается в речевую метку. Публичный `transcribe --json` по-прежнему отдаёт
+совместимые `start_s/end_s`; это внутренний формат истории.
+Для decoded MP3/codec seek-timebase границы допускается только bounded 0.10 s delta
 от плановой длительности каждого фрагмента; большее расхождение остаётся
 fail-closed. Планировщик
 отклоняет gap, отсутствующий tail, выход за hard limit и известный
@@ -1670,11 +1691,15 @@ Text-only long-form использует смежные фрагменты бе�
 ### Qwen3-ASR local optional runtime
 
 `qwen-local` в ASR registry — отдельное пространство имён от одноимённого TTS
-provider. Его default model — `Qwen/Qwen3-ASR-0.6B`; runtime устанавливается
+provider. Его default model — `Qwen/Qwen3-ASR-0.6B`; тем же provider ID явно
+выбирается `Qwen/Qwen3-ASR-1.7B`. Каждый размер владеет собственной локальной
+директорией весов, поэтому запрошенные 1.7B не могут быть обслужены каталогом
+0.6B, а неизвестный model ID отклоняется до загрузки. Runtime устанавливается
 явно, без автоматической загрузки модели:
 
 ```powershell
 voiceover list asr-providers --json
+voiceover transcribe --audio recording.wav --provider qwen-local --model Qwen/Qwen3-ASR-1.7B --json
 voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-compute auto --json
 ```
 
@@ -1694,10 +1719,26 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
 - Capability допускает request `--device cpu|cuda` и `--compute
   auto|bfloat16|float32`; `auto` выбирает `float32` для CPU и `bfloat16` для
   opt-in CUDA. Python route допускается только с уже размещёнными official
-  model and Hugging Face cache directories under `/media/v/storage`; it passes
-  these paths and `local_files_only=True` to the runtime, so it cannot download
-  or use a root cache. `doctor` checks that local admission without loading a
-  model or assessing GPU suitability.
+  model and Hugging Face cache directories, выбранными явно, и передаёт эти
+  пути с `local_files_only=True` в runtime, поэтому он не может скачать модель
+  или использовать root cache. Корень ассетов разрешается в порядке: переменные
+  окружения `VOICEOVER_QWEN_ASR_MODELS_ROOT`, `VOICEOVER_QWEN_ASR_CACHE_DIR`,
+  `VOICEOVER_QWEN_ASR_REVISION`; затем `settings.toml` `[asr.qwen_local]`
+  `models_root`/`cache_dir`/`revision`; затем legacy
+  `/media/v/storage/voiceover-pipeline/qwen-asr` с одним deprecation warning.
+  В корне лежат `models/<Qwen3-ASR-0.6B|Qwen3-ASR-1.7B|Qwen3-ForcedAligner-0.6B>`
+  и `huggingface-cache`. Каталог `models/<selected-name>` должен доказывать выбранную
+  модель: alias на другой размер или на чужой Hugging Face snapshot отклоняется до
+  загрузки. Явно заданная revision должна совпасть с каталогом Hugging Face
+  snapshot, иначе admission падает до загрузки. `doctor` проверяет ту же local
+  admission и сообщает availability, когда хотя бы одна из выбираемых моделей
+  размещена, без загрузки модели и без оценки GPU.
+- Явный `--runtime python` выбирает Python route, а явный `--runtime audio-cpp` —
+  native route, независимо от выставленных `VOICEOVER_AUDIO_CPP_*` переменных;
+  `auto` сохраняет прежний выбор по окружению. Перед long-form extraction explicit
+  Python route проверяет admission именно выбранной модели, а explicit audio.cpp
+  route — pinned inventory, поэтому неподдерживаемый размер отклоняется раньше, чем
+  извлечён первый чанк.
 - Для короткого input adapter выдаёт transcript, effective language и execution
   receipt. Для long-form public CLI выполняет описанную выше external
   orchestration, поэтому Qwen не является short-audio-only route. Text-only
@@ -1712,9 +1753,21 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
   `audio_cpp_dependency_closure.json`, `VOICEOVER_AUDIO_CPP_QWEN_ASR_MODEL`
   и `VOICEOVER_AUDIO_CPP_QWEN_FORCED_ALIGNER_MODEL`. Docker/WSL fallback не
   выбирается; отсутствие package/model closure остаётся unavailable. Этот
-  static contract не доказывает Windows inference/readiness.
-- При отсутствии required local model/cache directories under `/media/v/storage`
-  selected Python route also returns exit code `10`, without a network attempt.
+  static contract не доказывает Windows inference/readiness. Эта pinned
+  inventory обслуживает только `Qwen/Qwen3-ASR-0.6B`: другой выбранный размер
+  отклоняется до любого runtime invocation с exit code `10` и предложением
+  `--runtime python`.
+- При отсутствии required local model/cache directories для выбранной модели
+  selected Python route also returns exit code `10`, без сетевой попытки.
+  Receipt и history сохраняют фактически выбранный model ID, разрешённый effective
+  путь весов (`ASRExecutionReceipt.model_path`) и observed revision: если каталог
+  является Hugging Face snapshot, его revision записывается даже без заданного pin.
+  Если выбранный root/cache/revision меняется после загрузки модели, следующий
+  runtime-вызов отклоняется, поэтому long-form чанки не могут обслуживаться разными
+  весами. Загрузка и word-режим используют канонический путь весов, ForcedAligner
+  и cache, зафиксированный на admission: retarget симлинка выбранного размера или
+  aligner во время загрузки не подменяет загруженные веса, и такой retarget
+  отклоняется до следующего runtime-вызова.
 
 Установленный пакет, модельные веса, конкретный response schema и CPU/GPU
 совместимость не доказаны этим offline slice. Они требуют отдельного
@@ -1885,7 +1938,13 @@ voiceover index rebuild --json
   скрывает текст из истории: результат
   возвращается с `audio.availability = "missing"`. Сохранённый как `missing`
   артефакт не повышается до `present` без подтверждения байтов. Временные метки
-  не выдумываются.
+  не выдумываются: FTS берёт диапазон только для точного `asr_transcript` с
+  совпавшими UUID источника и SHA-256 текста из канонического SQLite snapshot
+  и лишь когда **все**
+  речевые символы поискового чанка покрыты наблюдаемыми native/forced span-ами.
+  Частичные и text-only чанки, другие роли, старые и импортированные записи,
+  а также локальный `timings` без такой посимвольной привязки показывают `null`.
+  `index rebuild` воспроизводит диапазоны из SQLite без модели, аудио и сети.
 - Отсутствующая БД или непересобранный индекс (`search_chunks` ещё нет) → exit `0`
   с пустым результатом и предупреждением про `voiceover index build`; ничего не
   создаётся. Старые тексты после upgrade v2→v3, не охваченные немедленной

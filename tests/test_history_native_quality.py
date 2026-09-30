@@ -374,6 +374,10 @@ def test_transcribe_local_asr_quality_reuses_the_registered_asr_path(monkeypatch
         dependency_probe=lambda: ASRDependencyHealth(available=True, remediation=""),
     )
     monkeypatch.setattr(transcription, "get_asr_provider_spec", lambda _provider_id: spec)
+    monkeypatch.setattr(
+        "voiceover_pipeline.providers.qwen_asr_local.qwen_asr_python_dependency_probe",
+        lambda _model_id: ASRDependencyHealth(available=True, remediation=""),
+    )
     # The adapter reuses the long-form orchestration of ``transcribe``, which needs
     # a real duration probe for this provider; the passthrough keeps the unit test
     # offline while still exercising the spec/provider/validation path.

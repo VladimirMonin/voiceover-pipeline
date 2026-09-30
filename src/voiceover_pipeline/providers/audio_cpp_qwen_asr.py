@@ -7,7 +7,7 @@ import tempfile
 from collections.abc import Mapping
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 from uuid import uuid4
 
 from voiceover_pipeline.local_runtime.contracts import (
@@ -49,9 +49,17 @@ from voiceover_pipeline.providers.qwen_asr_local import (
 QWEN_ASR_FAMILY = "qwen3-asr"
 QWEN_AUDIO_CPP_MIN_FREE_VRAM_MB = 4096
 QWEN_AUDIO_CPP_MAX_GPU_UTILIZATION_PERCENT = 90
+# The pinned audio.cpp runtime revision serves only its one inventoried Qwen3 ASR
+# artifact, so a selected model it cannot serve is refused before any runtime
+# invocation instead of silently running the configured weights.
+QWEN_AUDIO_CPP_MODEL_IDS: Final = frozenset({QWEN_ASR_MODEL_ID})
 AUDIO_CPP_QWEN_INSTALL_REMEDIATION = (
     "audio.cpp Qwen ASR runtime is unavailable. Set VOICEOVER_AUDIO_CPP_BINARY to a pinned "
     "JSON driver or configure the verified audio.cpp container image and model paths before retrying."
+)
+AUDIO_CPP_QWEN_MODEL_REMEDIATION = (
+    f"audio.cpp Qwen ASR runtime is pinned to {QWEN_ASR_MODEL_ID} and cannot serve the "
+    "selected model. Select the pinned model or request --runtime python."
 )
 _CONTAINER_COMMAND_JSON_ENV = "VOICEOVER_AUDIO_CPP_CONTAINER_COMMAND_JSON"
 
@@ -161,6 +169,7 @@ class AudioCppQwenASRProvider(ASRProvider):
         if self._runtime is None:
             raise ModuleNotFoundError(AUDIO_CPP_QWEN_INSTALL_REMEDIATION)
         model_id = request.model_id or QWEN_ASR_MODEL_ID
+        admit_audio_cpp_qwen_model(model_id)
         local_request = LocalASRRequest(
             request_id=uuid4().hex,
             family=QWEN_ASR_FAMILY,
@@ -200,6 +209,19 @@ class AudioCppQwenASRProvider(ASRProvider):
                 execution=_execution_receipt(response.receipt, request),
             )
         return validate_asr_response(request, result)
+
+
+def admit_audio_cpp_qwen_model(model_id: str) -> None:
+    """Refuse a model the pinned audio.cpp runtime cannot serve, before any invocation.
+
+    The native request envelope accepts only the family's inventoried model id, so
+    the check fails closed here with an actionable message instead of letting the
+    transport decode reject it after the audio was staged. Callers that resolve a
+    runtime before long-form audio extraction use it as a preflight.
+    """
+    if model_id in QWEN_AUDIO_CPP_MODEL_IDS:
+        return
+    raise ModuleNotFoundError(f"{AUDIO_CPP_QWEN_MODEL_REMEDIATION} Selected model: {model_id!r}.")
 
 
 def _audio_cpp_gpu_lifecycle() -> GPULifecycleOwner:

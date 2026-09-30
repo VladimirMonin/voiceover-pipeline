@@ -64,7 +64,16 @@ def test_output_dir_is_cwd_fails():
     from pathlib import Path
 
     cwd = str(Path.cwd())
-    code, data = cli_json("generate", "--output-dir", cwd, "--json")
+    code, data = cli_json(
+        "generate",
+        "--output-dir",
+        cwd,
+        "--script",
+        str(fixture_path("smoke_test.md")),
+        "--dry-run-cost",
+        "--json",
+        cwd=cwd,
+    )
     assert code == 2, f"expected exit 2, got {code}"
     assert (
         "current working directory" in data["error"].lower()

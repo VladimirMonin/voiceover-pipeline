@@ -25,6 +25,7 @@ from .asr_longform import (
     transcribe_prerecorded_long_form,
     uses_long_form_orchestration,
 )
+from .asr_timing_map import build_observed_timing, seconds_to_ms
 from .commands import history as history_commands
 from .commands import search as search_commands
 from .commands.split import ScriptNotFoundError, prepare_split_chunks
@@ -2579,6 +2580,7 @@ def _asr_result_payload(result, source_audio: Path) -> dict:
         "runtime": result.execution.runtime,
         "runtime_version": result.execution.runtime_version,
         "model_revision": result.execution.model_revision,
+        "model_path": result.execution.model_path,
         "device": result.execution.resolved_device,
         "compute": result.execution.resolved_compute,
         "measurements": dict(result.execution.measurements),
@@ -2733,9 +2735,12 @@ def _asr_run_snapshot(
 ) -> dict[str, Any]:
     """Build the bounded non-secret provenance map stored on an ASR run.
 
-    Only observed values are copied: the reported timestamp origin, the actual
-    segments with their own ``null`` bounds, and the runtime receipt. A text-only
-    result therefore carries no span it did not report.
+    Only observed values are copied: the reported timestamp origin and unit, the
+    producing model identity, the actual segments as integer millisecond bounds
+    (each keeping its own ``null`` when it reported none), and the runtime
+    receipt. ``observed_spans`` is the fail-closed placement of those observed
+    spans onto the canonical transcript characters; a text-only result maps to an
+    empty span list, so the run carries no timestamp it did not observe.
     """
     execution = result.execution
     snapshot: dict[str, Any] = {
@@ -2746,6 +2751,7 @@ def _asr_run_snapshot(
         "runtime": execution.runtime,
         "runtime_version": execution.runtime_version,
         "model_revision": execution.model_revision,
+        "model_path": execution.model_path,
         "device": execution.resolved_device,
         "compute": execution.resolved_compute,
         "timestamp_mode": result.alignment_origin or "none",
@@ -2755,10 +2761,15 @@ def _asr_run_snapshot(
             1 for segment in result.segments if segment.start_s is not None
         ),
         "segments": [
-            {"text": segment.text, "start_s": segment.start_s, "end_s": segment.end_s}
+            {
+                "text": segment.text,
+                "start_ms": seconds_to_ms(segment.start_s),
+                "end_ms": seconds_to_ms(segment.end_s),
+            }
             for segment in result.segments
         ],
         "word_count": len(result.words),
+        "observed_spans": build_observed_timing(result),
         "context_source": context_source,
         "context_prompt_present": context_prompt_present,
         "runtime_measurements": dict(execution.measurements) or None,

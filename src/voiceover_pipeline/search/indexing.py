@@ -26,11 +26,15 @@ Guarantees:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterable, Iterator, Sequence
 
+from ..asr_timing_map import ObservedTimingSpan, chunk_time_range, observed_spans_from_snapshot
 from ..history.database import utc_now
+from ..history.native_asr import NATIVE_ASR_ORIGIN
+from ..history.repository import TEXT_KIND_ASR_TRANSCRIPT
 from .lexical import (
     CHUNKER_VERSION,
     KIND_RUN_LABEL,
@@ -44,7 +48,7 @@ from .lexical import (
     text_hash,
 )
 
-_SOURCE_COLUMNS = "text_source_uuid, run_uuid, part_uuid, artifact_uuid, kind, content"
+_SOURCE_COLUMNS = "text_source_uuid, run_uuid, part_uuid, artifact_uuid, kind, origin, content"
 _INDEXABLE_KIND_VALUES = tuple(ROLE_BY_KIND)
 _INDEXABLE_KIND_PLACEHOLDERS = ", ".join("?" for _ in _INDEXABLE_KIND_VALUES)
 
@@ -278,15 +282,22 @@ def _replace_source_chunks(connection: sqlite3.Connection, row: sqlite3.Row, now
 
     The original chunk text is stored in ``search_chunks``; only the derived
     ``normalized_text`` column of ``search_fts`` is folded. Existing rows are
-    removed first, so the operation is idempotent.
+    removed first, so the operation is idempotent. The chunk's ``start_ms`` /
+    ``end_ms`` are derived from the observed timing spans the run stored in its
+    canonical snapshot, intersected with the chunk's character window, so a
+    rebuild from SQLite alone reproduces the exact same ranges.
     """
     text_source_uuid = row["text_source_uuid"]
     _delete_source_chunks(connection, text_source_uuid)
     role = role_for_kind(row["kind"])
     if role is None:
         return 0
+    spans = _observed_spans_for_run(connection, row)
     written = 0
     for chunk_index, (char_start, char_end, chunk) in enumerate(chunk_text(row["content"] or "")):
+        start_ms, end_ms = chunk_time_range(
+            spans, char_start=char_start, char_end=char_end, chunk_text=chunk
+        )
         written += _insert_chunk(
             connection,
             text_source_uuid=text_source_uuid,
@@ -299,11 +310,45 @@ def _replace_source_chunks(connection: sqlite3.Connection, row: sqlite3.Row, now
             char_start=char_start,
             char_end=char_end,
             chunk=chunk,
-            start_ms=None,
-            end_ms=None,
+            start_ms=start_ms,
+            end_ms=end_ms,
             now=now,
         )
     return written
+
+
+def _observed_spans_for_run(
+    connection: sqlite3.Connection, source: sqlite3.Row
+) -> tuple[ObservedTimingSpan, ...]:
+    """Read only spans bound to this exact canonical ASR transcript source.
+
+    A run may also carry scripts, instructions, or an independently imported
+    transcript. Neither a matching character offset nor a matching run UUID is
+    evidence that such text was recognized at the ASR transcript's times.
+    """
+    if source["kind"] != TEXT_KIND_ASR_TRANSCRIPT or source["origin"] != NATIVE_ASR_ORIGIN:
+        return ()
+    content = source["content"]
+    if not isinstance(content, str):
+        return ()
+    run = connection.execute(
+        "SELECT config_snapshot FROM runs WHERE run_uuid = ?", (source["run_uuid"],)
+    ).fetchone()
+    if run is None or run["config_snapshot"] is None:
+        return ()
+    try:
+        snapshot = json.loads(run["config_snapshot"])
+    except (TypeError, ValueError):
+        return ()
+    if not isinstance(snapshot, dict) or snapshot.get("operation_origin") != NATIVE_ASR_ORIGIN:
+        return ()
+    observed = snapshot.get("observed_spans")
+    if (
+        not isinstance(observed, dict)
+        or observed.get("text_source_uuid") != source["text_source_uuid"]
+    ):
+        return ()
+    return observed_spans_from_snapshot(snapshot, source_text=content)
 
 
 def _ensure_run_label_chunks(connection: sqlite3.Connection, run_uuid: str, now: str) -> int:

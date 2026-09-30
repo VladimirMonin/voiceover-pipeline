@@ -83,7 +83,11 @@ def resolve_asr_provider(spec: ASRProviderSpec, request: ASRRequest) -> ASRProvi
     runtime never imports another optional local package. A missing runtime
     backend or unavailable dependency raises ``ASRDependencyUnavailableError``;
     a ``factory()`` failure propagates unchanged, matching the constructor's
-    former position outside the CLI invocation ``try``.
+    former position outside the CLI invocation ``try``. For the two providers with
+    an explicit Python/native choice (Nemotron and Qwen) the requested runtime is
+    honored deterministically and never auto-switches; ``auto`` keeps the
+    environment-based selection. Every Qwen request preflights the pinned
+    audio.cpp inventory or the selected Python model before long-form extraction.
     """
     runtime = request.runtime_choice
     if spec.provider_id == "nemotron-local" and runtime == "audio-cpp":
@@ -100,6 +104,52 @@ def resolve_asr_provider(spec: ASRProviderSpec, request: ASRRequest) -> ASRProvi
 
         health = nemotron_asr_python_dependency_probe()
         provider_factory = nemotron_asr_python_provider_factory
+    elif spec.provider_id == "qwen-local" and runtime == "audio-cpp":
+        from ..providers.audio_cpp_qwen_asr import (
+            admit_audio_cpp_qwen_model,
+            audio_cpp_qwen_asr_dependency_probe,
+        )
+        from ..providers.qwen_asr_local import (
+            QWEN_ASR_MODEL_ID,
+            qwen_asr_audio_cpp_provider_factory,
+        )
+
+        try:
+            admit_audio_cpp_qwen_model(request.model_id or QWEN_ASR_MODEL_ID)
+        except ModuleNotFoundError as exc:
+            raise ASRDependencyUnavailableError(str(exc)) from exc
+        if not os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip():
+            raise ASRDependencyUnavailableError(
+                f"ASR provider {spec.provider_id} does not support runtime=audio-cpp "
+                "without a native audio.cpp package"
+            )
+        health = audio_cpp_qwen_asr_dependency_probe()
+        provider_factory = qwen_asr_audio_cpp_provider_factory
+    elif spec.provider_id == "qwen-local" and runtime == "python":
+        from ..providers.qwen_asr_local import (
+            qwen_asr_python_dependency_probe,
+            qwen_asr_python_provider_factory,
+        )
+
+        health = qwen_asr_python_dependency_probe(request.model_id)
+        provider_factory = qwen_asr_python_provider_factory
+    elif spec.provider_id == "qwen-local" and runtime == "auto":
+        from ..providers.qwen_asr_local import QWEN_ASR_MODEL_ID, qwen_asr_python_dependency_probe
+
+        if (
+            os.environ.get("VOICEOVER_AUDIO_CPP_BINARY", "").strip()
+            or os.environ.get("VOICEOVER_AUDIO_CPP_CONTAINER_IMAGE", "").strip()
+        ):
+            from ..providers.audio_cpp_qwen_asr import admit_audio_cpp_qwen_model
+
+            try:
+                admit_audio_cpp_qwen_model(request.model_id or QWEN_ASR_MODEL_ID)
+            except ModuleNotFoundError as exc:
+                raise ASRDependencyUnavailableError(str(exc)) from exc
+            health = spec.dependency_probe()
+        else:
+            health = qwen_asr_python_dependency_probe(request.model_id or QWEN_ASR_MODEL_ID)
+        provider_factory = spec.factory
     elif runtime == "audio-cpp":
         if not os.environ.get(NATIVE_AUDIO_CPP_EXECUTABLE_ENV, "").strip():
             raise ASRDependencyUnavailableError(

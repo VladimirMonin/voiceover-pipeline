@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import subprocess
@@ -127,6 +128,7 @@ def transcribe_prerecorded_long_form(provider: ASRProvider, request: ASRRequest)
     if source_duration_s <= LONG_FORM_HARD_MAX_S:
         return provider.transcribe(request)
 
+    source_sha256 = _sha256_file(source_path)
     ffmpeg_path = _ffmpeg_path()
     silence_boundaries = _silence_boundaries(ffmpeg_path, source_path)
     overlap_s = LONG_FORM_OVERLAP_S if request.timestamp_mode == "word" else 0.0
@@ -138,13 +140,14 @@ def transcribe_prerecorded_long_form(provider: ASRProvider, request: ASRRequest)
     if len(plans) < 2:
         raise LongFormASRError("long-form source was not split into bounded inputs")
 
-    chunk_results: list[tuple[ASRChunkPlan, ASRResult, float]] = []
+    chunk_results: list[tuple[ASRChunkPlan, ASRResult, float, str]] = []
     with tempfile.TemporaryDirectory(prefix="voiceover-asr-") as temp_dir:
         temp_path = Path(temp_dir)
         for plan in plans:
             chunk_path = temp_path / f"chunk-{plan.index:04d}.wav"
             output_duration_s = _extract_chunk(ffmpeg_path, source_path, plan, chunk_path)
             _validate_extracted_duration(plan, output_duration_s)
+            output_sha256 = _sha256_file(chunk_path)
             chunk_request = replace(request, audio_path=chunk_path)
             try:
                 result = validate_asr_response(chunk_request, provider.transcribe(chunk_request))
@@ -153,15 +156,31 @@ def transcribe_prerecorded_long_form(provider: ASRProvider, request: ASRRequest)
             except Exception as exc:
                 raise LongFormASRError(f"ASR chunk {plan.index} failed: {exc}") from exc
             _validate_chunk_result(plan, output_duration_s, result)
-            chunk_results.append((plan, result, output_duration_s))
+            chunk_results.append((plan, result, output_duration_s, output_sha256))
+
+    if _sha256_file(source_path) != source_sha256:
+        raise LongFormASRError("long-form source audio changed during execution")
 
     return _merge_chunk_results(
         chunk_results,
         request=request,
         source_duration_s=source_duration_s,
+        source_sha256=source_sha256,
         silence_boundary_count=len(silence_boundaries),
         overlap_s=overlap_s,
     )
+
+
+_HASH_BLOCK_BYTES = 1024 * 1024
+
+
+def _sha256_file(path: Path) -> str:
+    """Return the streaming SHA-256 of a local file for bounded provenance."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(_HASH_BLOCK_BYTES), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _prefer_silence_boundary(
@@ -369,36 +388,35 @@ def _measurement_is_truthy(value: object) -> bool:
 
 
 def _merge_chunk_results(
-    chunk_results: list[tuple[ASRChunkPlan, ASRResult, float]],
+    chunk_results: list[tuple[ASRChunkPlan, ASRResult, float, str]],
     *,
     request: ASRRequest,
     source_duration_s: float,
+    source_sha256: str,
     silence_boundary_count: int,
     overlap_s: float,
 ) -> ASRResult:
     if not chunk_results:
         raise LongFormASRError("long-form execution produced no chunk results")
     _assert_complete_coverage(
-        (plan for plan, _result, _output_duration_s in chunk_results), source_duration_s
+        (plan for plan, _result, _output_duration_s, _output_sha256 in chunk_results),
+        source_duration_s,
     )
 
     first_result = chunk_results[0][1]
+    _assert_consistent_chunk_identity(chunk_results)
+
     merged_words: list[ASRWordSpan] = []
     transcript_parts: list[str] = []
     segments: list[ASRSegment] = []
-    word_segment_indices: list[int] = []
+    word_segment_bounds: dict[int, tuple[float, float]] = {}
     evidence_chunks: list[dict[str, object]] = []
     alignment_origins: set[str] = set()
     previous_plan: ASRChunkPlan | None = None
     deduplicated_word_count = 0
     deduplicated_text_token_count = 0
 
-    for plan, result, output_duration_s in chunk_results:
-        if result.provider_id != first_result.provider_id:
-            raise LongFormASRError("long-form chunks returned inconsistent provider IDs")
-        if result.model_id != first_result.model_id:
-            raise LongFormASRError("long-form chunks returned inconsistent model IDs")
-
+    for plan, result, output_duration_s, output_sha256 in chunk_results:
         offset_words = tuple(
             ASRWordSpan(
                 text=word.text,
@@ -407,6 +425,9 @@ def _merge_chunk_results(
                 confidence=word.confidence,
             )
             for word in result.words
+        )
+        has_input_overlap = previous_plan is not None and (
+            plan.input_start_s < previous_plan.input_end_s - _EPSILON_S
         )
         if offset_words:
             if result.alignment_origin not in {"native", "forced"}:
@@ -423,31 +444,31 @@ def _merge_chunk_results(
             retained_words = _with_word_boundary_space(merged_words, retained_words)
             merged_words.extend(retained_words)
             deduplicated_word_count += removed_words + trimmed_existing
-            word_segment_indices.append(len(segments))
-            segments.append(
-                ASRSegment(
-                    text="",
-                    start_s=plan.coverage_start_s,
-                    end_s=plan.coverage_end_s,
-                )
-            )
+            # The span is filled from the retained word bounds after the loop; a
+            # chunk never claims the source coverage it happened to read.
+            word_segment_bounds[len(segments)] = (plan.coverage_start_s, plan.coverage_end_s)
+            segments.append(ASRSegment(text="", start_s=None, end_s=None))
         else:
             merged_text, removed_tokens = _merge_text_without_word_timestamps(
                 transcript_parts,
                 result.transcript,
-                has_input_overlap=previous_plan is not None
-                and plan.input_start_s < previous_plan.input_end_s - _EPSILON_S,
+                has_input_overlap=has_input_overlap,
             )
             if merged_text:
                 transcript_parts.append(merged_text)
             deduplicated_text_token_count += removed_tokens
-            segments.append(
-                ASRSegment(
-                    text=merged_text,
-                    start_s=plan.coverage_start_s,
-                    end_s=plan.coverage_end_s,
-                )
+            observed_segments = _provable_text_segments(
+                plan,
+                result,
+                merged_text,
+                has_input_overlap=has_input_overlap,
             )
+            if observed_segments is not None:
+                assert result.alignment_origin in {"native", "forced"}
+                alignment_origins.add(result.alignment_origin)
+                segments.extend(observed_segments)
+            else:
+                segments.append(ASRSegment(text=merged_text, start_s=None, end_s=None))
         evidence_chunks.append(
             {
                 "index": plan.index,
@@ -457,6 +478,7 @@ def _merge_chunk_results(
                 "output_duration_s": output_duration_s,
                 "output_duration_delta_s": output_duration_s - plan.input_duration_s,
                 "output_duration_tolerance_s": LONG_FORM_EXTRACT_DURATION_TOLERANCE_S,
+                "output_sha256": output_sha256,
                 "output_status": "duration_verified",
                 "coverage_start_s": plan.coverage_start_s,
                 "coverage_end_s": plan.coverage_end_s,
@@ -468,22 +490,7 @@ def _merge_chunk_results(
         )
         previous_plan = plan
 
-    if merged_words:
-        for segment_index in word_segment_indices:
-            segment = segments[segment_index]
-            if segment.start_s is None:
-                continue
-            segment_start_s = segment.start_s
-            next_start_s = (
-                segments[segment_index + 1].start_s if segment_index + 1 < len(segments) else None
-            )
-            assigned_text = "".join(
-                word.text
-                for word in merged_words
-                if word.start_s >= segment_start_s
-                and (next_start_s is None or word.start_s < next_start_s)
-            ).strip()
-            segments[segment_index] = replace(segment, text=assigned_text)
+    segments = _finalize_word_segments(segments, word_segment_bounds, merged_words)
 
     if len(alignment_origins) > 1:
         raise LongFormASRError("long-form chunks returned inconsistent word-timestamp origins")
@@ -500,10 +507,10 @@ def _merge_chunk_results(
         alignment_origin = "forced"
     measurements = dict(first_result.execution.measurements)
     processed_duration_s = sum(
-        output_duration_s for _plan, _result, output_duration_s in chunk_results
+        output_duration_s for _plan, _result, output_duration_s, _output_sha256 in chunk_results
     )
     planned_processed_duration_s = sum(
-        plan.input_duration_s for plan, _result, _output_duration_s in chunk_results
+        plan.input_duration_s for plan, _result, _output_duration_s, _output_sha256 in chunk_results
     )
     if abs(processed_duration_s - planned_processed_duration_s) > (
         len(chunk_results) * LONG_FORM_EXTRACT_DURATION_TOLERANCE_S
@@ -521,6 +528,7 @@ def _merge_chunk_results(
         "covered_duration_s": source_duration_s,
         "processed_duration_s": processed_duration_s,
         "planned_processed_duration_s": planned_processed_duration_s,
+        "source_sha256": source_sha256,
         "chunk_count": len(chunk_results),
         "chunk_target_s": LONG_FORM_TARGET_S,
         "chunk_hard_max_s": LONG_FORM_HARD_MAX_S,
@@ -539,7 +547,7 @@ def _merge_chunk_results(
         language=next(
             (
                 chunk_result.language
-                for _plan, chunk_result, _output_duration_s in chunk_results
+                for _plan, chunk_result, _output_duration_s, _output_sha256 in chunk_results
                 if chunk_result.language
             ),
             request.language or "",
@@ -552,6 +560,7 @@ def _merge_chunk_results(
             runtime=first_result.execution.runtime,
             runtime_version=first_result.execution.runtime_version,
             model_revision=first_result.execution.model_revision,
+            model_path=first_result.execution.model_path,
             resolved_device=first_result.execution.resolved_device,
             resolved_compute=first_result.execution.resolved_compute,
             measurements=measurements,
@@ -560,6 +569,99 @@ def _merge_chunk_results(
     )
     result.validate_timestamp_bounds(source_duration_s)
     return result
+
+
+def _assert_consistent_chunk_identity(
+    chunk_results: list[tuple[ASRChunkPlan, ASRResult, float, str]],
+) -> None:
+    """Refuse chunks that disagree on the provider or the effective local weights.
+
+    The provider, model, runtime, model revision, and resolved non-secret weights
+    path must match across every chunk so one merged result can never combine two
+    different effective models without saying so.
+    """
+    first = chunk_results[0][1]
+    for _plan, result, _output_duration_s, _output_sha256 in chunk_results:
+        if result.provider_id != first.provider_id:
+            raise LongFormASRError("long-form chunks returned inconsistent provider IDs")
+        if result.model_id != first.model_id:
+            raise LongFormASRError("long-form chunks returned inconsistent model IDs")
+        if result.execution.runtime != first.execution.runtime:
+            raise LongFormASRError("long-form chunks returned inconsistent runtimes")
+        if result.execution.model_revision != first.execution.model_revision:
+            raise LongFormASRError("long-form chunks returned inconsistent model revisions")
+        if result.execution.model_path != first.execution.model_path:
+            raise LongFormASRError("long-form chunks returned inconsistent model paths")
+
+
+def _finalize_word_segments(
+    segments: list[ASRSegment],
+    word_segment_bounds: dict[int, tuple[float, float]],
+    merged_words: list[ASRWordSpan],
+) -> list[ASRSegment]:
+    """Replace each word-chunk placeholder with its real retained word bounds.
+
+    Words are grouped into a word-chunk segment by the absolute time region that
+    chunk covered, the same grouping that already assigns the segment text. A
+    chunk with no retained words after overlap deduplication keeps a null span
+    instead of the coverage it happened to read, and a segment never reports
+    invented phrase precision.
+    """
+    if not merged_words or not word_segment_bounds:
+        return segments
+    finalized = list(segments)
+    for index, (coverage_start_s, coverage_end_s) in word_segment_bounds.items():
+        assigned_words = [
+            word for word in merged_words if coverage_start_s <= word.start_s < coverage_end_s
+        ]
+        if not assigned_words:
+            finalized[index] = ASRSegment(text="", start_s=None, end_s=None)
+            continue
+        finalized[index] = ASRSegment(
+            text="".join(word.text for word in assigned_words).strip(),
+            start_s=min(word.start_s for word in assigned_words),
+            end_s=max(word.end_s for word in assigned_words),
+        )
+    return finalized
+
+
+def _provable_text_segments(
+    plan: ASRChunkPlan,
+    result: ASRResult,
+    merged_text: str,
+    *,
+    has_input_overlap: bool,
+) -> tuple[ASRSegment, ...] | None:
+    """Return offset provider segment spans only when their text provably maps.
+
+    A chunk without word spans may still report genuine provider segment times.
+    They are preserved only when the chunk had no input overlap (so nothing was
+    deduplicated) and the provider's own segment text reconstructs the retained
+    transcript; otherwise the chunk keeps a null span rather than using its
+    source coverage as a fabricated acoustic proxy.
+    """
+    if has_input_overlap or not result.segments:
+        return None
+    if result.alignment_origin not in {"native", "forced"}:
+        return None
+    if any(segment.start_s is None or segment.end_s is None for segment in result.segments):
+        return None
+    if _word_key("".join(segment.text for segment in result.segments)) != _word_key(merged_text):
+        return None
+    offset_segments: list[ASRSegment] = []
+    for segment in result.segments:
+        start_s = segment.start_s
+        end_s = segment.end_s
+        if start_s is None or end_s is None:
+            return None
+        offset_segments.append(
+            ASRSegment(
+                text=segment.text,
+                start_s=start_s + plan.input_start_s,
+                end_s=end_s + plan.input_start_s,
+            )
+        )
+    return tuple(offset_segments)
 
 
 def _deduplicate_overlap_words(

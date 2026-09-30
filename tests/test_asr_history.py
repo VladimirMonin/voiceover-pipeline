@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import sqlite3
 from pathlib import Path
@@ -137,7 +138,11 @@ def _spec(factory, *, timed: bool = True) -> ASRProviderSpec:
 
 
 def _install_spec(monkeypatch, result: ASRResult, factory=None, *, timed: bool = True):
-    """Install the fake provider spec and skip the real long-form orchestrator."""
+    """Install a fake Qwen spec and bypass only real assets and duration probing."""
+    monkeypatch.setattr(
+        "voiceover_pipeline.providers.qwen_asr_local.qwen_asr_python_dependency_probe",
+        lambda _model_id: ASRDependencyHealth(available=True, remediation=""),
+    )
     monkeypatch.setattr(
         cli,
         "get_asr_provider_spec",
@@ -298,9 +303,30 @@ def test_transcribe_persists_run_attempt_source_audio_and_private_transcript(
     assert snapshot["operation_origin"] == "native_asr"
     assert snapshot["timestamp_mode"] == "native"
     assert snapshot["segments"] == [
-        {"text": TRANSCRIPT, "start_s": 0.0, "end_s": 1.0},
+        {"text": TRANSCRIPT, "start_ms": 0, "end_ms": 1000},
     ]
     assert snapshot["segments_with_timestamps"] == 1
+    # The observed span is placed on the canonical transcript with explicit
+    # millisecond unit and producing-model provenance.
+    observed = snapshot["observed_spans"]
+    assert observed["origin"] == "native"
+    assert observed["unit"] == "ms"
+    assert observed["model"] == MODEL_ID
+    assert observed["text_source_uuid"] == texts[0]["text_source_uuid"]
+    search_chunks = _rows(
+        asr_home,
+        "SELECT start_ms, end_ms FROM search_chunks WHERE text_source_uuid = ?",
+        (texts[0]["text_source_uuid"],),
+    )
+    assert [(row["start_ms"], row["end_ms"]) for row in search_chunks] == [(0, 1000)]
+    assert observed["spans"] == [
+        {
+            "char_start": 0,
+            "char_end": len(TRANSCRIPT),
+            "start_ms": 0,
+            "end_ms": 1000,
+        }
+    ]
 
 
 def test_transcribe_run_is_visible_through_history_metadata_only(
@@ -364,8 +390,51 @@ def test_transcribe_text_only_result_stores_no_invented_spans(
     assert snapshot["segments"] == []
     assert snapshot["segments_with_timestamps"] == 0
     assert snapshot["word_count"] == 0
+    # A text-only result invents no span: the unit and origin are still named,
+    # but there is no observed range to place on the transcript.
+    assert snapshot["observed_spans"]["origin"] == "none"
+    assert snapshot["observed_spans"]["unit"] == "ms"
+    assert snapshot["observed_spans"]["spans"] == []
+    assert (
+        snapshot["observed_spans"]["text_source_uuid"]
+        == _rows(asr_home, "SELECT text_source_uuid FROM text_sources")[0]["text_source_uuid"]
+    )
     assert _kinds(asr_home) == ["asr_transcript"]
     assert _rows(asr_home, "SELECT content FROM text_sources")[0]["content"] == TRANSCRIPT
+
+
+def test_transcribe_word_timestamps_store_exact_ms_offsets(asr_home, tmp_path, monkeypatch, capsys):
+    audio = _audio(tmp_path)
+    _install_spec(monkeypatch, _result(words=True))
+
+    code = _run_transcribe(monkeypatch, audio, extra=("--word-timestamps",))
+
+    assert code == 0
+    snapshot = json.loads(_rows(asr_home, "SELECT config_snapshot FROM runs")[0]["config_snapshot"])
+    observed = snapshot["observed_spans"]
+    assert observed["origin"] == "native"
+    assert observed["unit"] == "ms"
+    assert observed["model"] == MODEL_ID
+    # The word spans 0.0-0.5 s and 0.5-1.0 s are placed on the canonical "привет
+    # мир" characters as exact integer milliseconds.
+    assert observed["spans"] == [
+        {"char_start": 0, "char_end": 6, "start_ms": 0, "end_ms": 500},
+        {"char_start": 7, "char_end": 10, "start_ms": 500, "end_ms": 1000},
+    ]
+
+
+def test_transcribe_logs_never_carry_the_transcript(
+    asr_home, tmp_path, monkeypatch, capsys, caplog
+):
+    audio = _audio(tmp_path)
+    _install_spec(monkeypatch, _result())
+
+    with caplog.at_level(logging.DEBUG, logger="voiceover_pipeline"):
+        code = _run_transcribe(monkeypatch, audio)
+
+    assert code == 0
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert TRANSCRIPT not in logged
 
 
 def test_transcribe_stores_context_prompt_and_its_provenance(
@@ -477,6 +546,7 @@ def test_transcribe_persists_long_form_provenance_without_changing_coverage(
             resolved_compute="auto",
             long_form={
                 "source_duration_s": 200.0,
+                "source_sha256": hashlib.sha256(AUDIO_BYTES).hexdigest(),
                 "coverage_verified": True,
                 "chunks": [{"index": 0, "output_duration_s": 110.0}],
             },
@@ -491,7 +561,53 @@ def test_transcribe_persists_long_form_provenance_without_changing_coverage(
     snapshot = json.loads(_rows(asr_home, "SELECT config_snapshot FROM runs")[0][0])
     assert snapshot["timestamp_mode"] == "chunked"
     assert snapshot["long_form"]["coverage_verified"] is True
+    assert (
+        snapshot["long_form"]["source_sha256"]
+        == _rows(asr_home, "SELECT sha256 FROM artifacts WHERE role = 'asr_source_audio'")[0][
+            "sha256"
+        ]
+    )
     assert snapshot["long_form"]["chunks"][0]["index"] == 0
+
+
+def test_transcribe_refuses_source_hash_changed_after_long_form_result(
+    asr_home, tmp_path, monkeypatch, capsys
+):
+    audio = _audio(tmp_path)
+    base = _result(timed=False)
+    long_form_result = ASRResult(
+        transcript=base.transcript,
+        provider_id=base.provider_id,
+        model_id=base.model_id,
+        language=base.language,
+        alignment_origin="chunked",
+        execution=ASRExecutionReceipt(
+            runtime="fixture-runtime",
+            resolved_device="cpu",
+            resolved_compute="auto",
+            long_form={"source_sha256": hashlib.sha256(AUDIO_BYTES).hexdigest()},
+        ),
+    )
+    calls: list[str] = []
+    _install_spec(
+        monkeypatch, long_form_result, factory=lambda: _FixtureProvider(long_form_result, calls)
+    )
+    actual_persist = cli.persist_asr_history
+
+    def mutate_after_transcription(save):
+        audio.write_bytes(b"source changed after transcription")
+        return actual_persist(save)
+
+    monkeypatch.setattr(cli, "persist_asr_history", mutate_after_transcription)
+
+    code = _run_transcribe(monkeypatch, audio)
+
+    assert code == 50
+    data = json.loads(capsys.readouterr().out)
+    assert data["transcript"] == TRANSCRIPT
+    assert data["history"] == {"saved": False, "error_code": "HISTORY_PERSISTENCE_FAILED"}
+    assert calls == ["transcribe"]
+    assert _rows(asr_home, "SELECT run_uuid FROM runs") == []
 
 
 def test_unreadable_settings_fails_closed_instead_of_silently_saving(

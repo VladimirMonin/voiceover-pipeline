@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +28,9 @@ def _result(
     measurements: dict[str, float] | None = None,
     alignment_origin: str = "forced",
     provider_id: str = "qwen-local",
+    model_path: str | None = None,
+    model_revision: str | None = None,
+    runtime: str = "fixture-asr",
 ) -> ASRResult:
     return ASRResult(
         transcript="".join(word.text for word in words),
@@ -35,8 +40,10 @@ def _result(
         words=words,
         alignment_origin=alignment_origin,
         execution=ASRExecutionReceipt(
-            runtime="fixture-asr",
+            runtime=runtime,
             runtime_version="1.0",
+            model_revision=model_revision,
+            model_path=model_path,
             resolved_device="cpu",
             resolved_compute="float32",
             measurements=measurements or {},
@@ -50,6 +57,27 @@ def _text_result(text: str) -> ASRResult:
         provider_id="nemotron-local",
         model_id="fixture-model",
         language="ru",
+        execution=ASRExecutionReceipt(
+            runtime="fixture-asr",
+            runtime_version="1.0",
+            resolved_device="cpu",
+            resolved_compute="float32",
+        ),
+    )
+
+
+def _segmented_text_result(
+    segments: tuple[ASRSegment, ...],
+    *,
+    transcript: str | None = None,
+) -> ASRResult:
+    return ASRResult(
+        transcript=transcript if transcript is not None else " ".join(s.text for s in segments),
+        provider_id="nemotron-local",
+        model_id="fixture-model",
+        language="ru",
+        segments=segments,
+        alignment_origin="chunked",
         execution=ASRExecutionReceipt(
             runtime="fixture-asr",
             runtime_version="1.0",
@@ -208,12 +236,18 @@ def test_long_form_merges_absolute_word_timestamps_and_retains_unique_boundary_t
     assert [word.start_s for word in result.words] == pytest.approx(
         [0.1, 108.9, 109.2, 109.6, 219.4, 359.7]
     )
-    assert [(segment.start_s, segment.end_s) for segment in result.segments] == [
-        (0.0, 110.0),
-        (110.0, 220.0),
-        (220.0, 330.0),
-        (330.0, 360.0),
+    assert [segment.text for segment in result.segments] == [
+        "opening boundary words unique",
+        "middle",
+        "",
+        "tail",
     ]
+    assert [segment.start_s for segment in result.segments] == pytest.approx(
+        [0.1, 219.4, None, 359.7]
+    )
+    assert [segment.end_s for segment in result.segments] == pytest.approx(
+        [109.9, 219.8, None, 359.95]
+    )
     assert result.alignment_origin == "forced"
     assert result.execution.long_form is not None
     assert result.execution.long_form["coverage_verified"] is True
@@ -335,10 +369,9 @@ def test_long_form_nemotron_reconciles_mismatched_boundary_words_by_absolute_tim
     assert result.transcript == "alpha delta"
     assert result.execution.long_form is not None
     assert result.execution.long_form["deduplicated_word_count"] == 2
-    assert [(segment.text, segment.start_s, segment.end_s) for segment in result.segments] == [
-        ("alpha delta", 0.0, 110.0),
-        ("", 110.0, 120.001),
-    ]
+    assert [segment.text for segment in result.segments] == ["alpha delta", ""]
+    assert [segment.start_s for segment in result.segments] == pytest.approx([108.16, None])
+    assert [segment.end_s for segment in result.segments] == pytest.approx([111.64, None])
 
 
 def test_long_form_overlap_keeps_identical_text_at_distinct_nonoverlapping_positions(
@@ -457,7 +490,7 @@ def test_long_form_fails_closed_when_a_provider_reports_token_limit_truncation(
         longform.transcribe_prerecorded_long_form(provider, _request(source))
 
 
-def test_long_form_supplies_chunk_timing_when_a_selected_route_has_no_word_timestamps(
+def test_long_form_text_only_chunks_report_null_acoustic_spans_with_coverage_in_evidence(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "text-only.wav"
@@ -481,9 +514,241 @@ def test_long_form_supplies_chunk_timing_when_a_selected_route_has_no_word_times
     assert result.words == ()
     assert result.alignment_origin == "chunked"
     assert result.duration_s == pytest.approx(120.001)
-    assert [(segment.start_s, segment.end_s) for segment in result.segments] == [
+    assert [(segment.text, segment.start_s, segment.end_s) for segment in result.segments] == [
+        ("alpha beta", None, None),
+        ("gamma tail", None, None),
+    ]
+    assert result.execution.long_form is not None
+    chunks = result.execution.long_form["chunks"]
+    assert isinstance(chunks, list)
+    assert [(chunk["coverage_start_s"], chunk["coverage_end_s"]) for chunk in chunks] == [
         (0.0, 110.0),
         (110.0, 120.001),
+    ]
+
+
+def test_long_form_orchestration_is_scoped_to_the_two_local_provider_families() -> None:
+    assert longform.uses_long_form_orchestration("qwen-local")
+    assert longform.uses_long_form_orchestration("nemotron-local")
+    assert not longform.uses_long_form_orchestration("faster-whisper")
+    assert not longform.uses_long_form_orchestration("openrouter-whisper")
+
+
+def test_long_form_records_source_and_chunk_sha256_provenance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "hashed-source.wav"
+    source.write_bytes(b"source-bytes")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider([_text_result("alpha beta"), _text_result("gamma tail")])
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(
+        provider, ASRRequest(audio_path=source, model_id="fixture-model", language="ru")
+    )
+
+    assert result.execution.long_form is not None
+    assert (
+        result.execution.long_form["source_sha256"] == hashlib.sha256(b"source-bytes").hexdigest()
+    )
+    chunks = result.execution.long_form["chunks"]
+    assert isinstance(chunks, list)
+    chunk_sha = hashlib.sha256(b"fixture").hexdigest()
+    assert [chunk["output_sha256"] for chunk in chunks] == [chunk_sha, chunk_sha]
+
+
+def test_long_form_fails_closed_when_the_source_changes_during_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "changing-source.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider([_text_result("alpha beta"), _text_result("gamma tail")])
+    provider.provider_id = "nemotron-local"
+    real_sha256_file = longform._sha256_file
+    source_reads = {"count": 0}
+
+    def changing_sha256_file(path: Path) -> str:
+        if Path(path) == source:
+            source_reads["count"] += 1
+            return "source-start" if source_reads["count"] == 1 else "source-changed"
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(longform, "_sha256_file", changing_sha256_file)
+
+    with pytest.raises(longform.LongFormASRError, match="changed during execution"):
+        longform.transcribe_prerecorded_long_form(
+            provider, ASRRequest(audio_path=source, model_id="fixture-model", language="ru")
+        )
+
+
+def test_long_form_propagates_consistent_runtime_and_model_path_from_first_receipt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "audio-cpp-qwen.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _result(
+                (ASRWordSpan(text="first", start_s=0.0, end_s=0.2),),
+                alignment_origin="forced",
+                provider_id="qwen-local",
+                runtime="audio-cpp-qwen",
+                model_path="/models/qwen3-asr.gguf",
+                model_revision="rev-1",
+            ),
+            _result(
+                (ASRWordSpan(text="tail", start_s=0.0, end_s=0.2),),
+                alignment_origin="forced",
+                provider_id="qwen-local",
+                runtime="audio-cpp-qwen",
+                model_path="/models/qwen3-asr.gguf",
+                model_revision="rev-1",
+            ),
+        ]
+    )
+    provider.provider_id = "qwen-local"
+
+    result = longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+    assert result.execution.runtime == "audio-cpp-qwen"
+    assert result.execution.model_revision == "rev-1"
+    assert result.execution.model_path == "/models/qwen3-asr.gguf"
+
+
+@pytest.mark.parametrize(
+    ("field", "first_value", "second_value", "message"),
+    [
+        ("model_path", "/models/a", "/models/b", "inconsistent model paths"),
+        ("runtime", "audio-cpp-qwen", "qwen-asr", "inconsistent runtimes"),
+        ("model_revision", "rev-1", "rev-2", "inconsistent model revisions"),
+    ],
+)
+def test_long_form_refuses_chunks_with_inconsistent_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    field: str,
+    first_value: str,
+    second_value: str,
+    message: str,
+) -> None:
+    source = tmp_path / "identity-mismatch.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    base: dict[str, str] = {
+        "alignment_origin": "forced",
+        "provider_id": "qwen-local",
+        "runtime": "qwen-asr",
+        "model_path": "/models/a",
+        "model_revision": "rev-1",
+    }
+    first = dict(base)
+    first[field] = first_value
+    second = dict(base)
+    second[field] = second_value
+    provider = _ChunkProvider(
+        [
+            _result((ASRWordSpan(text="first", start_s=0.0, end_s=0.2),), **first),
+            _result((ASRWordSpan(text="tail", start_s=0.0, end_s=0.2),), **second),
+        ]
+    )
+    provider.provider_id = "qwen-local"
+
+    with pytest.raises(longform.LongFormASRError, match=message):
+        longform.transcribe_prerecorded_long_form(provider, _request(source))
+
+
+def test_long_form_preserves_provable_provider_segment_times_without_words(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "provider-segments.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            replace(
+                _segmented_text_result(
+                    (
+                        ASRSegment(text="alpha", start_s=0.5, end_s=2.0),
+                        ASRSegment(text="beta", start_s=2.2, end_s=4.0),
+                    )
+                ),
+                alignment_origin="native",
+            ),
+            replace(
+                _segmented_text_result((ASRSegment(text="gamma", start_s=0.3, end_s=1.5),)),
+                alignment_origin="native",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(
+        provider, ASRRequest(audio_path=source, model_id="fixture-model", language="ru")
+    )
+
+    assert result.transcript == "alpha beta gamma"
+    assert [segment.text for segment in result.segments] == ["alpha", "beta", "gamma"]
+    assert [segment.start_s for segment in result.segments] == pytest.approx([0.5, 2.2, 110.3])
+    assert [segment.end_s for segment in result.segments] == pytest.approx([2.0, 4.0, 111.5])
+    assert result.alignment_origin == "native"
+
+
+def test_long_form_rejects_segment_times_without_observed_alignment_origin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "chunked-segments.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            _segmented_text_result((ASRSegment(text="alpha", start_s=0.5, end_s=2.0),)),
+            _segmented_text_result((ASRSegment(text="beta", start_s=0.3, end_s=1.5),)),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(
+        provider, ASRRequest(audio_path=source, model_id="fixture-model", language="ru")
+    )
+
+    assert result.transcript == "alpha beta"
+    assert all(segment.start_s is None and segment.end_s is None for segment in result.segments)
+    assert result.alignment_origin == "chunked"
+
+
+def test_long_form_leaves_null_spans_when_provider_segment_text_does_not_map(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "unmappable-segments.wav"
+    source.write_bytes(b"source")
+    _patch_media(monkeypatch, duration_s=120.001)
+    provider = _ChunkProvider(
+        [
+            replace(
+                _segmented_text_result(
+                    (ASRSegment(text="alpha", start_s=0.5, end_s=2.0),),
+                    transcript="alpha beta",
+                ),
+                alignment_origin="native",
+            ),
+            replace(
+                _segmented_text_result((ASRSegment(text="gamma", start_s=0.3, end_s=1.5),)),
+                alignment_origin="native",
+            ),
+        ]
+    )
+    provider.provider_id = "nemotron-local"
+
+    result = longform.transcribe_prerecorded_long_form(
+        provider, ASRRequest(audio_path=source, model_id="fixture-model", language="ru")
+    )
+
+    assert result.transcript == "alpha beta gamma"
+    assert [(segment.text, segment.start_s, segment.end_s) for segment in result.segments] == [
+        ("alpha beta", None, None),
+        ("gamma", 110.3, 111.5),
     ]
 
 
@@ -764,6 +1029,10 @@ def test_public_transcribe_routes_selected_local_families_through_long_form_laye
     )
     captured: list[tuple[object, ASRRequest]] = []
     monkeypatch.setattr(cli, "get_asr_provider_spec", lambda _provider_id: spec)
+    # The resolver preflights each provider's real runtime for an explicit
+    # python/audio-cpp choice, so this route test injects the fixture provider
+    # instead of depending on an installed local runtime.
+    monkeypatch.setattr(cli.transcription, "resolve_asr_provider", lambda _spec, _request: provider)
     monkeypatch.setattr(
         cli,
         "transcribe_prerecorded_long_form",

@@ -365,7 +365,7 @@ def _qwen_audio_cpp_spec(probe, factory):
         provider_id="qwen-local",
         description="Offline fixture provider",
         factory=factory,
-        models=({"id": "fixture-model", "default": True},),
+        models=({"id": "Qwen/Qwen3-ASR-0.6B", "default": True},),
         capabilities=ASRCapabilities(
             batch_audio=True,
             forced_language=True,
@@ -456,6 +456,12 @@ def test_transcribe_qwen_audio_cpp_cuda_with_native_package_selects_audio_cpp_ro
     monkeypatch.setattr(
         cli, "get_asr_provider_spec", lambda _provider_id: _qwen_audio_cpp_spec(probe, factory)
     )
+    # An explicit Qwen audio.cpp request is deterministic: it uses the dedicated
+    # native probe/factory, never the spec's environment-selecting pair.
+    from voiceover_pipeline.providers import audio_cpp_qwen_asr, qwen_asr_local
+
+    monkeypatch.setattr(audio_cpp_qwen_asr, "audio_cpp_qwen_asr_dependency_probe", probe)
+    monkeypatch.setattr(qwen_asr_local, "qwen_asr_audio_cpp_provider_factory", factory)
     monkeypatch.setattr(
         cli,
         "transcribe_prerecorded_long_form",

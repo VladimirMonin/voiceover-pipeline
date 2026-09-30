@@ -296,3 +296,18 @@ def test_audio_cpp_qwen_applies_chunk_offset_before_contract_validation():
     result = provider.transcribe(ASRRequest(audio_path="fixture.wav", timestamp_mode="word"))
 
     assert [(word.start_s, word.end_s) for word in result.words] == [(10.0, 10.3), (10.4, 10.8)]
+
+
+def test_audio_cpp_qwen_refuses_a_model_outside_its_pinned_inventory_before_invocation():
+    from voiceover_pipeline.providers.audio_cpp_qwen_asr import (
+        AUDIO_CPP_QWEN_MODEL_REMEDIATION,
+    )
+
+    provider = _provider({"transcript": "unused"})
+
+    with pytest.raises(ModuleNotFoundError) as error:
+        provider.transcribe(ASRRequest(audio_path="fixture.wav", model_id="Qwen/Qwen3-ASR-1.7B"))
+
+    assert AUDIO_CPP_QWEN_MODEL_REMEDIATION in str(error.value)
+    assert "Qwen/Qwen3-ASR-1.7B" in str(error.value)
+    assert provider._runtime.requests == []

@@ -192,6 +192,9 @@ class ASRExecutionReceipt:
     runtime: str
     runtime_version: str | None = None
     model_revision: str | None = None
+    # The non-secret resolved local weights path actually loaded, when the
+    # provider can observe one. A cloud route leaves it ``None``.
+    model_path: str | None = None
     resolved_device: str = "cpu"
     resolved_compute: str = "auto"
     measurements: Mapping[str, float] = field(default_factory=dict)
