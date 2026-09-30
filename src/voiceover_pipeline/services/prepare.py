@@ -332,6 +332,10 @@ class PreparedRun:
     and the single-profile monologue), and
     ``qwen_clone_identity``/``qwen_mode_identity`` only for the admitted
     ``qwen-local`` local routes (clone, or the instructed preset/design modes).
+    ``fallback_voice`` is present only for the ordinary ``polza-chat-audio``
+    route: it is that provider's compatibility ``--fallback-voice`` value, which
+    selects no fallback but is part of the run's synthesis identity, so a resume
+    with a changed value is refused.
     """
 
     provider: str
@@ -343,6 +347,7 @@ class PreparedRun:
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
     qwen_clone_identity: QwenCloneVoiceIdentity | None = None
     qwen_mode_identity: QwenModeVoiceIdentity | None = None
+    fallback_voice: str | None = None
 
 
 def default_voice(args: argparse.Namespace) -> str | None:
@@ -514,6 +519,9 @@ def prepare_run(
     bank routes -- the two-cast dialogue and the single-profile monologue -- build
     their ``voice_bank_identity`` here from the admitted catalog and the profiles
     the run actually references; every other OmniVoice mode leaves it ``None``.
+    The ordinary ``polza-chat-audio`` route records its resolved ``--fallback-voice``
+    as ``fallback_voice`` so the native snapshot can keep that non-secret synthesis
+    identity; every other route leaves it ``None``.
     """
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
     if args.provider == "omnivoice-local":
@@ -553,6 +561,9 @@ def prepare_run(
         voice_bank_identity=voice_bank_identity,
         qwen_clone_identity=qwen_clone_identity,
         qwen_mode_identity=qwen_mode_identity,
+        fallback_voice=(
+            getattr(args, "fallback_voice", None) if args.provider == "polza-chat-audio" else None
+        ),
     )
 
 

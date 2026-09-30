@@ -1369,7 +1369,8 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     """Whether this command is an admitted DB-first native TTS route.
 
     An ordinary, non-dialogue ``polza-tts`` run on either its async ``elevenlabs/``
-    ``/media`` model route or its synchronous ``/audio/speech`` model route, and an
+    ``/media`` model route or its synchronous ``/audio/speech`` model route, an
+    ordinary non-dialogue ``polza-chat-audio`` chat-audio run, and an
     ordinary ``openrouter-tts`` run, are executed by the native executor when they
     use no unsupported option mixture. Two bounded integrated steps are admitted
     for that same route: an installed *local* ``--tts-quality-provider``
@@ -1409,7 +1410,11 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         return False
     if not isinstance(getattr(args, "model", None), str):
         return False
-    if getattr(args, "provider", None) not in ("polza-tts", "openrouter-tts"):
+    if getattr(args, "provider", None) not in (
+        "polza-tts",
+        "polza-chat-audio",
+        "openrouter-tts",
+    ):
         return False
     if getattr(args, "with_timings", False):
         if quality_provider is not None:
@@ -1624,9 +1629,9 @@ def _run_native_route(
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an admitted native "
-            "polza-tts, openrouter-tts, local Qwen clone/preset/design, or local OmniVoice "
-            "dialogue/bank-mono run may continue it; choose a different --run-id for other "
-            "options.",
+            "polza-tts, polza-chat-audio, openrouter-tts, local Qwen clone/preset/design, "
+            "or local OmniVoice dialogue/bank-mono run may continue it; choose a different "
+            "--run-id for other options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
         )
@@ -3566,16 +3571,21 @@ def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     """Build the provider a reconstructed native run needs, lazily from its snapshot.
 
     ``history resume`` and ``history sync`` recover the provider identity from the
-    committed snapshot, so an admitted ``polza-tts``, ``openrouter-tts``,
-    ``omnivoice-local``, or ``qwen-local`` provider is built from those stored values
-    only. The API key is read when the executor first calls the factory -- for a
+    committed snapshot, so an admitted ``polza-tts``, ``polza-chat-audio``,
+    ``openrouter-tts``, ``omnivoice-local``, or ``qwen-local`` provider is built from
+    those stored values only. The ``polza-chat-audio`` route rebuilds its resolved
+    compatibility ``fallback_voice`` from the snapshot. The API key is read when the
+    executor first calls the factory -- for a
     fresh unattempted submit or a known-id GET recovery -- and never for an export
     repair or a local raw rebuild.
     """
     if prepared.provider == "qwen-local":
         return _build_native_qwen_local_provider(prepared)
     identity_args = argparse.Namespace(
-        provider=prepared.provider, model=prepared.model, voice=prepared.voice
+        provider=prepared.provider,
+        model=prepared.model,
+        voice=prepared.voice,
+        fallback_voice=prepared.fallback_voice,
     )
     api_key = read_api_key(identity_args)
     if prepared.provider == "omnivoice-local":

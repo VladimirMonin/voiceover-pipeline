@@ -661,6 +661,13 @@ def _read_committed_view(
         )
     qwen_clone = _config_optional_qwen_clone(config)
     qwen_mode = _config_optional_qwen_mode(config)
+    fallback_voice = _config_optional_str(config, "fallback_voice")
+    if provider == "polza-chat-audio" and fallback_voice is None:
+        # The writer always records the resolved compatibility fallback voice for
+        # this route, so a run without one did not come from that writer unchanged.
+        raise NativeViewIntegrityError(
+            "native snapshot polza-chat-audio run is missing its fallback voice"
+        )
     if provider == "qwen-local":
         # The writer stores exactly one local-Qwen identity block per run: the clone
         # block for clone mode, or the instructed-mode block for preset/design. A run
@@ -686,6 +693,7 @@ def _read_committed_view(
         voice_bank=voice_bank,
         qwen_clone=qwen_clone,
         qwen_mode=qwen_mode,
+        fallback_voice=fallback_voice,
     )
     native_parts, part_fingerprints = _build_parts(run, config, parts, text_sources, identity)
 

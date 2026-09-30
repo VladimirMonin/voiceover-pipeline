@@ -321,10 +321,11 @@ voiceover list timing-providers --json
 | Папка существует без флагов | Ошибка exit code 30 |
 | Папка — нативный прогон | Свойства: `--overwrite` отклоняется (exit 30); `--skip-existing` возвращает `skipped`; без `--resume` — ошибка; `--resume` идёт по canonical SQLite (см. ниже) |
 
-### Нативный прогон `polza-tts` / `openrouter-tts`
+### Нативный прогон `polza-tts` / `polza-chat-audio` / `openrouter-tts`
 
 Если запуск — обычный не-диалоговый `polza-tts` (модель `elevenlabs/...` через
-async `/media` либо любая другая через синхронный `/audio/speech`) или
+async `/media` либо любая другая через синхронный `/audio/speech`), обычный
+не-диалоговый `polza-chat-audio` или
 `openrouter-tts` без неподдерживаемого сочетания опций, то история становится
 canonical: части, попытки, оплаченные байты и финальная
 сборка хранятся в SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON
@@ -349,10 +350,12 @@ exit 50 с `details.error_code = NATIVE_EXPORT_FAILED`. Изменённый т�
 JSON для такого каталога запрещён. Существующие legacy-каталоги не захватываются:
 свежий native-запуск требует ещё не созданного `run_root`.
 
-Синхронный `polza-tts` (`/audio/speech`) и `openrouter-tts` не дают
+Синхронный `polza-tts` (`/audio/speech`), `openrouter-tts` и `polza-chat-audio`
+(один streaming `POST /chat/completions` с инлайн-аудио) не дают
 восстановимого task id. Их принятые байты связываются с БД с
 `remote_task_id = null`; точная стоимость ответа `polza-tts` пишется до FFmpeg,
-а `openrouter-tts` не отдаёт синхронного usage, поэтому его стоимость остаётся
+а `openrouter-tts` и `polza-chat-audio` не отдают синхронного usage, поэтому их
+стоимость остаётся
 неизвестной без нового сетевого GET и не выдумывается. Неопределённый
 синхронный ответ оставляет маркер `submitting` и блокирует `--resume` без
 повторного POST/GET; крах между записью `raw/` и его связыванием с БД

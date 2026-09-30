@@ -278,10 +278,12 @@ ATTEMPT_STATUS_COMPLETED = "completed"
 POLZA_TTS_PROVIDER_ID = "polza-tts"
 # Providers whose synchronous (non-media) paid TTS route links its accepted raw
 # bytes without an accepted remote task id: ``polza-tts`` for every
-# non-ElevenLabs model (the ``/audio/speech`` route) and ``openrouter-tts``,
-# which returns the audio inline. Neither can hold a recoverable media task id,
-# so the raw link is the only durable evidence of the paid outcome.
-SYNC_TTS_PROVIDER_IDS = frozenset({POLZA_TTS_PROVIDER_ID, "openrouter-tts"})
+# non-ElevenLabs model (the ``/audio/speech`` route), ``openrouter-tts``,
+# which returns the audio inline, and ``polza-chat-audio``, whose one streaming
+# ``/chat/completions`` submit returns audio inline too. None can hold a
+# recoverable media task id, so the raw link is the only durable evidence of the
+# paid outcome.
+SYNC_TTS_PROVIDER_IDS = frozenset({POLZA_TTS_PROVIDER_ID, "openrouter-tts", "polza-chat-audio"})
 # A run whose work already finished. Repeating finished work creates a new run
 # with a link to the previous one, not another paid attempt on the closed run.
 RUN_STATUS_COMPLETED = "completed"

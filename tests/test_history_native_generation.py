@@ -24,6 +24,7 @@ from voiceover_pipeline.providers import PolzaTTSProvider
 
 POLZA_MEDIA_MODEL = "elevenlabs/text-to-speech-turbo-2-5"
 POLZA_SYNC_MODEL = "openai/gpt-4o-mini-tts"
+POLZA_CHAT_AUDIO_MODEL = "openai/gpt-audio-mini"
 
 
 class FakeMediaProvider:
@@ -90,6 +91,37 @@ class FakeSyncProvider:
             generation_id=f"gen-{chunk_id}",
             client_path="requests",
             raw_metadata=raw_metadata,
+        )
+
+    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+        self.calls.append(chunk_id)
+        if self.script is not None:
+            return self.script(self, text, chunk_id)
+        return self._result(text, chunk_id)
+
+
+class FakeChatAudioProvider:
+    """Offline stand-in for the synchronous Polza ``polza-chat-audio`` submit.
+
+    The real provider is one streaming ``/chat/completions`` POST that returns
+    inline PCM16 audio and no synchronous usage, so this fake returns inline bytes
+    with no ``usage_direct``. The route must therefore persist its cost as unknown
+    and never issue a history cost GET. ``script`` lets a test replace one call,
+    for example to raise after the paid marker exists.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.script = None
+
+    def _result(self, text: str, chunk_id: str) -> SynthesisResult:
+        return SynthesisResult(
+            audio_bytes=f"{chunk_id}-audio".encode(),
+            audio_format="pcm16",
+            transcript=text,
+            generation_id=f"gen-{chunk_id}",
+            client_path="requests",
+            raw_metadata={"voice": "ash", "provider": "polza-chat-audio"},
         )
 
     def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
@@ -649,6 +681,196 @@ def test_native_sync_unknown_submit_blocks_without_repeat(
     assert code == 30
     assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
     assert provider.calls == ["chunk_01"]
+
+
+def test_native_chat_audio_fresh_run_submits_once_and_keeps_unknown_cost(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """The chat-audio route commits one paid POST per part and an unknown cost."""
+    provider = FakeChatAudioProvider()
+    _install_provider(monkeypatch, provider)
+    monkeypatch.setattr(
+        cli,
+        "attach_costs",
+        lambda *_args, **_kwargs: pytest.fail("chat-audio must not fetch an enriched cost"),
+    )
+    script = _script(tmp_path, ["Первый фрагмент.", "Второй фрагмент."])
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path,
+            script,
+            "native-chat",
+            provider="polza-chat-audio",
+            model=POLZA_CHAT_AUDIO_MODEL,
+            voice="ash",
+        ),
+    )
+
+    assert code == 0
+    assert payload["status"] == "success"
+    assert provider.calls == ["chunk_01", "chunk_02"]
+    # The chat-audio response carries no synchronous usage, so the cost is unknown
+    # rather than invented, exactly like openrouter-tts.
+    assert payload["cost"]["total"] is None
+
+    run_root = tmp_path / "out" / "native-chat"
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    # The inline PCM16 bytes are retained raw (``pcm16`` maps to a ``pcm`` file)
+    # before conversion, so a later FFmpeg failure rebuilds them with no POST.
+    assert (run_root / "raw" / "chunk_01.pcm").read_bytes() == b"chunk_01-audio"
+    detail = _history_show(_run_uuid("native-chat"))
+    assert detail["run"]["status"] == "completed"
+    assert all(attempt["status"] == "completed" for attempt in detail["attempts"])
+    assert all(attempt["remote_id"] is None for attempt in detail["attempts"])
+    assert all(attempt["cost"]["amount"] is None for attempt in detail["attempts"])
+    roles = {artifact["role"] for artifact in detail["artifacts"]}
+    assert {"paid_raw_audio", "chunk_audio", "final_audio"} <= roles
+
+
+def test_native_chat_audio_unknown_outcome_blocks_without_second_submit(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A chat-audio submit whose outcome is unknown blocks resume with no repeat."""
+    provider = FakeChatAudioProvider()
+
+    def fail_after_marker(_inner, _text, _chunk_id):
+        raise requests.Timeout("stream lost after the paid marker")
+
+    provider.script = fail_after_marker
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Неопределённый исход."])
+    argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-chat-unknown",
+        provider="polza-chat-audio",
+        model=POLZA_CHAT_AUDIO_MODEL,
+        voice="ash",
+    )
+
+    code, payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_SYNTHESIS_FAILED"
+    assert provider.calls == ["chunk_01"]
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("an unconfirmed chat-audio submit must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-chat-unknown",
+        provider="polza-chat-audio",
+        model=POLZA_CHAT_AUDIO_MODEL,
+        voice="ash",
+        extra=["--resume"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert provider.calls == ["chunk_01"]
+
+
+def test_native_chat_audio_changed_fallback_voice_blocks_before_network(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Changing the compatibility fallback voice refuses a resume before any provider."""
+    provider = FakeChatAudioProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый фрагмент.", "Второй фрагмент."])
+    code, _ = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path,
+            script,
+            "native-chat-fb",
+            provider="polza-chat-audio",
+            model=POLZA_CHAT_AUDIO_MODEL,
+            voice="ash",
+        ),
+    )
+    assert code == 0
+    assert provider.calls == ["chunk_01", "chunk_02"]
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("a changed fallback voice must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-chat-fb",
+        provider="polza-chat-audio",
+        model=POLZA_CHAT_AUDIO_MODEL,
+        voice="ash",
+        extra=["--resume", "--fallback-voice", "echo"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_RESUME_IDENTITY_CHANGED"
+    assert provider.calls == ["chunk_01", "chunk_02"]
+
+
+def test_native_chat_audio_resume_rebuilds_from_raw_receipt_without_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A chat-audio raw receipt written before a failed conversion rebuilds locally."""
+    provider = FakeChatAudioProvider()
+    _install_provider(monkeypatch, provider)
+    calls = {"n": 0}
+
+    def flaky_write(_ffmpeg, data, _fmt, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("conversion boom")
+        path.write_bytes(data)
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
+    script = _script(tmp_path, ["Сохранённый raw."])
+    argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-chat-raw",
+        provider="polza-chat-audio",
+        model=POLZA_CHAT_AUDIO_MODEL,
+        voice="ash",
+    )
+    code, payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 50
+    assert payload["details"]["error_code"] == "NATIVE_CONVERSION_FAILED"
+    assert provider.calls == ["chunk_01"]
+    # The inline bytes were linked to the attempt before FFmpeg, so the failed
+    # conversion leaves valid on-disk evidence.
+    assert (tmp_path / "out" / "native-chat-raw" / "raw" / "chunk_01.pcm").exists()
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", _write_mp3)
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("a local chat-audio raw rebuild must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-chat-raw",
+        provider="polza-chat-audio",
+        model=POLZA_CHAT_AUDIO_MODEL,
+        voice="ash",
+        extra=["--resume"],
+    )
+    code, _payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0
+    assert provider.calls == ["chunk_01"]
+    assert (
+        tmp_path / "out" / "native-chat-raw" / "chunks" / "chunk_01.mp3"
+    ).read_bytes() == b"chunk_01-audio"
+    assert _history_show(_run_uuid("native-chat-raw"))["run"]["status"] == "completed"
 
 
 def test_native_sync_resume_reconciles_raw_receipt_written_before_db_link(
@@ -1327,8 +1549,14 @@ def test_native_run_parts_shape_is_valid() -> None:
     args.tts_quality_provider = "qwen-local"
     args.provider = "polza-tts"
     assert cli._native_route_eligible(args, "dialogue") is False
-    # A provider outside the admitted set keeps the legacy executor.
+    # The ordinary non-dialogue ``polza-chat-audio`` chat-audio route is admitted
+    # with the same bounded integrated steps; its dialogue form is not.
     args.provider = "polza-chat-audio"
+    args.model = "openai/gpt-audio-mini"
+    assert cli._native_route_eligible(args, "markdown") is True
+    assert cli._native_route_eligible(args, "dialogue") is False
+    # A non-string model is never admitted.
+    args.model = object()
     assert cli._native_route_eligible(args, "markdown") is False
 
 
@@ -1912,6 +2140,81 @@ def test_history_resume_submits_only_the_unattempted_part_without_original_scrip
     assert payload["mode"] == "resume"
     status, _revision = _run_row(native_env, run_uuid)
     assert status == "completed"
+
+
+def test_history_resume_reconstructs_chat_audio_run_without_original_script(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """history resume rebuilds the chat-audio snapshot and submits only the missing part."""
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    provider = FakeChatAudioProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый.", "Второй."])
+
+    real_reserve = HistoryRepository.reserve_paid_tts_attempt
+    calls = {"n": 0}
+
+    def flaky_reserve(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("crash before the second reserve")
+        return real_reserve(self, *args, **kwargs)
+
+    monkeypatch.setattr(HistoryRepository, "reserve_paid_tts_attempt", flaky_reserve)
+    code, _payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path,
+            script,
+            "hist-chat-resume",
+            provider="polza-chat-audio",
+            model=POLZA_CHAT_AUDIO_MODEL,
+            voice="ash",
+        ),
+    )
+    assert code == 30
+    assert provider.calls == ["chunk_01"]
+    monkeypatch.setattr(HistoryRepository, "reserve_paid_tts_attempt", real_reserve)
+
+    run_uuid = _run_uuid("hist-chat-resume")
+    script.unlink()
+
+    resume_provider = FakeChatAudioProvider()
+    _install_provider(monkeypatch, resume_provider)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "resume"))
+
+    assert code == 0, payload
+    # Part 1 was skipped; only the unattempted part was submitted, rebuilt from the
+    # snapshot alone because the original script is gone.
+    assert resume_provider.calls == ["chunk_02"]
+    assert payload["mode"] == "resume"
+    status, _revision = _run_row(native_env, run_uuid)
+    assert status == "completed"
+
+
+def test_native_history_provider_builder_passes_chat_audio_fallback_voice(monkeypatch):
+    """history resume rebuilds the chat-audio provider with the committed fallback voice."""
+    from voiceover_pipeline.services.prepare import PreparedPart, PreparedRun
+
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: "sk-test")
+    chunk = ScriptChunk(number=1, id="chunk_01", text="x", voice="ash")
+    prepared = PreparedRun(
+        provider="polza-chat-audio",
+        model=POLZA_CHAT_AUDIO_MODEL,
+        voice="ash",
+        style_prompt=None,
+        prompt_mode="plain",
+        parts=(PreparedPart(chunk=chunk, voice="ash"),),
+        fallback_voice="onyx",
+    )
+
+    provider = cli._native_history_provider_builder(prepared)
+
+    assert provider.provider_id == "polza-chat-audio"
+    assert provider.voice == "ash"
+    assert provider.fallback_voice == "onyx"
 
 
 def test_history_sync_known_media_id_is_get_only(tmp_path, monkeypatch, capsys, native_env):

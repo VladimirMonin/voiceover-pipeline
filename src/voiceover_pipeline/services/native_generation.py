@@ -6,7 +6,10 @@ chunks, and final assembly live in the database, and the legacy JSON files becom
 compatibility exports. This module owns the bounded executor for the admitted
 routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing
 processing, either its synchronous ``/audio/speech`` model or its async
-``elevenlabs/`` ``/media`` model, the synchronous ``openrouter-tts`` route, and
+``elevenlabs/`` ``/media`` model, the synchronous ``openrouter-tts`` route, the
+ordinary non-dialogue ``polza-chat-audio`` chat-audio route (one streaming
+``/chat/completions`` submit whose compatibility ``fallback_voice`` is a recorded
+identity input but never an automatic fallback request), and
 the validated ``openrouter-tts`` Gemini two-speaker dialogue route, and the
 ``omnivoice-local`` preset bank routes (the two-profile dialogue and the
 single-profile monologue), and the ordinary
@@ -76,7 +79,8 @@ Contract:
   paid POST or local model run, and the paid raw bytes, converted audio, and cost
   stay on disk.
 
-Known limits: this slice admits the non-dialogue ``polza-tts`` and
+Known limits: this slice admits the non-dialogue ``polza-tts``, ``polza-chat-audio``
+(chat-audio), and
 ``openrouter-tts`` routes with the recorded trimming/timing/quality semantics in
 the snapshot, the validated ``openrouter-tts`` Gemini dialogue route, the
 ``omnivoice-local`` preset bank routes (the two-profile dialogue and the
@@ -85,7 +89,10 @@ non-dialogue ``qwen-local`` local routes (clone and the instructed preset/design
 modes). The
 crash window between a synchronous raw receipt and its database link (covered by
 local reconciliation) is the only place a synchronous observed cost cannot be
-rebuilt, because the receipt carries no cost. Cloud ASR, cloud timing, the other
+rebuilt, because the receipt carries no cost; the ``polza-chat-audio`` route
+reports no synchronous usage, so its cost stays unknown exactly like
+``openrouter-tts`` and it never issues a history cost GET. Cloud ASR, cloud
+timing, the other
 speech providers, and every ``polza-tts`` dialogue route stay on the legacy
 executor until their own identity and processing paths are supported.
 """
@@ -3443,6 +3450,25 @@ def _stored_identity_str(config: dict[str, Any], key: str) -> str:
     return value
 
 
+def _stored_optional_identity_str(config: dict[str, Any], key: str) -> str | None:
+    """Return one optional stored identity field, or fail closed on a malformed value.
+
+    ``None`` (the key is absent, as for every route that records no such block) is
+    returned as ``None``; a present value must be a non-empty string, matching the
+    writer. The message echoes no stored value.
+    """
+    value = config.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise NativeGenerationError(
+            "the committed snapshot is malformed; refusing to reconstruct the run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class NativeRunReconstruction:
     """The prepared synthesis inputs rebuilt from one committed native view.
@@ -3558,6 +3584,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
     voice_bank_identity = _stored_voice_bank_identity(config)
     qwen_clone_identity = _stored_qwen_clone_identity(config)
     qwen_mode_identity = _stored_qwen_mode_identity(config)
+    fallback_voice = _stored_optional_identity_str(config, "fallback_voice")
     prepared = PreparedRun(
         provider=_stored_identity_str(config, "provider"),
         model=model,
@@ -3568,6 +3595,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         voice_bank_identity=voice_bank_identity,
         qwen_clone_identity=qwen_clone_identity,
         qwen_mode_identity=qwen_mode_identity,
+        fallback_voice=fallback_voice,
     )
     run_root = Path(view.run.run_root)
     paths = build_run_paths(run_root.parent, model, run_root.name)

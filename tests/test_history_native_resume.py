@@ -503,3 +503,27 @@ def test_stored_paid_attempt_record_does_not_grant_action(tmp_path, repository):
     assert with_marker.attempts[0].status == ATTEMPT_STATUS_SUBMITTING
     assert _row_counts(repository) == before_counts
     assert repository.get_run(snapshot.run.run_uuid).revision == before_revision
+
+
+def test_chat_audio_fallback_voice_change_is_rejected(tmp_path, repository):
+    """The ordinary polza-chat-audio route binds its fallback voice into identity."""
+    run_root = tmp_path / "run"
+    run_root.mkdir()
+    prepared = _prepared(
+        provider="polza-chat-audio",
+        model="openai/gpt-audio-mini",
+        voice="ash",
+        fallback_voice="onyx",
+    )
+    snapshot = _persist(repository, prepared, run_root)
+
+    # The unchanged candidate passes; a different fallback voice fails closed with
+    # the fixed conflict message that echoes no value.
+    view = _preflight(repository, snapshot, prepared, run_root)
+    assert view.run.run_uuid == snapshot.run.run_uuid
+
+    with pytest.raises(NativeResumeIdentityConflictError) as excinfo:
+        _preflight(repository, snapshot, replace(prepared, fallback_voice="echo"), run_root)
+
+    assert "fallback voice changed" in str(excinfo.value)
+    assert "echo" not in str(excinfo.value)

@@ -122,6 +122,9 @@ _QWEN_MODE_CONFLICT = (
     "native resume identity conflict: the qwen-local preset/design mode, model, voice, "
     "instruction, runtime, or language changed"
 )
+_FALLBACK_VOICE_CONFLICT = (
+    "native resume identity conflict: the polza-chat-audio fallback voice changed"
+)
 _PART_COUNT_CONFLICT = "native resume identity conflict: part count changed"
 _PART_ORDER_CONFLICT = (
     "native resume identity conflict: candidate parts are not contiguous with the generated "
@@ -199,6 +202,13 @@ def _require_prepared(prepared: object) -> PreparedRun:
     if qwen_mode is not None and not isinstance(qwen_mode, QwenModeVoiceIdentity):
         raise NativeResumeValidationError(
             "prepared qwen mode identity must be None or a QwenModeVoiceIdentity"
+        )
+    fallback_voice = prepared.fallback_voice
+    if fallback_voice is not None and (
+        not isinstance(fallback_voice, str) or not fallback_voice.strip()
+    ):
+        raise NativeResumeValidationError(
+            "prepared fallback voice must be None or a non-empty string"
         )
     return prepared
 
@@ -329,6 +339,13 @@ def preflight_native_tts_resume(
     )
     if committed_qwen_mode != candidate_qwen_mode:
         raise NativeResumeIdentityConflictError(_QWEN_MODE_CONFLICT)
+    committed_fallback_voice = config.get("fallback_voice")
+    if committed_fallback_voice is not None and (
+        not isinstance(committed_fallback_voice, str) or not committed_fallback_voice
+    ):
+        raise NativeResumeIdentityConflictError(_FALLBACK_VOICE_CONFLICT)
+    if committed_fallback_voice != candidate.fallback_voice:
+        raise NativeResumeIdentityConflictError(_FALLBACK_VOICE_CONFLICT)
 
     if len(candidate.parts) != len(view.parts):
         raise NativeResumeIdentityConflictError(_PART_COUNT_CONFLICT)
@@ -347,6 +364,7 @@ def preflight_native_tts_resume(
         voice_bank=candidate_voice_bank,
         qwen_clone=candidate_qwen_clone,
         qwen_mode=candidate_qwen_mode,
+        fallback_voice=candidate.fallback_voice,
     )
     for position, part in enumerate(candidate.parts, start=1):
         chunk = part.chunk

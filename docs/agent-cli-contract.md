@@ -404,7 +404,8 @@ provider/model/voice/script, с которыми позднее будет за�
 
 Узкий вертикальный срез S05 переводит на canonical SQLite обычные
 не-диалоговые запуски `polza-tts` — как async `--model elevenlabs/...`
-(`/media`), так и синхронный `/audio/speech` (любая другая модель) — и
+(`/media`), так и синхронный `/audio/speech` (любая другая модель) — обычный
+не-диалоговый `polza-chat-audio` и
 `openrouter-tts`. Этого же маршрута касаются: записанная семантика обрезки
 (`--no-trim` либо обрезка по умолчанию), локальные
 `--with-timings --timing-provider faster-whisper`, которые дают аудио и
@@ -447,11 +448,13 @@ provider/model/voice/script, с которыми позднее будет за�
   без подтверждения блокирует (`PAID_SUBMIT_UNCONFIRMED`), известный Media ID
   доводится только GET-запросами, валидный raw receipt пересобирается локально.
 - **Синхронный маршрут без remote id.** Синхронный `polza-tts`
-  (`/audio/speech`) и `openrouter-tts` возвращают аудио инлайн и никогда не дают
+  (`/audio/speech`), `openrouter-tts` и `polza-chat-audio` (один streaming
+  `POST /chat/completions` с инлайн-аудио) возвращают аудио инлайн и никогда не дают
   восстановимого task id. Их принятые байты и bounded receipt связываются одним
   CAS-переходом (`submitting` → `raw_saved`, `remote_task_id = null`). Точная
   стоимость ответа `polza-tts` пишется в той же транзакции **до FFmpeg**;
-  `openrouter-tts` не отдаёт синхронного usage, поэтому его стоимость остаётся
+  `openrouter-tts` и `polza-chat-audio` не отдают синхронного usage, поэтому их
+  стоимость остаётся
   неизвестной без нового сетевого GET и не выдумывается. Потерянный или
   неопределённый синхронный ответ оставляет `submitting` и блокирует любой
   resume/overwrite без повторного POST/GET. Крах между записью receipt и его
@@ -1112,7 +1115,7 @@ Dry-run сообщает найденные каталоги/записи, impor
 
 `history resume ID` и `history sync ID` восстанавливают **один уже
 закоммиченный нативный TTS-прогон** (обычный не-диалоговый `polza-tts` /
-`openrouter-tts`, локальный Qwen clone или `omnivoice-local`, который записал
+`polza-chat-audio` / `openrouter-tts`, локальный Qwen clone или `omnivoice-local`, который записал
 снимок в canonical SQLite) из его сохранённого
 снимка и запускают тот же нативный исполнитель, что и `generate --resume`. `ID`
 — внутренний `run_uuid`; метка не разрешается, потому что resume и sync меняют
@@ -1560,7 +1563,7 @@ offline/local runtime experiment.
 }
 ```
 
-Для **нативного** обычного `polza-tts` / `openrouter-tts` прогона с
+Для **нативного** обычного `polza-tts` / `polza-chat-audio` / `openrouter-tts` прогона с
 `--timing-provider faster-whisper` сбой локальных таймингов — это exit `50` с
 фиксированным `details.error_code` (`NATIVE_TIMING_FAILED` или
 `NATIVE_TIMING_HISTORY_FAILED`); завершённое аудио, оплаченный raw и стоимость

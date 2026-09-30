@@ -3180,7 +3180,7 @@ def test_record_polza_sync_raw_saved_rejects_unsupported_provider(repository, tm
     run = repository.create_run(operation="tts", run_root=str(tmp_path))
     part = repository.add_part(run.run_uuid, position=1, fingerprint=_SYNC_FINGERPRINT)
     attempt = _reserve_sync_attempt(
-        repository, run.run_uuid, part.part_uuid, expected_revision=1, provider="polza-chat-audio"
+        repository, run.run_uuid, part.part_uuid, expected_revision=1, provider="acme-tts-9000"
     )
     receipt = _write_sync_receipt(tmp_path, attempt.attempt_uuid, part.part_uuid)
 
@@ -3188,6 +3188,26 @@ def test_record_polza_sync_raw_saved_rejects_unsupported_provider(repository, tm
         _record_sync_raw_saved(repository, run, part, attempt, receipt)
 
     _assert_no_sync_raw_link(repository, run, attempt)
+
+
+def test_record_polza_sync_raw_saved_accepts_chat_audio_with_unknown_cost(repository, tmp_path):
+    # The ordinary ``polza-chat-audio`` route is one synchronous streaming submit
+    # that returns inline audio without usage: it links its raw evidence with no
+    # remote task id and leaves the cost unknown, exactly like openrouter-tts.
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(
+        repository, tmp_path, provider="polza-chat-audio", model="openai/gpt-audio-mini"
+    )
+
+    _advanced, updated, artifact = _record_sync_raw_saved(
+        repository, run, part, attempt, receipt, amount=None
+    )
+
+    assert updated.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert updated.remote_id is None
+    assert updated.cost.amount is None
+    assert updated.cost.source == COST_SOURCE_UNKNOWN
+    assert artifact.role == history_repository_module.ARTIFACT_ROLE_PAID_RAW_AUDIO
+    assert artifact.path == "raw/chunk_01.mp3"
 
 
 def test_record_polza_sync_raw_saved_rejects_non_null_remote_id(repository, tmp_path):

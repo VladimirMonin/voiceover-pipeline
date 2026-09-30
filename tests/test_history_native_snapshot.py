@@ -219,6 +219,20 @@ def _single_chunk_prepared(*, provider, model, voice="voice_a"):
     )
 
 
+def _chat_audio_prepared(*, fallback_voice="onyx"):
+    """A valid-looking ordinary ``polza-chat-audio`` run with its fallback voice."""
+    chunk = ScriptChunk(number=1, id="chunk_01", text="Одиночный текст.", voice="ash")
+    return PreparedRun(
+        provider="polza-chat-audio",
+        model=_POLZA_CHAT_MODEL,
+        voice="ash",
+        style_prompt=None,
+        prompt_mode="plain",
+        parts=(PreparedPart(chunk=chunk, voice=chunk.voice),),
+        fallback_voice=fallback_voice,
+    )
+
+
 _UNSUPPORTED_ROUTES = {
     "omnivoice-preset": lambda: (
         _omnivoice_single_mode_prepared(),
@@ -244,7 +258,7 @@ _UNSUPPORTED_ROUTES = {
         _single_chunk_prepared(provider="qwen-local", model=_QWEN_MODEL),
         {"voice_identity": f"design:{'e' * 64}"},
     ),
-    "polza-chat-audio": lambda: (
+    "polza-chat-audio-no-fallback": lambda: (
         _single_chunk_prepared(provider="polza-chat-audio", model=_POLZA_CHAT_MODEL),
         {},
     ),
@@ -964,3 +978,39 @@ def test_route_rejection_precedes_run_voice_validation(repository, tmp_path):
     assert _row_count(repository, "runs") == 0
     assert _row_count(repository, "parts") == 0
     assert _row_count(repository, "text_sources") == 0
+
+
+def test_chat_audio_snapshot_records_fallback_voice(repository, tmp_path):
+    """The ordinary polza-chat-audio route commits its fallback voice as identity."""
+    result = _persist(repository, _chat_audio_prepared(), tmp_path / "runs" / "chat")
+
+    snapshot = repository.get_run(result.run.run_uuid).config_snapshot
+    assert snapshot["provider"] == "polza-chat-audio"
+    assert snapshot["model"] == _POLZA_CHAT_MODEL
+    assert snapshot["voice"] == "ash"
+    assert snapshot["fallback_voice"] == "onyx"
+
+
+def test_chat_audio_fallback_voice_changes_the_run_identity(repository, tmp_path):
+    """A different fallback voice must produce a different committed fingerprint."""
+    first = _persist(
+        repository, _chat_audio_prepared(fallback_voice="onyx"), tmp_path / "runs" / "a"
+    )
+    second = _persist(
+        repository, _chat_audio_prepared(fallback_voice="echo"), tmp_path / "runs" / "b"
+    )
+
+    assert first.fingerprint != second.fingerprint
+
+
+def test_fallback_voice_on_a_non_chat_route_is_rejected(repository, tmp_path):
+    """Only the polza-chat-audio route may carry a fallback voice identity."""
+    prepared = replace(_scenario(), fallback_voice="onyx")
+    run_root = tmp_path / "runs" / "not-chat"
+
+    with pytest.raises(NativeSnapshotValidationError) as excinfo:
+        _persist(repository, prepared, run_root)
+
+    assert "polza-chat-audio" in str(excinfo.value)
+    assert _row_count(repository, "runs") == 0
+    assert not run_root.exists()
