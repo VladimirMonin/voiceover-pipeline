@@ -61,10 +61,13 @@ from .config import (
     QWEN_MODEL_CUSTOMVOICE,
     QWEN_MODEL_VOICE_DESIGN,
     QWEN_PRESET_SPEAKERS,
+    EnvFileError,
     read_groq_key,
     read_openrouter_key,
     read_polza_key,
     read_xai_key,
+    resolved_env_file_path,
+    use_env_file,
 )
 from .gemini_dialogue import (
     DIALOGUE_FORMAT,
@@ -277,41 +280,44 @@ def main() -> None:
             _json_error("Invalid command-line arguments", _EXIT_ARGS)
         raise
 
-    try:
-        if args.command == "generate":
-            generate(args)
-        elif args.command == "split":
-            split_cmd(args)
-        elif args.command == "transcribe":
-            transcribe_cmd(args)
-        elif args.command == "verify-tts":
-            verify_tts_cmd(args)
-        elif args.command == "timings":
-            run_timings(args)
-        elif args.command == "status":
-            status_cmd(args)
-        elif args.command == "concat":
-            concat_cmd(args)
-        elif args.command == "doctor":
-            doctor_cmd(args)
-        elif args.command == "validate":
-            validate_cmd(args)
-        elif args.command == "list":
-            list_cmd(args)
-        elif args.command == "history":
-            history_cmd(args)
-        elif args.command == "search":
-            search_cmd(args)
-        elif args.command == "index":
-            index_cmd(args)
-        elif args.command == "help":
-            help_cmd(args)
-    except CliError as exc:
-        _emit_error(args, str(exc), exc.code, details=exc.details)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        _emit_error(args, str(exc), _EXIT_PROVIDER)
+    with use_env_file(getattr(args, "env_file", None)):
+        try:
+            if args.command == "generate":
+                generate(args)
+            elif args.command == "split":
+                split_cmd(args)
+            elif args.command == "transcribe":
+                transcribe_cmd(args)
+            elif args.command == "verify-tts":
+                verify_tts_cmd(args)
+            elif args.command == "timings":
+                run_timings(args)
+            elif args.command == "status":
+                status_cmd(args)
+            elif args.command == "concat":
+                concat_cmd(args)
+            elif args.command == "doctor":
+                doctor_cmd(args)
+            elif args.command == "validate":
+                validate_cmd(args)
+            elif args.command == "list":
+                list_cmd(args)
+            elif args.command == "history":
+                history_cmd(args)
+            elif args.command == "search":
+                search_cmd(args)
+            elif args.command == "index":
+                index_cmd(args)
+            elif args.command == "help":
+                help_cmd(args)
+        except CliError as exc:
+            _emit_error(args, str(exc), exc.code, details=exc.details)
+        except EnvFileError as exc:
+            _emit_error(args, str(exc), _EXIT_NO_KEY)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            _emit_error(args, str(exc), _EXIT_PROVIDER)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -321,6 +327,17 @@ def main() -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Voiceover + Whisper timing CLI for agents.")
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Read secrets from this explicit env file for this call. It replaces the "
+            "default <CWD>/.env without a hidden parent search; the process "
+            "environment still wins. An unreadable explicit file fails closed."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="command")
     subparsers.required = True
 
@@ -3485,6 +3502,24 @@ def _run_cloud_timing_locked(
 ) -> None:
     """Body of the paid cloud timing route, already holding the output-root lock."""
     _guard_foreign_timings_root(output_leaf)
+    # Existing-output refusal and --skip-existing do not need a credential.
+    # --overwrite must wait until after the key gate before deleting anything.
+    if (args.skip_existing or not args.overwrite) and _handle_timings_output_dir(
+        args, output_dir, run_id, audio_path
+    ):
+        return
+    # Resolve the cloud credential before changing the output root or reserving a
+    # paid attempt. An unusable explicit env file must not leave a false marker.
+    key_reader = {
+        "groq-whisper": read_groq_key,
+        "xai-stt": read_xai_key,
+    }.get(args.timing_provider)
+    if key_reader is None:
+        fail("Unsupported cloud timing provider.", _EXIT_ARGS)
+    try:
+        key_reader()
+    except (EnvFileError, RuntimeError) as exc:
+        fail(str(exc), _EXIT_NO_KEY)
     if _handle_timings_output_dir(args, output_dir, run_id, audio_path):
         return
     try:
@@ -3518,6 +3553,10 @@ def _run_cloud_timing_locked(
         )
     except CliError:
         raise
+    except EnvFileError as exc:
+        # If the file changed after preflight, keep the marker as evidence but
+        # report a path-free credential failure rather than an ASR failure.
+        fail(str(exc), _EXIT_NO_KEY)
     except ModuleNotFoundError as exc:
         fail(
             f"Missing dependency for Whisper timing: {exc}. Install with: uv sync --extra timing-whisper",
@@ -3650,8 +3689,16 @@ def doctor_cmd(args: argparse.Namespace) -> None:
     results["ffmpeg"] = {"ok": bool(ffmpeg), "path": ffmpeg, "required": True}
     results["ffprobe"] = {"ok": bool(ffprobe), "path": ffprobe, "required": True}
 
-    env_file = Path.cwd() / ".env"
-    results["env_file"] = {"ok": env_file.exists(), "path": str(env_file), "required": True}
+    env_file = resolved_env_file_path()
+    try:
+        env_file_available = env_file.is_file()
+    except OSError:
+        env_file_available = False
+    results["env_file"] = {
+        "ok": env_file_available,
+        "path": str(env_file),
+        "required": True,
+    }
 
     need_polza = (args.provider or DEFAULT_PROVIDER) in ("polza-chat-audio", "polza-tts")
     polza_ok = False

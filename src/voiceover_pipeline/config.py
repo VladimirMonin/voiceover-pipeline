@@ -1,4 +1,7 @@
+import contextvars
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 POLZA_BASE_URL = "https://polza.ai/api/v1"
@@ -6,7 +9,6 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 XAI_BASE_URL = "https://api.x.ai/v1"
 
-DEFAULT_ENV_FILE = Path.cwd() / ".env"
 DEFAULT_SCRIPT_DIR = Path.cwd() / "in"
 DEFAULT_OUTPUT_DIR = Path.cwd() / "out"
 DEFAULT_TEMP_DIR = Path.cwd() / "temp"
@@ -208,12 +210,76 @@ def model_slug(model: str) -> str:
     return model.replace("/", "-").replace(":", "-").replace(".", "-")
 
 
-def read_env_file(env_path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
-    if not env_path.exists():
-        return {}
+# Runtime ``.env`` resolution. The process environment always wins; then an explicit
+# ``--env-file`` scoped to the current CLI call; then ``<call-time CWD>/.env`` for
+# compatibility. No hidden parent-directory search runs and no import-time path is
+# captured for a runtime lookup.
+_ACTIVE_ENV_FILE: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "voiceover_active_env_file", default=None
+)
+
+
+class EnvFileError(RuntimeError):
+    """A fixed, redacted failure for an unusable runtime env file.
+
+    The message never carries the file path, its contents, or a secret value.
+    """
+
+
+def resolved_env_file_path() -> Path:
+    """The file a runtime secret lookup would read.
+
+    Returns the explicit ``--env-file`` when one is scoped to this call, otherwise
+    ``<call-time CWD>/.env``. It never reads the file, so a read-only command can
+    report the path without touching a secret.
+    """
+    active = _ACTIVE_ENV_FILE.get()
+    if active is not None:
+        return active
+    return Path.cwd() / ".env"
+
+
+@contextmanager
+def use_env_file(env_path: Path | None) -> Iterator[None]:
+    """Scope an explicit ``--env-file`` to the current call.
+
+    Setting the override never reads the file, so ``help`` and other read-only
+    commands keep working even when the flag points at a missing file. The token is
+    reset on every exit -- including ``SystemExit`` and raised errors -- so a later
+    in-process call falls back to ``<call-time CWD>/.env``.
+    """
+    token = _ACTIVE_ENV_FILE.set(env_path)
+    try:
+        yield
+    finally:
+        _ACTIVE_ENV_FILE.reset(token)
+
+
+def _require_regular_explicit_env_file(env_path: Path) -> None:
+    """Reject an unusable explicit path without opening or parsing its contents."""
+    try:
+        regular_file = env_path.is_file()
+    except OSError as exc:
+        raise EnvFileError("Explicit --env-file could not be read.") from exc
+    if not regular_file:
+        raise EnvFileError("Explicit --env-file is missing or not a regular file.")
+
+
+def _read_env_values(env_path: Path, *, required: bool) -> dict[str, str]:
+    if required:
+        _require_regular_explicit_env_file(env_path)
+    try:
+        if not env_path.exists():
+            return {}
+        text = env_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        message = (
+            "Explicit --env-file could not be read." if required else "Env file could not be read."
+        )
+        raise EnvFileError(message) from exc
 
     values: dict[str, str] = {}
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -227,7 +293,36 @@ def read_env_file(env_path: Path = DEFAULT_ENV_FILE) -> dict[str, str]:
     return values
 
 
-def get_secret(name: str, env_path: Path = DEFAULT_ENV_FILE) -> str | None:
+def read_env_file(env_path: Path | None = None) -> dict[str, str]:
+    """Read a ``.env`` file under the runtime resolution rules.
+
+    An explicit ``env_path`` (direct-call compatibility) reads exactly that file and
+    returns an empty mapping when it does not exist. With no argument, an explicit
+    ``--env-file`` scoped through :func:`use_env_file` is read next and fails closed
+    when it is missing or unreadable; otherwise ``<call-time CWD>/.env`` is read for
+    compatibility. Parents are never searched.
+    """
+    if env_path is not None:
+        return _read_env_values(env_path, required=False)
+
+    active = _ACTIVE_ENV_FILE.get()
+    if active is not None:
+        return _read_env_values(active, required=True)
+
+    return _read_env_values(Path.cwd() / ".env", required=False)
+
+
+def get_secret(name: str, env_path: Path | None = None) -> str | None:
+    """Resolve a secret: validate an explicit CLI path, then prefer the process value.
+
+    A supplied --env-file must exist and be regular even when the process has a
+    usable key. Validation checks metadata only; contents are not read when the
+    process value wins. Direct-call env_path retains its historical behavior.
+    """
+    if env_path is None:
+        active = _ACTIVE_ENV_FILE.get()
+        if active is not None:
+            _require_regular_explicit_env_file(active)
     value = os.environ.get(name)
     if value:
         return value
@@ -247,7 +342,7 @@ def read_openrouter_key() -> str:
     if not env_key:
         raise RuntimeError(
             "OPENROUTER_API_KEY is required for provider=openrouter-tts. "
-            f"Put it into {DEFAULT_ENV_FILE}: OPENROUTER_API_KEY=sk-or-..."
+            "Set it in the environment or an env file: OPENROUTER_API_KEY=sk-or-..."
         )
     return env_key.removeprefix("Bearer ").strip()
 
@@ -257,7 +352,7 @@ def read_groq_key() -> str:
     if not env_key:
         raise RuntimeError(
             "GROQ_API_KEY is required for timing-provider=groq-whisper. "
-            f"Put it into {DEFAULT_ENV_FILE}: GROQ_API_KEY=gsk_..."
+            "Set it in the environment or an env file: GROQ_API_KEY=gsk_..."
         )
     return env_key.removeprefix("Bearer ").strip()
 
@@ -267,6 +362,6 @@ def read_xai_key() -> str:
     if not env_key:
         raise RuntimeError(
             "X_AI_API_KEY is required for timing-provider=xai-stt. "
-            f"Put it into {DEFAULT_ENV_FILE}: X_AI_API_KEY=xai-..."
+            "Set it in the environment or an env file: X_AI_API_KEY=xai-..."
         )
     return env_key.removeprefix("Bearer ").strip()

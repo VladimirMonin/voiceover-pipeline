@@ -126,6 +126,10 @@ class _CloudTiming:
 
 
 def _install_cli_seams(monkeypatch, tmp_path: Path) -> None:
+    # The real pre-POST key gate runs before the fake cloud adapter. Supply only
+    # synthetic keys so these offline lifecycle tests cannot depend on a user env.
+    monkeypatch.setenv("GROQ_API_KEY", "synthetic-paid-timing-groq")
+    monkeypatch.setenv("X_AI_API_KEY", "synthetic-paid-timing-xai")
     monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
     monkeypatch.setattr(cli.shutil, "which", lambda _command: "ffprobe")
     monkeypatch.setattr(cli, "mp3_duration_ms", lambda _ffprobe, _source: 1000)
