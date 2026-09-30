@@ -149,6 +149,13 @@ session на прогон. `format: dialogue` создаёт один bound bank
 - `--mode design` — голос по инструкции: `--design-instruction`; для русского route accent/dialect attributes запрещены как unsupported-language conditioning. Short Russian design до 30 estimated seconds — warning + experimental; long Russian design выше threshold отклоняется до provider/GPU. Альтернативы: explicit `clone`, доступный accepted `preset`, отдельно принятые short clips или другой provider; mode/voice не подменяются.
 - `--voice` вне preset+bank, Qwen-опции и style-флаги для этого провайдера fail closed.
 - `list voices --provider omnivoice-local --voice-bank <catalog.json>` показывает профили банка.
+- Обычный одноголосый `--mode preset --voice-bank` прогон идёт через canonical
+  SQLite как нативный локальный маршрут: снимок хранит локатор каталога, выбранный
+  profile (reference path/SHA/text/language) и effective voice; `generate --resume`
+  и `history resume ID` доказывают ту же идентичность, а `history sync ID` модель не
+  запускает. `--mode auto`/`clone`/`design`, `--no-trim`, `--with-timings` и
+  `--tts-quality-provider` остаются на legacy-маршруте. Подробности — в
+  [Agent CLI Contract](../../../agent-cli-contract.md).
 
 ### Whisper timing опции (generate + timings)
 

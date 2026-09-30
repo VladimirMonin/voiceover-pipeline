@@ -118,11 +118,12 @@ class OmniVoiceBankProfileIdentity:
 
 @dataclass(frozen=True)
 class OmniVoiceVoiceBankIdentity:
-    """The admitted preset voice bank one OmniVoice dialogue run commits to.
+    """The admitted preset voice bank one OmniVoice bank run commits to.
 
     ``catalog_path`` locates the user's catalog for a later resume; ``profiles``
-    holds only the cast profiles the run actually references, in stable profile
-    id order, so an unrelated catalog edit does not change this identity.
+    holds only the profiles the run actually references (the dialogue's cast
+    voices, or the monologue's single selected profile), in stable profile id
+    order, so an unrelated catalog edit does not change this identity.
     """
 
     catalog_path: str
@@ -327,7 +328,8 @@ class PreparedRun:
 
     ``voice`` is the run-level voice the CLI already resolved; a part without
     its own cast voice falls back to it. ``voice_bank_identity`` is present only
-    for the admitted ``omnivoice-local`` preset dialogue route, and
+    for the admitted ``omnivoice-local`` preset bank routes (the two-cast dialogue
+    and the single-profile monologue), and
     ``qwen_clone_identity``/``qwen_mode_identity`` only for the admitted
     ``qwen-local`` local routes (clone, or the instructed preset/design modes).
     """
@@ -408,12 +410,13 @@ def bind_omnivoice_dialogue_fingerprints(
 def build_omnivoice_voice_bank_identity(
     catalog: VoiceBankCatalog, catalog_path: Path, profile_ids: Iterable[str]
 ) -> OmniVoiceVoiceBankIdentity:
-    """Bind the cast profile ids of one dialogue run to their bank settings.
+    """Bind the referenced profile ids of one preset bank run to their settings.
 
     The referenced profiles are resolved from the admitted catalog and stored in
     stable id order, so the run identity never depends on a catalog's own order
-    or on profiles the run does not use. An unknown cast voice raises
-    ``PreparationError`` before any provider work.
+    or on profiles the run does not use. The two-cast dialogue supplies both cast
+    voices; the monologue supplies its one selected profile. An unknown voice id
+    raises ``PreparationError`` before any provider work.
     """
     by_id = {profile.id: profile for profile in catalog.profiles}
     selected: list[OmniVoiceBankProfileIdentity] = []
@@ -431,7 +434,7 @@ def build_omnivoice_voice_bank_identity(
             )
         )
     if not selected:
-        raise PreparationError("OmniVoice dialogue has no cast voice-bank profile")
+        raise PreparationError("OmniVoice bank run references no voice-bank profile")
     return OmniVoiceVoiceBankIdentity(
         catalog_path=str(catalog_path), mode="preset", profiles=tuple(selected)
     )
@@ -507,23 +510,39 @@ def prepare_run(
     ``qwen_clone_identity`` is supplied only by the admitted local Qwen clone
     route, which has already read and hashed its reference sample; the instructed
     local Qwen preset/design routes supply ``qwen_mode_identity`` instead. Every
-    other caller leaves both ``None``.
+    other caller leaves both ``None``. The admitted ``omnivoice-local`` preset
+    bank routes -- the two-cast dialogue and the single-profile monologue -- build
+    their ``voice_bank_identity`` here from the admitted catalog and the profiles
+    the run actually references; every other OmniVoice mode leaves it ``None``.
     """
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
-    if args.provider == "omnivoice-local" and is_dialogue_format(
-        getattr(args, "format", "markdown")
-    ):
+    if args.provider == "omnivoice-local":
         catalog = getattr(args, "voice_bank_catalog", None)
         bank_arg = getattr(args, "voice_bank", None)
-        if not isinstance(catalog, VoiceBankCatalog) or bank_arg is None:
-            raise PreparationError(
-                "omnivoice-local dialogue requires an admitted --voice-bank catalog"
+        bank_profile = getattr(args, "voice_bank_profile", None)
+        if is_dialogue_format(getattr(args, "format", "markdown")):
+            if not isinstance(catalog, VoiceBankCatalog) or bank_arg is None:
+                raise PreparationError(
+                    "omnivoice-local dialogue requires an admitted --voice-bank catalog"
+                )
+            voice_bank_identity = build_omnivoice_voice_bank_identity(
+                catalog,
+                Path(bank_arg).expanduser().resolve(),
+                [chunk.voice for chunk in chunks if chunk.voice],
             )
-        voice_bank_identity = build_omnivoice_voice_bank_identity(
-            catalog,
-            Path(bank_arg).expanduser().resolve(),
-            [chunk.voice for chunk in chunks if chunk.voice],
-        )
+        elif (
+            getattr(args, "mode", "preset") == "preset"
+            and isinstance(catalog, VoiceBankCatalog)
+            and bank_arg is not None
+            and bank_profile is not None
+        ):
+            # The non-dialogue preset bank route clones exactly its one selected
+            # catalog profile, so its identity is that single referenced profile.
+            voice_bank_identity = build_omnivoice_voice_bank_identity(
+                catalog,
+                Path(bank_arg).expanduser().resolve(),
+                [bank_profile.id],
+            )
     return PreparedRun(
         provider=args.provider,
         model=args.model,

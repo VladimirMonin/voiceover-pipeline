@@ -205,6 +205,14 @@ reference-файл профиля пропал или изменился, зап
 не заявляй два слышимо разных голоса до PASS для нужного provider. Реальный
 локальный запуск модели (audio.cpp/OmniVoice) в тестах `NOT_RUN`.
 
+Обычный одноголосый вариант того же банка (`--provider omnivoice-local --mode
+preset --voice-bank <catalog.json>` без `format: dialogue`) тоже сохраняется в
+каноническую историю: весь сценарий сливается в одну OmniVoice session, которая
+клонирует выбранный profile, с той же durable-попыткой `local_tts_chunk`, raw-
+восстановлением и fail-closed проверкой reference. Режимы `auto`/`clone`/`design`,
+`--no-trim`, `--with-timings` и `--tts-quality-provider` остаются на legacy
+маршруте.
+
 ## Voiceover metadata format
 
 Для обычных single-speaker режимов можно хранить provider/model/voice прямо в

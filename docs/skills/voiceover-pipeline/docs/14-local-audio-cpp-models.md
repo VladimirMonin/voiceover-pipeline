@@ -95,7 +95,10 @@ OmniVoice — локальный TTS через `audio.cpp` (модель `audio
 Обычная озвучка остаётся **одним голосом на прогон** и одним native session.
 Канонический `format: dialogue` использует общий admitted runtime, но вызывает
 свой bound voice-bank profile на каждую реплику; два profile ID с одинаковым
-`reference_sha256` отклоняются. OpenRouter dialogue также делает один request
+`reference_sha256` отклоняются. Одноголосый `--mode preset --voice-bank` прогон
+тоже сохраняется в canonical SQLite как нативный локальный маршрут (см.
+[Agent CLI Contract](../../../agent-cli-contract.md)); `auto`/`clone`/`design`
+остаются на legacy. OpenRouter dialogue также делает один request
 с одним documented voice на turn; `multi_speaker_voice_config` не используется.
 Offline contract не заменяет отдельный human audible PASS.
 

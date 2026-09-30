@@ -8,7 +8,8 @@ routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing
 processing, either its synchronous ``/audio/speech`` model or its async
 ``elevenlabs/`` ``/media`` model, the synchronous ``openrouter-tts`` route, and
 the validated ``openrouter-tts`` Gemini two-speaker dialogue route, and the
-``omnivoice-local`` preset two-profile bank dialogue route, and the ordinary
+``omnivoice-local`` preset bank routes (the two-profile dialogue and the
+single-profile monologue), and the ordinary
 non-dialogue ``qwen-local`` local routes (clone and the instructed preset/design
 modes) -- and their recovery decisions. Two
 orthogonal integrated steps are admitted for that same
@@ -29,7 +30,10 @@ cast voice-bank profile, no paid POST or paid attempt marker, no quality gate, a
 cost-free ``local_tts_chunk`` attempt before the local model runs and links that
 turn's raw bytes to it before conversion, so a crash converts from them with no
 second model run and an interrupted or failed invocation stays truthful and
-repeatable on an explicit resume. Every other dialogue route -- every
+repeatable on an explicit resume. The admitted ``omnivoice-local`` preset
+monologue route reuses that exact local attempt/raw seam for its one merged
+session part, which clones the run's single selected bank profile and records no
+quality gate. Every other dialogue route -- every
 ``polza-tts`` dialogue -- stays on the legacy executor.
 
 Contract:
@@ -75,7 +79,8 @@ Contract:
 Known limits: this slice admits the non-dialogue ``polza-tts`` and
 ``openrouter-tts`` routes with the recorded trimming/timing/quality semantics in
 the snapshot, the validated ``openrouter-tts`` Gemini dialogue route, the
-``omnivoice-local`` preset two-profile bank dialogue route, and the ordinary
+``omnivoice-local`` preset bank routes (the two-profile dialogue and the
+single-profile monologue), and the ordinary
 non-dialogue ``qwen-local`` local routes (clone and the instructed preset/design
 modes). The
 crash window between a synchronous raw receipt and its database link (covered by
@@ -209,7 +214,7 @@ _ERROR_EVIDENCE_INCONSISTENT = "NATIVE_EVIDENCE_INCONSISTENT"
 _ERROR_RAWS_EVIDENCE_INVALID = "NATIVE_RAW_EVIDENCE_INVALID"
 _ERROR_SUBMIT_UNCONFIRMED = "PAID_SUBMIT_UNCONFIRMED"
 _ERROR_SYNTHESIS_FAILED = "NATIVE_SYNTHESIS_FAILED"
-# Local synthesis (the admitted ``omnivoice-local`` preset dialogue route) has no
+# Local synthesis (the admitted ``omnivoice-local`` preset bank routes) has no
 # paid POST, so it has its own bounded codes: a local model failure, verified
 # local raw evidence that no longer matches, and a local reference profile that
 # changed or disappeared before any local model call.
@@ -1233,7 +1238,7 @@ class _Executor:
         self.script_format = script_format
         self.dialogue = is_dialogue_format(script_format)
         # The admitted local routes have no paid POST and no paid-marker guard: the
-        # ``omnivoice-local`` preset dialogue and every ``qwen-local`` local route
+        # ``omnivoice-local`` preset bank routes and every ``qwen-local`` local route
         # (clone and the instructed preset/design modes). Each
         # reserves its own cost-free ``local_tts_chunk`` attempt per real invocation.
         self.local = prepared.provider in {"omnivoice-local", "qwen-local"}
@@ -1409,7 +1414,7 @@ class _Executor:
             # turn audio, before any later turn's paid submit and before concat.
             self._run_turn_quality(evidence)
 
-    # -- local synthesis (admitted omnivoice-local preset dialogue) -------------
+    # -- local synthesis (admitted omnivoice-local preset bank routes) ----------
 
     def _local_raw_path(self, part: NativeTtsPart, audio_format: str) -> str:
         """Return the managed-relative raw path for one local turn's bytes."""

@@ -1387,7 +1387,9 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     route, the existing ``omnivoice-local`` preset two-profile bank script, is
     likewise admitted with the default trimming semantics and records no quality
     gate. The ordinary non-dialogue ``qwen-local`` clone mode is admitted as a
-    local route with the default trimming semantics and no timing or quality step.
+    local route with the default trimming semantics and no timing or quality step,
+    and so is the existing non-dialogue ``omnivoice-local`` ``--mode preset`` bank
+    run (one merged session part that clones the selected bank profile).
     Every other dialogue route -- every ``polza-tts`` dialogue -- and every
     dialogue option mixture (``--no-trim``, ``--with-timings``) stays on the
     legacy executor.
@@ -1398,6 +1400,8 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         return False
     if getattr(args, "provider", None) == "qwen-local":
         return _native_qwen_local_route_eligible(args)
+    if getattr(args, "provider", None) == "omnivoice-local":
+        return _native_omnivoice_monologue_route_eligible(args)
     quality_provider = getattr(args, "tts_quality_provider", None)
     if quality_provider is not None and quality_provider not in (
         native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
@@ -1416,6 +1420,34 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         # the legacy executor until its paid-submit contract is confirmed.
         return getattr(args, "timing_provider", "faster-whisper") == "faster-whisper"
     return True
+
+
+def _native_omnivoice_monologue_route_eligible(args: argparse.Namespace) -> bool:
+    """Whether this command is the admitted non-dialogue OmniVoice bank route.
+
+    The existing ordinary ``--mode preset`` run with an admitted ``--voice-bank``
+    catalog and a resolved profile is admitted with the default trimming semantics
+    and no integrated timing or quality step. Such a run merges into one OmniVoice
+    session part that clones the selected bank profile, and its identity (the
+    catalog locator, mode, the selected profile's reference locator/digest/text and
+    language, model, and effective voice) is captured on the prepared run. The
+    ``auto``, ``clone``, and ``design`` modes carry no bank profile, so they keep
+    the legacy executor, as do ``--no-trim``, ``--with-timings``, and any quality
+    provider.
+    """
+    if getattr(args, "no_trim", False):
+        return False
+    if getattr(args, "with_timings", False):
+        return False
+    if getattr(args, "tts_quality_provider", None):
+        return False
+    if getattr(args, "model", None) != OMNIVOICE_LOCAL_MODEL_ID:
+        return False
+    if (getattr(args, "mode", None) or "preset") != "preset":
+        return False
+    if getattr(args, "voice_bank_catalog", None) is None:
+        return False
+    return getattr(args, "voice_bank_profile", None) is not None
 
 
 def _qwen_tts_runtime() -> str:
@@ -1586,13 +1618,15 @@ def _run_native_route(
     native run so accepted paid evidence is never deleted; ``--skip-existing``
     keeps its usual precedence. ``gemini_report`` carries the validated dialogue
     cast so a dialogue run resolves its first-cast voice identity exactly as the
-    legacy executor does.
+    legacy executor does; the non-dialogue OmniVoice bank route instead resolves
+    its effective voice from the selected bank profile before the snapshot.
     """
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an admitted native "
             "polza-tts, openrouter-tts, local Qwen clone/preset/design, or local OmniVoice "
-            "dialogue run may continue it; choose a different --run-id for other options.",
+            "dialogue/bank-mono run may continue it; choose a different --run-id for other "
+            "options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
         )
@@ -1621,6 +1655,16 @@ def _run_native_route(
                 "or a different --run-id.",
                 _EXIT_PROVIDER,
             )
+    if (
+        args.provider == "omnivoice-local"
+        and not is_dialogue_format(script_format)
+        and getattr(args, "voice_bank_profile", None) is not None
+        and args.voice is None
+    ):
+        # The monologue bank route's effective voice is its selected profile id.
+        # The native snapshot needs a non-empty run voice, and the run identity
+        # records it; the legacy executor keeps its unchanged ``None`` voice.
+        args.voice = args.voice_bank_profile.id
     try:
         generation_identity = prepare_generation_identity(
             args,
@@ -1673,18 +1717,22 @@ def _run_native_route(
     def provider_factory() -> Any:
         if not provider_cache:
             api_key = read_api_key(args)
-            provider: Any = build_provider(
-                args, api_key, generation_identity.style_prompt, generation_identity.prompt_mode
-            )
-            if args.provider == "omnivoice-local" and gemini_report:
-                # The local dialogue route clones one provider per cast voice-bank
-                # profile, exactly as the legacy executor binds them. A changed or
-                # missing reference file is verified here, before any local model
-                # call, and fails closed with a bounded error.
+            if args.provider == "omnivoice-local":
+                # Every local OmniVoice bank route verifies its committed reference
+                # (and, for dialogue, clones one provider per cast voice-bank
+                # profile) before any local model call; a changed or missing
+                # reference file fails closed with a bounded error.
                 try:
-                    provider = _bind_dialogue_voice_bank_providers(
-                        provider, args.voice_bank_catalog, gemini_report["speaker_voice_map"]
+                    provider: Any = build_provider(
+                        args,
+                        api_key,
+                        generation_identity.style_prompt,
+                        generation_identity.prompt_mode,
                     )
+                    if gemini_report:
+                        provider = _bind_dialogue_voice_bank_providers(
+                            provider, args.voice_bank_catalog, gemini_report["speaker_voice_map"]
+                        )
                 except VoiceBankError as exc:
                     fail(
                         str(exc),
@@ -1693,6 +1741,10 @@ def _run_native_route(
                             "error_code": native_generation._ERROR_LOCAL_REFERENCE_UNAVAILABLE
                         },
                     )
+            else:
+                provider = build_provider(
+                    args, api_key, generation_identity.style_prompt, generation_identity.prompt_mode
+                )
             provider_cache.append(provider)
         return provider_cache[0]
 
@@ -3400,21 +3452,21 @@ def _omnivoice_dialogue_cast_map(prepared: PreparedRun) -> dict[str, str]:
     return cast
 
 
-def _build_native_omnivoice_dialogue_provider(prepared: PreparedRun, api_key: str) -> Any:
-    """Rebuild the per-cast OmniVoice providers for a reconstructed local dialogue run.
+def _build_native_omnivoice_bank_provider(prepared: PreparedRun, api_key: str) -> Any:
+    """Rebuild the OmniVoice bank provider(s) for a reconstructed local bank run.
 
     The committed voice-bank locator is re-loaded and every referenced profile's
     current ``reference_sha256`` is required to match the digest this run stored
     before any local model is constructed, so a changed or missing reference fails
-    closed instead of silently synthesizing a different voice. The base provider is
-    built with its dialogue cast left to the binder, then one provider is cloned per
-    cast profile by the same ``bind_dialogue_voice_bank_providers`` seam the fresh
-    route uses.
+    closed instead of silently synthesizing a different voice. A dialogue run
+    (every part carries a cast profile) is cloned per cast profile by the same
+    ``bind_dialogue_voice_bank_providers`` seam the fresh route uses; a monologue
+    run's one referenced profile is bound as the run's clone reference.
     """
     identity = prepared.voice_bank_identity
     if identity is None:
         fail(
-            "this local dialogue run records no voice-bank identity; refusing to resume it.",
+            "this local OmniVoice run records no voice-bank identity; refusing to resume it.",
             _EXIT_PROVIDER,
         )
     try:
@@ -3423,25 +3475,49 @@ def _build_native_omnivoice_dialogue_provider(prepared: PreparedRun, api_key: st
         fail(str(exc), _EXIT_PROVIDER)
     stored = {profile.profile_id: profile for profile in identity.profiles}
     cast = _omnivoice_dialogue_cast_map(prepared)
-    for voice_id in cast.values():
-        profile = next((item for item in catalog.profiles if item.id == voice_id), None)
+    referenced = (
+        list(cast.values()) if cast else [profile.profile_id for profile in identity.profiles]
+    )
+    catalog_profiles = {profile.id: profile for profile in catalog.profiles}
+    for voice_id in referenced:
+        profile = catalog_profiles.get(voice_id)
         bound = stored.get(voice_id)
         if profile is None or bound is None or bound.reference_sha256 != profile.reference_sha256:
             fail(
                 "the voice-bank reference for this run changed or is missing; refusing to "
-                "resume the local dialogue.",
+                "resume the local OmniVoice run.",
                 _EXIT_PROVIDER,
                 details={"error_code": native_generation._ERROR_LOCAL_REFERENCE_UNAVAILABLE},
             )
+    if cast:
+        identity_args = argparse.Namespace(
+            provider="omnivoice-local",
+            model=prepared.model,
+            voice=prepared.voice,
+            mode="preset",
+            format="dialogue",
+        )
+        base = build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
+        return _bind_dialogue_voice_bank_providers(base, catalog, cast)
+    # Monologue: the run's one referenced profile is its clone reference, bound
+    # through the committed catalog locator exactly as the fresh route does.
     identity_args = argparse.Namespace(
         provider="omnivoice-local",
         model=prepared.model,
         voice=prepared.voice,
         mode="preset",
-        format="dialogue",
+        format="markdown",
+        voice_bank=identity.catalog_path,
+        voice_bank_catalog=catalog,
     )
-    base = build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
-    return _bind_dialogue_voice_bank_providers(base, catalog, cast)
+    try:
+        return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
+    except VoiceBankError as exc:
+        fail(
+            str(exc),
+            _EXIT_PROVIDER,
+            details={"error_code": native_generation._ERROR_LOCAL_REFERENCE_UNAVAILABLE},
+        )
 
 
 def _build_native_qwen_local_provider(prepared: PreparedRun) -> Any:
@@ -3503,7 +3579,7 @@ def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     )
     api_key = read_api_key(identity_args)
     if prepared.provider == "omnivoice-local":
-        return _build_native_omnivoice_dialogue_provider(prepared, api_key)
+        return _build_native_omnivoice_bank_provider(prepared, api_key)
     return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
 
 

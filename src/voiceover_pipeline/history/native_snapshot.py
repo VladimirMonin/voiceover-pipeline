@@ -56,12 +56,13 @@ Known limits at this foundation stage:
 
 * Only the routes whose prepared run carries its full nonsecret resume identity
   are snapshotted: ``polza-tts``, ``openrouter-tts``, the ``omnivoice-local``
-  preset dialogue route, and every admitted ``qwen-local`` local route (the
+  preset bank routes (the two-cast dialogue and the single-profile monologue),
+  and every admitted ``qwen-local`` local route (the
   clone route, and the instructed preset/design routes). Every other route
   raises :class:`NativeSnapshotValidationError` before any insert, because it
   omits nonsecret identity a later ``history resume UUID`` would need:
-  ``omnivoice-local`` non-dialogue modes carry no catalog locator or reference
-  fingerprint, a ``qwen-local`` run with neither identity block carries no
+  ``omnivoice-local`` auto/clone/design modes carry no catalog locator or
+  reference fingerprint, a ``qwen-local`` run with neither identity block carries no
   reference/mode inputs, and ``polza-chat-audio`` carries no
   ``fallback_voice``. This is a temporary S05 integration gap, not a disabled
   live path: those routes still perform their own run and JSON state writes. A
@@ -124,9 +125,10 @@ _REDACTED_IDENTITY_REJECTED = (
 # resume needs, so only they may be snapshotted:
 #   * ``polza-tts`` -- model and voice.
 #   * ``openrouter-tts`` -- model, voice, style prompt, and prompt mode.
-#   * ``omnivoice-local`` -- the admitted preset dialogue route, whose
+#   * ``omnivoice-local`` -- the admitted preset bank routes, whose
 #     ``PreparedRun.voice_bank_identity`` carries the catalog locator and each
-#     referenced profile's reference locator, digest, text, and language.
+#     referenced profile's reference locator, digest, text, and language (the
+#     dialogue's two cast profiles, or the monologue's one selected profile).
 #   * ``qwen-local`` -- an admitted local route. Its clone mode's
 #     ``PreparedRun.qwen_clone_identity`` carries the reference sample locator,
 #     digest, and size, the reference text, and the runtime/language knobs, and
@@ -135,7 +137,7 @@ _REDACTED_IDENTITY_REJECTED = (
 #     runtime/language knobs. Exactly one block is present per run.
 # Every other route fails closed before any insert, whether it is a known route
 # whose resume inputs ``PreparedRun`` does not carry (a ``qwen-local`` run with
-# neither identity block, a non-dialogue ``omnivoice-local`` mode, or
+# neither identity block, an ``omnivoice-local`` auto/clone/design mode, or
 # ``polza-chat-audio``) or an
 # unknown identifier. A supported provider whose route-specific identity block is
 # missing fails the same way, so only a run that captured its full identity is
@@ -432,50 +434,67 @@ def _require_output_options(value: object) -> dict[str, Any] | None:
 def _require_voice_bank_identity(prepared: PreparedRun, provider: str) -> dict[str, Any] | None:
     """Return the committed voice-bank identity payload, or ``None`` when absent.
 
-    Only the admitted ``omnivoice-local`` preset dialogue route carries one, and
-    it must always carry one: a non-dialogue ``omnivoice-local`` run (or any other
-    provider) that somehow reached this writer would otherwise commit an identity
-    whose voice-bank inputs were never captured. The rejection echoes no value.
+    Only the admitted ``omnivoice-local`` preset bank routes carry one, and
+    they must always carry one: an ``omnivoice-local`` auto/clone/design run (or
+    any other provider) that somehow reached this writer would otherwise commit
+    an identity whose voice-bank inputs were never captured. The rejection echoes
+    no value.
     """
     identity = prepared.voice_bank_identity
     if provider == "omnivoice-local":
         if not isinstance(identity, OmniVoiceVoiceBankIdentity):
-            # A local run without a committed voice-bank identity (a non-dialogue
-            # preset/clone/design mode) did not capture its resume inputs, so the
+            # A local run without a committed voice-bank identity (an auto, clone,
+            # or design mode) did not capture its resume inputs, so the
             # same fixed route-rejection message applies and names no value.
             raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
         return identity.to_payload()
     if identity is not None:
         raise NativeSnapshotValidationError(
-            "a voice-bank identity is only valid for the local OmniVoice dialogue route"
+            "a voice-bank identity is only valid for a local OmniVoice bank route"
         )
     return None
 
 
-def _require_dialogue_bank_consistency(
+def _require_voice_bank_consistency(
     prepared: PreparedRun, identity_payload: dict[str, Any] | None
 ) -> None:
-    """Require every local dialogue turn to match its committed voice-bank profile.
+    """Require every part to match a profile of its committed voice-bank identity.
 
-    Each turn's cast profile id must be one of the identity's referenced profiles
-    and its bound reference digest must equal that profile's stored
-    ``reference_sha256``, so a committed snapshot can never bind a turn to a
-    reference the run did not actually clone. The rejection echoes no value.
+    A dialogue turn carries its cast profile id and its bound reference digest, and
+    both must match one of the identity's referenced profiles, so a committed
+    snapshot can never bind a turn to a reference the run did not actually clone.
+    A non-dialogue monologue part carries no cast voice: it is bound to the run's
+    one referenced profile through the run voice, so that identity must reference
+    exactly one profile whose id equals the run voice and the part must carry no
+    cast voice or fingerprint. The rejection echoes no value.
     """
     if identity_payload is None:
         return
-    by_id = {
-        item["profile_id"]: item["reference_sha256"]
-        for item in identity_payload["profiles"]
+    raw_profiles = identity_payload["profiles"]
+    profiles = [
+        item
+        for item in raw_profiles
         if isinstance(item, dict)
         and isinstance(item.get("profile_id"), str)
         and isinstance(item.get("reference_sha256"), str)
-    }
+    ]
+    by_id = {item["profile_id"]: item["reference_sha256"] for item in profiles}
+    single_profile_id = profiles[0]["profile_id"] if len(profiles) == 1 else None
     for part in prepared.parts:
         chunk = part.chunk
-        if chunk.voice is None or by_id.get(chunk.voice) != chunk.voice_fingerprint:
+        if chunk.voice is not None:
+            if by_id.get(chunk.voice) != chunk.voice_fingerprint:
+                raise NativeSnapshotValidationError(
+                    "a local OmniVoice dialogue turn does not match its voice-bank identity"
+                )
+            continue
+        if (
+            chunk.voice_fingerprint is not None
+            or single_profile_id is None
+            or prepared.voice != single_profile_id
+        ):
             raise NativeSnapshotValidationError(
-                "a local OmniVoice dialogue turn does not match its voice-bank identity"
+                "a local OmniVoice run part does not match its voice-bank identity"
             )
 
 
@@ -573,12 +592,13 @@ def persist_prepared_tts_snapshot(
 
     Only an admitted route whose prepared run carries its full nonsecret resume
     identity is accepted: ``polza-tts``, ``openrouter-tts``, the
-    ``omnivoice-local`` preset dialogue route, and an admitted ``qwen-local`` local
+    ``omnivoice-local`` preset bank routes (the two-cast dialogue and the
+    single-profile monologue), and an admitted ``qwen-local`` local
     route (the clone route or the instructed preset/design routes).
     Any other provider, or a supported provider whose route-specific identity
-    block is missing -- a ``qwen-local`` run with neither identity block, a
-    non-dialogue
-    ``omnivoice-local`` mode, ``polza-chat-audio``, or an unknown identifier -- is
+    block is missing -- a ``qwen-local`` run with neither identity block, an
+    ``omnivoice-local`` auto/clone/design mode,
+    ``polza-chat-audio``, or an unknown identifier -- is
     rejected with :class:`NativeSnapshotValidationError` before any insert: its
     resume identity inputs are not persisted on ``PreparedRun``, so the snapshot
     would be unreconstructable.
@@ -625,7 +645,7 @@ def persist_prepared_tts_snapshot(
     # voice-bank identity; every other route must not, so a mismatched pairing
     # fails closed instead of committing an identity the reader cannot rebuild.
     voice_bank_payload = _require_voice_bank_identity(prepared, provider)
-    _require_dialogue_bank_consistency(prepared, voice_bank_payload)
+    _require_voice_bank_consistency(prepared, voice_bank_payload)
 
     identity = _run_identity_payload(
         provider=provider,

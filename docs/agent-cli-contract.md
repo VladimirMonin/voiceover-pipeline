@@ -198,6 +198,8 @@ JSON argv для локального Docker command (default `["docker"]`). `do
   digest дают exit code `2`; при `--resume` с изменённым fingerprint — exit
   code `30`. Public metadata: kind `bank-preset` + `voice_id` +
   `voice_fingerprint` (sha256). Reference path/transcript не публикуются.
+  Одноголосый preset-bank прогон сохраняется в каноническую историю (см.
+  «Нативный локальный OmniVoice monologue»).
 - `--mode clone` требует читаемый файл через `--reference-audio` и непустой
   `--reference-text`; `--design-instruction` и `--voice` запрещены.
   Reference нормализуется до PCM16 mono 24 kHz при staging. Public kind:
@@ -603,6 +605,33 @@ OmniVoice и любой `polza-tts` dialogue остаются на legacy execut
   сообщает `NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED`, завершённый прогон только
   переписывает совместимые JSON-экспорты из БД. Реальный локальный запуск модели
   в тестах — `NOT_RUN`.
+
+### Нативный локальный OmniVoice monologue (фрагмент S05)
+
+Обычный не-диалоговый маршрут `--provider omnivoice-local --model
+audio-cpp/omnivoice-q8_0 --mode preset --voice-bank <catalog.json>` (plain Markdown
+без frontmatter) с обрезкой по умолчанию также переведён на каноническую
+историю. Весь script сливается в одну OmniVoice session (один локальный вызов),
+которая клонирует выбранный profile каталога. `--mode auto`/`clone`/`design` (нет
+bank profile), `--no-trim`, `--with-timings`, `--tts-quality-provider` и
+`format: voiceover` остаются на legacy executor.
+
+- Снимок хранит выбранную идентичность: локатор каталога, mode, локатор/SHA/
+text/language выбранного профиля, model и effective voice (= profile id).
+Публичные JSON-экспорты публикуют provider/model/voice (profile id) и текст, но
+не reference text каталога.
+- Платной попытки нет: единственный локальный вызов пишет свою durable-попытку
+`local_tts_chunk` (`status`/`cost` NULL, никогда не платный маркер), а raw-байты
+линкуются к попытке до конвертации, поэтому сбой FFmpeg восстанавливается из raw
+без повторного запуска модели; `history costs` считает эту попытку в
+`local_attempts_without_api_charge`, а не как облачную неизвестную стоимость и не
+как выдуманный ноль.
+- Пропавший reference или изменившийся digest даёт
+`NATIVE_LOCAL_REFERENCE_UNAVAILABLE` / `NATIVE_RESUME_IDENTITY_CHANGED` до вызова
+локальной модели. `history sync ID` локальную модель не запускает: незавершённая
+локальная часть сообщает `NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED`, завершённый
+прогон только переписывает совместимые JSON-экспорты из БД.
+- Реальный локальный запуск модели (audio.cpp/OmniVoice) в тестах — `NOT_RUN`.
 
 ### Нативный локальный Qwen (фрагмент S05)
 

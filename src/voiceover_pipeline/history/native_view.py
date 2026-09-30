@@ -268,7 +268,8 @@ def _config_optional_voice_bank(config: dict[str, Any]) -> dict[str, Any] | None
     """Return the committed voice-bank identity, or ``None`` when absent.
 
     The writer stores this block only for the admitted ``omnivoice-local`` preset
-    dialogue route. When present it must parse as the same identity the writer
+    bank routes (the two-cast dialogue and the single-profile monologue). When
+    present it must parse as the same identity the writer
     hash-covered, or the view fails closed with a fixed message; the block is
     returned verbatim so the recomputed run identity matches the committed one
     byte-for-byte.
