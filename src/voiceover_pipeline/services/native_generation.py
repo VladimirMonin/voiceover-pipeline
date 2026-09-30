@@ -197,6 +197,7 @@ from ..history.repository import (
 )
 from ..models import ASRResult, RunPaths, ScriptChunk, SynthesisResult
 from ..run_state import LOG_FILE, GenerationLogger
+from ..speech_parts import SPEECH_PARTS_FORMAT
 from ..tts_quality import TTSQualityResult, evaluate_tts_transcript
 from . import costs
 from .prepare import (
@@ -1097,6 +1098,7 @@ def build_output_options(
     *,
     timing: NativeTimingOptions | None = None,
     quality: NativeQualityOptions | None = None,
+    audio_format: str = "mp3",
 ) -> dict[str, Any]:
     """Return the fixed output-processing settings the native route records.
 
@@ -1105,12 +1107,16 @@ def build_output_options(
     command line: the default trims each converted part while ``--no-trim`` keeps
     the provider's final silence. When the run requested local timings or local
     quality verification, those effective settings are recorded alongside so a
-    resume proves they did not change either.
+    resume proves they did not change either. The merged-output container is recorded
+    only when it is not the default ``mp3``, so every existing run keeps the exact
+    recorded options it committed and its resume is not invalidated by this stage.
     """
     options: dict[str, Any] = {
         "trim_final_silence": not no_trim,
         "processing_version": OUTPUT_PROCESSING_VERSION,
     }
+    if audio_format != "mp3":
+        options["audio_format"] = audio_format
     options.update(_timing_output_fields(timing))
     options.update(_quality_output_fields(quality))
     return options
@@ -1463,7 +1469,7 @@ class _Executor:
         prepared: PreparedRun,
         chunks: list[ScriptChunk],
         script_format: str,
-        script_path: Path,
+        script_path: Path | None,
         output_options: dict[str, Any],
         ffmpeg_path: str,
         ffprobe_path: str,
@@ -1483,6 +1489,11 @@ class _Executor:
         self.chunks = chunks
         self.script_format = script_format
         self.dialogue = is_dialogue_format(script_format)
+        # A ``speech-parts`` run (and its single-part ``--text`` form) is a
+        # non-dialogue run, but each part carries its own cast voice and instruction,
+        # so it goes through the shared ``synthesize_part`` seam exactly as a dialogue
+        # turn does instead of the plain run-voice provider call.
+        self.speech_parts = script_format == SPEECH_PARTS_FORMAT
         # The admitted local routes have no paid POST and no paid-marker guard: the
         # ``omnivoice-local`` preset bank routes and every ``qwen-local`` local route
         # (clone and the instructed preset/design modes). Each
@@ -2735,13 +2746,16 @@ class _Executor:
     def _invoke_provider(self, provider: Any, part: NativeTtsPart) -> SynthesisResult:
         """Submit one part once, applying the per-turn dialogue cast voice as legacy did.
 
-        A non-dialogue native run keeps its run-level voice and calls the provider
-        directly. A dialogue turn goes through the same ``synthesize_part`` seam the
-        legacy executor uses, so an ``OpenRouterTTSProvider`` receives its own cast
-        voice as the ``voice`` keyword while a provider that does not accept one is
-        called unchanged. The provider is invoked exactly once; its error propagates.
+        A non-dialogue native run that is not ``speech-parts`` keeps its run-level
+        voice and calls the provider directly. A dialogue turn and a ``speech-parts``
+        part go through the same ``synthesize_part`` seam the legacy executor uses, so
+        an ``OpenRouterTTSProvider`` receives its own cast voice as the ``voice``
+        keyword while a provider that does not accept one is called unchanged, and a
+        ``speech-parts`` part's effective instruction is passed as the ``vibe``
+        keyword -- or the call fails closed before any POST when the provider cannot
+        carry it. The provider is invoked exactly once; its error propagates.
         """
-        if not self.dialogue:
+        if not self.dialogue and not self.speech_parts:
             return provider.synthesize_chunk(part.text, part.chunk_id)
         chunk = ScriptChunk(
             number=part.number,
@@ -2752,7 +2766,10 @@ class _Executor:
             voice_fingerprint=part.voice_fingerprint,
             pause_after_ms=part.pause_after_ms,
         )
-        return synthesize_part(provider, PreparedPart(chunk=chunk, voice=part.effective_voice))
+        prepared_part = PreparedPart(
+            chunk=chunk, voice=part.effective_voice, direction=part.direction
+        )
+        return synthesize_part(provider, prepared_part)
 
     def _recover_via_get(self, evidence: _PartEvidence, attempt: AttemptRecord) -> None:
         """Finish a known accepted task with GET calls only, then convert locally."""
@@ -3147,7 +3164,7 @@ class _Executor:
         except Exception as exc:
             staged.unlink(missing_ok=True)
             raise NativeGenerationError(
-                f"Failed to concat MP3 chunks: {exc}",
+                f"Failed to concatenate the ordered chunks: {exc}",
                 code=_EXIT_OUTPUT,
                 error_code=_ERROR_ASSEMBLY_FAILED,
             ) from exc
@@ -3156,7 +3173,9 @@ class _Executor:
                 self._run_uuid(),
                 expected_revision=self._revision,
                 path=self.paths.full_mp3.name,
-                mime="audio/mpeg",
+                mime=(
+                    "audio/wav" if self.paths.full_mp3.suffix.lower() == ".wav" else "audio/mpeg"
+                ),
                 size_bytes=size_bytes,
                 sha256=sha256,
                 media_metadata={
@@ -4175,7 +4194,7 @@ def execute_native_tts(
     prepared: PreparedRun,
     chunks: list[ScriptChunk],
     script_format: str,
-    script_path: Path,
+    script_path: Path | None,
     output_options: dict[str, Any],
     ffmpeg_path: str,
     ffprobe_path: str,
@@ -4350,7 +4369,7 @@ def run_native_generation(
     prepared: PreparedRun,
     chunks: list[ScriptChunk],
     script_format: str,
-    script_path: Path,
+    script_path: Path | None,
     output_options: dict[str, Any],
     ffmpeg_path: str,
     ffprobe_path: str,
@@ -4464,7 +4483,7 @@ class NativeRunReconstruction:
     prepared: PreparedRun
     chunks: list[ScriptChunk]
     paths: RunPaths
-    script_path: Path
+    script_path: Path | None
 
 
 def _stored_voice_bank_identity(config: dict[str, Any]) -> OmniVoiceVoiceBankIdentity | None:
@@ -4594,7 +4613,10 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         voice=_stored_identity_str(config, "voice"),
         style_prompt=view.style_prompt,
         prompt_mode=_stored_identity_str(config, "prompt_mode"),
-        parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
+        parts=tuple(
+            PreparedPart(chunk=chunk, voice=chunk.voice, direction=part.direction)
+            for chunk, part in zip(chunks, view.parts)
+        ),
         voice_bank_identity=voice_bank_identity,
         omnivoice_mode_identity=omnivoice_mode_identity,
         qwen_clone_identity=qwen_clone_identity,
@@ -4602,9 +4624,15 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         fallback_voice=fallback_voice,
     )
     run_root = Path(view.run.run_root)
-    paths = build_run_paths(run_root.parent, model, run_root.name)
+    output_options = view.output_options or {}
+    paths = build_run_paths(
+        run_root.parent,
+        model,
+        run_root.name,
+        audio_format=str(output_options.get("audio_format", "mp3")),
+    )
     script_path_value = view.script_path
-    if script_path_value is None:
+    if script_path_value is None and view.script_format != SPEECH_PARTS_FORMAT:
         raise NativeGenerationError(
             "the committed snapshot records no source script path for its compatibility export; "
             "refusing to guess one.",
@@ -4615,7 +4643,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         prepared=prepared,
         chunks=chunks,
         paths=paths,
-        script_path=Path(script_path_value),
+        script_path=None if script_path_value is None else Path(script_path_value),
     )
 
 

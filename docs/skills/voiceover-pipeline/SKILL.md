@@ -42,6 +42,7 @@ description: >
 | **D: Troubleshoot** | Что-то сломалось | doctor --json → exit code → recovery |
 | **E: Local hybrid** | Нужны локальные ASR/TTS через `audio.cpp` | inventory → doctor → explicit runtime → receipt → cleanup |
 | **F: Two-speaker podcast** | «подкаст», «диалог», «два ведущих», «вопрос-ответ» | author script → validate → doctor → approval → generate → artifacts |
+| **G: Short line / speech-parts** | «одна реплика», явные части с одним голосом на часть | text/speech-parts → preflight → approval → generate (native) |
 
 ## Когда навык должен срабатывать
 
@@ -199,6 +200,34 @@ description: >
 > `Alias:` из synthesized text и сохраняет детерминированные паузы. `input`
 > byte-equals текущему turn text: style/profile/vibe/соседний контекст не
 > отправляются. Перед concat обязателен явный `--tts-quality-provider`.
+
+## Режим G: Короткая реплика и `speech-parts` (S06)
+
+Когда нужна одна реплика или явный список частей с одним голосом на часть и
+своей подачей:
+
+```bash
+voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спокойный ведущий." --json
+voiceover validate --script ./podcast.yaml --format speech-parts --json
+voiceover generate --script ./podcast.yaml --format speech-parts --run-id podcast-01 --json
+```
+
+- `--vibe` при обычном `--script`/legacy-формате отклоняется до ключа и платного
+  запроса, а не игнорируется; использовать его с `--text` или записать в YAML.
+- `speech-parts` — строгий YAML (`version: 1`, `format: speech-parts`,
+  непустой `parts`, ровно одна непустая `voice` и непустой `text` на часть,
+  опциональные общий и частный `vibe`). `provider`/`model` задаёт CLI, не файл;
+  CLI `--voice`/`--vibe` для такого сценария отклоняются — скрытых override нет.
+- Итоговая инструкция = общий vibe, пустая строка, vibe части; в произносимый
+  текст она не попадает и хранится в снимке отдельно. Прогон и resume идут
+  через DB-first нативную историю без чтения исходного файла.
+- Все части проверяются до первого POST; поздняя слишком длинная часть не
+  отправляет ничего.
+- **Статус Gemini-маршрута:** Polza Gemini 3.8 speech-parts **не подтверждён**
+  (`BLOCKED_PROVIDER_CONTRACT`). Не рекламируй его как доступный маршрут и не
+  обещай озвучку с vibe до отдельной live-приёмки.
+- `--audio-format {mp3,wav}` выбирает контейнер итогового файла (default mp3);
+  `wav` — только нативный маршрут.
 
 - Агент — автор сценария: когда пользователь просит готовый подкаст или
   озвучку, агент может написать структурированный диалоговый скрипт

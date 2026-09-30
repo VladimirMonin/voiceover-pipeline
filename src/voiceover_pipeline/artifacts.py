@@ -7,16 +7,23 @@ from .config import model_slug
 from .models import ChunkArtifact, RunPaths, TimingResult
 
 
-def build_run_paths(output_dir: Path, model: str, run_id: str | None = None) -> RunPaths:
+def build_run_paths(
+    output_dir: Path, model: str, run_id: str | None = None, audio_format: str = "mp3"
+) -> RunPaths:
     root = (output_dir / (run_id or model_slug(model))).resolve()
     chunks_dir = root / "chunks"
 
     slug = model_slug(model)
     prefix = run_id or slug
+    # ``full_mp3`` is the one merged run output; its container follows the recorded
+    # ``audio_format`` so a real ``--audio-format wav`` writes a ``.wav`` file with
+    # WAV bytes while the default stays the byte-identical ``.mp3`` path. The chunk
+    # intermediates under ``chunks/`` stay MP3 in every case.
+    final_suffix = ".wav" if audio_format == "wav" else ".mp3"
     return RunPaths(
         output_root=root,
         chunks_dir=chunks_dir,
-        full_mp3=root / f"{prefix}-voiceover-{slug}.mp3",
+        full_mp3=root / f"{prefix}-voiceover-{slug}{final_suffix}",
         chunks_json=chunks_dir / "chunks.json",
         run_json=root / f"{prefix}-voiceover-{slug}.json",
         prefix=prefix,
@@ -50,7 +57,7 @@ def build_chunks_manifest(
     model: str,
     voice: str,
     style_prompt: str | None,
-    script: Path,
+    script: Path | None,
     chunks_dir: Path,
     pricing_snapshot: dict[str, Any] | None,
     cost_exact_available: bool,
@@ -81,7 +88,7 @@ def build_chunks_manifest(
             "execution_source": execution_source,
             "tts_quality": tts_quality_receipt,
             "format": "mp3",
-            "script": str(script.resolve()),
+            "script": None if script is None else str(script.resolve()),
             "chunks_dir": str(chunks_dir),
             "chunk_count": len(chunk_artifacts),
             "total_duration_ms": total_duration_ms,

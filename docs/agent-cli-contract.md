@@ -133,6 +133,54 @@ voiceover doctor --with-asr --asr-provider qwen-local --asr-device cpu --asr-com
 
 При `issues` агент предлагает пользователю исправить сценарий.
 
+## `generate` / `validate`: `speech-parts`, короткая реплика и `--audio-format` (S06)
+
+`--format speech-parts` — новый строгий YAML-формат: `version: 1`, `format: speech-parts`,
+опциональный общий `vibe`, непустой упорядоченный `parts` со
+ ровно одной непустой строкой `voice` и непустым `text`, опциональным
+ per-part `vibe`. Дубликатов ключей, неизвестных ключей, вложенных блоков и
+ tab-отступов нет: loader отклоняет их до любой работы; BOM (`utf-8-sig`)
+ принимается. `provider`/`model` в документе не дублируются — только CLI или
+ постоянные defaults приложения. Голоса и оба vibe остаются в YAML, поэтому CLI
+ `--voice`/`--vibe`/`--style-prompt` для `speech-parts` отклоняются вместо
+ скрытого override.
+
+```bash
+voiceover validate --script ./podcast.yaml --format speech-parts \
+  --provider polza-tts --model google/gemini-3.8-flash-tts --json
+voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спокойный ведущий." --json
+```
+
+- `generate --text ... --voice ... --vibe ...` создаёт ровно одну часть. Вызов без
+  `--text` сохраняет прежний выбор default script; явные `--text` и `--script`
+  взаимоисключающие. `--vibe` — свободная строка, не enum: с обычным
+  `--script`/legacy-форматом она отклоняется до чтения ключа/POST
+  (`VIBE_UNSUPPORTED_FORMAT`, exit `2`), а в `speech-parts` vibe задаётся в YAML.
+- Итоговая инструкция части = общий vibe, затем пустая строка, затем vibe части;
+  отсутствующие значения пропускаются. В произносимый `text` инструкция не
+  попадает и в снимке хранится отдельно (`vibe_shared`/`vibe_specific`/
+  `vibe_effective`). `history resume`/`sync` восстанавливают прогон из снимка, не
+  перечитывая исходный файл.
+- До первого POST проверяются **все** части: `request_chars = len(text) +
+  len(effective_vibe) + len(required_text_wrapper) <= 5000` (приложение-side
+  консервативная политика, не доказанный предел Gemini). Поздняя over-limit
+  часть не отправляет ни одного запроса (JSON `SPEECH_PART_TOO_LONG`, exit `2`).
+- Маршрут `speech-parts` идёт только через DB-first нативную генерацию; legacy
+  fallback отсутствует. Пока контракт Polza Gemini не подтверждён live-пробой,
+  candidate-модель `google/gemini-3.8-flash-tts` (и любая непустая vibe) не
+  регистрируется как stable и fail-closed: JSON `error_code
+  BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до** чтения ключа и любого POST.
+- `--audio-format {mp3,wav}` задаёт контейнер итогового merged-файла (default
+  `mp3`); промежуточные части в `chunks/` остаются MP3. `wav` пишет реальный
+  RIFF/WAVE через ffmpeg и допускается только на нативном маршруте; смена
+  формата на `--resume` отклоняется. `speech-parts` не запускает скрытую
+  облачную ASR-проверку на каждую реплику.
+
+`validate --format speech-parts --json` возвращает `parts`, `request_chars`,
+`route.admitted` и `route.reason`; синтаксическая/бюджетная ошибка — exit `2`,
+неподтверждённый маршрут — предупреждение `BLOCKED_PROVIDER_CONTRACT` при
+валидном документе.
+
 ## `generate` — Style Prompt Flags
 
 | Флаг | Тип | Default | Поведение |

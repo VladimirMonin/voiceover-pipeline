@@ -40,6 +40,7 @@
 | [S03 офлайн-приёмка границ CLI и сервисов](reports/2026-09-29-s03-service-boundaries.md) | На `f373d54`: подготовка, единый paid TTS loop, ASR, recovery, цены и финализация вынесены в сервисы; CLI/JSON и paid-safety сохранены по офлайн-тестам, live/listening **NOT_RUN**. |
 | [S04 офлайн-приёмка SQLite-истории и импорта](reports/2026-09-29-s04-local-history.md) | На `025ff62` проверены migration/Decimal/FK/WAL, приватный home, zero-write legacy preview, идемпотентный import и metadata-only history CLI; текущая генерация остаётся на JSON до S05, live/listening **NOT_RUN**. |
 | [S05 DB-first исполнение и восстановление](reports/2026-09-30-s05-db-first-execution.md) | На `01bca32`: каноническая SQLite-история для всех фактически работающих свежих маршрутов TTS/ASR/timing/verify, единый владелец и paid-boundary, матрица диспетчеризации и ручной fake interruption→resume; live/listening/installed-model **NOT_RUN**, статус `ACCEPT_OFFLINE` после проверенного P1 fix (Sol6 BLOCK относился к прежним байтам, повторный review не выполнялся). |
+| [S06 speech-parts, короткая реплика и audio-format](reports/2026-09-30-s06-speech-parts.md) | Офлайн-ядро (`speech-parts`, `--text`, pre-POST бюджет, DB-first resume и WAV) принято родителем; **полный S06 не принят**: Polza Gemini-маршрут остаётся `BLOCKED_PROVIDER_CONTRACT`, live/listening **NOT_RUN**. |
 
 ## Быстрый старт
 

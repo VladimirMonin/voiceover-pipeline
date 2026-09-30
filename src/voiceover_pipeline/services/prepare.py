@@ -19,6 +19,7 @@ from ..config import (
 from ..gemini_dialogue import DIALOGUE_FORMAT, is_dialogue_format
 from ..models import ScriptChunk
 from ..omnivoice_voice_bank import VoiceBankCatalog
+from ..speech_parts import SPEECH_PARTS_FORMAT
 from ..tts_prompting import resolve_prompt_mode
 from ..voiceover_script import VOICEOVER_FORMAT, detect_frontmatter_format
 
@@ -59,17 +60,58 @@ class PreparedScriptFragments:
 
 
 @dataclass(frozen=True)
+class SpeechPartDirection:
+    """The authored and composed direction for one ``speech-parts`` request.
+
+    ``shared_vibe`` is the document-level instruction, ``specific_vibe`` the
+    part-level one, and ``effective_vibe`` the composed instruction the adapter
+    would send. The spoken ``text`` is deliberately absent, so a stored direction
+    can never be read back as speech. ``effective_vibe`` is empty when neither vibe
+    was authored, which means this part carries no instruction at all and the
+    adapter must not invent one.
+    """
+
+    shared_vibe: str | None
+    specific_vibe: str | None
+    effective_vibe: str
+
+    def to_payload(self) -> dict[str, str | None]:
+        return {
+            "shared_vibe": self.shared_vibe,
+            "specific_vibe": self.specific_vibe,
+            "effective_vibe": self.effective_vibe,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> "SpeechPartDirection":
+        shared = payload.get("shared_vibe")
+        specific = payload.get("specific_vibe")
+        effective = payload.get("effective_vibe")
+        if shared is not None and not isinstance(shared, str):
+            raise ValueError("speech-part direction shared_vibe must be a string or None")
+        if specific is not None and not isinstance(specific, str):
+            raise ValueError("speech-part direction specific_vibe must be a string or None")
+        if not isinstance(effective, str):
+            raise ValueError("speech-part direction effective_vibe must be a string")
+        return cls(shared_vibe=shared, specific_vibe=specific, effective_vibe=effective)
+
+
+@dataclass(frozen=True)
 class PreparedPart:
     """One original script chunk plus the per-part voice identity for its call.
 
     The wrapped chunk is the exact object the run hashes and stores, so part
     identity (number, id, text, speaker, pause) never changes between
     preparation and synthesis. ``voice`` is the chunk's own voice from the
-    dialogue cast; ``None`` means the run-level voice applies.
+    dialogue cast; ``None`` means the run-level voice applies. ``direction`` is
+    present only for the ``speech-parts`` format (and its single-part ``--text``
+    form): it carries that part's shared/specific/effective instruction without
+    ever mixing it into the spoken text.
     """
 
     chunk: ScriptChunk
     voice: str | None
+    direction: SpeechPartDirection | None = None
 
 
 @dataclass(frozen=True)
@@ -707,6 +749,7 @@ def prepare_run(
     qwen_clone_identity: QwenCloneVoiceIdentity | None = None,
     qwen_mode_identity: QwenModeVoiceIdentity | None = None,
     omnivoice_mode_identity: OmniVoiceModeIdentity | None = None,
+    part_directions: Mapping[str, SpeechPartDirection] | None = None,
 ) -> PreparedRun:
     """Wrap the already-resolved run identity and chunks without changing them.
 
@@ -721,7 +764,10 @@ def prepare_run(
     route leaves it ``None``.
     The ordinary ``polza-chat-audio`` route records its resolved ``--fallback-voice``
     as ``fallback_voice`` so the native snapshot can keep that non-secret synthesis
-    identity; every other route leaves it ``None``.
+    identity; every other route leaves it ``None``. The ``speech-parts`` format and
+    its single-part ``--text`` form supply ``part_directions`` keyed by chunk id, so
+    each part keeps its own instruction while every other route leaves it ``None``
+    and stores no per-part direction.
     """
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
     if args.provider == "omnivoice-local":
@@ -758,13 +804,17 @@ def prepare_run(
         # identity block carries. Binding it here leaves ``args.voice`` untouched, so
         # the CLI's own voice-control validation still refuses a user-supplied value.
         voice = omnivoice_mode_identity.voice
+    directions = part_directions or {}
     return PreparedRun(
         provider=args.provider,
         model=args.model,
         voice=voice,
         style_prompt=style_prompt,
         prompt_mode=prompt_mode,
-        parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
+        parts=tuple(
+            PreparedPart(chunk=chunk, voice=chunk.voice, direction=directions.get(chunk.id))
+            for chunk in chunks
+        ),
         voice_bank_identity=voice_bank_identity,
         omnivoice_mode_identity=omnivoice_mode_identity,
         qwen_clone_identity=qwen_clone_identity,
@@ -786,11 +836,13 @@ def prepare_script_fragments(
 
     Non-dialogue scripts first pass through the caller's provider/model spoken-text
     profile, so ``--limit-chunks`` always slices already-prepared fragments. Dialogue
-    chunks are one turn each and bypass that step. Empty scripts and non-positive
+    chunks are one turn each and bypass that step, and ``speech-parts`` chunks keep
+    the author's exact part boundaries and bypass it too, so a part's spoken text is
+    never re-chunked. Empty scripts and non-positive
     limits raise ``PreparationError`` before any provider, key, or pricing work.
     """
     prepared = chunks
-    if not is_dialogue_format(script_format):
+    if not is_dialogue_format(script_format) and script_format != SPEECH_PARTS_FORMAT:
         prepared = local_prepare(prepared, args.provider, args.model)
     if not prepared:
         raise PreparationError("Script produced no chunks. Check delimiter and content.")

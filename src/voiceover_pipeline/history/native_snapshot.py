@@ -94,7 +94,9 @@ from ..services.prepare import (
     PreparedRun,
     QwenCloneVoiceIdentity,
     QwenModeVoiceIdentity,
+    SpeechPartDirection,
 )
+from ..speech_parts import SPEECH_PARTS_FORMAT
 from .repository import (
     TEXT_COMPLETENESS_COMPLETE,
     TEXT_KIND_TTS_DIRECTION,
@@ -201,6 +203,7 @@ class _PlannedPart:
     effective_voice: str
     fingerprint: str
     config_entry: dict[str, Any]
+    direction: SpeechPartDirection | None = None
 
 
 def _sha256_text(text: str) -> str:
@@ -281,6 +284,33 @@ def _resolve_effective_voice(part: PreparedPart, run_voice: str) -> str:
     return voice
 
 
+def _require_part_direction(part: PreparedPart) -> SpeechPartDirection | None:
+    """Return a validated per-part direction, or ``None`` for an ordinary part.
+
+    A ``speech-parts`` part's two authored vibes must each be a string or ``None``
+    and its composed instruction must be the exact string the adapter would send;
+    an unknown object or a non-string fails closed before any insert, so a part
+    whose instruction could not be reconstructed is never committed. The rejection
+    echoes no value.
+    """
+    direction = part.direction
+    if direction is None:
+        return None
+    if not isinstance(direction, SpeechPartDirection):
+        raise NativeSnapshotValidationError(
+            "prepared part direction is not a speech-part direction"
+        )
+    for name, value in (
+        ("shared_vibe", direction.shared_vibe),
+        ("specific_vibe", direction.specific_vibe),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise NativeSnapshotValidationError(f"speech-part direction {name} must be a string")
+    if not isinstance(direction.effective_vibe, str):
+        raise NativeSnapshotValidationError("speech-part direction effective_vibe must be a string")
+    return direction
+
+
 def _run_identity_payload(
     *,
     provider: str,
@@ -355,11 +385,19 @@ def _part_fingerprint(
     chunk: ScriptChunk,
     position: int,
     effective_voice: str,
+    direction: SpeechPartDirection | None = None,
 ) -> str:
     payload: dict[str, Any] = dict(identity)
     payload["position"] = position
     payload["chunk"] = _chunk_payload(chunk)
     payload["effective_voice"] = effective_voice
+    if direction is not None:
+        # Only a ``speech-parts`` part carries a direction. The keys are added only
+        # when present, so every route committed before this stage -- and every
+        # other route -- keeps its exact version-1 part payload byte-for-byte.
+        payload["vibe_shared"] = direction.shared_vibe
+        payload["vibe_specific"] = direction.specific_vibe
+        payload["vibe_effective"] = direction.effective_vibe
     return _fingerprint(payload)
 
 
@@ -699,6 +737,15 @@ def persist_prepared_tts_snapshot(
         _require_nonempty_text(user_label, "user_label")
     if not prepared.parts:
         raise NativeSnapshotValidationError("prepared run has no parts to snapshot")
+    # A per-part direction belongs to the ``speech-parts`` format only, so a
+    # direction on any other format fails closed instead of committing an identity
+    # whose route the reader would never rebuild the same way.
+    if any(part.direction is not None for part in prepared.parts) and (
+        resolved_format != SPEECH_PARTS_FORMAT
+    ):
+        raise NativeSnapshotValidationError(
+            "a per-part direction is only valid for a speech-parts run"
+        )
     if script_path is not None and not isinstance(script_path, Path):
         raise NativeSnapshotValidationError("script_path must be a Path or None")
     if voice_identity is not None:
@@ -763,12 +810,29 @@ def persist_prepared_tts_snapshot(
         if not isinstance(chunk.text, str):
             raise NativeSnapshotValidationError(f"chunk {chunk_id!r} text must be a string")
         effective_voice = _resolve_effective_voice(part, voice)
+        direction = _require_part_direction(part)
         part_fingerprint = _part_fingerprint(
             identity,
             chunk=chunk,
             position=position,
             effective_voice=effective_voice,
+            direction=direction,
         )
+        entry: dict[str, Any] = {
+            "position": position,
+            "number": number,
+            "id": chunk_id,
+            "speaker": chunk.speaker,
+            "cast_voice": chunk.voice,
+            "voice_fingerprint": chunk.voice_fingerprint,
+            "pause_after_ms": chunk.pause_after_ms,
+            "effective_voice": effective_voice,
+            "fingerprint": part_fingerprint,
+        }
+        if direction is not None:
+            entry["vibe_shared"] = direction.shared_vibe
+            entry["vibe_specific"] = direction.specific_vibe
+            entry["vibe_effective"] = direction.effective_vibe
         planned.append(
             _PlannedPart(
                 position=position,
@@ -776,17 +840,8 @@ def persist_prepared_tts_snapshot(
                 content_hash=_sha256_text(chunk.text),
                 effective_voice=effective_voice,
                 fingerprint=part_fingerprint,
-                config_entry={
-                    "position": position,
-                    "number": number,
-                    "id": chunk_id,
-                    "speaker": chunk.speaker,
-                    "cast_voice": chunk.voice,
-                    "voice_fingerprint": chunk.voice_fingerprint,
-                    "pause_after_ms": chunk.pause_after_ms,
-                    "effective_voice": effective_voice,
-                    "fingerprint": part_fingerprint,
-                },
+                config_entry=entry,
+                direction=direction,
             )
         )
 
@@ -852,13 +907,19 @@ def persist_prepared_tts_snapshot(
             )
         parts: list[PartRecord] = []
         for item in planned:
-            # No stage: the raw-saved seam later moves NULL -> raw_saved.
+            # No stage: the raw-saved seam later moves NULL -> raw_saved. A
+            # ``speech-parts`` part stores its two authored vibes and the composed
+            # effective instruction; every other route leaves all three NULL.
+            direction = item.direction
             record = repository.add_part(
                 run.run_uuid,
                 position=item.position,
                 prepared_text=item.text,
                 voice=item.effective_voice,
                 fingerprint=item.fingerprint,
+                vibe_shared=None if direction is None else direction.shared_vibe,
+                vibe_specific=None if direction is None else direction.specific_vibe,
+                vibe_effective=None if direction is None else direction.effective_vibe,
             )
             parts.append(record)
             repository.add_text_source(

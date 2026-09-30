@@ -398,7 +398,11 @@ def preflight_native_tts_resume(
         if not isinstance(effective_voice, str) or not effective_voice.strip():
             raise NativeResumeIdentityConflictError(_PART_IDENTITY_CONFLICT)
         fingerprint = _part_fingerprint(
-            identity, chunk=chunk, position=position, effective_voice=effective_voice
+            identity,
+            chunk=chunk,
+            position=position,
+            effective_voice=effective_voice,
+            direction=part.direction,
         )
         if fingerprint != committed.fingerprint:
             raise NativeResumeIdentityConflictError(_PART_IDENTITY_CONFLICT)

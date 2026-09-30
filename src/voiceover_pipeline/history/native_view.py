@@ -68,6 +68,7 @@ from ..services.prepare import (
     OmniVoiceVoiceBankIdentity,
     QwenCloneVoiceIdentity,
     QwenModeVoiceIdentity,
+    SpeechPartDirection,
 )
 from .native_snapshot import (
     _NATIVE_SNAPSHOT_SUPPORTED_TTS_PROVIDERS,
@@ -159,6 +160,7 @@ class NativeTtsPart:
     effective_voice: str
     fingerprint: str
     text: str
+    direction: SpeechPartDirection | None = None
 
 
 @dataclass(frozen=True)
@@ -387,6 +389,36 @@ def _entry_int(entry: dict[str, Any], key: str) -> int:
     return value
 
 
+def _entry_direction(entry: dict[str, Any], part: PartRecord) -> SpeechPartDirection | None:
+    """Reconstruct one part's committed ``speech-parts`` direction, or fail closed.
+
+    A part that committed a per-part direction records all three values in its
+    config entry and its row; a part that did not records none in both places.
+    Either they agree on all three or the run is refused with a fixed message, so a
+    direct ``UPDATE`` of a vibe column can never silently change what a resume would
+    send while its fingerprint still matched.
+    """
+    present = any(key in entry for key in ("vibe_shared", "vibe_specific", "vibe_effective"))
+    row_values = (part.vibe_shared, part.vibe_specific, part.vibe_effective)
+    row_present = any(value is not None for value in row_values)
+    if not present:
+        if row_present:
+            raise NativeViewIntegrityError(
+                "native snapshot part vibe disagrees with its config entry"
+            )
+        return None
+    shared = _entry_optional_str(entry, "vibe_shared")
+    specific = _entry_optional_str(entry, "vibe_specific")
+    effective = _entry_optional_str(entry, "vibe_effective")
+    if effective is None:
+        raise NativeViewIntegrityError(
+            "native snapshot part entry field 'vibe_effective' is not null or a string"
+        )
+    if (shared, specific, effective) != row_values:
+        raise NativeViewIntegrityError("native snapshot part vibe disagrees with its config entry")
+    return SpeechPartDirection(shared_vibe=shared, specific_vibe=specific, effective_vibe=effective)
+
+
 def _require_native_config(run: RunRecord) -> dict[str, Any]:
     """Return the run's committed native config, or fail closed.
 
@@ -600,8 +632,13 @@ def _build_parts(
             voice_fingerprint=_entry_optional_str(entry, "voice_fingerprint"),
             pause_after_ms=_entry_int(entry, "pause_after_ms"),
         )
+        direction = _entry_direction(entry, part)
         recomputed = _part_fingerprint(
-            identity, chunk=chunk, position=position, effective_voice=effective_voice
+            identity,
+            chunk=chunk,
+            position=position,
+            effective_voice=effective_voice,
+            direction=direction,
         )
         if recomputed != part.fingerprint:
             raise NativeViewIntegrityError(
@@ -620,6 +657,7 @@ def _build_parts(
                 effective_voice=effective_voice,
                 fingerprint=recomputed,
                 text=text,
+                direction=direction,
             )
         )
     return native_parts, part_fingerprints

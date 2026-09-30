@@ -180,6 +180,7 @@ from .services.prepare import (
     OMNIVOICE_MODE_IDENTITY_MODES,
     PreparationError,
     PreparedRun,
+    SpeechPartDirection,
     bind_omnivoice_dialogue_fingerprints,
     build_omnivoice_mode_identity,
     build_qwen_clone_identity,
@@ -193,6 +194,21 @@ from .services.prepare import (
 )
 from .services.synthesis import synthesize_part
 from .services.transcription import build_asr_request
+from .speech_parts import (
+    SPEECH_PARTS_FORMAT,
+    SPEECH_PARTS_REQUEST_CHAR_LIMIT,
+    SpeechPart,
+    SpeechPartsDocument,
+    SpeechPartsError,
+    build_speech_parts_document,
+    compose_effective_vibe,
+    speech_part_request_chars,
+)
+from .speech_parts_route import (
+    SpeechPartsRouteError,
+    require_confirmed_speech_parts_route,
+    speech_parts_required_text_wrapper,
+)
 from .tts_prompting import read_style_prompt_from_file
 from .tts_quality import evaluate_tts_transcript
 from .voiceover_script import (
@@ -315,14 +331,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     gen.add_argument("--model", default=argparse.SUPPRESS)
-    gen.add_argument("--script", type=Path, default=_find_default_script())
+    gen.add_argument("--script", type=Path, default=None)
+    gen.add_argument(
+        "--text",
+        default=None,
+        help=(
+            "One simple spoken line for a single speech part. Mutually exclusive with an "
+            "explicit --script; a call without --text keeps the default script selection."
+        ),
+    )
+    gen.add_argument(
+        "--vibe",
+        default=None,
+        help=(
+            "Free-form delivery instruction for --text. It is never read aloud; a route that "
+            "cannot transmit it fails closed before any paid request."
+        ),
+    )
     gen.add_argument("--delimiter", default="******")
     gen.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     gen.add_argument("--run-id", default="")
     gen.add_argument("--voice", default=None)
     gen.add_argument(
         "--format",
-        choices=["markdown", VOICEOVER_FORMAT, DIALOGUE_FORMAT, GEMINI_DIALOGUE_FORMAT],
+        choices=[
+            "markdown",
+            VOICEOVER_FORMAT,
+            DIALOGUE_FORMAT,
+            GEMINI_DIALOGUE_FORMAT,
+            SPEECH_PARTS_FORMAT,
+        ],
         default="markdown",
     )
     gen.add_argument(
@@ -341,6 +379,12 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--style-prompt", default=None)
     gen.add_argument("--style-prompt-file", type=Path, default=None)
     gen.add_argument("--no-style-prompt", action="store_true")
+    gen.add_argument(
+        "--audio-format",
+        choices=["mp3", "wav"],
+        default="mp3",
+        help="Container for the merged run file (default: mp3). Chunk intermediates stay MP3.",
+    )
     gen.add_argument("--no-trim", action="store_true")
     gen.add_argument(
         "--json", dest="json_output", action="store_true", help="Output JSON to stdout."
@@ -612,7 +656,13 @@ def build_parser() -> argparse.ArgumentParser:
     val.add_argument("--delimiter", default="******")
     val.add_argument(
         "--format",
-        choices=["markdown", VOICEOVER_FORMAT, DIALOGUE_FORMAT, GEMINI_DIALOGUE_FORMAT],
+        choices=[
+            "markdown",
+            VOICEOVER_FORMAT,
+            DIALOGUE_FORMAT,
+            GEMINI_DIALOGUE_FORMAT,
+            SPEECH_PARTS_FORMAT,
+        ],
         default="markdown",
     )
     val.add_argument(
@@ -1047,6 +1097,98 @@ def _resolve_script_format(script_path: Path, requested_format: str) -> str:
     return resolve_script_format(script_path, requested_format)
 
 
+def _single_speech_part_document(*, text: str, voice: str, vibe: str | None) -> SpeechPartsDocument:
+    """Build the one-part ``speech-parts`` document a ``--text`` run uses."""
+    if not isinstance(text, str) or not text.strip():
+        fail("--text must be a non-empty line.", _EXIT_ARGS)
+    return SpeechPartsDocument(
+        global_vibe=None,
+        parts=(
+            SpeechPart(
+                position=1,
+                voice=voice,
+                text=text,
+                vibe=vibe,
+                effective_vibe=compose_effective_vibe(None, vibe),
+            ),
+        ),
+    )
+
+
+def _load_speech_parts_document(script_path: Path) -> SpeechPartsDocument:
+    """Read and parse one ``speech-parts`` script, reporting a usage error."""
+    try:
+        raw = script_path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        fail(f"Failed to read the speech-parts script {script_path}: {exc}", _EXIT_ARGS)
+    try:
+        return build_speech_parts_document(raw)
+    except SpeechPartsError as exc:
+        fail(str(exc), _EXIT_ARGS)
+
+
+def _speech_parts_chunks(
+    document: SpeechPartsDocument,
+) -> tuple[list[ScriptChunk], dict[str, SpeechPartDirection]]:
+    """Build the ordered chunks and per-part directions a speech-parts run stores.
+
+    Part order is exactly the document order, and the generated ``chunk_NN`` id is
+    the only id the native snapshot accepts, so the stored order and the spoken
+    order can never diverge.
+    """
+    chunks: list[ScriptChunk] = []
+    directions: dict[str, SpeechPartDirection] = {}
+    for part in document.parts:
+        chunk_id = f"chunk_{part.position:02d}"
+        chunks.append(
+            ScriptChunk(number=part.position, id=chunk_id, text=part.text, voice=part.voice)
+        )
+        directions[chunk_id] = SpeechPartDirection(
+            shared_vibe=document.global_vibe,
+            specific_vibe=part.vibe,
+            effective_vibe=part.effective_vibe,
+        )
+    return chunks, directions
+
+
+def _preflight_speech_parts_route(args: argparse.Namespace, document: SpeechPartsDocument) -> None:
+    """Reject, before any provider or key, an over-budget or unconfirmed request.
+
+    Every part is checked against the conservative character budget first, so a
+    late over-limit part stops the run before the first POST rather than after some
+    paid parts, and the whole request route is then admitted only when it is
+    confirmed. An unverified candidate route or any non-empty effective vibe fails
+    closed with an explicit ``BLOCKED_PROVIDER_CONTRACT`` instead of a silent
+    fallback or a dropped instruction.
+    """
+    wrapper = speech_parts_required_text_wrapper(args.provider, args.model)
+    for part in document.parts:
+        request_chars = speech_part_request_chars(part.text, part.effective_vibe, wrapper)
+        if request_chars > SPEECH_PARTS_REQUEST_CHAR_LIMIT:
+            fail(
+                f"speech-part {part.position} needs {request_chars} characters including its "
+                f"effective vibe; the conservative per-request limit is "
+                f"{SPEECH_PARTS_REQUEST_CHAR_LIMIT}. Shorten the part or its vibe; nothing was "
+                "submitted.",
+                _EXIT_ARGS,
+                details={
+                    "error_code": "SPEECH_PART_TOO_LONG",
+                    "part": part.position,
+                    "request_chars": request_chars,
+                    "limit": SPEECH_PARTS_REQUEST_CHAR_LIMIT,
+                },
+            )
+    try:
+        require_confirmed_speech_parts_route(
+            provider=args.provider,
+            model=args.model,
+            voices=[part.voice for part in document.parts],
+            has_vibe=any(part.effective_vibe for part in document.parts),
+        )
+    except SpeechPartsRouteError as exc:
+        fail(str(exc), _EXIT_PROVIDER, details={"error_code": exc.error_code})
+
+
 def generate(args: argparse.Namespace) -> None:
     if getattr(args, "json_output", False) and getattr(args, "json_events", False):
         fail(
@@ -1060,8 +1202,39 @@ def generate(args: argparse.Namespace) -> None:
             "--confirm-delete-paid-audio for an explicitly new run.",
             _EXIT_ARGS,
         )
-    script_format = _resolve_script_format(args.script, args.format)
+    explicit_text = getattr(args, "text", None) is not None
+    explicit_script = args.script is not None
+    if explicit_text and explicit_script:
+        fail(
+            "--text and an explicit --script are mutually exclusive: pass one input. A call "
+            "without --text keeps the default script selection.",
+            _EXIT_ARGS,
+        )
+    speech_parts_document: SpeechPartsDocument | None = None
+    if explicit_text:
+        if args.format != "markdown":
+            fail(
+                "--text does not accept --format: a single line is always one speech part.",
+                _EXIT_ARGS,
+            )
+        script_format = SPEECH_PARTS_FORMAT
+    else:
+        if args.script is None:
+            args.script = _find_default_script()
+        script_format = _resolve_script_format(args.script, args.format)
     args.format = script_format
+    if (
+        not explicit_text
+        and script_format != SPEECH_PARTS_FORMAT
+        and getattr(args, "vibe", None) is not None
+    ):
+        fail(
+            "--vibe is only accepted with --text; a speech-parts script records its vibes in "
+            "YAML. Legacy script formats do not carry --vibe, so refusing to drop the "
+            "instruction before a paid request.",
+            _EXIT_ARGS,
+            details={"error_code": "VIBE_UNSUPPORTED_FORMAT"},
+        )
     _validate_omnivoice_options(args)
     try:
         ffmpeg_path, ffprobe_path = check_media_tools()
@@ -1070,7 +1243,51 @@ def generate(args: argparse.Namespace) -> None:
 
     gemini_report = None
     voiceover_report = None
-    if is_dialogue_format(script_format):
+    part_directions: dict[str, SpeechPartDirection] = {}
+    if explicit_text or script_format == SPEECH_PARTS_FORMAT:
+        if explicit_text:
+            # A single line is one part; its voice is the run voice, so an omitted
+            # --voice resolves to the provider/model default exactly as before.
+            args.provider = args.provider or DEFAULT_PROVIDER
+            _resolve_model(args)
+            text_voice = args.voice or default_voice(args)
+            if not text_voice:
+                fail(
+                    "--text requires --voice: this provider/model has no default voice.",
+                    _EXIT_ARGS,
+                )
+            speech_parts_document = _single_speech_part_document(
+                text=args.text, voice=text_voice, vibe=getattr(args, "vibe", None)
+            )
+        else:
+            if args.voice is not None:
+                fail(
+                    "A speech-parts script supplies every voice itself; remove --voice instead of "
+                    "creating a hidden override.",
+                    _EXIT_ARGS,
+                )
+            if getattr(args, "vibe", None) is not None:
+                fail(
+                    "A speech-parts script supplies both vibes itself; remove --vibe instead of "
+                    "creating a hidden override.",
+                    _EXIT_ARGS,
+                )
+            if args.style_prompt is not None or args.style_prompt_file is not None:
+                fail(
+                    "A speech-parts script supplies its direction itself; remove "
+                    "--style-prompt/--style-prompt-file instead of creating a hidden override.",
+                    _EXIT_ARGS,
+                )
+            args.provider = args.provider or DEFAULT_PROVIDER
+            _resolve_model(args)
+            speech_parts_document = _load_speech_parts_document(args.script)
+        chunks, part_directions = _speech_parts_chunks(speech_parts_document)
+        # The run voice is the first part's voice and every part carries its own cast
+        # voice, so the snapshot's one run voice agrees with every committed part.
+        args.voice = speech_parts_document.parts[0].voice
+        _preflight_speech_parts_route(args, speech_parts_document)
+        args.speech_part_directions = part_directions
+    elif is_dialogue_format(script_format):
         args.provider = args.provider or "openrouter-tts"
         _resolve_model(args)
         allowed_voices = None
@@ -1186,7 +1403,12 @@ def generate(args: argparse.Namespace) -> None:
     if args.run_id:
         _validate_run_id(args.run_id)
     _validate_output_dir(args.output_dir)
-    paths = build_run_paths(args.output_dir, args.model, args.run_id or None)
+    paths = build_run_paths(
+        args.output_dir,
+        args.model,
+        args.run_id or None,
+        audio_format=getattr(args, "audio_format", "mp3"),
+    )
 
     if getattr(args, "dry_run_cost", False):
         _json_ok(
@@ -1204,6 +1426,29 @@ def generate(args: argparse.Namespace) -> None:
                 "estimated_cost": None,
                 "estimate_note": "Exact pre-generation cost is unavailable for this provider/model without usage data.",
             }
+        )
+
+    # A ``speech-parts`` run has no legacy executor: an unsupported option mixture
+    # fails closed here instead of silently falling back to the legacy JSON writer.
+    if script_format == SPEECH_PARTS_FORMAT and not _native_route_eligible(args, script_format):
+        fail(
+            "This speech-parts run requested an option mixture the DB-first native route does "
+            "not admit, and there is no legacy fallback for this format. Remove the unsupported "
+            "option or choose an admitted provider/model/option combination.",
+            _EXIT_PROVIDER,
+            details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
+        )
+
+    # ``--audio-format wav`` is only honored on the DB-first native route, which
+    # records it with the run so a resume proves it unchanged; a route that keeps the
+    # legacy executor refuses it instead of silently writing MP3.
+    if getattr(args, "audio_format", "mp3") != "mp3" and not _native_route_eligible(
+        args, script_format
+    ):
+        fail(
+            "--audio-format wav is only supported on the DB-first native route; this option "
+            "mixture keeps the legacy executor. Remove --audio-format or change the options.",
+            _EXIT_ARGS,
         )
 
     # Native history ownership is resolved before the legacy JSON recovery guards,
@@ -1425,6 +1670,22 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     """
     if is_dialogue_format(script_format):
         return _native_dialogue_route_eligible(args)
+    if script_format == SPEECH_PARTS_FORMAT:
+        # The explicit ``speech-parts`` format and its single-part ``--text`` form are
+        # admitted only on the DB-first native route: each part is one provider request
+        # with its own voice (and, when confirmed, its own instruction), and the
+        # snapshot must keep the exact parts and directions. There is no legacy
+        # executor for this format, so ``generate`` refuses an unsupported option
+        # mixture instead of falling back.
+        if not _native_local_output_steps_admitted(args):
+            return False
+        if not isinstance(getattr(args, "model", None), str):
+            return False
+        return getattr(args, "provider", None) in (
+            "polza-tts",
+            "polza-chat-audio",
+            "openrouter-tts",
+        )
     if getattr(args, "provider", None) == "qwen-local":
         # The local Qwen routes admit a plain Markdown script and a
         # ``format: voiceover`` script: the voiceover validator resolves one voice
@@ -1861,6 +2122,7 @@ def _run_native_route(
         qwen_clone_identity=qwen_clone_identity,
         qwen_mode_identity=qwen_mode_identity,
         omnivoice_mode_identity=omnivoice_mode_identity,
+        part_directions=getattr(args, "speech_part_directions", None),
     )
     provider_cache: list[Any] = []
 
@@ -1903,6 +2165,7 @@ def _run_native_route(
         args.no_trim,
         timing=_native_timing_options(args),
         quality=_native_quality_options(args),
+        audio_format=getattr(args, "audio_format", "mp3"),
     )
     try:
         summary = native_generation.run_native_generation(
@@ -3455,12 +3718,122 @@ def doctor_cmd(args: argparse.Namespace) -> None:
             print(f"  WARNING: {w}")
 
 
+def _validate_speech_parts_cmd(args: argparse.Namespace, script: Path) -> None:
+    """Validate one ``speech-parts`` script and report its syntax, budget, and route.
+
+    The document syntax, part order, one voice per part, and the conservative
+    request budget are checked fully offline. The provider route is reported too: an
+    unverified candidate model, or a non-empty vibe that no confirmed route can
+    carry without reading it, is surfaced with ``BLOCKED_PROVIDER_CONTRACT`` so the
+    author sees it before ``generate`` would refuse the run. Validation never reads
+    an API key and never submits.
+    """
+    provider = args.provider or DEFAULT_PROVIDER
+    model = args.model or PROVIDER_DEFAULT_MODELS.get(provider, DEFAULT_MODEL)
+    errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
+    try:
+        raw = script.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        fail(f"Failed to read the speech-parts script {script}: {exc}", _EXIT_ARGS)
+    document: SpeechPartsDocument | None = None
+    try:
+        document = build_speech_parts_document(raw)
+    except SpeechPartsError as exc:
+        errors.append({"code": "SPEECH_PARTS_INVALID", "message": str(exc)})
+
+    wrapper = speech_parts_required_text_wrapper(provider, model)
+    parts_report: list[dict[str, Any]] = []
+    total_chars = 0
+    if document is not None:
+        for part in document.parts:
+            request_chars = speech_part_request_chars(part.text, part.effective_vibe, wrapper)
+            total_chars += len(part.text)
+            parts_report.append(
+                {
+                    "position": part.position,
+                    "voice": part.voice,
+                    "chars": len(part.text),
+                    "request_chars": request_chars,
+                    "has_vibe": bool(part.effective_vibe),
+                }
+            )
+            if request_chars > SPEECH_PARTS_REQUEST_CHAR_LIMIT:
+                errors.append(
+                    {
+                        "code": "SPEECH_PART_TOO_LONG",
+                        "part": part.position,
+                        "request_chars": request_chars,
+                        "limit": SPEECH_PARTS_REQUEST_CHAR_LIMIT,
+                        "message": (
+                            f"Part {part.position} needs {request_chars} characters including "
+                            f"its effective vibe; the limit is {SPEECH_PARTS_REQUEST_CHAR_LIMIT}."
+                        ),
+                    }
+                )
+
+    route_admitted = False
+    route_reason: str | None = None
+    if document is not None and not errors:
+        try:
+            require_confirmed_speech_parts_route(
+                provider=provider,
+                model=model,
+                voices=[part.voice for part in document.parts],
+                has_vibe=any(part.effective_vibe for part in document.parts),
+            )
+            route_admitted = True
+        except SpeechPartsRouteError as exc:
+            route_reason = exc.error_code
+            warnings.append({"code": exc.error_code, "message": str(exc)})
+
+    valid = not errors
+    report: dict[str, Any] = {
+        "status": "success" if valid else "error",
+        "valid": valid,
+        "format": SPEECH_PARTS_FORMAT,
+        "script": str(script),
+        "provider": provider,
+        "model": model,
+        "request_char_limit": SPEECH_PARTS_REQUEST_CHAR_LIMIT,
+        "parts": parts_report,
+        "total_chars": total_chars,
+        "route": {
+            "admitted": route_admitted,
+            "reason": route_reason,
+        },
+        "errors": errors,
+        "warnings": warnings,
+    }
+    if args.json_output:
+        print(json.dumps(report, ensure_ascii=False))
+        sys.exit(_EXIT_OK if valid else _EXIT_ARGS)
+    print(f"Script: {script}")
+    print(f"Format: {SPEECH_PARTS_FORMAT}")
+    print(f"Provider: {provider}, Model: {model}")
+    print(f"Parts: {len(parts_report)}, Valid: {valid}")
+    for item in parts_report:
+        print(
+            f"  part {item['position']}: voice={item['voice']}, chars={item['chars']}, "
+            f"request_chars={item['request_chars']}"
+        )
+    for item in errors:
+        print(f"  ERROR {item['code']}: {item['message']}")
+    for item in warnings:
+        print(f"  WARNING {item['code']}: {item['message']}")
+    sys.exit(_EXIT_OK if valid else _EXIT_ARGS)
+
+
 def validate_cmd(args: argparse.Namespace) -> None:
     script = Path(args.script)
     if not script.exists():
         fail("Script file not found", _EXIT_ARGS)
 
     script_format = _resolve_script_format(script, args.format)
+
+    if script_format == SPEECH_PARTS_FORMAT:
+        _validate_speech_parts_cmd(args, script)
+        return
 
     if is_dialogue_format(script_format):
         report = validate_gemini_dialogue_file(

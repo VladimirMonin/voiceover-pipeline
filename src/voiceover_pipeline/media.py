@@ -267,9 +267,8 @@ def concat_dialogue_turns(
             "-map",
             "[dialogue]",
             "-codec:a",
-            "libmp3lame",
-            "-b:a",
-            MP3_BITRATE,
+            _concat_codec(output_path),
+            *(_concat_bitrate_args(output_path)),
             str(output_path),
         ],
         stdout=subprocess.PIPE,
@@ -317,12 +316,18 @@ def concat_audio_files(ffmpeg_path: str, chunk_paths: list[Path], output_path: P
 
 
 def _concat_codec(output_path: Path) -> str:
-    if output_path.suffix.lower() == ".ogg":
+    suffix = output_path.suffix.lower()
+    if suffix == ".ogg":
         return "libopus"
+    if suffix == ".wav":
+        return "pcm_s16le"
     return "libmp3lame"
 
 
 def _concat_bitrate_args(output_path: Path) -> list[str]:
-    if output_path.suffix.lower() == ".ogg":
+    suffix = output_path.suffix.lower()
+    if suffix == ".ogg":
         return ["-b:a", "96k"]
+    if suffix == ".wav":
+        return []
     return ["-b:a", MP3_BITRATE]

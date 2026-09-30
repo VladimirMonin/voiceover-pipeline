@@ -329,7 +329,7 @@ def build_native_export(
     view: NativeTtsView,
     paths: RunPaths,
     *,
-    script_path: Path,
+    script_path: Path | None,
     ffmpeg_path: str,
     ffprobe_path: str,
 ) -> NativeExport:
@@ -408,7 +408,7 @@ def _build_run_state(
     paths: RunPaths,
     *,
     config: dict[str, Any],
-    script_path: Path,
+    script_path: Path | None,
     by_part: dict[str, ChunkArtifact],
     main_duration_ms: int,
 ) -> dict[str, Any]:
