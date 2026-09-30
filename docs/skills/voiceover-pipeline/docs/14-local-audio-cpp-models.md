@@ -98,7 +98,10 @@ OmniVoice — локальный TTS через `audio.cpp` (модель `audio
 `reference_sha256` отклоняются. Одноголосый `--mode preset --voice-bank` прогон
 тоже сохраняется в canonical SQLite как нативный локальный маршрут (см.
 [Agent CLI Contract](../../../agent-cli-contract.md)); `auto`/`clone`/`design`
-остаются на legacy. OpenRouter dialogue также делает один request
+идут тем же нативным локальным маршрутом, как и записанная обрезка `--no-trim`,
+локальные `--with-timings --timing-provider faster-whisper` и установленный
+локальный `--tts-quality-provider`; облачный timing- или quality-провайдер
+остаётся на legacy. OpenRouter dialogue также делает один request
 с одним documented voice на turn; `multi_speaker_voice_config` не используется.
 Offline contract не заменяет отдельный human audible PASS.
 

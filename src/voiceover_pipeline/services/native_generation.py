@@ -1251,11 +1251,18 @@ class _Executor:
         # (clone and the instructed preset/design modes). Each
         # reserves its own cost-free ``local_tts_chunk`` attempt per real invocation.
         self.local = prepared.provider in {"omnivoice-local", "qwen-local"}
-        self.dialogue_quality_gate = self.dialogue and prepared.provider == "openrouter-tts"
         self.script_path = script_path
         self.output_options = output_options
         self.timing_options = timing_options_from_output_options(output_options)
         self.quality_options = quality_options_from_output_options(output_options)
+        # The required per-turn gate runs for the OpenRouter dialogue route (whose
+        # local quality provider is mandatory) and for the optional OmniVoice
+        # dialogue route whenever this run recorded an installed local quality
+        # provider; a plain OmniVoice dialogue run without one keeps the exact
+        # legacy behavior of no gate.
+        self.dialogue_quality_gate = self.dialogue and (
+            prepared.provider == "openrouter-tts" or self.quality_options is not None
+        )
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
         self.provider_factory = provider_factory

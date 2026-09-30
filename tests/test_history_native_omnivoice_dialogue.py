@@ -23,12 +23,13 @@ import pytest
 
 import voiceover_pipeline.cli as cli
 from voiceover_pipeline.config import OMNIVOICE_LOCAL_MODEL_ID
-from voiceover_pipeline.models import SynthesisResult
+from voiceover_pipeline.models import ASRExecutionReceipt, ASRResult, SynthesisResult
 from voiceover_pipeline.providers import OmniVoiceLocalTTSProvider
-from voiceover_pipeline.services import native_generation
+from voiceover_pipeline.services import native_generation, transcription
 
 PROFILE_A = "voice_a"
 PROFILE_B = "voice_b"
+QWEN_ASR_MODEL = "Qwen/Qwen3-ASR-0.6B"
 
 
 def _mono_wav(seed: int) -> bytes:
@@ -128,6 +129,9 @@ def local_env(tmp_path, monkeypatch):
     monkeypatch.setattr(cli, "trim_final_silence", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(cli, "mp3_duration_ms", lambda _ffprobe, _path: 1000)
     monkeypatch.setattr(cli, "concat_audio_files", _concat_audio)
+    # The local quality preflight is a real dependency probe; the tests stub it so
+    # no local ASR install is required. The per-turn model run is replaced per test.
+    monkeypatch.setattr(native_generation, "_preflight_local_quality", lambda _options: None)
     return home
 
 
@@ -200,6 +204,46 @@ def _install_concat(monkeypatch):
 
     monkeypatch.setattr(cli, "concat_dialogue_turns", fake_concat)
     return calls
+
+
+def _asr_result(transcript: str) -> ASRResult:
+    return ASRResult(
+        transcript=transcript,
+        provider_id="qwen-local",
+        model_id=QWEN_ASR_MODEL,
+        execution=ASRExecutionReceipt(
+            runtime="python",
+            model_revision="rev-1",
+            resolved_device="cpu",
+            resolved_compute="auto",
+        ),
+        language="ru",
+    )
+
+
+def _install_quality(monkeypatch, transcripts: dict[str, str]):
+    """Replace the local ASR with a lookup keyed by the checked turn's file name."""
+    calls: list[dict[str, Any]] = []
+
+    def fake_transcribe(**kwargs):
+        calls.append(dict(kwargs))
+        return _asr_result(transcripts[Path(kwargs["audio_path"]).name])
+
+    monkeypatch.setattr(transcription, "transcribe_local_asr_quality", fake_transcribe)
+    return calls
+
+
+def _turn_quality(home: Path, run_uuid: str) -> list[sqlite3.Row]:
+    return _rows(
+        home,
+        "SELECT parts.position AS position, artifacts.media_metadata_json AS metadata, "
+        "text_sources.content AS transcript FROM artifacts JOIN text_sources "
+        "ON text_sources.artifact_uuid = artifacts.artifact_uuid "
+        "JOIN parts ON parts.part_uuid = artifacts.part_uuid "
+        "WHERE artifacts.run_uuid = ? AND artifacts.role = 'tts_turn_quality_receipt' "
+        "ORDER BY parts.position",
+        (run_uuid,),
+    )
 
 
 def _explode(*_args, **_kwargs):  # pragma: no cover - asserted never to run
@@ -676,6 +720,130 @@ def test_native_local_dialogue_history_sync_is_export_only_without_a_model(
     assert state["calls"] == before
 
 
+def test_native_local_dialogue_optional_quality_gate_runs_before_concat(
+    tmp_path, monkeypatch, capsys, local_env
+):
+    """The optional OmniVoice dialogue QA runs per turn and links its verdicts."""
+    state: dict[str, Any] = {"calls": []}
+    _install_provider(monkeypatch, state)
+    concat_calls = _install_concat(monkeypatch)
+    quality_calls = _install_quality(
+        monkeypatch,
+        {"turn_0001.mp3": "Первая реплика.", "turn_0002.mp3": "Вторая реплика."},
+    )
+    monkeypatch.setattr(
+        cli, "write_audio_as_mp3", lambda f, d, fmt, p: _write_mp3(f, d, fmt, p, state)
+    )
+    catalog = _write_bank(tmp_path / "bank")
+    script = _script(tmp_path, [["Host: Первая реплика.", "Guest: Вторая реплика."]])
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path,
+            script,
+            catalog,
+            "local-dialogue-qa",
+            extra=("--tts-quality-provider", "qwen-local"),
+        ),
+    )
+
+    assert code == 0, payload
+    assert payload["quality"] == {"complete": True, "passed": True}
+    assert len(quality_calls) == 2
+    assert len(concat_calls) == 1
+    run_uuid = _run_uuid("local-dialogue-qa")
+    verdicts = _turn_quality(local_env, run_uuid)
+    assert [row["position"] for row in verdicts] == [1, 2]
+    assert all(json.loads(row["metadata"])["quality_passed"] is True for row in verdicts)
+    assert [row["transcript"] for row in verdicts] == ["Первая реплика.", "Вторая реплика."]
+    chunks = json.loads(Path(payload["files"]["chunks_json"]).read_text(encoding="utf-8"))
+    assert "verification_transcript" not in json.dumps(chunks, ensure_ascii=False)
+
+
+def test_native_local_dialogue_quality_fail_stops_concat_and_is_never_repeated(
+    tmp_path, monkeypatch, capsys, local_env
+):
+    """A recorded OmniVoice dialogue FAIL keeps the local audio and never reruns."""
+    state: dict[str, Any] = {"calls": []}
+    _install_provider(monkeypatch, state)
+    concat_calls = _install_concat(monkeypatch)
+    quality_calls = _install_quality(
+        monkeypatch,
+        {"turn_0001.mp3": "Первая реплика.", "turn_0002.mp3": "Совсем не то."},
+    )
+    monkeypatch.setattr(
+        cli, "write_audio_as_mp3", lambda f, d, fmt, p: _write_mp3(f, d, fmt, p, state)
+    )
+    catalog = _write_bank(tmp_path / "bank")
+    script = _script(tmp_path, [["Host: Первая реплика.", "Guest: Вторая реплика."]])
+    extra = ("--tts-quality-provider", "qwen-local")
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(tmp_path, script, catalog, "local-dialogue-fail", extra=extra),
+    )
+    assert code == 60, payload
+    assert payload["details"]["error_code"] == "NATIVE_QUALITY_FAILED"
+    # The failed turn stops the final concat; the local audio and attempts stay.
+    assert concat_calls == []
+    run_uuid = _run_uuid("local-dialogue-fail")
+    verdicts = _turn_quality(local_env, run_uuid)
+    assert {json.loads(row["metadata"])["quality_passed"] for row in verdicts} == {True, False}
+    calls_after_fail = len(quality_calls)
+    calls_after_tts = list(state["calls"])
+
+    # A resume re-reports the durable verdict without running the local model.
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path, script, catalog, "local-dialogue-fail", extra=(*extra, "--resume")
+        ),
+    )
+    assert code == 60, payload
+    assert payload["details"]["error_code"] == "NATIVE_QUALITY_FAILED"
+
+    # ``history sync`` re-reports the recorded failure and runs no local model.
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+    assert code == 60, payload
+    assert payload["details"]["error_code"] == "NATIVE_QUALITY_FAILED"
+    assert len(quality_calls) == calls_after_fail
+    assert state["calls"] == calls_after_tts
+    assert concat_calls == []
+
+
+def test_native_local_dialogue_no_trim_skips_the_trim_seam_and_is_recorded(
+    tmp_path, monkeypatch, capsys, local_env
+):
+    """``--no-trim`` is recorded and skips the per-turn trim on the local route."""
+    state: dict[str, Any] = {"calls": []}
+    _install_provider(monkeypatch, state)
+    _install_concat(monkeypatch)
+    trims: list[str] = []
+    monkeypatch.setattr(cli, "trim_final_silence", lambda _f, _p, path: trims.append(path.name))
+    monkeypatch.setattr(
+        cli, "write_audio_as_mp3", lambda f, d, fmt, p: _write_mp3(f, d, fmt, p, state)
+    )
+    catalog = _write_bank(tmp_path / "bank")
+    script = _script(tmp_path, [["Host: Первая реплика.", "Guest: Вторая реплика."]])
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(tmp_path, script, catalog, "local-notrim", extra=("--no-trim",)),
+    )
+    assert code == 0, payload
+    assert trims == []
+    run_uuid = _run_uuid("local-notrim")
+    snapshot = _rows(local_env, "SELECT config_snapshot FROM runs WHERE run_uuid = ?", (run_uuid,))[
+        0
+    ]
+    assert json.loads(snapshot["config_snapshot"])["output"]["trim_final_silence"] is False
+
+
 def test_native_local_dialogue_legacy_root_stays_legacy(tmp_path, monkeypatch, local_env):
     run_root = tmp_path / "out" / "legacy-local"
     (run_root / "chunks").mkdir(parents=True)
@@ -705,11 +873,21 @@ def test_native_local_dialogue_route_gate_requires_the_admitted_bank():
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.voice_bank_catalog = object()
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
-    # ``--no-trim``, integrated timings, or a quality provider keep it legacy.
+    # ``--no-trim``, integrated local timings, and an installed local quality
+    # provider are recorded on the route; a cloud timing or quality provider keeps
+    # it legacy.
     args.no_trim = True
-    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.no_trim = False
+    args.with_timings = True
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.timing_provider = "xai-stt"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    args.timing_provider = "faster-whisper"
+    args.with_timings = False
     args.tts_quality_provider = "qwen-local"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.tts_quality_provider = "xai-stt"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.tts_quality_provider = None
     args.mode = "clone"

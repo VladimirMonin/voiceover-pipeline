@@ -1381,35 +1381,36 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     script and for a ``format: voiceover`` script: the voiceover validator has
     already resolved the one provider, model, and voice the whole script speaks
     with, and the snapshot hashes the prepared chunk text, so no per-chunk provider
-    or voice is invented. Two bounded integrated steps are admitted
-    for that same route: an installed *local* ``--tts-quality-provider``
-    (``qwen-local``/``nemotron-local``), and the recorded trimming semantics of
-    ``--no-trim``. ``--with-timings --timing-provider faster-whisper`` stays
-    admitted as before. Every other route and mixture -- a cloud or unregistered
-    quality provider, a cloud timing provider, and any command that asks for local
-    timings *and* local quality at once -- keeps the legacy executor and its JSON
-    writer unchanged.
+    or voice is invented. Two bounded integrated steps and the recorded trimming
+    semantics are admitted for that same route: an installed *local*
+    ``--tts-quality-provider`` (``qwen-local``/``nemotron-local``),
+    ``--with-timings --timing-provider faster-whisper``, and ``--no-trim``. The
+    local timing and local quality steps may be requested together. Every other
+    route and mixture -- a cloud or unregistered quality provider and a cloud
+    timing provider -- keeps the legacy executor and its JSON writer unchanged.
 
     One dialogue route is admitted separately: the existing validated
     ``openrouter-tts`` Gemini two-speaker script with the required installed local
-    ``--tts-quality-provider`` and the default trimming semantics. It runs each
-    turn's required local quality gate before the final concat. A second dialogue
+    ``--tts-quality-provider``. It runs each turn's required local quality gate
+    before the final concat and before the next paid turn. A second dialogue
     route, the existing ``omnivoice-local`` preset two-profile bank script, is
-    likewise admitted with the default trimming semantics and records no quality
-    gate. Every ordinary non-dialogue ``qwen-local`` mode (clone, and the
-    instructed preset/design) and every non-dialogue ``omnivoice-local`` mode
-    (preset bank, and ``auto``/``clone``/``design``) is admitted as a local route
-    with the default trimming semantics and no timing or quality step. Both local
-    families also admit a ``format: voiceover`` script for the combinations that
-    already function on the legacy executor: every ``qwen-local`` mode, and the
-    ``omnivoice-local`` preset bank route. The voiceover validator resolves one
-    voice for the whole script and each mode then applies its own effective voice
-    (see the helpers below), so no new voice semantics is invented. An
-    ``omnivoice-local`` non-preset mode keeps the legacy executor for a
-    ``format: voiceover`` script because that script always supplies a voice the
-    mode rejects. Every other dialogue route -- every ``polza-tts``
-    dialogue -- and every dialogue option mixture (``--no-trim``,
-    ``--with-timings``) stays on the legacy executor.
+    likewise admitted and runs its optional local quality gate before concat only
+    when it recorded a local ``--tts-quality-provider``. Both dialogue routes also
+    admit the recorded trimming semantics of ``--no-trim`` and an integrated local
+    ``--with-timings --timing-provider faster-whisper`` step. Every ordinary
+    non-dialogue ``qwen-local`` mode (clone, and the instructed preset/design) and
+    every non-dialogue ``omnivoice-local`` mode (preset bank, and
+    ``auto``/``clone``/``design``) is admitted as a local route with the same
+    recorded trimming, integrated local timing, and installed local quality steps.
+    Both local families also admit a ``format: voiceover`` script for the
+    combinations that already function on the legacy executor: every
+    ``qwen-local`` mode, and the ``omnivoice-local`` preset bank route. The
+    voiceover validator resolves one voice for the whole script and each mode then
+    applies its own effective voice (see the helpers below), so no new voice
+    semantics is invented. An ``omnivoice-local`` non-preset mode keeps the legacy
+    executor for a ``format: voiceover`` script because that script always
+    supplies a voice the mode rejects. Every other dialogue route -- every
+    ``polza-tts`` dialogue -- stays on the legacy executor.
     """
     if is_dialogue_format(script_format):
         return _native_dialogue_route_eligible(args)
@@ -1436,28 +1437,37 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         return _native_omnivoice_monologue_route_eligible(args)
     if script_format not in ("markdown", VOICEOVER_FORMAT):
         return False
-    quality_provider = getattr(args, "tts_quality_provider", None)
-    if quality_provider is not None and quality_provider not in (
-        native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
-    ):
+    if not _native_local_output_steps_admitted(args):
         return False
     if not isinstance(getattr(args, "model", None), str):
         return False
-    if getattr(args, "provider", None) not in (
+    return getattr(args, "provider", None) in (
         "polza-tts",
         "polza-chat-audio",
         "openrouter-tts",
+    )
+
+
+def _native_local_output_steps_admitted(args: argparse.Namespace) -> bool:
+    """Whether the requested local post-audio steps may run on the native route.
+
+    The recorded trimming semantics of ``--no-trim`` are always part of the native
+    route and need no gate here. The two optional local steps are an integrated
+    ``--with-timings --timing-provider faster-whisper`` run and an installed local
+    ``--tts-quality-provider`` (``qwen-local``/``nemotron-local``). Either, both, or
+    neither may be requested: the native executor records each requested step in
+    the snapshot and runs the missing work on resume, so neither is silently
+    dropped. A cloud timing provider and a cloud or unregistered quality provider
+    keep the legacy executor until their paid-submit contract is confirmed.
+    """
+    if getattr(args, "with_timings", False) and (
+        getattr(args, "timing_provider", "faster-whisper") != "faster-whisper"
     ):
         return False
-    if getattr(args, "with_timings", False):
-        if quality_provider is not None:
-            # Two pending local post-audio steps in one run are not part of this
-            # bounded slice; the combination keeps the legacy executor.
-            return False
-        # Only the local timing provider is admitted; a cloud timing route stays on
-        # the legacy executor until its paid-submit contract is confirmed.
-        return getattr(args, "timing_provider", "faster-whisper") == "faster-whisper"
-    return True
+    quality_provider = getattr(args, "tts_quality_provider", None)
+    return quality_provider is None or (
+        quality_provider in native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
+    )
 
 
 def _bind_native_omnivoice_monologue_voice(args: argparse.Namespace) -> None:
@@ -1475,8 +1485,7 @@ def _bind_native_omnivoice_monologue_voice(args: argparse.Namespace) -> None:
 def _native_omnivoice_monologue_route_eligible(args: argparse.Namespace) -> bool:
     """Whether this command is an admitted non-dialogue OmniVoice route.
 
-    Two families are admitted, each with the default trimming semantics and no
-    integrated timing or quality step:
+    Two families are admitted:
 
     * the existing ``--mode preset`` run with an admitted ``--voice-bank`` catalog
       and a resolved profile, which merges into one OmniVoice session part that
@@ -1485,18 +1494,16 @@ def _native_omnivoice_monologue_route_eligible(args: argparse.Namespace) -> bool
       mode plus, for clone, a readable ``--reference-audio`` with a non-empty
       ``--reference-text``, and, for design, a non-empty ``--design-instruction``.
 
-    ``--no-trim``, ``--with-timings``, a quality provider, an unexpected model, and
-    an unknown mode keep the legacy executor, because the native route records the
-    mode, its reference/instruction inputs, the model, and the effective voice as
-    part of its identity. The route gate admits the preset bank route for a
-    ``format: voiceover`` script too; a non-preset mode is never admitted there,
-    because such a script always supplies the ``--voice`` those modes reject.
+    ``--no-trim``, ``--with-timings --timing-provider faster-whisper``, and an
+    installed local quality provider are admitted by
+    :func:`_native_local_output_steps_admitted`; an unexpected model and an unknown
+    mode keep the legacy executor, because the native route records the mode, its
+    reference/instruction inputs, the model, and the effective voice as part of its
+    identity. The route gate admits the preset bank route for a ``format:
+    voiceover`` script too; a non-preset mode is never admitted there, because such
+    a script always supplies the ``--voice`` those modes reject.
     """
-    if getattr(args, "no_trim", False):
-        return False
-    if getattr(args, "with_timings", False):
-        return False
-    if getattr(args, "tts_quality_provider", None):
+    if not _native_local_output_steps_admitted(args):
         return False
     if getattr(args, "model", None) != OMNIVOICE_LOCAL_MODEL_ID:
         return False
@@ -1526,8 +1533,7 @@ def _qwen_tts_runtime() -> str:
 def _native_qwen_local_route_eligible(args: argparse.Namespace) -> bool:
     """Whether this command is an admitted local Qwen native route.
 
-    Three ordinary non-dialogue ``qwen-local`` modes are admitted, each with the
-    default trimming semantics and no integrated timing or quality step:
+    Three ordinary non-dialogue ``qwen-local`` modes are admitted:
 
     * ``clone`` with a reference ``--sample``;
     * ``preset`` with the CustomVoice model; and
@@ -1540,17 +1546,16 @@ def _native_qwen_local_route_eligible(args: argparse.Namespace) -> bool:
     ``format: voiceover`` script; the CLI's ``_resolve_qwen_mode_identity`` has
     already selected the exact effective voice each mode speaks with. ``auto``
     (rejected as a usage error before this gate, because the runtime implements no
-    automatic mode selection), an unexpected model, a missing sample, ``--no-trim``,
-    ``--with-timings``, a quality provider, and an unrecognized
-    ``VOICEOVER_QWEN_TTS_RUNTIME`` all keep the legacy executor, because the native
-    route records the mode, model, voice, instruction, and runtime as part of its
-    identity.
+    automatic mode selection), an unexpected model, a missing sample, and an
+    unrecognized ``VOICEOVER_QWEN_TTS_RUNTIME`` all keep the legacy executor,
+    because the native route records the mode, model, voice, instruction, and
+    runtime as part of its identity. The recorded trimming semantics, an integrated
+    local ``--with-timings --timing-provider faster-whisper`` step, and an installed
+    local quality provider are admitted by
+    :func:`_native_local_output_steps_admitted`; a cloud timing or quality provider
+    keeps the legacy executor.
     """
-    if getattr(args, "no_trim", False):
-        return False
-    if getattr(args, "with_timings", False):
-        return False
-    if getattr(args, "tts_quality_provider", None):
+    if not _native_local_output_steps_admitted(args):
         return False
     if _qwen_tts_runtime() not in ("python", "audio-cpp"):
         return False
@@ -1586,12 +1591,16 @@ def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
     """Whether this command is one of the two admitted native dialogue routes.
 
     The existing validated OpenRouter Gemini two-speaker dialogue is admitted only
-    with the required installed local ``--tts-quality-provider`` and the default
-    trimming semantics; its per-turn quality gate runs before the final concat. The
+    with the required installed local ``--tts-quality-provider``; its per-turn
+    quality gate runs before the next paid turn and before the final concat. The
     existing ``omnivoice-local`` preset dialogue is admitted with its admitted
-    voice bank and the same default trimming semantics, and records no quality
-    gate (its legacy route never had one). ``--no-trim`` and ``--with-timings`` keep
-    the legacy executor, as does every ``polza-tts`` dialogue.
+    voice bank and runs the same per-turn local quality gate before concat only
+    when it recorded an installed local ``--tts-quality-provider``; without one it
+    keeps the exact legacy behavior of no gate. Both dialogue routes also admit the
+    recorded trimming semantics of ``--no-trim`` and an integrated local
+    ``--with-timings --timing-provider faster-whisper`` step. A cloud timing
+    provider keeps both routes on the legacy executor, as does every ``polza-tts``
+    dialogue.
     """
     provider = getattr(args, "provider", None)
     if provider == "omnivoice-local":
@@ -1599,13 +1608,7 @@ def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
             return False
         if (getattr(args, "mode", None) or "preset") != "preset":
             return False
-        if getattr(args, "no_trim", False):
-            return False
-        if getattr(args, "with_timings", False):
-            return False
-        # The local dialogue route has no OpenRouter-style quality gate; keep the
-        # exact legacy behavior rather than silently adding one.
-        if getattr(args, "tts_quality_provider", None):
+        if not _native_local_output_steps_admitted(args):
             return False
         if getattr(args, "voice_bank_catalog", None) is None:
             return False
@@ -1618,11 +1621,10 @@ def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
         native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
     ):
         return False
-    if getattr(args, "no_trim", False):
-        return False
-    if getattr(args, "with_timings", False):
-        return False
-    return True
+    # The optional local timing step and the recorded trimming semantics are
+    # admitted alongside the required per-turn quality gate; a cloud timing
+    # provider still keeps this route on the legacy executor.
+    return _native_local_output_steps_admitted(args)
 
 
 @contextmanager

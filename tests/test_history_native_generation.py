@@ -1528,22 +1528,34 @@ def test_native_run_parts_shape_is_valid() -> None:
     # A cloud ASR quality provider keeps the legacy executor.
     args.tts_quality_provider = "xai-stt"
     assert cli._native_route_eligible(args, "markdown") is False
-    # Asking for local timings and local quality at once is not part of the slice.
+    # Combined local timing and local quality are admitted in one run.
     args.tts_quality_provider = "qwen-local"
     args.with_timings = True
+    assert cli._native_route_eligible(args, "markdown") is True
+    # A cloud timing provider keeps the combination on the legacy executor.
+    args.timing_provider = "groq-whisper"
     assert cli._native_route_eligible(args, "markdown") is False
+    args.timing_provider = "faster-whisper"
+    assert cli._native_route_eligible(args, "markdown") is True
     args.with_timings = False
     args.tts_quality_provider = None
     assert cli._native_route_eligible(args, "dialogue") is False
     # The one admitted dialogue route is the OpenRouter Gemini two-speaker script
-    # with the required installed local quality provider and the default trim.
+    # with the required installed local quality provider; the recorded trim and an
+    # integrated local timing step are admitted too.
     args.provider = "openrouter-tts"
     args.model = "google/gemini-3.1-flash-tts-preview"
     args.tts_quality_provider = "qwen-local"
     assert cli._native_route_eligible(args, "dialogue") is True
     args.no_trim = True
-    assert cli._native_route_eligible(args, "dialogue") is False
+    assert cli._native_route_eligible(args, "dialogue") is True
     args.no_trim = False
+    args.with_timings = True
+    assert cli._native_route_eligible(args, "dialogue") is True
+    args.timing_provider = "xai-stt"
+    assert cli._native_route_eligible(args, "dialogue") is False
+    args.timing_provider = "faster-whisper"
+    args.with_timings = False
     args.tts_quality_provider = "xai-stt"
     assert cli._native_route_eligible(args, "dialogue") is False
     args.tts_quality_provider = "qwen-local"

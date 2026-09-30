@@ -671,17 +671,32 @@ def test_native_qwen_mode_route_gate_admits_preset_and_design(monkeypatch):
         is True
     )
     assert cli._native_route_eligible(_args(qwen_instruct="Спокойная подача."), "markdown") is True
-    # A mode/model mismatch, the unmodeled ``auto`` mode, an empty instruction, and
-    # every unsupported option mixture keep the legacy executor.
+    # A mode/model mismatch, the unmodeled ``auto`` mode, and an empty instruction
+    # keep the legacy executor; the recorded trim, integrated local timings, and an
+    # installed local quality provider are recorded on the route, while a cloud
+    # timing or quality provider keeps it legacy.
     assert (
         cli._native_route_eligible(_args(mode="preset", model="other/model"), "markdown") is False
     )
     assert cli._native_route_eligible(_args(mode="auto"), "markdown") is False
     assert cli._native_route_eligible(_args(qwen_instruct="  "), "markdown") is False
     assert cli._native_route_eligible(_args(qwen_instruct=""), "markdown") is False
-    assert cli._native_route_eligible(_args(no_trim=True), "markdown") is False
-    assert cli._native_route_eligible(_args(with_timings=True), "markdown") is False
-    assert cli._native_route_eligible(_args(tts_quality_provider="qwen-local"), "markdown") is False
+    assert cli._native_route_eligible(_args(no_trim=True), "markdown") is True
+    assert cli._native_route_eligible(_args(with_timings=True), "markdown") is True
+    assert cli._native_route_eligible(_args(tts_quality_provider="qwen-local"), "markdown") is True
+    assert (
+        cli._native_route_eligible(
+            _args(with_timings=True, tts_quality_provider="nemotron-local"), "markdown"
+        )
+        is True
+    )
+    assert cli._native_route_eligible(_args(tts_quality_provider="xai-stt"), "markdown") is False
+    assert (
+        cli._native_route_eligible(
+            _args(with_timings=True, timing_provider="groq-whisper"), "markdown"
+        )
+        is False
+    )
     assert cli._native_route_eligible(_args(), "dialogue") is False
     monkeypatch.setenv("VOICEOVER_QWEN_TTS_RUNTIME", "bogus")
     assert cli._native_route_eligible(_args(), "markdown") is False

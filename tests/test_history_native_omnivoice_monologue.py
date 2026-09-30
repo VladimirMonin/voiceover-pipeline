@@ -648,10 +648,25 @@ def test_native_local_monologue_route_gate(tmp_path):
     # A missing catalog or unresolved profile stays legacy.
     assert cli._native_route_eligible(_args(voice_bank_catalog=None), "markdown") is False
     assert cli._native_route_eligible(_args(voice_bank_profile=None), "markdown") is False
-    # ``--no-trim``, integrated timings, or a quality provider keep it legacy.
-    assert cli._native_route_eligible(_args(no_trim=True), "markdown") is False
-    assert cli._native_route_eligible(_args(with_timings=True), "markdown") is False
-    assert cli._native_route_eligible(_args(tts_quality_provider="qwen-local"), "markdown") is False
+    # ``--no-trim``, integrated local timings, and an installed local quality
+    # provider are recorded on the route; a cloud timing or quality provider keeps
+    # it legacy.
+    assert cli._native_route_eligible(_args(no_trim=True), "markdown") is True
+    assert cli._native_route_eligible(_args(with_timings=True), "markdown") is True
+    assert cli._native_route_eligible(_args(tts_quality_provider="qwen-local"), "markdown") is True
+    assert (
+        cli._native_route_eligible(
+            _args(with_timings=True, tts_quality_provider="nemotron-local"), "markdown"
+        )
+        is True
+    )
+    assert (
+        cli._native_route_eligible(
+            _args(with_timings=True, timing_provider="groq-whisper"), "markdown"
+        )
+        is False
+    )
+    assert cli._native_route_eligible(_args(tts_quality_provider="xai-stt"), "markdown") is False
     # A plain non-Markdown script stays legacy; the preset bank route additionally
     # admits a voiceover script, and the paid/openrouter route is unchanged.
     assert cli._native_route_eligible(_args(), "voiceover") is True

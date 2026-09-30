@@ -21,7 +21,13 @@ import requests
 
 import voiceover_pipeline.cli as cli
 from voiceover_pipeline.gemini_dialogue import DIALOGUE_FORMAT, GEMINI_TTS_MODEL
-from voiceover_pipeline.models import ASRExecutionReceipt, ASRResult, SynthesisResult
+from voiceover_pipeline.models import (
+    ASRExecutionReceipt,
+    ASRResult,
+    SynthesisResult,
+    TimingResult,
+    TimingSegment,
+)
 from voiceover_pipeline.providers import OpenRouterTTSProvider
 from voiceover_pipeline.services import native_generation, transcription
 
@@ -96,6 +102,7 @@ def dialogue_env(tmp_path, monkeypatch):
     # The preflight and the model run are replaced per test; a no-op preflight is
     # the default so only the explicit preflight test exercises the installer probe.
     monkeypatch.setattr(native_generation, "_preflight_local_quality", lambda _options: None)
+    monkeypatch.setattr(native_generation, "_preflight_local_timing", lambda _options: None)
     return home
 
 
@@ -176,6 +183,41 @@ def _install_quality(monkeypatch, transcripts: dict[str, str], error: Exception 
     return calls
 
 
+def _timing_result() -> TimingResult:
+    return TimingResult(
+        segments=[
+            TimingSegment(
+                id=0,
+                start_sec=0.0,
+                end_sec=1.0,
+                start_ms=0,
+                end_ms=1000,
+                duration_ms=1000,
+                text="Текст распознавания таймингов.",
+            )
+        ],
+        model="small",
+        backend="faster-whisper",
+        provider="faster-whisper",
+        device="cpu",
+        compute_type="int8",
+        language="ru",
+    )
+
+
+def _install_timing(monkeypatch, error: Exception | None = None):
+    calls: list[dict[str, Any]] = []
+
+    def fake_transcribe_timing(**kwargs):
+        calls.append(dict(kwargs))
+        if error is not None:
+            raise error
+        return _timing_result()
+
+    monkeypatch.setattr(transcription, "transcribe_timing_audio", fake_transcribe_timing)
+    return calls
+
+
 def _install_concat(monkeypatch):
     calls: list[list[tuple[str, int]]] = []
 
@@ -222,6 +264,34 @@ def _turn_quality(home: Path, run_uuid: str) -> list[sqlite3.Row]:
         "JOIN parts ON parts.part_uuid = artifacts.part_uuid "
         "WHERE artifacts.run_uuid = ? AND artifacts.role = 'tts_turn_quality_receipt' "
         "ORDER BY parts.position",
+        (run_uuid,),
+    )
+
+
+def _timing_children(home: Path, run_uuid: str) -> list[sqlite3.Row]:
+    return _rows(
+        home,
+        "SELECT * FROM runs WHERE parent_uuid = ? AND operation = 'timings'",
+        (run_uuid,),
+    )
+
+
+def _paid_attempts(home: Path, run_uuid: str) -> list[sqlite3.Row]:
+    """The run's paid TTS attempts in turn order with their paid raw artifact link.
+
+    One row per durable attempt: its identity, status, remote id, cost and the
+    ``paid_raw_audio`` artifact linked to it by ``attempt_uuid`` (``NULL`` when
+    that link is missing). This lets a test prove the paid evidence survives a
+    post-audio failure without being rewritten by a later resume.
+    """
+    return _rows(
+        home,
+        "SELECT a.attempt_uuid, a.call_type, a.status, a.remote_id, a.cost, "
+        "a.cost_exact_available, a.part_uuid, art.part_uuid AS raw_part_uuid "
+        "FROM attempts a JOIN parts p ON p.part_uuid = a.part_uuid "
+        "LEFT JOIN artifacts art ON art.attempt_uuid = a.attempt_uuid "
+        "AND art.role = 'paid_raw_audio' "
+        "WHERE a.run_uuid = ? ORDER BY p.position",
         (run_uuid,),
     )
 
@@ -758,8 +828,110 @@ def test_native_dialogue_private_verification_transcript_never_reaches_exports(
         assert "verification_transcript" not in exported
 
 
+def test_native_dialogue_timing_failure_preserves_paid_turns_and_resume_finishes(
+    tmp_path, monkeypatch, capsys, dialogue_env
+):
+    """A local timing failure after concat never re-submits a paid turn."""
+    provider = FakeDialogueProvider()
+    _install_provider(monkeypatch, provider)
+    concat = _install_concat(monkeypatch)
+    _install_quality(
+        monkeypatch,
+        {"turn_0001.mp3": "Первая реплика.", "turn_0002.mp3": "Вторая реплика."},
+    )
+    timing_calls = _install_timing(monkeypatch, error=RuntimeError("timing boom"))
+    script = _script(tmp_path, [["Host: Первая реплика.", "Guest: Вторая реплика."]])
+    extra = (*QUALITY_ARGS, "--with-timings", "--timing-provider", "faster-whisper")
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(tmp_path, script, "dialogue-timing", extra=extra),
+    )
+    assert code == 50, payload
+    assert payload["details"]["error_code"] == "NATIVE_TIMING_FAILED"
+    # Both turns were submitted exactly once and the final concat already ran.
+    assert provider.calls == [("turn_0001", "Kore"), ("turn_0002", "Puck")]
+    assert len(concat) == 1
+    run_uuid = _run_uuid("dialogue-timing")
+    assert _timing_children(dialogue_env, run_uuid) == []
+    assert len(timing_calls) == 1
+
+    # The post-audio timing failure must leave both paid turns as valid durable
+    # evidence: a completed attempt each, linked to its own paid raw artifact, with
+    # the synchronous OpenRouter cost still unknown (never an invented zero).
+    run_root = tmp_path / "out" / "dialogue-timing"
+    attempts = _paid_attempts(dialogue_env, run_uuid)
+    assert [row["call_type"] for row in attempts] == ["tts_chunk", "tts_chunk"]
+    assert all(row["status"] == "completed" for row in attempts)
+    assert all(row["remote_id"] is None for row in attempts)
+    assert all(row["cost"] is None for row in attempts)
+    assert all(row["cost_exact_available"] == 0 for row in attempts)
+    assert all(row["raw_part_uuid"] == row["part_uuid"] for row in attempts)
+    assert all(row["raw_part_uuid"] is not None for row in attempts)
+    paid_attempt_uuids = [row["attempt_uuid"] for row in attempts]
+    for turn in ("turn_0001", "turn_0002"):
+        assert (run_root / "raw" / f"{turn}.mp3").is_file()
+        assert (run_root / "raw" / f"{turn}.mp3.receipt.json").is_file()
+
+    # Resume finishes only the pending timing: no second POST and no re-concat.
+    _install_timing(monkeypatch)
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(tmp_path, script, "dialogue-timing", extra=(*extra, "--resume")),
+    )
+    assert code == 0, payload
+    assert payload["timing"] == {"complete": True}
+    assert payload["quality"] == {"complete": True, "passed": True}
+    assert payload["cost"]["total"] is None
+    assert provider.calls == [("turn_0001", "Kore"), ("turn_0002", "Puck")]
+    assert len(concat) == 1
+    assert len(_timing_children(dialogue_env, run_uuid)) == 1
+
+    # The resume rewrote no paid evidence: the same two attempts, still completed,
+    # still linked to their paid raw bytes, and their cost is still unknown.
+    resumed = _paid_attempts(dialogue_env, run_uuid)
+    assert [row["attempt_uuid"] for row in resumed] == paid_attempt_uuids
+    assert all(row["status"] == "completed" for row in resumed)
+    assert all(row["cost"] is None for row in resumed)
+    assert all(row["cost_exact_available"] == 0 for row in resumed)
+    assert all(row["raw_part_uuid"] == row["part_uuid"] for row in resumed)
+    for turn in ("turn_0001", "turn_0002"):
+        assert (run_root / "raw" / f"{turn}.mp3.receipt.json").is_file()
+
+
+def test_native_dialogue_no_trim_skips_the_trim_seam_and_is_recorded(
+    tmp_path, monkeypatch, capsys, dialogue_env
+):
+    """``--no-trim`` is part of the dialogue route, not a reason to go legacy."""
+    provider = FakeDialogueProvider()
+    _install_provider(monkeypatch, provider)
+    _install_concat(monkeypatch)
+    _install_quality(
+        monkeypatch,
+        {"turn_0001.mp3": "Первая реплика.", "turn_0002.mp3": "Вторая реплика."},
+    )
+    trims: list[str] = []
+    monkeypatch.setattr(cli, "trim_final_silence", lambda _f, _p, path: trims.append(path.name))
+    script = _script(tmp_path, [["Host: Первая реплика.", "Guest: Вторая реплика."]])
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(tmp_path, script, "dialogue-notrim", extra=(*QUALITY_ARGS, "--no-trim")),
+    )
+    assert code == 0, payload
+    assert trims == []
+    run_uuid = _run_uuid("dialogue-notrim")
+    snapshot = _rows(
+        dialogue_env, "SELECT config_snapshot FROM runs WHERE run_uuid = ?", (run_uuid,)
+    )[0]
+    assert json.loads(snapshot["config_snapshot"])["output"]["trim_final_silence"] is False
+
+
 def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route():
-    """The gate admits the OpenRouter Gemini dialogue only with local QA and trim."""
+    """The gate admits both dialogue routes with their recorded local steps."""
     import argparse
 
     args = argparse.Namespace(
@@ -776,15 +948,19 @@ def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route()
     args.tts_quality_provider = "xai-stt"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.tts_quality_provider = "qwen-local"
-    # ``--no-trim`` and integrated timings keep the legacy executor.
+    # The recorded trim and an integrated local timing step are admitted; a cloud
+    # timing provider keeps the legacy executor.
     args.no_trim = True
-    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.no_trim = False
     args.with_timings = True
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.timing_provider = "groq-whisper"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    args.timing_provider = "faster-whisper"
     args.with_timings = False
-    # OmniVoice is admitted only with its own voice bank and no quality provider;
-    # every Polza dialogue stays legacy.
+    # OmniVoice is admitted with its own voice bank and an optional installed local
+    # quality provider; every Polza dialogue stays legacy.
     args.provider = "omnivoice-local"
     args.model = "audio-cpp/omnivoice-q8_0"
     args.mode = "preset"
@@ -792,5 +968,10 @@ def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route()
     args.voice_bank_catalog = object()
     args.tts_quality_provider = None
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.tts_quality_provider = "qwen-local"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.tts_quality_provider = "xai-stt"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    args.tts_quality_provider = None
     args.provider = "polza-tts"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False

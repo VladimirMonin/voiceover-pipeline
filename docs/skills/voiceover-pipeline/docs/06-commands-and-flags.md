@@ -98,7 +98,7 @@
 | `--no-retry` | flag | false | Отключить retry |
 | `--limit-chunks` | int | — | Сгенерировать только первые N chunks для теста |
 | `--dry-run-cost` | flag | false | Посчитать chunks/chars без TTS-запросов |
-| `--tts-quality-provider` | str | — | ASR для строгой сверки каждого dialogue turn до concat; обязателен для OpenRouter dialogue |
+| `--tts-quality-provider` | str | — | ASR для строгой сверки: на нативном не-диалоговом прогоне сверяет транскрипт с собственным записанным текстом сценария, на dialogue проверяет каждый turn до concat; обязателен для OpenRouter dialogue. Нативным маршрутом идёт только установленный локальный ASR (`qwen-local`/`nemotron-local`); на legacy не-диалоговом прогоне (например облачный/незарегистрированный провайдер) флаг не выполняется и сверка не записывается |
 | `--tts-quality-model` | str | provider default | ASR model для quality gate |
 | `--tts-quality-language` | str | — | Явный язык ASR quality gate |
 | `--tts-quality-device` | str | `cpu` | ASR device |
@@ -121,9 +121,12 @@
   (или маркер `design`), точную инструкцию, рантайм и язык. `generate --resume` и
   `history resume ID` доказывают ту же идентичность, а установленный локальный
   рантайм и (для `clone`) референс проверяются до первой локальной части;
-  `history sync ID` модель не запускает. `--mode auto` (не разрешает модель),
-  `--no-trim`, `--with-timings` и `--tts-quality-provider` остаются на
-  legacy-маршруте. Подробности — в
+  `history sync ID` модель не запускает. `--mode auto` (не разрешает модель)
+  остаётся usage error, а записанная семантика обрезки (`--no-trim`), локальные
+  `--with-timings --timing-provider faster-whisper` и установленный локальный
+  `--tts-quality-provider` (`qwen-local`/`nemotron-local`) входят в тот же
+  маршрут; облачный timing- или quality-провайдер остаётся на legacy-маршруте.
+  Подробности — в
   [Agent CLI Contract](../../../agent-cli-contract.md).
 
 ### OmniVoice-local опции (локальный)
@@ -153,8 +156,12 @@ session на прогон. `format: dialogue` создаёт один bound bank
   SQLite как нативный локальный маршрут: снимок хранит локатор каталога, выбранный
   profile (reference path/SHA/text/language) и effective voice; `generate --resume`
   и `history resume ID` доказывают ту же идентичность, а `history sync ID` модель не
-  запускает. `--mode auto`/`clone`/`design`, `--no-trim`, `--with-timings` и
-  `--tts-quality-provider` остаются на legacy-маршруте. Подробности — в
+  запускает. `--mode auto`/`clone`/`design` идут тем же нативным маршрутом со
+  своими обязательными входами (mode + reference/design); записанная семантика
+  обрезки (`--no-trim`), локальные `--with-timings --timing-provider
+  faster-whisper` и установленный локальный `--tts-quality-provider` тоже входят
+  в маршрут, а облачный timing- или quality-провайдер остаётся на
+  legacy-маршруте. Подробности — в
   [Agent CLI Contract](../../../agent-cli-contract.md).
 
 ### Whisper timing опции (generate + timings)
@@ -331,11 +338,20 @@ canonical: части, попытки, оплаченные байты и фин
 сборка хранятся в SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON
 пишутся как совместимый экспорт с `history_run_uuid` и `history_revision`.
 Этого маршрута касаются: `--no-trim`, локальные
-`--with-timings --timing-provider faster-whisper` и — отдельно — установленный
-локальный `--tts-quality-provider` (`qwen-local`/`nemotron-local`); dialogue,
-облачный или незарегистрированный `--tts-quality-provider`, облачные
-`--timing-provider` и одновременный запрос локальных таймингов и локальной
-проверки остаются на legacy JSON-writer.
+`--with-timings --timing-provider faster-whisper` и установленный
+локальный `--tts-quality-provider` (`qwen-local`/`nemotron-local`); локальные
+тайминги и локальная проверка могут быть запрошены вместе. Облачный или
+незарегистрированный `--tts-quality-provider` и облачные
+`--timing-provider` (например `groq-whisper`, `xai-stt`) остаются на legacy
+JSON-writer, и на legacy не-диалоговом прогоне quality-флаг там не
+выполняется — сверка не записывается. Нативно идут и два dialogue-маршрута:
+`openrouter-tts` Gemini с обязательным установленным локальным
+`--tts-quality-provider` (per-turn gate до следующего платного turn и до
+concat) и `omnivoice-local` preset-банк с необязательным локальным per-turn
+gate; оба несут записанные `--no-trim`, локальные `--with-timings
+--timing-provider faster-whisper` и локальную проверку turn-ов. Облачный
+`--tts-quality-provider` на dialogue (например `xai-stt`) тоже остаётся на
+legacy JSON-writer.
 Владелец каталога определяется до чтения ключа, цен и удаления: committed прогон
 по `run_root` или крошечный `.voiceover-native-history.json`. Нативный след при
 нечитаемой/отсутствующей БД и дескриптор без своего прогона дают fail-closed

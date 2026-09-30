@@ -413,12 +413,12 @@ provider/model/voice/script, с которыми позднее будет за�
 записанная семантика обрезки
 (`--no-trim` либо обрезка по умолчанию), локальные
 `--with-timings --timing-provider faster-whisper`, которые дают аудио и
-локальные субтитры одной командой, и — отдельно — установленный локальный
+локальные субтитры одной командой, и установленный локальный
 `--tts-quality-provider` (`qwen-local`, `nemotron-local`), дающий аудио и
-локальную проверку одной командой. Облачный или
-незарегистрированный `--tts-quality-provider`, облачные timing-провайдеры
-(`openrouter-whisper`, `groq-whisper`, `xai-stt`) и одновременный запрос
-локальных таймингов и локальной проверки остаются вне среза. Все прочие
+локальную проверку одной командой; локальные тайминги и локальная проверка
+могут быть запрошены вместе в одном прогоне. Облачный или
+незарегистрированный `--tts-quality-provider` и облачные timing-провайдеры
+(`openrouter-whisper`, `groq-whisper`, `xai-stt`) остаются вне среза. Все прочие
 маршруты, все существующие legacy-каталоги и уже начатые JSON-прогоны
 продолжают использовать прежний executor и прежний JSON-writer без изменений.
 
@@ -569,9 +569,11 @@ OmniVoice-режимом, который отклоняет `--voice`, и с Omn
 `--provider openrouter-tts --model google/gemini-3.1-flash-tts-preview
 --format dialogue` (валидированный YAML, ровно два speaker'а с различными
 голосами из `GEMINI_TTS_VOICES`) с обязательным установленным локальным
-`--tts-quality-provider` (`qwen-local`/`nemotron-local`) и обрезкой по
-умолчанию. `--no-trim`, `--with-timings` и любой `polza-tts` dialogue остаются
-на legacy executor; новый обобщённый движок не добавляется.
+`--tts-quality-provider` (`qwen-local`/`nemotron-local`). Записанная семантика
+обрезки (`--no-trim`) и локальные
+`--with-timings --timing-provider faster-whisper` входят в тот же маршрут; любой
+`polza-tts` dialogue и облачный timing-провайдер остаются на legacy executor,
+новый обобщённый движок не добавляется.
 
 - Каждая реплика — один paid-запрос со своим cast-voice (`voice`, как в legacy);
   снимок хранит порядок реплик, speaker, cast/effective voice, паузу и текст.
@@ -598,8 +600,10 @@ OmniVoice-режимом, который отклоняет `--voice`, и с Omn
 Второй диалоговый маршрут — `--provider omnivoice-local --model
 audio-cpp/omnivoice-q8_0 --mode preset --voice-bank <catalog.json> --format
 dialogue` (валидированный YAML, ровно два speaker'а с различными profile ID из
-admitted bank и различными `reference_sha256`) с обрезкой по умолчанию.
-`--no-trim`, `--with-timings`, `--tts-quality-provider`, другие режимы
+admitted bank и различными `reference_sha256`). Записанная семантика обрезки
+(`--no-trim`), локальные `--with-timings --timing-provider faster-whisper` и
+установленный локальный `--tts-quality-provider` (`qwen-local`/`nemotron-local`)
+входят в тот же маршрут; облачный timing- или quality-провайдер, другие режимы
 OmniVoice и любой `polza-tts` dialogue остаются на legacy executor.
 
 - Каждая реплика — один локальный запрос со своим cast voice-bank profile;
@@ -614,6 +618,12 @@ OmniVoice и любой `polza-tts` dialogue остаются на legacy execut
   повторного запуска модели; упавший или прерванный локальный запуск сохраняет
   свой truthful outcome (`local_failed` или pending-строка) и безопасно
   повторяется новой попыткой при явном `--resume`/`history resume`.
+- Опциональная локальная ASR-проверка: когда прогон запросил установленный
+  локальный `--tts-quality-provider`, каждая реплика проходит ту же строгую
+  сверку до concat, а наблюдённый вердикт PASS/FAIL и приватный
+  `verification_transcript` связываются с частью; записанный FAIL повторно
+  сообщается exit `60` без нового запуска модели, а без провайдера сохраняется
+  прежнее поведение без проверки.
 - Если reference-файл профиля пропал или его digest изменился, запуск
   завершается ошибкой (`NATIVE_LOCAL_REFERENCE_UNAVAILABLE` или
   `NATIVE_RESUME_IDENTITY_CHANGED`) до вызова локальной модели.
@@ -626,7 +636,7 @@ OmniVoice и любой `polza-tts` dialogue остаются на legacy execut
 
 Нативные не-диалоговые маршруты `--provider omnivoice-local --model
 audio-cpp/omnivoice-q8_0` (plain Markdown без frontmatter, а для preset-ветки
-банка — ещё и `format: voiceover`) с обрезкой по умолчанию:
+банка — ещё и `format: voiceover`):
 
 - `--mode preset --voice-bank <catalog.json>`: весь script сливается в одну
   OmniVoice session (один локальный вызов), которая клонирует выбранный profile
@@ -641,8 +651,11 @@ audio-cpp/omnivoice-q8_0` (plain Markdown без frontmatter, а для preset-�
   отклоняется существующей проверкой длины до admission, а короткий русский
   design остаётся experimental.
 
-`--no-trim`, `--with-timings` и `--tts-quality-provider` остаются на legacy
-executor. `--mode preset --voice-bank` допускается и для `format: voiceover`:
+Записанная семантика обрезки (`--no-trim`), локальные
+`--with-timings --timing-provider faster-whisper` и установленный локальный
+`--tts-quality-provider` (`qwen-local`/`nemotron-local`) входят в тот же
+маршрут; облачный timing- или quality-провайдер остаётся на legacy executor.
+`--mode preset --voice-bank` допускается и для `format: voiceover`:
 валидатор такого сценария разрешает единственный голос
 `built-in-female-style-condition`, поэтому admitted-каталог обязан содержать
 профиль с этим id, а прогон коммитит именно его identity. Остальные
@@ -677,7 +690,7 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
 ### Нативный локальный Qwen (фрагмент S05)
 
 Третье нативное локальное семейство маршрутов — обычные не-диалоговые режимы
-`qwen-local` с обрезкой по умолчанию: клон-маршрут
+`qwen-local`: клон-маршрут
 `--provider qwen-local --mode clone --sample <файл> [--sample-text <текст>]` и
 инструктированные маршруты `--mode preset` (модель CustomVoice, `--voice` из
 каталога `QWEN_PRESET_SPEAKERS`) и `--mode design` (модель VoiceDesign,
@@ -688,9 +701,12 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
 голос из frontmatter для этих двух режимов в legacy игнорируется, и новая
 семантика не вводится. Режим `auto` не реализован и
 отклоняется как usage error (exit `2`) до провайдера, модели и снимка:
-автоматический выбор режима не подменяется на `preset`. `--no-trim`,
-`--with-timings`, `--tts-quality-provider` и неизвестное
-значение `VOICEOVER_QWEN_TTS_RUNTIME` остаются на legacy executor.
+автоматический выбор режима не подменяется на `preset`; неизвестное
+значение `VOICEOVER_QWEN_TTS_RUNTIME` остаётся на legacy executor. Записанная
+семантика обрезки (`--no-trim`), локальные
+`--with-timings --timing-provider faster-whisper` и установленный локальный
+`--tts-quality-provider` (`qwen-local`/`nemotron-local`) входят в тот же
+маршрут; облачный timing- или quality-провайдер остаётся на legacy executor.
 
 - Снимок хранит полную неизменяемую идентичность клона: канонический абсолютный
   локатор референс-файла, его SHA-256 и размер (сами байты в снимок и публичные
