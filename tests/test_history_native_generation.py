@@ -1271,6 +1271,7 @@ def test_native_run_parts_shape_is_valid() -> None:
         provider="polza-tts",
         model=POLZA_MEDIA_MODEL,
         with_timings=False,
+        timing_provider="faster-whisper",
         tts_quality_provider=None,
         no_trim=False,
     )
@@ -1283,12 +1284,22 @@ def test_native_run_parts_shape_is_valid() -> None:
     assert cli._native_route_eligible(args, "markdown") is True
     args.provider = "polza-tts"
     args.model = POLZA_MEDIA_MODEL
+    # The one admitted integrated step is a local faster-whisper timing request.
     args.with_timings = True
+    assert cli._native_route_eligible(args, "markdown") is True
+    # A cloud timing provider stays on the legacy executor.
+    args.timing_provider = "groq-whisper"
+    assert cli._native_route_eligible(args, "markdown") is False
+    args.timing_provider = "openrouter-whisper"
     assert cli._native_route_eligible(args, "markdown") is False
     args.with_timings = False
+    args.timing_provider = "faster-whisper"
     args.no_trim = True
     assert cli._native_route_eligible(args, "markdown") is False
     args.no_trim = False
+    args.tts_quality_provider = "qwen-local"
+    assert cli._native_route_eligible(args, "markdown") is False
+    args.tts_quality_provider = None
     assert cli._native_route_eligible(args, "dialogue") is False
     # A provider outside the admitted set keeps the legacy executor.
     args.provider = "polza-chat-audio"

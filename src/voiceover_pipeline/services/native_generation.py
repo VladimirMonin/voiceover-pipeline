@@ -66,7 +66,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
-from ..artifacts import build_run_paths
+from ..artifacts import build_run_paths, build_srt, build_timing_manifest
+from ..config import DEFAULT_TIMING_MODEL
 from ..execution_identity import build_execution_identity
 from ..history.database import (
     HistoryDatabase,
@@ -74,6 +75,17 @@ from ..history.database import (
     connect_readonly_consistent,
 )
 from ..history.locking import HistoryRunLockedError, acquire_run_lock
+from ..history.native_asr import (
+    ARTIFACT_ROLE_SRT,
+    ARTIFACT_ROLE_TIMINGS_JSON,
+    ATTEMPT_CALL_TYPE_TIMING,
+    NATIVE_ASR_ORIGIN,
+    OPERATION_TIMINGS,
+    AsrHistoryArtifact,
+    AsrHistorySave,
+    AsrHistoryText,
+    persist_asr_history,
+)
 from ..history.native_export import build_native_export, write_native_export
 from ..history.native_resume import NativeResumeError, preflight_native_tts_resume
 from ..history.native_snapshot import (
@@ -103,6 +115,10 @@ from ..history.repository import (
     ATTEMPT_STATUS_REMOTE_ACCEPTED,
     ATTEMPT_STATUS_SUBMITTING,
     MAX_QUERY_LIMIT,
+    RUN_STATUS_COMPLETED,
+    TEXT_COMPLETENESS_COMPLETE,
+    TEXT_COMPLETENESS_INCOMPLETE,
+    TEXT_KIND_ASR_TRANSCRIPT,
     ArtifactRecord,
     AttemptRecord,
     HistoryRepository,
@@ -118,6 +134,7 @@ from .recovery import polza_media_route_model
 # Numeric exit codes duplicated from ``cli.py`` because the CLI imports this
 # service; only the documented stable codes are used here.
 _EXIT_ARGS = 2
+_EXIT_MISSING_DEP = 10
 _EXIT_PROVIDER = 30
 _EXIT_OUTPUT = 50
 
@@ -157,6 +174,18 @@ _ERROR_HISTORY_INCOMPLETE = "NATIVE_HISTORY_RECONSTRUCTION_FAILED"
 _ERROR_HISTORY_RUN_MISMATCH = "NATIVE_HISTORY_RUN_MISMATCH"
 _ERROR_FINAL_AUDIO_MISSING = "NATIVE_FINAL_AUDIO_MISSING"
 _ERROR_SYNC_SUBMIT_REQUIRED = "NATIVE_SYNC_PAID_SUBMIT_REQUIRED"
+# Local timing (after the committed final audio) has its own bounded codes: a
+# timing extraction failure, a timing-history persistence failure, a malformed
+# recorded timing block, an unsupported timing provider, an unavailable local
+# timing model, a timing artifact write failure, and duplicate linked timing
+# evidence each report their own stable code.
+_ERROR_TIMING_FAILED = "NATIVE_TIMING_FAILED"
+_ERROR_TIMING_HISTORY_FAILED = "NATIVE_TIMING_HISTORY_FAILED"
+_ERROR_TIMING_OPTIONS_INVALID = "NATIVE_TIMING_OPTIONS_INVALID"
+_ERROR_TIMING_PROVIDER_UNSUPPORTED = "NATIVE_TIMING_PROVIDER_UNSUPPORTED"
+_ERROR_TIMING_MODEL_UNAVAILABLE = "NATIVE_TIMING_MODEL_UNAVAILABLE"
+_ERROR_TIMING_ARTIFACT_FAILED = "NATIVE_TIMING_ARTIFACT_FAILED"
+_ERROR_TIMING_CONFLICT = "NATIVE_TIMING_CONFLICT"
 
 # Stable mode names for the two history entry points.
 _MODE_RESUME = "resume"
@@ -206,6 +235,134 @@ class NativeExecutionHooks:
     progress: Callable[[str], None]
 
 
+# Flat keys recorded in a native run's output options so a resume can prove the
+# exact local timing settings instead of inferring them from the current command
+# line. They are plain scalars, so the snapshot's redaction boundary and the
+# verified view accept them unchanged, and a run that recorded no timing keeps
+# its original output options byte-for-byte.
+_TIMING_ENABLED_KEY = "timing_enabled"
+_TIMING_PROVIDER_KEY = "timing_provider"
+_TIMING_MODEL_KEY = "timing_model"
+_TIMING_DEVICE_KEY = "timing_device"
+_TIMING_COMPUTE_KEY = "timing_compute"
+_TIMING_LANGUAGE_KEY = "timing_language"
+_TIMING_WORD_TIMESTAMPS_KEY = "timing_word_timestamps"
+
+
+@dataclass(frozen=True)
+class NativeTimingOptions:
+    """The local timing settings a native run records and a resume must match.
+
+    Only the local ``faster-whisper`` provider is admitted for native timings;
+    cloud timing providers stay on the legacy executor. ``model`` is ``None``
+    when the command left it unset, in which case the adapter's default applies.
+    """
+
+    provider: str
+    model: str | None
+    device: str
+    compute: str
+    language: str
+    word_timestamps: bool
+
+
+def _timing_output_fields(timing: NativeTimingOptions | None) -> dict[str, Any]:
+    """Return the flat output-option fields for a timing run, or nothing."""
+    if timing is None:
+        return {}
+    return {
+        _TIMING_ENABLED_KEY: True,
+        _TIMING_PROVIDER_KEY: timing.provider,
+        _TIMING_MODEL_KEY: timing.model or "",
+        _TIMING_DEVICE_KEY: timing.device,
+        _TIMING_COMPUTE_KEY: timing.compute,
+        _TIMING_LANGUAGE_KEY: timing.language,
+        _TIMING_WORD_TIMESTAMPS_KEY: timing.word_timestamps,
+    }
+
+
+def timing_options_from_output_options(
+    options: dict[str, Any] | None,
+) -> NativeTimingOptions | None:
+    """Return the recorded local timing settings, or ``None`` when timing is off.
+
+    A run that recorded no timing, or an older snapshot written before timing was
+    part of the output options, reports ``None`` and a resume performs no local
+    timing. A present but malformed timing block fails closed instead of silently
+    dropping the requested work.
+    """
+    if not isinstance(options, dict) or not options.get(_TIMING_ENABLED_KEY):
+        return None
+    provider = options.get(_TIMING_PROVIDER_KEY)
+    model = options.get(_TIMING_MODEL_KEY)
+    device = options.get(_TIMING_DEVICE_KEY)
+    compute = options.get(_TIMING_COMPUTE_KEY)
+    language = options.get(_TIMING_LANGUAGE_KEY)
+    word_timestamps = options.get(_TIMING_WORD_TIMESTAMPS_KEY)
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(model, str)
+        or not isinstance(device, str)
+        or not device
+        or not isinstance(compute, str)
+        or not compute
+        or not isinstance(language, str)
+        or not language
+        or not isinstance(word_timestamps, bool)
+    ):
+        raise NativeGenerationError(
+            "the recorded local timing settings are malformed; refusing to run a partial "
+            "timing step.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_TIMING_OPTIONS_INVALID,
+        )
+    return NativeTimingOptions(
+        provider=provider,
+        model=model or None,
+        device=device,
+        compute=compute,
+        language=language,
+        word_timestamps=word_timestamps,
+    )
+
+
+def _preflight_local_timing(options: NativeTimingOptions) -> None:
+    """Fail closed before any paid submit when local timing cannot run offline.
+
+    Only the local ``faster-whisper`` provider is admitted. The probe inspects the
+    installed package and its model cache without downloading, so an unavailable
+    dependency or an uncached model stops the command before the paid TTS POST
+    instead of after the audio is already paid for.
+    """
+    if options.provider != "faster-whisper":
+        raise NativeGenerationError(
+            "only the local faster-whisper provider is admitted for native timings; cloud "
+            "timing providers stay on the legacy executor.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_TIMING_PROVIDER_UNSUPPORTED,
+        )
+    from ..providers.faster_whisper import faster_whisper_availability
+
+    availability = faster_whisper_availability(options.model or DEFAULT_TIMING_MODEL)
+    if not availability.available:
+        raise NativeGenerationError(
+            availability.remediation or "the local faster-whisper model is unavailable.",
+            code=_EXIT_MISSING_DEP,
+            error_code=_ERROR_TIMING_MODEL_UNAVAILABLE,
+        )
+
+
+@dataclass(frozen=True)
+class NativeLinkedTiming:
+    """One verified linked local-timing run and its on-disk artifacts."""
+
+    run_uuid: str
+    timings_json: Path
+    srt: Path
+    segment_count: int | None
+
+
 @dataclass(frozen=True)
 class NativeGenerationSummary:
     """What the CLI turns into its success JSON or human output."""
@@ -217,6 +374,8 @@ class NativeGenerationSummary:
     segment_count: int | None
     cost_total: float | None
     cost_currency: str | None
+    timing_requested: bool = False
+    timing_complete: bool = False
 
 
 class _ReadOnlyConnection:
@@ -456,14 +615,23 @@ def resolve_native_ownership(
     return NativeOwnership(route=_ROUTE_LEGACY)
 
 
-def build_output_options(no_trim: bool) -> dict[str, Any]:
+def build_output_options(
+    no_trim: bool, *, timing: NativeTimingOptions | None = None
+) -> dict[str, Any]:
     """Return the fixed output-processing settings the native route records.
 
     The native slice always trims final silence; ``--no-trim`` is rejected before
     any provider work, so the recorded settings prove a later resume used the same
-    semantics rather than inferring them from the current command line.
+    semantics rather than inferring them from the current command line. When the
+    run requested local timings, the effective timing settings are recorded
+    alongside so a resume proves they did not change either.
     """
-    return {"trim_final_silence": not no_trim, "processing_version": OUTPUT_PROCESSING_VERSION}
+    options: dict[str, Any] = {
+        "trim_final_silence": not no_trim,
+        "processing_version": OUTPUT_PROCESSING_VERSION,
+    }
+    options.update(_timing_output_fields(timing))
+    return options
 
 
 # ── database helpers ──────────────────────────────────────────────────────────
@@ -720,6 +888,7 @@ class _Executor:
         logger: GenerationLogger,
         resume: bool,
         paid_submit_allowed: bool = True,
+        local_timing_allowed: bool = True,
     ) -> None:
         self.repository = repository
         self.view = view
@@ -730,6 +899,7 @@ class _Executor:
         self.script_format = script_format
         self.script_path = script_path
         self.output_options = output_options
+        self.timing_options = timing_options_from_output_options(output_options)
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
         self.provider_factory = provider_factory
@@ -737,6 +907,7 @@ class _Executor:
         self.logger = logger
         self.resume = resume
         self.paid_submit_allowed = paid_submit_allowed
+        self.local_timing_allowed = local_timing_allowed
         self._revision = view.run.revision
         self._provider: Any = None
 
@@ -1377,6 +1548,288 @@ class _Executor:
             return
         self.assemble_and_complete()
 
+    # -- linked local timing --------------------------------------------------
+
+    def _final_audio_path(self) -> Path:
+        """Return the committed final audio path, or fail closed before timing."""
+        finals = [
+            artifact
+            for artifact in self.view.artifacts
+            if artifact.role == ARTIFACT_ROLE_FINAL_AUDIO
+        ]
+        if len(finals) != 1:
+            raise NativeGenerationError(
+                "the completed run has no single committed final audio artifact to time.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_FINAL_AUDIO_MISSING,
+            )
+        path = self.run_root / finals[0].path
+        if not path.is_file():
+            raise NativeGenerationError(
+                "the committed final audio is missing; refusing to run local timings.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_FINAL_AUDIO_MISSING,
+            )
+        return path
+
+    def _verified_timing_artifact(self, artifact: ArtifactRecord) -> Path | None:
+        """Return a linked timing artifact's path only when it still matches its row."""
+        if artifact.sha256 is None or artifact.size_bytes is None:
+            return None
+        path = Path(artifact.path)
+        if not path.is_file():
+            return None
+        try:
+            if path.stat().st_size != artifact.size_bytes:
+                return None
+            if self.hooks.sha256_file(path) != artifact.sha256:
+                return None
+        except OSError:
+            return None
+        return path
+
+    def _linked_timing(self) -> NativeLinkedTiming | None:
+        """Return the verified linked local-timing evidence for this run, else ``None``.
+
+        Timing is persisted as a separate ``timings`` run whose ``parent_uuid`` is
+        this TTS run, so the link is read from committed rows rather than a JSON
+        marker. The evidence counts only when exactly one child run exists and
+        both its ``timings_json`` and ``srt`` artifacts still match their committed
+        digest and size; a duplicate, altered, or missing artifact reports no
+        usable timing, and two child runs fail closed instead of being told apart.
+        """
+        children = self.repository.find_runs_by_parent(self._run_uuid(), limit=MAX_QUERY_LIMIT)
+        timing_runs = [
+            run
+            for run in children
+            if run.operation == OPERATION_TIMINGS and run.legacy_source_root is None
+        ]
+        if len(timing_runs) > 1:
+            raise NativeGenerationError(
+                "more than one linked local timing run belongs to this run; refusing to "
+                "choose one.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_TIMING_CONFLICT,
+            )
+        if not timing_runs:
+            return None
+        run = timing_runs[0]
+        if run.status != RUN_STATUS_COMPLETED:
+            return None
+        artifacts = self.repository.get_artifacts(run.run_uuid)
+        json_artifacts = [item for item in artifacts if item.role == ARTIFACT_ROLE_TIMINGS_JSON]
+        srt_artifacts = [item for item in artifacts if item.role == ARTIFACT_ROLE_SRT]
+        if len(json_artifacts) != 1 or len(srt_artifacts) != 1:
+            return None
+        timings_json = self._verified_timing_artifact(json_artifacts[0])
+        srt = self._verified_timing_artifact(srt_artifacts[0])
+        if timings_json is None or srt is None:
+            return None
+        snapshot = run.config_snapshot if isinstance(run.config_snapshot, dict) else {}
+        segment_count = snapshot.get("segment_count")
+        return NativeLinkedTiming(
+            run_uuid=run.run_uuid,
+            timings_json=timings_json,
+            srt=srt,
+            segment_count=(
+                segment_count
+                if isinstance(segment_count, int) and not isinstance(segment_count, bool)
+                else None
+            ),
+        )
+
+    def preflight_timing(self) -> None:
+        """Fail closed before any paid submit when the pending local timing cannot run.
+
+        A run whose timing is already linked, or one that runs under ``history
+        sync`` (where local model inference is not allowed), needs no local
+        timing and is skipped. Otherwise the availability probe runs before
+        ``run_parts`` so an unavailable or uncached model stops the command before
+        the paid TTS POST.
+        """
+        options = self.timing_options
+        if options is None or not self.local_timing_allowed:
+            return
+        if self._linked_timing() is not None:
+            return
+        _preflight_local_timing(options)
+
+    def _publish_timing_artifact(self, target: Path, text: str) -> None:
+        """Publish one timing artifact through the shared private staging seam."""
+        staged = _new_staging_path(target)
+        try:
+            staged.write_text(text, encoding="utf-8")
+            size_bytes = staged.stat().st_size
+            sha256 = self.hooks.sha256_file(staged)
+            _publish_staged(
+                staged,
+                target,
+                error_code=_ERROR_TIMING_ARTIFACT_FAILED,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                sha256_file=self.hooks.sha256_file,
+            )
+        except NativeGenerationError:
+            staged.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            staged.unlink(missing_ok=True)
+            raise NativeGenerationError(
+                f"Failed to write the local timing artifact {target.name}.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_ARTIFACT_FAILED,
+            ) from exc
+
+    def _timing_history_save(
+        self,
+        options: NativeTimingOptions,
+        manifest: dict[str, Any],
+        audio_path: Path,
+        timings_json_path: Path,
+        srt_path: Path,
+    ) -> AsrHistorySave:
+        """Build the linked timing-history evidence from the durable timing JSON.
+
+        The transcript is read back from the just-published timing JSON, so the
+        stored text is exactly what the artifact holds and no span is invented.
+        The save carries this TTS run root as ``parent_run_root`` so
+        :func:`persist_asr_history` links it through ``parent_uuid`` instead of
+        fabricating TTS parts or a second TTS attempt.
+        """
+        payload = json.loads(timings_json_path.read_text(encoding="utf-8"))
+        segments = payload.get("segments") or []
+        transcript = " ".join(str(segment.get("text") or "") for segment in segments).strip()
+        snapshot: dict[str, Any] = {
+            "operation_origin": NATIVE_ASR_ORIGIN,
+            "provider": manifest.get("provider") or options.provider,
+            "model": manifest.get("model"),
+            "backend": manifest.get("backend"),
+            "device": manifest.get("device"),
+            "compute_type": manifest.get("compute_type"),
+            "language": manifest.get("language") or None,
+            "timestamp_basis": "provider_segment_timestamps",
+            "word_timestamps_requested": options.word_timestamps,
+            "segment_count": len(segments),
+            "total_duration_ms": manifest.get("total_duration_ms"),
+            "source_audio": str(audio_path.resolve()),
+            "timings_json": str(timings_json_path),
+            "srt": str(srt_path),
+        }
+        return AsrHistorySave(
+            operation=OPERATION_TIMINGS,
+            attempt_call_type=ATTEMPT_CALL_TYPE_TIMING,
+            provider=manifest.get("provider") or options.provider,
+            model=manifest.get("model") or options.model,
+            config_snapshot=snapshot,
+            text_sources=(
+                AsrHistoryText(
+                    kind=TEXT_KIND_ASR_TRANSCRIPT,
+                    content=transcript,
+                    language=manifest.get("language") or None,
+                    text_completeness=(
+                        TEXT_COMPLETENESS_COMPLETE
+                        if transcript.strip()
+                        else TEXT_COMPLETENESS_INCOMPLETE
+                    ),
+                ),
+            ),
+            artifacts=(
+                AsrHistoryArtifact(
+                    role=ARTIFACT_ROLE_TIMINGS_JSON,
+                    path=timings_json_path,
+                    mime="application/json",
+                ),
+                AsrHistoryArtifact(
+                    role=ARTIFACT_ROLE_SRT,
+                    path=srt_path,
+                    mime="application/x-subrip",
+                ),
+            ),
+            parent_run_root=self.run_root,
+            source_audio=audio_path,
+            source_audio_mime="audio/mpeg",
+        )
+
+    def ensure_timing(self) -> None:
+        """Run the pending local timing step for a completed run, once only.
+
+        The step runs only when the run recorded local timing, the timing is not
+        already linked, and this execution may run a local model (``generate``,
+        ``generate --resume``, and ``history resume``; never ``history sync``). A
+        timing failure or a timing-history persistence failure keeps the completed
+        TTS audio, its paid raw bytes, and its cost untouched: no legacy JSON
+        writer runs, the just-written timing artifacts are removed so no export can
+        reference unlinked timing, and the caller reports the fixed partial error.
+        """
+        options = self.timing_options
+        if options is None:
+            return
+        if self._linked_timing() is not None:
+            return
+        if not self.local_timing_allowed:
+            return
+        self._reload_view()
+        audio_path = self._final_audio_path()
+        timings_json_path = self.paths.output_root / f"{self.paths.prefix}.timings.json"
+        srt_path = self.paths.output_root / f"{self.paths.prefix}.srt"
+        from .transcription import transcribe_timing_audio
+
+        try:
+            timing = transcribe_timing_audio(
+                audio_path=audio_path,
+                timing_provider=options.provider,
+                model=options.model,
+                device=options.device,
+                compute_type=options.compute,
+                language=options.language,
+                word_timestamps=options.word_timestamps,
+                quiet=True,
+                local_files_only=True,
+            )
+        except Exception as exc:
+            self.logger.event("error", "timings_failed", error=type(exc).__name__)
+            raise NativeGenerationError(
+                "the voiceover audio is complete, but local timing extraction failed.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_FAILED,
+            ) from None
+        duration_ms = self.hooks.mp3_duration_ms(self.ffprobe_path, audio_path)
+        manifest = build_timing_manifest(timing, duration_ms)
+        published: list[Path] = []
+        try:
+            self._publish_timing_artifact(
+                timings_json_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            )
+            published.append(timings_json_path)
+            self._publish_timing_artifact(srt_path, build_srt(timing))
+            published.append(srt_path)
+        except NativeGenerationError:
+            for path in published:
+                path.unlink(missing_ok=True)
+            raise
+        try:
+            save = self._timing_history_save(
+                options, manifest, audio_path, timings_json_path, srt_path
+            )
+            persist_asr_history(save)
+        except Exception:
+            for path in published:
+                path.unlink(missing_ok=True)
+            self.logger.event("error", "timings_history_failed")
+            raise NativeGenerationError(
+                "the voiceover audio and timings files were produced, but the linked timing "
+                "history could not be stored.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_HISTORY_FAILED,
+            ) from None
+        if self._linked_timing() is None:
+            raise NativeGenerationError(
+                "the linked timing history could not be verified after it was written.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_HISTORY_FAILED,
+            )
+        self.logger.event("info", "timings_complete", segments=len(timing.segments))
+
     def export(self) -> NativeGenerationSummary:
         """Project one verified committed view onto the compatibility JSON files."""
         self._reload_view()
@@ -1413,14 +1866,24 @@ class _Executor:
             "chunks_json": str(self.paths.chunks_json),
             "manifest_json": str(self.paths.output_root / "manifest.json"),
         }
+        # Only a linked, still-verified timing run adds timing references to the
+        # result; a run that requested timing but has none stays incomplete.
+        timing = self._linked_timing()
+        segment_count: int | None = None
+        if timing is not None:
+            files["timings_json"] = str(timing.timings_json)
+            files["srt"] = str(timing.srt)
+            segment_count = timing.segment_count
         return NativeGenerationSummary(
             run_uuid=view.run.run_uuid,
             revision=view.run.revision,
             files=files,
             duration_ms=duration_ms,
-            segment_count=None,
+            segment_count=segment_count,
             cost_total=export.chunks_manifest.get("cost_total"),
             cost_currency=export.chunks_manifest.get("cost_currency"),
+            timing_requested=self.timing_options is not None,
+            timing_complete=timing is not None,
         )
 
 
@@ -1510,6 +1973,7 @@ def execute_native_tts(
     logger: GenerationLogger,
     expected_run_uuid: str | None = None,
     paid_submit_allowed: bool = True,
+    local_timing_allowed: bool = True,
 ) -> NativeGenerationSummary:
     """Run one locked native TTS generation, resume, or completed-run export.
 
@@ -1525,6 +1989,8 @@ def execute_native_tts(
     resume``/``history sync`` can neither create a new run nor silently switch to
     another one. ``paid_submit_allowed`` is ``False`` for ``history sync``, which
     then fails closed on an unattempted part instead of submitting it.
+    ``local_timing_allowed`` is ``False`` for ``history sync`` so it never runs a
+    local timing model; the pending timing work stays for an explicit resume.
     """
     canonical_root = str(run_root.resolve())
     existing = _find_native_run_in_repository(repository, canonical_root)
@@ -1628,9 +2094,12 @@ def execute_native_tts(
         logger=logger,
         resume=resume,
         paid_submit_allowed=paid_submit_allowed,
+        local_timing_allowed=local_timing_allowed,
     )
+    executor.preflight_timing()
     executor.run_parts()
     executor.ensure_complete()
+    executor.ensure_timing()
     return executor.export()
 
 
@@ -1651,12 +2120,15 @@ def run_native_generation(
     database_path: Path | None = None,
     expected_run_uuid: str | None = None,
     paid_submit_allowed: bool = True,
+    local_timing_allowed: bool = True,
 ) -> NativeGenerationSummary:
     """Hold the run lock and the history database around one native execution.
 
     The generation logger is constructed here, after the run lock is taken, so the
     native route creates no file in the run root before the lock and the ownership
-    recheck inside :func:`execute_native_tts`.
+    recheck inside :func:`execute_native_tts`. ``local_timing_allowed`` is threaded
+    to :func:`execute_native_tts` so an explicit resume may run the pending local
+    timing while ``history sync`` never runs a local model.
     """
     try:
         with acquire_run_lock(paths.output_root):
@@ -1680,6 +2152,7 @@ def run_native_generation(
                     logger=logger,
                     expected_run_uuid=expected_run_uuid,
                     paid_submit_allowed=paid_submit_allowed,
+                    local_timing_allowed=local_timing_allowed,
                 )
     except HistoryRunLockedError as exc:
         raise NativeGenerationError(
@@ -1883,4 +2356,5 @@ def run_native_history_generation(
         database_path=database_path,
         expected_run_uuid=view.run.run_uuid,
         paid_submit_allowed=(mode == _MODE_RESUME),
+        local_timing_allowed=(mode == _MODE_RESUME),
     )

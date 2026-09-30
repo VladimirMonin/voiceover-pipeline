@@ -403,10 +403,13 @@ provider/model/voice/script, с которыми позднее будет за�
 Узкий вертикальный срез S05 переводит на canonical SQLite обычные
 не-диалоговые запуски `polza-tts` — как async `--model elevenlabs/...`
 (`/media`), так и синхронный `/audio/speech` (любая другая модель) — и
-`openrouter-tts`, без `--with-timings`, `--tts-quality-provider` и
-`--no-trim`. Все прочие маршруты, все существующие legacy-каталоги и уже
-начатые JSON-прогоны продолжают использовать прежний executor и прежний
-JSON-writer без изменений.
+`openrouter-tts`. Один интегрированный шаг допущен: локальные
+`--with-timings --timing-provider faster-whisper`, которые дают аудио и
+локальные субтитры одной командой. `--tts-quality-provider`, `--no-trim`,
+dialogue и облачные timing-провайдеры (`openrouter-whisper`, `groq-whisper`,
+`xai-stt`) остаются вне среза. Все прочие маршруты, все существующие
+legacy-каталоги и уже начатые JSON-прогоны продолжают использовать прежний
+executor и прежний JSON-writer без изменений.
 
 - **Раннее владение.** `generate` разрешает владельца каталога до legacy JSON
   recovery, до чтения ключа, до построения провайдера, до цен и до удаления.
@@ -473,9 +476,29 @@ JSON-writer без изменений.
   нужен другой `--run-id`. `--skip-existing` сохраняет приоритет. Новые
   опции, которые срез не поддерживает, на нативном прогоне отклоняются до
   провайдера (`NATIVE_OPTIONS_UNSUPPORTED`).
+- **Локальные тайминги после готового аудио.** Когда прогон запросил
+  `--with-timings --timing-provider faster-whisper`, эффективные настройки
+  таймингов пишутся в снимок вместе с output-опциями, поэтому resume
+  доказывает, что они не менялись (иначе exit `30`
+  `NATIVE_PROCESSING_UNSUPPORTED` до провайдера). Перед **любым** новым
+  платным POST проверяется доступность локальной модели faster-whisper без
+  скачивания; недоступная зависимость или некэшированная модель — fail-closed
+  (exit `10` `NATIVE_TIMING_MODEL_UNAVAILABLE`) до POST, и сам прогон всегда
+  идёт с `local_files_only`, без неявного скачивания. После CAS-коммита
+  готового аудио исполнитель пишет `<prefix>.timings.json` и `<prefix>.srt`
+  через тот же приватный staging и связывает отдельный history-прогон
+  `timings` через `parent_uuid` (не дублирует TTS-попытки, не запускает legacy
+  finalizer/JSON-writer). Сбой извлечения — exit `50` `NATIVE_TIMING_FAILED`;
+  сбой записи связанной истории — exit `50` `NATIVE_TIMING_HISTORY_FAILED`;
+  оба сохраняют завершённое TTS-аудио, оплаченный raw и стоимость нетронутыми
+  и удаляют только что записанные timing-файлы, чтобы экспорт не ссылался на
+  несвязанные тайминги. Ссылки на тайминги попадают в экспорт/`files`
+  (`timings_json`, `srt`) только при наличии verified связанного прогона.
 
-Этот фрагмент не завершает S05: ASR/timing/verify, dialogue и остальные
-провайдеры остаются на legacy executor. Пользовательские глаголы
+Этот фрагмент не завершает S05: ASR/`verify-tts`, dialogue, облачные
+`--timing-provider` и остальные провайдеры остаются на legacy executor.
+Локальный faster-whisper timing интегрирован в нативный прогон (см. выше).
+Пользовательские глаголы
 `history resume ID` / `history sync ID`, которые восстанавливают такой прогон из
 снимка, описаны в разделе ниже.
 
@@ -920,9 +943,14 @@ voiceover history sync ID --json        # без нового оплаченно
   converted chunk, локально пересобирает часть из валидного raw receipt,
   доводит известный Polza Media task id только GET-запросами и делает новый
   платный POST **только** для действительно unattempted части (в обычном порядке
-  оплаты, с pre-submit маркером и обычной проверкой identity). `--overwrite` не
+  оплаты, с pre-submit маркером и обычной проверкой identity). Для прогона с
+  сохранёнными настройками локальных таймингов он дополнительно завершает
+  недостающий локальный faster-whisper шаг (без TTS POST/GET), а проверка
+  доступности модели происходит до любого платного POST. `--overwrite` не
   принимается вообще (exit `2`), чтобы не удалить принятые платные доказательства.
-- **Бесплатный `sync`.** Никогда не начинает новый оплаченный submit. На
+- **Бесплатный `sync`.** Никогда не начинает новый оплаченный submit и **никогда
+  не запускает локальную модель таймингов**: недостающие локальные тайминги
+  остаются незавершёнными (`timing.complete = false`) для явного resume. На
   завершённом прогоне починка ограничивается четырьмя совместимыми JSON из
   committed DB-вида (без API-ключа, провайдера и GET); при валидном raw
   receipt/`raw_saved` — локальная пересборка; при известном Media ID —
@@ -943,13 +971,15 @@ voiceover history sync ID --json        # без нового оплаченно
   пропал или изменён, падает fail-closed без пересборки (exit `50`
   `NATIVE_FINAL_AUDIO_MISSING`).
 - **Приватность.** Успешный JSON — только метаданные (`run_uuid`, `revision`,
-  `mode`, пути артефактов, длительность, cost). Полный сценарий, prepared text,
-  transcript, raw snapshot, подписанные URL и секреты не печатаются.
+  `mode`, пути артефактов, длительность, cost, а для таймингового прогона
+  `timing.complete`). Полный сценарий, prepared text, transcript, raw snapshot,
+  подписанные URL и секреты не печатаются.
 
 Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
 из S05; live/listening-приёмка при этом не проводилась. `history costs` —
 read-only offline-учёт расходов (см. выше). S05 целиком пока не принят:
-ASR/timing/verify, dialogue и остальные провайдеры остаются на legacy executor.
+ASR/`verify-tts`, dialogue, облачные timing-маршруты и остальные провайдеры
+остаются на legacy executor.
 
 ## Gemini Dialogue (machine-facing)
 
@@ -1331,7 +1361,8 @@ offline/local runtime experiment.
 
 ### `generate --json` (timing failure)
 
-Timing failure при `--with-timings` — это hard error (code 40), но MP3 сохранён:
+Для **legacy** маршрута timing failure при `--with-timings` — это hard error
+(code 40), но MP3 сохранён:
 
 ```json
 {
@@ -1340,6 +1371,13 @@ Timing failure при `--with-timings` — это hard error (code 40), но MP3
   "code": 40
 }
 ```
+
+Для **нативного** обычного `polza-tts` / `openrouter-tts` прогона с
+`--timing-provider faster-whisper` сбой локальных таймингов — это exit `50` с
+фиксированным `details.error_code` (`NATIVE_TIMING_FAILED` или
+`NATIVE_TIMING_HISTORY_FAILED`); завершённое аудио, оплаченный raw и стоимость
+сохраняются, а недостающие тайминги завершает явный `--resume` (см. «Нативная
+история...»).
 
 MP3 можно восстановить отдельно: `voiceover timings --audio ...`
 

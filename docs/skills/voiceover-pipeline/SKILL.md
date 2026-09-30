@@ -119,7 +119,12 @@ description: >
    `voiceover verify-tts --audio <mp3> --expected-file <script> --provider <ASR> --receipt <json> --json`.
    Exit `60` — quality FAIL; exit `0` всё равно требует человеческого прослушивания.
 7. **Тайминги.** Предпочитай `generate --with-timings` в том же безопасном прогоне.
-   Если тайминги нужны отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
+   Для обычного не-диалогового `polza-tts` / `openrouter-tts` с
+   `--timing-provider faster-whisper` аудио и локальные субтитры пишутся одной
+   командой в canonical history; локальная модель должна быть уже установлена и
+   закеширована (неявного скачивания нет — иначе команда падает до платного POST),
+   а сбой только таймингов даёт exit `50` с сохранённым MP3 и завершается явным
+   `--resume`. Если тайминги нужны отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
    не перезаписывай папку платного прогона:
    `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --output-dir "out" --run-id "prod-timings" --json`.
 8. **Локальная история.** Локальные `transcribe`, `timings` (без облачного

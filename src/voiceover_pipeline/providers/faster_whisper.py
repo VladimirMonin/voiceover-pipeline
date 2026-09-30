@@ -1,5 +1,6 @@
 import shutil
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,83 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.models import TimingResult, TimingSegment
 from voiceover_pipeline.providers.base import TranscriptionProvider
+
+# Files a cached Hugging Face snapshot must carry before faster-whisper can load
+# its model with ``local_files_only=True`` and no download.
+_REQUIRED_MODEL_FILES = ("model.bin", "config.json")
+_REASON_MISSING_PACKAGE = "faster_whisper_missing"
+_REASON_MODEL_NOT_CACHED = "model_not_cached"
+_REASON_CACHE_UNVERIFIABLE = "cache_unverifiable"
+
+
+@dataclass(frozen=True)
+class FasterWhisperAvailability:
+    """Whether the local Faster-Whisper model can run without downloading.
+
+    ``reason_code`` and ``remediation`` are bounded, content-free, and name no
+    user path or secret. ``available=True`` means a caller may load the model
+    with ``local_files_only=True``; it never guarantees the transcription itself
+    will succeed.
+    """
+
+    available: bool
+    reason_code: str | None = None
+    remediation: str | None = None
+
+
+def faster_whisper_availability(model_size: str) -> FasterWhisperAvailability:
+    """Report whether the local Faster-Whisper model is usable without a download.
+
+    The probe only inspects the installed package and the local Hugging Face
+    cache: it never constructs a ``WhisperModel`` and never downloads a model.
+    A caller uses it to fail closed before a paid TTS submit when the local
+    timing dependency or its cached model is unavailable, so the native timing
+    route can enforce "no implicit model download" instead of discovering the
+    gap only after paying for audio.
+    """
+    try:
+        import faster_whisper  # noqa: F401
+    except ModuleNotFoundError:
+        return FasterWhisperAvailability(
+            available=False,
+            reason_code=_REASON_MISSING_PACKAGE,
+            remediation=(
+                "faster-whisper is not installed; install it with "
+                "uv sync --extra timing-whisper before requesting local timings."
+            ),
+        )
+    if model_size and Path(model_size).expanduser().is_dir():
+        # A caller may point at an already-downloaded local model directory; that
+        # needs no cache lookup and no download.
+        return FasterWhisperAvailability(available=True)
+    try:
+        from huggingface_hub import try_to_load_from_cache
+    except ModuleNotFoundError:
+        return FasterWhisperAvailability(
+            available=False,
+            reason_code=_REASON_CACHE_UNVERIFIABLE,
+            remediation=(
+                "the Hugging Face cache client is unavailable, so the local "
+                "Faster-Whisper model cannot be verified without a download."
+            ),
+        )
+    repo_id = WHISPER_HF_REPOS.get(model_size, WHISPER_HF_REPOS["small"])
+    for filename in _REQUIRED_MODEL_FILES:
+        try:
+            cached = try_to_load_from_cache(repo_id, filename)
+        except Exception:
+            cached = None
+        if not isinstance(cached, str) or not Path(cached).is_file():
+            return FasterWhisperAvailability(
+                available=False,
+                reason_code=_REASON_MODEL_NOT_CACHED,
+                remediation=(
+                    f"the local Faster-Whisper model {model_size!r} is not cached; "
+                    "download it explicitly before requesting local timings "
+                    "(no implicit download is performed)."
+                ),
+            )
+    return FasterWhisperAvailability(available=True)
 
 
 def _detect_device(requested: str) -> str:
@@ -95,6 +173,7 @@ class FasterWhisperProvider(TranscriptionProvider):
         language: str = "ru",
         word_timestamps: bool = False,
         quiet: bool = False,
+        local_files_only: bool = False,
     ) -> TimingResult:
         def _log(msg: str) -> None:
             if not quiet:
@@ -124,6 +203,7 @@ class FasterWhisperProvider(TranscriptionProvider):
                 model_size_or_path=hf_repo,
                 device=resolved_device,
                 compute_type=resolved_compute,
+                local_files_only=local_files_only,
             )
         except Exception as first_error:
             fallback_compute = "float32" if resolved_device == "cpu" else "float16"
@@ -136,6 +216,7 @@ class FasterWhisperProvider(TranscriptionProvider):
                 model_size_or_path=hf_repo,
                 device=resolved_device,
                 compute_type=resolved_compute,
+                local_files_only=local_files_only,
             )
 
         segments_iter, info = model.transcribe(

@@ -252,15 +252,19 @@ def transcribe_timing_audio(
     language: str,
     word_timestamps: bool = False,
     quiet: bool = False,
+    local_files_only: bool = False,
 ) -> TimingResult:
     """Select the timing provider and run one timestamped transcription.
 
     Each optional adapter is imported only for its own branch so an unselected
     runtime never imports another package. The model defaults match the former
     CLI branches; ``openrouter-whisper`` is rejected by the CLI before this
-    point because it cannot return real timestamps.
+    point because it cannot return real timestamps. ``local_files_only`` is
+    forwarded to the local faster-whisper adapter so the native timing route can
+    forbid an implicit model download; cloud providers ignore it.
     """
     provider: TranscriptionProvider
+    local_provider: Any | None = None
     if timing_provider == "groq-whisper":
         from ..providers.groq_whisper import GroqWhisperProvider
 
@@ -275,12 +279,23 @@ def transcribe_timing_audio(
         from ..providers.faster_whisper import FasterWhisperProvider
 
         effective_model = model or DEFAULT_TIMING_MODEL
-        provider = FasterWhisperProvider(
+        local_provider = FasterWhisperProvider(
             model_size=effective_model,
             device=device,
             compute_type=compute_type,
         )
+        provider = local_provider
 
+    if local_provider is not None:
+        # Only the local adapter understands ``local_files_only``; passing it to a
+        # cloud adapter would be an unexpected keyword argument.
+        return local_provider.transcribe(
+            audio_path=audio_path,
+            language=language,
+            word_timestamps=word_timestamps,
+            quiet=quiet,
+            local_files_only=local_files_only,
+        )
     return provider.transcribe(
         audio_path=audio_path,
         language=language,

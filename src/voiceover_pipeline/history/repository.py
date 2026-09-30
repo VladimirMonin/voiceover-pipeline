@@ -2409,6 +2409,26 @@ class HistoryRepository:
         ).fetchall()
         return [_row_to_run(row) for row in rows]
 
+    def find_runs_by_parent(
+        self, parent_uuid: str, *, limit: int = DEFAULT_QUERY_LIMIT, offset: int = 0
+    ) -> list[RunRecord]:
+        """Return every run whose ``parent_uuid`` is exactly ``parent_uuid``.
+
+        A linked local ASR/timing run records the native TTS run it observed as
+        its ``parent_uuid``, so a completed TTS run can find the child timing
+        evidence that belongs to it without scanning the whole table. The read is
+        ordered newest first, mirroring :meth:`find_runs_by_root`.
+        """
+        _require_uuid(parent_uuid, "parent_uuid")
+        _require_limit(limit)
+        _require_offset(offset)
+        rows = self._connection.execute(
+            "SELECT * FROM runs WHERE parent_uuid = ? "
+            "ORDER BY created_at DESC, run_uuid DESC LIMIT ? OFFSET ?",
+            (parent_uuid, limit, offset),
+        ).fetchall()
+        return [_row_to_run(row) for row in rows]
+
     def get_parts(self, run_uuid: str) -> list[PartRecord]:
         """Return a run's parts ordered by position."""
         rows = self._connection.execute(

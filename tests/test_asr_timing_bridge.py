@@ -186,6 +186,7 @@ def test_timing_provider_selection_and_transcribe_belong_to_transcription_servic
             "language": "ru",
             "word_timestamps": True,
             "quiet": True,
+            "local_files_only": False,
         },
     )
 
