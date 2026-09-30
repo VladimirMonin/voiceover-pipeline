@@ -297,6 +297,27 @@ voiceover list timing-providers --json
 | Папка существует + `--skip-existing` | Вернуть `status: skipped`, не менять файлы |
 | Папка существует + `--resume` | Продолжить с первого несохранённого chunk; при `pending_attempt` допускается лишь проверенный raw receipt либо известная paid media задача (см. ниже) |
 | Папка существует без флагов | Ошибка exit code 30 |
+| Папка — нативный прогон | Свойства: `--overwrite` отклоняется (exit 30); `--skip-existing` возвращает `skipped`; без `--resume` — ошибка; `--resume` идёт по canonical SQLite (см. ниже) |
+
+### Нативный прогон `polza-tts` + `elevenlabs/...`
+
+Если запуск — обычный не-диалоговый `polza-tts` с моделью `elevenlabs/...` без
+`--with-timings`, `--tts-quality-provider` и `--no-trim`, то история становится
+canonical: части, попытки, оплаченные байты и финальная сборка хранятся в
+SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON пишутся как
+совместимый экспорт с `history_run_uuid` и `history_revision`. Владелец
+каталога определяется до чтения ключа, цен и удаления: committed прогон по
+`run_root` или крошечный `.voiceover-native-history.json`. Нативный след при
+нечитаемой/отсутствующей БД и дескриптор без своего прогона дают fail-closed
+(exit 30, `details.error_code = NATIVE_OWNERSHIP_UNVERIFIABLE` /
+`NATIVE_OWNERSHIP_RUN_MISSING`) без фоллбэка на JSON. Провайдер строится
+лениво: только для нового POST или GET-only добора известного Media ID;
+локальная пересборка из `raw/` и починка экспортов завершённого прогона не
+читают ключ. Сбой экспорта оставляет БД и аудио нетронутыми и возвращает
+exit 50 с `details.error_code = NATIVE_EXPORT_FAILED`. Изменённый текст,
+голос или модель блокируются до сети (`NATIVE_RESUME_IDENTITY_CHANGED`),
+занятый run lock — exit 30 `NATIVE_RUN_LOCKED`. Обратный переход к legacy
+JSON для такого каталога запрещён.
 
 ### Платный submit и маркер `pending_attempt`
 

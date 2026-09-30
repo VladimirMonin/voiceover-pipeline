@@ -173,6 +173,7 @@ class NativeTtsView:
     script_path: str | None
     script_text: str
     style_prompt: str | None
+    output_options: dict[str, Any] | None
     parts: tuple[NativeTtsPart, ...]
     attempts: tuple[AttemptRecord, ...]
     artifacts: tuple[ArtifactRecord, ...]
@@ -229,6 +230,29 @@ def _config_required_int(config: dict[str, Any], key: str) -> int:
         raise NativeViewIntegrityError(
             f"native snapshot config field {key!r} is missing or not an integer"
         )
+    return value
+
+
+def _config_optional_output(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the committed output-processing settings, or ``None`` when absent.
+
+    The writer stores this mapping only when the run recorded output settings, so
+    an older snapshot without the key stays readable. When present it must be a
+    flat mapping of plain scalar values, mirroring what the writer accepted, or
+    the view fails closed with a fixed message.
+    """
+    value = config.get("output")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise NativeViewIntegrityError("native snapshot output options are not a mapping")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise NativeViewIntegrityError("native snapshot output option key is not a string")
+        if not isinstance(item, (str, int, bool)) or isinstance(item, float):
+            raise NativeViewIntegrityError(
+                "native snapshot output option value is not a plain string, integer, or boolean"
+            )
     return value
 
 
@@ -610,6 +634,7 @@ def _read_committed_view(
         script_path=script_path,
         script_text=script_text,
         style_prompt=style_prompt,
+        output_options=_config_optional_output(config),
         parts=tuple(native_parts),
         attempts=tuple(attempts),
         artifacts=tuple(artifacts),

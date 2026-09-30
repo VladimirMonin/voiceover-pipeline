@@ -1,0 +1,1060 @@
+"""End-to-end contract tests for the native DB-first Polza Media TTS slice.
+
+Every test is offline and synthetic: a temporary ``VOICEOVER_HOME``, a temp run
+directory, a fake in-memory media provider, and patched FFmpeg/concat seams. No
+real provider, network call, API key, ``.env``, model, or paid request is used.
+The tests assert paid-submit counts and committed history rather than only
+statuses, so a slice that silently re-submits or loses evidence fails here.
+"""
+
+import json
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+import pytest
+import requests
+
+import voiceover_pipeline.cli as cli
+from voiceover_pipeline.models import ScriptChunk, SynthesisResult
+from voiceover_pipeline.providers import PolzaTTSProvider
+
+POLZA_MEDIA_MODEL = "elevenlabs/text-to-speech-turbo-2-5"
+POLZA_SYNC_MODEL = "openai/gpt-4o-mini-tts"
+
+
+class FakeMediaProvider:
+    """Offline stand-in for the Polza ElevenLabs ``/media`` provider.
+
+    ``on_media_task_accepted`` and ``on_media_completed`` are bound by the native
+    executor before any submit, so the default path exercises the real DB
+    transitions. ``script`` lets a test replace one call, for example to raise
+    after acceptance or before it.
+    """
+
+    def __init__(self) -> None:
+        self.on_media_task_accepted = None
+        self.on_media_completed = None
+        self.submits: list[str] = []
+        self.recovers: list[str] = []
+        self.script = None
+
+    @staticmethod
+    def _audio(text: str, chunk_id: str) -> SynthesisResult:
+        return SynthesisResult(
+            audio_bytes=f"{chunk_id}-audio".encode(),
+            audio_format="mp3",
+            transcript=text,
+            generation_id=f"gen-{chunk_id}",
+            client_path="requests",
+        )
+
+    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+        self.submits.append(chunk_id)
+        if self.script is not None:
+            return self.script(self, text, chunk_id)
+        self.on_media_task_accepted(f"task-{chunk_id}")
+        self.on_media_completed(f"task-{chunk_id}", {"cost_rub": Decimal("0.3")}, f"gen-{chunk_id}")
+        return self._audio(text, chunk_id)
+
+    def recover_media_task(self, task_id: str, text: str, chunk_id: str) -> SynthesisResult:
+        self.recovers.append(task_id)
+        self.on_media_completed(task_id, {"cost_rub": Decimal("0.3")}, f"gen-{chunk_id}")
+        return self._audio(text, chunk_id)
+
+
+class FakeSyncProvider:
+    """Offline stand-in for the legacy synchronous synthesis seam."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+        self.calls.append(chunk_id)
+        return SynthesisResult(
+            audio_bytes=f"{chunk_id}-audio".encode(),
+            audio_format="mp3",
+            transcript=text,
+            generation_id=f"gen-{chunk_id}",
+            client_path="requests",
+        )
+
+
+def _write_mp3(_ffmpeg: str, data: bytes, _fmt: str, path: Path) -> None:
+    path.write_bytes(data)
+
+
+def _concat(_ffmpeg: str, paths: list[Path], output: Path) -> None:
+    output.write_bytes(b"".join(path.read_bytes() for path in paths))
+
+
+@pytest.fixture
+def native_env(tmp_path, monkeypatch):
+    """Point history at a temp home and replace every local media seam."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("VOICEOVER_HOME", str(home))
+    monkeypatch.setattr(cli, "check_media_tools", lambda: ("ffmpeg", "ffprobe"))
+    monkeypatch.setattr(cli.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(cli, "read_api_key", lambda _args: "sk-test")
+    monkeypatch.setattr(cli, "fetch_pricing_snapshot", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "write_audio_as_mp3", _write_mp3)
+    monkeypatch.setattr(cli, "trim_final_silence", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "mp3_duration_ms", lambda _ffprobe, _path: 1000)
+    monkeypatch.setattr(cli, "concat_audio_files", _concat)
+    return home
+
+
+def _script(tmp_path: Path, parts: list[str]) -> Path:
+    path = tmp_path / "script.md"
+    path.write_text("\n******\n".join(parts), encoding="utf-8")
+    return path
+
+
+def _generate_argv(
+    tmp_path: Path,
+    script: Path,
+    run_id: str,
+    *,
+    model: str = POLZA_MEDIA_MODEL,
+    voice: str = "Rachel",
+    extra=(),
+):
+    return [
+        "voiceover-pipeline",
+        "generate",
+        "--provider",
+        "polza-tts",
+        "--model",
+        model,
+        "--voice",
+        voice,
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        run_id,
+        *extra,
+        "--json",
+    ]
+
+
+def _run(monkeypatch, argv) -> tuple[int, str]:
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+    return excinfo.value.code, ""
+
+
+def _json_run(monkeypatch, capsys, argv) -> tuple[int, dict]:
+    code, _ = _run(monkeypatch, argv)
+    out = capsys.readouterr().out
+    return code, json.loads(out)
+
+
+def _install_provider(monkeypatch, provider):
+    builds: list[str] = []
+
+    def fake_build(*_args, **_kwargs):
+        builds.append("built")
+        return provider
+
+    monkeypatch.setattr(cli, "build_provider", fake_build)
+    return builds
+
+
+def _history_show(run_uuid: str) -> dict:
+    from voiceover_pipeline.commands.history import show_history
+
+    return show_history(run_uuid)
+
+
+def _run_uuid(prefix: str) -> str:
+    from voiceover_pipeline.commands.history import list_history
+
+    runs = list_history()["runs"]
+    matches = [run for run in runs if run["user_label"] == prefix]
+    assert len(matches) == 1, matches
+    return matches[0]["run_uuid"]
+
+
+# ── fresh generation ──────────────────────────────────────────────────────────
+
+
+def test_native_fresh_two_parts_write_history_audio_and_exports(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A fresh two-part media run produces audio, canonical history, and exports."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый фрагмент текста.", "Второй фрагмент текста."])
+
+    code, payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-fresh"))
+
+    assert code == 0
+    assert payload["status"] == "success"
+    assert payload["duration_ms"] == 1000
+    assert provider.submits == ["chunk_01", "chunk_02"]
+
+    run_root = tmp_path / "out" / "native-fresh"
+    prefix = "native-fresh"
+    slug = POLZA_MEDIA_MODEL.replace("/", "-")
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    assert (run_root / "chunks" / "chunk_02.mp3").read_bytes() == b"chunk_02-audio"
+    assert (run_root / f"{prefix}-voiceover-{slug}.mp3").exists()
+    for name in ("run_state.json", "manifest.json", f"{prefix}-voiceover-{slug}.json"):
+        assert (run_root / name).exists(), name
+    assert (run_root / "chunks" / "chunks.json").exists()
+    assert (run_root / ".voiceover-native-history.json").exists()
+
+    # The compatibility state is a projection: completed, no paid permission.
+    state = json.loads((run_root / "run_state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert "pending_attempt" not in state
+    assert state["native_history"]["history_run_uuid"]
+    assert state["history_run_uuid"] == state["native_history"]["history_run_uuid"]
+
+    run_uuid = _run_uuid("native-fresh")
+    detail = _history_show(run_uuid)
+    assert detail["run"]["status"] == "completed"
+    assert detail["run"]["operation"] == "tts"
+    assert len(detail["parts"]) == 2
+    assert len(detail["attempts"]) == 2
+    roles = {artifact["role"] for artifact in detail["artifacts"]}
+    assert {"paid_raw_audio", "chunk_audio", "final_audio"} <= roles
+    assert sum(1 for art in detail["artifacts"] if art["role"] == "chunk_audio") == 2
+    assert all(attempt["status"] == "completed" for attempt in detail["attempts"])
+    assert all(attempt["cost"]["amount"] == "0.3" for attempt in detail["attempts"])
+    # No signed URL or secret reached the machine output.
+    assert "cdn.example.com" not in capsys.readouterr().out
+
+
+def test_native_fresh_route_never_calls_legacy_pricing_or_key_early(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """The provider is built only when a paid submit is actually needed."""
+    provider = FakeMediaProvider()
+    builds = _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Один фрагмент."])
+
+    code, _payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-lazy"))
+
+    assert code == 0
+    assert builds == ["built"]
+    assert provider.submits == ["chunk_01"]
+
+
+# ── resume: identity and evidence ─────────────────────────────────────────────
+
+
+def test_native_resume_changed_text_blocks_before_any_network(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Changed spoken text fails the identity preflight before a provider exists."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый фрагмент текста."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-identity")
+    )
+    assert code == 0
+    assert provider.submits == ["chunk_01"]
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("provider must not be constructed on a blocked resume")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    changed = _script(tmp_path, ["Совершенно другой текст."])
+    resume_argv = _generate_argv(tmp_path, changed, "native-identity", extra=["--resume"])
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 30
+    assert payload["status"] == "error"
+    assert payload["details"]["error_code"] == "NATIVE_RESUME_IDENTITY_CHANGED"
+    assert provider.submits == ["chunk_01"]
+
+
+def test_native_resume_known_id_uses_get_only_and_never_resubmits(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A stored accepted task id is finished with recover-only calls."""
+    provider = FakeMediaProvider()
+
+    def accept_then_fail(inner, text, chunk_id):
+        inner.on_media_task_accepted(f"task-{chunk_id}")
+        raise requests.Timeout("poll timed out")
+
+    provider.script = accept_then_fail
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Фрагмент для GET-восстановления."])
+
+    code, payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-get"))
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_SYNTHESIS_FAILED"
+    assert provider.submits == ["chunk_01"]
+    assert provider.recovers == []
+
+    resume_provider = FakeMediaProvider()
+    _install_provider(monkeypatch, resume_provider)
+    resume_argv = _generate_argv(tmp_path, script, "native-get", extra=["--resume"])
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0
+    assert resume_provider.submits == []
+    assert resume_provider.recovers == ["task-chunk_01"]
+    assert (tmp_path / "out" / "native-get" / "chunks" / "chunk_01.mp3").exists()
+
+
+def test_native_resume_rebuilds_from_raw_receipt_without_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A verified raw receipt is converted locally with no provider construction."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    calls = {"n": 0}
+
+    def flaky_write(_ffmpeg, data, _fmt, path):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("conversion boom")
+        path.write_bytes(data)
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
+    script = _script(tmp_path, ["Первый.", "Второй."])
+
+    code, payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-raw"))
+    assert code == 50
+    assert payload["details"]["error_code"] == "NATIVE_CONVERSION_FAILED"
+    assert provider.submits == ["chunk_01", "chunk_02"]
+    # The accepted paid bytes survive the conversion failure.
+    assert (tmp_path / "out" / "native-raw" / "raw" / "chunk_02.mp3").exists()
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", _write_mp3)
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("a local raw rebuild must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(tmp_path, script, "native-raw", extra=["--resume"])
+    code, _payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0
+    assert provider.submits == ["chunk_01", "chunk_02"]
+    assert (tmp_path / "out" / "native-raw" / "chunks" / "chunk_02.mp3").read_bytes() == (
+        b"chunk_02-audio"
+    )
+    run_uuid = _run_uuid("native-raw")
+    detail = _history_show(run_uuid)
+    assert detail["run"]["status"] == "completed"
+
+
+def test_native_resume_unconfirmed_submit_blocks_without_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A submit that was never confirmed blocks resume and sends no request."""
+    provider = FakeMediaProvider()
+
+    def fail_before_accept(_inner, _text, _chunk_id):
+        raise requests.Timeout("read timed out")
+
+    provider.script = fail_before_accept
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Неопределённый платный исход."])
+
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-unconfirmed")
+    )
+    assert code == 30
+    assert provider.submits == ["chunk_01"]
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("an unconfirmed paid submit must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(tmp_path, script, "native-unconfirmed", extra=["--resume"])
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert provider.submits == ["chunk_01"]
+
+
+def test_native_resume_reconciles_raw_receipt_written_before_db_link(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A crash between raw bytes and their database row is reconciled locally."""
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Окно между raw и БД."])
+
+    real_link = HistoryRepository.record_polza_media_raw_saved
+    calls = {"n": 0}
+
+    def flaky_link(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("crash between raw bytes and the database row")
+        return real_link(self, *args, **kwargs)
+
+    monkeypatch.setattr(HistoryRepository, "record_polza_media_raw_saved", flaky_link)
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-reconcile")
+    )
+    assert code == 30
+    assert provider.submits == ["chunk_01"]
+    raw_dir = tmp_path / "out" / "native-reconcile" / "raw"
+    assert (raw_dir / "chunk_01.mp3").exists()
+    assert (raw_dir / "chunk_01.mp3.receipt.json").exists()
+
+    monkeypatch.setattr(HistoryRepository, "record_polza_media_raw_saved", real_link)
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("reconciling an on-disk receipt must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(tmp_path, script, "native-reconcile", extra=["--resume"])
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0, payload
+    assert provider.submits == ["chunk_01"]
+    assert (
+        tmp_path / "out" / "native-reconcile" / "chunks" / "chunk_01.mp3"
+    ).read_bytes() == b"chunk_01-audio"
+
+
+@pytest.mark.parametrize(
+    ("overrides"),
+    [{"voice": "Bella"}, {"model": "elevenlabs/text-to-speech-multilingual-v2"}],
+)
+def test_native_resume_changed_synthesis_identity_blocks_before_network(
+    tmp_path, monkeypatch, capsys, native_env, overrides
+):
+    """A changed voice or model fails the identity preflight with no provider."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Проверка identity."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-synth-identity")
+    )
+    assert code == 0
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("provider must not be constructed on a blocked resume")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path, script, "native-synth-identity", extra=["--resume"], **overrides
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_RESUME_IDENTITY_CHANGED"
+    assert provider.submits == ["chunk_01"]
+
+
+# ── completed-run export repair ───────────────────────────────────────────────
+
+
+def test_native_completed_run_resume_only_repairs_exports(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A completed run re-exports its JSON without a provider or paid action."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Готовый прогон."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-export")
+    )
+    assert code == 0
+    run_root = tmp_path / "out" / "native-export"
+    (run_root / "run_state.json").unlink()
+    (run_root / "chunks" / "chunks.json").unlink()
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("export repair must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(tmp_path, script, "native-export", extra=["--resume"])
+    code, _payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0
+    assert (run_root / "run_state.json").exists()
+    assert (run_root / "chunks" / "chunks.json").exists()
+    assert provider.submits == ["chunk_01"]
+
+
+def test_native_export_failure_keeps_history_and_audio_then_repairs(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A failed export leaves audio and database intact and returns code 50."""
+    from voiceover_pipeline.services import native_generation
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Экспорт ломается."])
+
+    def broken_export(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(native_generation, "write_native_export", broken_export)
+    code, payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-export-fail")
+    )
+
+    assert code == 50
+    assert payload["details"]["error_code"] == "NATIVE_EXPORT_FAILED"
+    run_root = tmp_path / "out" / "native-export-fail"
+    assert (run_root / "chunks" / "chunk_01.mp3").exists()
+    run_uuid = _run_uuid("native-export-fail")
+    assert _history_show(run_uuid)["run"]["status"] == "completed"
+
+    # A later resume repairs the projection with no provider or paid action.
+    monkeypatch.setattr(native_generation, "write_native_export", _real_write_export())
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("projection repair must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(tmp_path, script, "native-export-fail", extra=["--resume"])
+    code, _payload = _json_run(monkeypatch, capsys, resume_argv)
+    assert code == 0
+    assert (run_root / "run_state.json").exists()
+    assert provider.submits == ["chunk_01"]
+
+
+def _real_write_export():
+    from voiceover_pipeline.history.native_export import write_native_export
+
+    return write_native_export
+
+
+# ── safety guards ─────────────────────────────────────────────────────────────
+
+
+def test_native_overwrite_is_rejected_and_keeps_accepted_evidence(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Overwrite is refused for a native run; the accepted evidence stays."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Перезапись запрещена."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-overwrite")
+    )
+    assert code == 0
+
+    argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-overwrite",
+        extra=["--overwrite", "--confirm-delete-paid-audio"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_OVERWRITE_UNSUPPORTED"
+    assert (tmp_path / "out" / "native-overwrite" / "chunks" / "chunk_01.mp3").exists()
+
+
+def test_native_run_held_lock_blocks_a_second_writer(tmp_path, monkeypatch, capsys, native_env):
+    """A held run lock fails the second writer closed instead of double-writing."""
+    from voiceover_pipeline.history.locking import acquire_run_lock
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Конкурентный писатель."])
+    run_root = tmp_path / "out" / "native-lock"
+
+    with acquire_run_lock(run_root):
+        argv = _generate_argv(tmp_path, script, "native-lock")
+        code, payload = _json_run(monkeypatch, capsys, argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_RUN_LOCKED"
+    assert provider.submits == []
+
+
+def test_native_run_with_missing_history_database_fails_closed(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Native local evidence without its database row refuses to run as legacy."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Потерянная история."])
+    code, _payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-lost"))
+    assert code == 0
+    run_root = tmp_path / "out" / "native-lost"
+
+    # Remove the committed history database but keep the run-local evidence.
+    database = native_env / "history.sqlite3"
+    for suffix in ("", "-wal", "-shm"):
+        candidate = Path(str(database) + suffix)
+        if candidate.exists():
+            candidate.unlink()
+
+    argv = _generate_argv(tmp_path, script, "native-lost", extra=["--resume"])
+    code, payload = _json_run(monkeypatch, capsys, argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_OWNERSHIP_RUN_MISSING"
+    assert (run_root / "chunks" / "chunk_01.mp3").exists()
+
+    # A present but unreadable database next to native evidence fails closed too.
+    root_db = native_env / "history.sqlite3"
+    root_db.write_bytes(b"not a database")
+    code, payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_OWNERSHIP_UNVERIFIABLE"
+    assert root_db.exists()
+
+
+def test_legacy_non_media_route_stays_on_the_json_writer(tmp_path, monkeypatch, capsys, native_env):
+    """A non-media polza-tts model keeps the legacy executor and JSON state."""
+    provider = FakeSyncProvider()
+    _install_provider(monkeypatch, provider)
+    monkeypatch.setattr(
+        cli,
+        "attach_costs",
+        lambda _provider, _key, _model, _started, chunks: chunks,
+    )
+    monkeypatch.setattr(
+        cli,
+        "concat_mp3_chunks",
+        lambda ffmpeg, chunks_dir, output: _concat(
+            ffmpeg, sorted(chunks_dir.glob("chunk_*.mp3")), output
+        ),
+    )
+    script = _script(tmp_path, ["Легаси-прогон."])
+
+    argv = _generate_argv(tmp_path, script, "legacy-run", model=POLZA_SYNC_MODEL, voice="alloy")
+    code, payload = _json_run(monkeypatch, capsys, argv)
+
+    assert code == 0
+    assert payload["status"] == "success"
+    run_root = tmp_path / "out" / "legacy-run"
+    state = json.loads((run_root / "run_state.json").read_text(encoding="utf-8"))
+    assert "native_history" not in state
+    assert not (run_root / ".voiceover-native-history.json").exists()
+
+    from voiceover_pipeline.commands.history import list_history
+
+    assert list_history()["count"] == 0
+
+
+def test_native_descriptor_is_required_for_ownership(monkeypatch, tmp_path, native_env):
+    """A native run row alone makes a root native-owned; a descriptor alone blocks."""
+    from voiceover_pipeline.services import native_generation
+
+    run_root = tmp_path / "out" / "owned"
+    run_root.mkdir(parents=True)
+    assert native_generation.resolve_native_ownership(run_root).route == "legacy"
+
+    native_generation._write_descriptor(run_root, "8e2f1c8e-0000-4000-8000-000000000001")
+    decision = native_generation.resolve_native_ownership(run_root)
+    assert decision.route == "blocked"
+    assert decision.error_code == "NATIVE_OWNERSHIP_RUN_MISSING"
+
+
+def test_native_run_parts_shape_is_valid() -> None:
+    """The native route is admitted only for the ordinary non-dialogue media run."""
+    import argparse
+
+    args = argparse.Namespace(
+        provider="polza-tts",
+        model=POLZA_MEDIA_MODEL,
+        with_timings=False,
+        tts_quality_provider=None,
+        no_trim=False,
+    )
+    assert cli._native_route_eligible(args, "markdown") is True
+    args.with_timings = True
+    assert cli._native_route_eligible(args, "markdown") is False
+    args.with_timings = False
+    args.no_trim = True
+    assert cli._native_route_eligible(args, "markdown") is False
+    args.no_trim = False
+    assert cli._native_route_eligible(args, "dialogue") is False
+
+
+def test_polza_provider_type_is_referenceable() -> None:
+    """Guard that the fake mirrors the real provider's callback surface."""
+    provider = PolzaTTSProvider(api_key="sk-test", model=POLZA_MEDIA_MODEL, voice="Rachel")
+    assert hasattr(provider, "on_media_task_accepted")
+    assert hasattr(provider, "on_media_completed")
+    assert hasattr(provider, "recover_media_task")
+
+
+def test_native_ownership_reads_a_live_wal_database(tmp_path, monkeypatch, capsys, native_env):
+    """A different run's active WAL must not hide a committed native owner."""
+    from voiceover_pipeline.history.database import HistoryDatabase
+    from voiceover_pipeline.services.native_generation import resolve_native_ownership
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Активная история."])
+    code, _ = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-wal"))
+    assert code == 0
+    run_root = tmp_path / "out" / "native-wal"
+    with HistoryDatabase(native_env / "history.sqlite3") as database:
+        database.connect()
+        database.migrate()
+        assert resolve_native_ownership(run_root).route == "native_existing"
+
+
+@pytest.mark.parametrize("artifact_kind", ["chunk", "final"])
+def test_native_resume_never_writes_through_artifact_symlink(
+    tmp_path, monkeypatch, capsys, native_env, artifact_kind
+):
+    """A recovered output must not overwrite an external file via an alias."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Не перезаписывать чужое."])
+    code, _ = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-alias"))
+    assert code == 0
+    run_root = tmp_path / "out" / "native-alias"
+    if artifact_kind == "chunk":
+        artifact = run_root / "chunks" / "chunk_01.mp3"
+    else:
+        slug = POLZA_MEDIA_MODEL.replace("/", "-")
+        artifact = run_root / f"native-alias-voiceover-{slug}.mp3"
+    external = tmp_path / "synthetic-external.mp3"
+    external.write_bytes(b"protected-external-bytes")
+    artifact.unlink()
+    artifact.symlink_to(external)
+    monkeypatch.setattr(
+        cli, "build_provider", lambda *_args, **_kwargs: pytest.fail("no provider on repair")
+    )
+
+    code, _ = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-alias", extra=["--resume"])
+    )
+    assert code != 0
+    assert external.read_bytes() == b"protected-external-bytes"
+
+
+@pytest.mark.parametrize("artifact_kind", ["chunk", "final"])
+def test_native_resume_never_clobbers_conflicting_regular_artifact(
+    tmp_path, monkeypatch, capsys, native_env, artifact_kind
+):
+    """Local recovery must not replace a pre-existing conflicting output name."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Сохраняем существующий файл."])
+    code, _ = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-conflict"))
+    assert code == 0
+    root = tmp_path / "out" / "native-conflict"
+    if artifact_kind == "chunk":
+        artifact = root / "chunks" / "chunk_01.mp3"
+    else:
+        slug = POLZA_MEDIA_MODEL.replace("/", "-")
+        artifact = root / f"native-conflict-voiceover-{slug}.mp3"
+    artifact.write_bytes(b"protected-existing-content")
+    monkeypatch.setattr(
+        cli, "build_provider", lambda *_args, **_kwargs: pytest.fail("no provider on repair")
+    )
+
+    code, _ = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "native-conflict", extra=["--resume"])
+    )
+    assert code != 0
+    assert artifact.read_bytes() == b"protected-existing-content"
+
+
+def test_native_provider_error_does_not_echo_untrusted_secret(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A remote error body is untrusted and cannot become the public JSON error."""
+    provider = FakeMediaProvider()
+
+    def fail_with_secret(_provider, _text, _chunk_id):
+        raise RuntimeError("Authorization: Bearer sk-synthetic-private")
+
+    provider.script = fail_with_secret
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Секрет не печатать."])
+    code, payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-error"))
+    assert code == 30
+    assert "sk-synthetic-private" not in json.dumps(payload)
+    assert provider.submits == ["chunk_01"]
+
+
+def test_native_descriptor_symlink_is_rejected_without_reading_target(
+    tmp_path, native_env, monkeypatch
+):
+    """The ownership probe must not follow a user-controlled descriptor link."""
+    from voiceover_pipeline.services import native_generation
+
+    run_root = tmp_path / "out" / "native-descriptor-link"
+    run_root.mkdir(parents=True)
+    external = tmp_path / "synthetic-descriptor-target.json"
+    external.write_text(
+        json.dumps(
+            {
+                "artifact_type": native_generation.OWNERSHIP_ARTIFACT_TYPE,
+                "ownership_version": native_generation.OWNERSHIP_VERSION,
+                "run_uuid": "8e2f1c8e-0000-4000-8000-000000000001",
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_root / native_generation.OWNERSHIP_FILE_NAME).symlink_to(external)
+    with pytest.raises(native_generation.NativeGenerationError) as excinfo:
+        native_generation.resolve_native_ownership(run_root)
+    assert excinfo.value.error_code == "NATIVE_OWNERSHIP_UNVERIFIABLE"
+
+
+def test_native_duplicate_part_evidence_fails_closed_before_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A part with two attempts is refused before any recovery or provider work."""
+    from voiceover_pipeline.history.database import HistoryDatabase
+    from voiceover_pipeline.history.repository import (
+        ATTEMPT_CALL_TYPE_TTS_CHUNK,
+        ATTEMPT_STATUS_REMOTE_ACCEPTED,
+        HistoryRepository,
+    )
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Дубль доказательств."])
+    code, _ = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-duplicate"))
+    assert code == 0
+    run_uuid = _run_uuid("native-duplicate")
+
+    database = HistoryDatabase(native_env / "history.sqlite3")
+    database.connect()
+    database.migrate()
+    try:
+        repository = HistoryRepository(database)
+        part = repository.get_parts(run_uuid)[0]
+        repository.add_attempt(
+            run_uuid,
+            call_type=ATTEMPT_CALL_TYPE_TTS_CHUNK,
+            part_uuid=part.part_uuid,
+            provider="polza-tts",
+            model=POLZA_MEDIA_MODEL,
+            remote_id="task-duplicate",
+            status=ATTEMPT_STATUS_REMOTE_ACCEPTED,
+        )
+    finally:
+        database.close()
+
+    monkeypatch.setattr(
+        cli,
+        "build_provider",
+        lambda *_args, **_kwargs: pytest.fail("duplicate evidence must not build a provider"),
+    )
+    resume_argv = _generate_argv(tmp_path, script, "native-duplicate", extra=["--resume"])
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_EVIDENCE_INCONSISTENT"
+    assert provider.submits == ["chunk_01"]
+
+
+def test_legacy_stale_selection_rechecks_native_ownership_before_writing(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A stale legacy selection must not delete or overwrite a native-owned root."""
+    from voiceover_pipeline.services import native_generation
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Нативный владелец каталога."])
+    code, _ = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "native-recheck"))
+    assert code == 0
+    run_root = tmp_path / "out" / "native-recheck"
+    chunk = run_root / "chunks" / "chunk_01.mp3"
+    descriptor = run_root / ".voiceover-native-history.json"
+    assert chunk.exists() and descriptor.exists()
+
+    real_resolve = native_generation.resolve_native_ownership
+    calls = {"n": 0}
+
+    def stale_first_read(output_root, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # The early read raced before the native commit was visible.
+            return native_generation.NativeOwnership(route="legacy")
+        return real_resolve(output_root, **kwargs)
+
+    monkeypatch.setattr(cli.native_generation, "resolve_native_ownership", stale_first_read)
+    argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-recheck",
+        extra=["--overwrite", "--confirm-delete-paid-audio"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"]
+    assert chunk.exists()
+    assert descriptor.exists()
+
+
+def test_native_fresh_run_refuses_a_root_with_existing_local_state(tmp_path):
+    """A fresh native run must not claim a root another writer already owns."""
+    from voiceover_pipeline.history.database import HistoryDatabase
+    from voiceover_pipeline.history.repository import HistoryRepository
+    from voiceover_pipeline.services import native_generation
+    from voiceover_pipeline.services.prepare import PreparedPart, PreparedRun
+
+    run_root = tmp_path / "out" / "native-race"
+    run_root.mkdir(parents=True)
+    legacy_state = run_root / "run_state.json"
+    legacy_bytes = json.dumps({"status": "completed", "chunks": []})
+    legacy_state.write_text(legacy_bytes, encoding="utf-8")
+
+    chunk = ScriptChunk(number=1, id="chunk_01", text="race", voice="Rachel")
+    prepared = PreparedRun(
+        provider="polza-tts",
+        model=POLZA_MEDIA_MODEL,
+        voice="Rachel",
+        style_prompt=None,
+        prompt_mode="none",
+        parts=(PreparedPart(chunk=chunk, voice="Rachel"),),
+    )
+
+    database = HistoryDatabase(tmp_path / "history.sqlite3")
+    database.connect()
+    database.migrate()
+    try:
+        repository = HistoryRepository(database)
+        with pytest.raises(native_generation.NativeGenerationError) as excinfo:
+            native_generation.execute_native_tts(
+                repository=repository,
+                run_root=run_root,
+                paths=object(),
+                prepared=prepared,
+                chunks=[chunk],
+                script_format="markdown",
+                script_path=tmp_path / "script.md",
+                output_options={"trim_final_silence": True, "processing_version": 1},
+                ffmpeg_path="ffmpeg",
+                ffprobe_path="ffprobe",
+                user_label="native-race",
+                resume=False,
+                provider_factory=lambda: pytest.fail("no provider for a refused fresh run"),
+                hooks=object(),
+                logger=object(),
+            )
+        assert excinfo.value.error_code == "NATIVE_OWNERSHIP_RUN_MISSING"
+        assert repository.find_runs_by_root(str(run_root.resolve()), limit=1) == []
+    finally:
+        database.close()
+    assert legacy_state.read_text(encoding="utf-8") == legacy_bytes
+
+
+@pytest.mark.parametrize("writer", ["descriptor", "export"])
+def test_native_json_writer_never_follows_predictable_temporary_symlink(tmp_path, writer):
+    """A pre-existing temp-name alias cannot overwrite an external file."""
+    from voiceover_pipeline.history.native_export import _atomic_write_json
+    from voiceover_pipeline.services import native_generation
+
+    run_root = tmp_path / "out" / "native-temp-link"
+    run_root.mkdir(parents=True)
+    external = tmp_path / "synthetic-protected.txt"
+    external.write_text("protected", encoding="utf-8")
+    if writer == "descriptor":
+        target = run_root / native_generation.OWNERSHIP_FILE_NAME
+        (run_root / f"{native_generation.OWNERSHIP_FILE_NAME}.tmp").symlink_to(external)
+        native_generation._write_descriptor(run_root, "8e2f1c8e-0000-4000-8000-000000000001")
+    else:
+        target = run_root / "run_state.json"
+        (run_root / "run_state.json.tmp").symlink_to(external)
+        _atomic_write_json(target, {"native_history": "synthetic"})
+    assert target.exists()
+    assert external.read_text(encoding="utf-8") == "protected"
+
+
+def test_native_locked_fresh_run_creates_no_run_directory_before_lock(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A fresh native attempt refused by a held lock leaves no run directory behind."""
+    from voiceover_pipeline.history.locking import acquire_run_lock
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Никаких каталогов до лока."])
+    run_root = tmp_path / "out" / "native-no-dirs"
+
+    with acquire_run_lock(run_root):
+        code, payload = _json_run(
+            monkeypatch, capsys, _generate_argv(tmp_path, script, "native-no-dirs")
+        )
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_RUN_LOCKED"
+    # The lock is taken before any directory or descriptor write, so a refused
+    # fresh attempt must not create even the output directory.
+    assert not (tmp_path / "out").exists()
+    assert provider.submits == []
+
+
+def test_legacy_writer_holds_run_lock_across_ownership_recheck(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """After the legacy ownership recheck, no native claim can acquire the run lock."""
+    from voiceover_pipeline.history.locking import HistoryRunLockedError, acquire_run_lock
+    from voiceover_pipeline.services import native_generation
+
+    provider = FakeSyncProvider()
+    _install_provider(monkeypatch, provider)
+    monkeypatch.setattr(
+        cli, "attach_costs", lambda _provider, _key, _model, _started, chunks: chunks
+    )
+    monkeypatch.setattr(
+        cli,
+        "concat_mp3_chunks",
+        lambda ffmpeg, chunks_dir, output: _concat(
+            ffmpeg, sorted(chunks_dir.glob("chunk_*.mp3")), output
+        ),
+    )
+    script = _script(tmp_path, ["Легаси под локом."])
+    argv = _generate_argv(tmp_path, script, "legacy-lock", model=POLZA_SYNC_MODEL, voice="alloy")
+
+    observed: dict[str, object] = {}
+    real_reject = cli._reject_native_owned_root_for_legacy
+
+    def spy_reject(paths):
+        real_reject(paths)
+        run_root = paths.output_root
+        # The interval the reviewer flagged: right after the ownership recheck and
+        # before the legacy JSON writer runs. A native claim must not acquire the
+        # run lock here, so it can neither commit a snapshot nor submit.
+        try:
+            with acquire_run_lock(run_root):
+                observed["second_writer_acquired"] = True
+        except HistoryRunLockedError:
+            observed["second_writer_acquired"] = False
+        observed["ownership_route"] = native_generation.resolve_native_ownership(run_root).route
+        observed["json_written"] = (run_root / "run_state.json").exists()
+
+    monkeypatch.setattr(cli, "_reject_native_owned_root_for_legacy", spy_reject)
+
+    code, payload = _json_run(monkeypatch, capsys, argv)
+
+    assert code == 0
+    assert payload["status"] == "success"
+    run_root = tmp_path / "out" / "legacy-lock"
+    assert observed["second_writer_acquired"] is False
+    assert observed["ownership_route"] == "legacy"
+    assert observed["json_written"] is False
+    assert provider.calls == ["chunk_01"]
+    state = json.loads((run_root / "run_state.json").read_text(encoding="utf-8"))
+    assert "native_history" not in state
+    assert not (run_root / ".voiceover-native-history.json").exists()
+
+    from voiceover_pipeline.commands.history import list_history
+
+    assert list_history()["count"] == 0
+
+
+def test_script_chunk_helpers_are_stable() -> None:
+    """Sanity check that the native snapshot consumes plain generated chunk ids."""
+    chunk = ScriptChunk(number=1, id="chunk_01", text="x")
+    assert chunk.id == "chunk_01"

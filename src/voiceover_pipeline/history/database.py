@@ -492,6 +492,51 @@ def connect_readonly(
     return connection
 
 
+def connect_readonly_consistent(
+    path: Path | str,
+    *,
+    migrations: Sequence[Migration] | None = None,
+) -> sqlite3.Connection:
+    """Open an existing history database read-only with a WAL-consistent view.
+
+    Unlike :func:`connect_readonly`, which pins ``immutable=1`` and therefore
+    refuses any adjacent ``-wal`` sidecar, this reader accepts a live
+    ``-wal``/``-shm`` pair and reads the committed frames written through it, so a
+    run another process just committed is never missed as a stale main-file
+    snapshot. It still writes nothing of its own: no migration, no DDL, no
+    journal-mode switch, and no database creation. A hot ``-journal`` (an unclean
+    non-WAL rollback) is refused because the main file may be mid-rollback, and a
+    symlinked database, home directory, or sidecar is rejected before any connect.
+    The migration ledger is validated with the same read-only gate as
+    :meth:`HistoryDatabase.migrate`, so a foreign, corrupt, or newer database
+    raises the corresponding :class:`HistoryDatabaseError`; a missing file raises
+    :class:`FileNotFoundError`.
+    """
+    target = Path(path).expanduser().absolute()
+    _reject_symlinked_database(target)
+    if not target.exists():
+        raise FileNotFoundError(str(target))
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = target.with_name(target.name + suffix)
+        if sidecar.is_symlink():
+            raise HistoryDatabaseError(f"history database sidecar must not be a symlink: {sidecar}")
+    journal = target.with_name(target.name + "-journal")
+    if journal.exists():
+        raise HistoryDatabaseReadOnlyError(
+            f"history database {target} has a journal sidecar; refusing to read a "
+            "possibly unrolled-back main file"
+        )
+    connection = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=2.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys = ON")
+    try:
+        _validate_schema(connection, MIGRATIONS if migrations is None else migrations)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
 class HistoryDatabase:
     """Owns the SQLite connection and migration state for one history database.
 

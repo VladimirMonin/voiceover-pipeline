@@ -144,6 +144,29 @@ class HistoryPaidRawConflictError(HistoryRepositoryError):
     """
 
 
+class HistoryPartCompletionConflictError(HistoryRepositoryError):
+    """A converted part artifact cannot be committed on the named attempt.
+
+    Raised when the target is not a paid ``tts_chunk`` attempt of the named run
+    and part, when the attempt has not already linked its verified raw audio
+    (``raw_saved``), when a partial or conflicting converted artifact already
+    exists, or when a guarded write affects no row. The completion is the last
+    per-part stage, so a finished part is never re-linked and a partial write
+    never leaves a completed part without its own converted artifact.
+    """
+
+
+class HistoryRunCompletionConflictError(HistoryRepositoryError):
+    """A run cannot be marked completed from its committed history.
+
+    Raised when the named run is an imported legacy run, when one of its parts
+    has not reached the completed stage, when a partial or conflicting final
+    artifact already exists, or when a guarded write affects no row. A completed
+    run is only ever returned as an idempotent repeat of the same final evidence,
+    never by committing a second close.
+    """
+
+
 class HistoryPaidAttemptInTransactionError(HistoryRepositoryError):
     """A paid attempt transition was attempted inside an already open transaction.
 
@@ -208,6 +231,19 @@ _RAW_AUDIO_MIME_BY_FORMAT = {"mp3": "audio/mpeg", "wav": "audio/wav", "pcm16": "
 # Part stage written once its paid raw response is linked, but only while the
 # part stage is still unset: an imported or already-staged part keeps its own.
 PART_STAGE_RAW_SAVED = "raw_saved"
+# Part stage written once its converted chunk audio is committed to history. It
+# is the last per-part stage of the native TTS slice, so a resumed run can skip
+# synthesis for a part whose conversion is already durable.
+PART_STAGE_COMPLETED = "completed"
+# Managed artifact roles of the native TTS slice: the converted per-part chunk
+# audio, and the assembled final run audio. Both are ``managed_relative`` rows
+# whose digest, size, and bounded processing metadata let a later export rebuild
+# the compatibility JSON without touching the filesystem again.
+ARTIFACT_ROLE_CHUNK_AUDIO = "chunk_audio"
+ARTIFACT_ROLE_FINAL_AUDIO = "final_audio"
+# Attempt status once its converted chunk artifact is committed. A completed
+# attempt may never be reserved again, so finished paid work cannot be repeated.
+ATTEMPT_STATUS_COMPLETED = "completed"
 # The only provider route whose accepted media task id this repository records.
 POLZA_TTS_PROVIDER_ID = "polza-tts"
 # A run whose work already finished. Repeating finished work creates a new run
@@ -424,6 +460,39 @@ def _observed_media_cost(value: Decimal | int | float | str) -> Cost:
             exact_available=True,
         )
     raise ValueError(_OBSERVED_MEDIA_COST_REJECTED)
+
+
+def _artifact_matches(
+    artifact: ArtifactRecord,
+    *,
+    role: str,
+    path: str,
+    mime: str,
+    size_bytes: int,
+    sha256: str,
+    media_metadata: dict[str, Any],
+    part_uuid: str | None,
+    attempt_uuid: str | None,
+) -> bool:
+    """Whether a committed managed artifact carries exactly the expected evidence.
+
+    Every field a later export or resume reads must agree: the role, the
+    managed-relative path kind and path, the MIME, the byte size, the digest, the
+    bounded processing metadata, and the part/attempt links. Only then is a
+    repeated completion call an idempotent no-op instead of a conflict.
+    """
+    return (
+        artifact.role == role
+        and artifact.path_kind == PATH_KIND_MANAGED_RELATIVE
+        and artifact.path == path
+        and artifact.mime == mime
+        and artifact.size_bytes == size_bytes
+        and artifact.sha256 == sha256
+        and artifact.media_metadata == media_metadata
+        and artifact.part_uuid == part_uuid
+        and artifact.attempt_uuid == attempt_uuid
+        and artifact.availability == AVAILABILITY_PRESENT
+    )
 
 
 def _same_observed_cost(stored: Cost, observed: Cost) -> bool:
@@ -1668,6 +1737,255 @@ class HistoryRepository:
                 )
             return advanced, updated, artifact
 
+    def record_tts_part_completed(
+        self,
+        run_uuid: str,
+        *,
+        part_uuid: str,
+        attempt_uuid: str,
+        expected_revision: int,
+        path: str,
+        mime: str,
+        size_bytes: int,
+        sha256: str,
+        media_metadata: dict[str, Any],
+    ) -> tuple[RunRecord, ArtifactRecord]:
+        """Commit one converted part artifact and move its attempt to completed.
+
+        This is the single seam that turns a saved paid raw response (already in
+        ``raw_saved``) into the canonical converted ``chunks/<id>.mp3`` artifact.
+        Inside one :meth:`transaction` it rechecks the run, part, and paid
+        ``tts_chunk`` attempt, compare-and-swaps the run revision, inserts exactly
+        one :data:`ARTIFACT_ROLE_CHUNK_AUDIO` managed artifact carrying the caller's
+        digest, size, MIME, and bounded processing metadata, moves the attempt to
+        :data:`ATTEMPT_STATUS_COMPLETED`, and sets the part stage to
+        :data:`PART_STAGE_COMPLETED`. The caller hashes and writes the file
+        *before* this call; no filesystem or provider work happens inside the
+        transaction.
+
+        A repeated identical call whose ``expected_revision`` is still current is
+        an idempotent no-op: it advances no revision and inserts no second
+        artifact, so a crash after the database commit but before a later export
+        can be retried safely. A stale revision, a foreign part, a different
+        attempt, an unexpected attempt status, or a partial or conflicting
+        artifact fails closed with no database mutation.
+
+        The call owns its transaction and refuses to run inside an already open
+        one. Raises :class:`ValueError` for a malformed argument before any write;
+        :class:`HistoryPaidAttemptInTransactionError` inside an open transaction;
+        :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign part or attempt;
+        :class:`HistoryPartCompletionConflictError` for an unexpected attempt
+        state, a conflicting artifact, or a guarded write that affects no row; and
+        :class:`HistoryRevisionConflictError` for a stale revision.
+        """
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        _require_expected_revision(expected_revision)
+        _require_managed_relative_path(path)
+        _require_identity_field(mime, "mime")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise ValueError("size_bytes must be a non-negative integer")
+        _require_identity_field(sha256, "sha256")
+        if not isinstance(media_metadata, dict):
+            raise ValueError("media_metadata must be a mapping")
+        self._require_no_open_transaction("record_tts_part_completed")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            part = self._get_part(part_identifier)
+            if part is None or part.run_uuid != run_uuid:
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            attempt = self.get_attempt(attempt_identifier)
+            if (
+                attempt is None
+                or attempt.run_uuid != run_uuid
+                or attempt.part_uuid != part_identifier
+                or attempt.call_type != ATTEMPT_CALL_TYPE_TTS_CHUNK
+            ):
+                raise HistoryPartNotFoundError(
+                    f"no paid chunk attempt for run {run_uuid!r} part {part_identifier!r}"
+                )
+            existing = self._part_role_artifact(
+                part_identifier, attempt_identifier, ARTIFACT_ROLE_CHUNK_AUDIO
+            )
+            if attempt.status == ATTEMPT_STATUS_COMPLETED:
+                if existing is None or not _artifact_matches(
+                    existing,
+                    role=ARTIFACT_ROLE_CHUNK_AUDIO,
+                    path=path,
+                    mime=mime,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                    media_metadata=media_metadata,
+                    part_uuid=part_identifier,
+                    attempt_uuid=attempt_identifier,
+                ):
+                    raise HistoryPartCompletionConflictError(
+                        f"attempt {attempt_identifier!r} records {ATTEMPT_STATUS_COMPLETED!r} "
+                        "but its converted chunk artifact is missing or different"
+                    )
+                if run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return run, existing
+            if existing is not None:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} already carries a converted chunk "
+                    f"artifact but is not {ATTEMPT_STATUS_COMPLETED!r}"
+                )
+            if attempt.status != ATTEMPT_STATUS_RAW_SAVED:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is {attempt.status!r}, not "
+                    f"{ATTEMPT_STATUS_RAW_SAVED!r}; refusing a converted chunk before its raw "
+                    "bytes are linked"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            artifact = self.add_artifact(
+                run_uuid,
+                role=ARTIFACT_ROLE_CHUNK_AUDIO,
+                path_kind=PATH_KIND_MANAGED_RELATIVE,
+                path=path,
+                part_uuid=part_identifier,
+                attempt_uuid=attempt_identifier,
+                mime=mime,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_metadata=media_metadata,
+            )
+            cursor = self._connection.execute(
+                "UPDATE attempts SET status = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND run_uuid = ? AND status = ?",
+                (
+                    ATTEMPT_STATUS_COMPLETED,
+                    utc_now(),
+                    attempt_identifier,
+                    run_uuid,
+                    ATTEMPT_STATUS_RAW_SAVED,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} did not carry linked raw audio during the "
+                    "conversion transition; refusing a partial completion"
+                )
+            cursor = self._connection.execute(
+                "UPDATE parts SET stage = ?, updated_at = ? WHERE part_uuid = ? AND run_uuid = ?",
+                (PART_STAGE_COMPLETED, utc_now(), part_identifier, run_uuid),
+            )
+            if cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} vanished during the conversion transition"
+                )
+            return advanced, artifact
+
+    def record_tts_run_completed(
+        self,
+        run_uuid: str,
+        *,
+        expected_revision: int,
+        path: str,
+        mime: str,
+        size_bytes: int,
+        sha256: str,
+        media_metadata: dict[str, Any],
+    ) -> tuple[RunRecord, ArtifactRecord]:
+        """Commit the assembled final run audio and close the run.
+
+        This is the single seam that marks a native TTS run complete. Inside one
+        :meth:`transaction` it rechecks the run, refuses an imported legacy run,
+        requires every committed part to have reached :data:`PART_STAGE_COMPLETED`,
+        compare-and-swaps the run revision with :data:`RUN_STATUS_COMPLETED`, and
+        inserts exactly one :data:`ARTIFACT_ROLE_FINAL_AUDIO` managed artifact with
+        the caller's digest, size, MIME, and bounded processing metadata. The
+        caller assembles and hashes the file *before* this call; no filesystem or
+        provider work happens inside the transaction.
+
+        A repeated identical call on the already-completed run whose
+        ``expected_revision`` is still current is an idempotent no-op. A stale
+        revision, an incomplete part, or a partial or conflicting final artifact
+        fails closed with no database mutation. The call owns its transaction and
+        refuses to run inside an already open one. Raises :class:`ValueError` for a
+        malformed argument before any write; :class:`HistoryPaidAttemptInTransactionError`
+        inside an open transaction; :class:`HistoryRunNotFoundError` for a missing
+        run; :class:`HistoryRunNotReservableError` for an imported legacy run;
+        :class:`HistoryRunCompletionConflictError` for an incomplete part, a
+        conflicting artifact, or a guarded write that affects no row; and
+        :class:`HistoryRevisionConflictError` for a stale revision.
+        """
+        _require_expected_revision(expected_revision)
+        _require_managed_relative_path(path)
+        _require_identity_field(mime, "mime")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise ValueError("size_bytes must be a non-negative integer")
+        _require_identity_field(sha256, "sha256")
+        if not isinstance(media_metadata, dict):
+            raise ValueError("media_metadata must be a mapping")
+        self._require_no_open_transaction("record_tts_run_completed")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            if run.legacy_source_root is not None:
+                raise HistoryRunNotReservableError(
+                    f"run {run_uuid!r} is an imported legacy run; refusing a native completion"
+                )
+            existing = self._run_role_artifact(run_uuid, ARTIFACT_ROLE_FINAL_AUDIO)
+            if run.status == RUN_STATUS_COMPLETED:
+                if existing is None or not _artifact_matches(
+                    existing,
+                    role=ARTIFACT_ROLE_FINAL_AUDIO,
+                    path=path,
+                    mime=mime,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                    media_metadata=media_metadata,
+                    part_uuid=None,
+                    attempt_uuid=None,
+                ):
+                    raise HistoryRunCompletionConflictError(
+                        f"run {run_uuid!r} is already completed but its final artifact is "
+                        "missing or different"
+                    )
+                if run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return run, existing
+            if existing is not None:
+                raise HistoryRunCompletionConflictError(
+                    f"run {run_uuid!r} already carries a final artifact but is not completed"
+                )
+            parts = self.get_parts(run_uuid)
+            if not parts:
+                raise HistoryRunCompletionConflictError(
+                    f"run {run_uuid!r} has no parts to complete"
+                )
+            if any(part.stage != PART_STAGE_COMPLETED for part in parts):
+                raise HistoryRunCompletionConflictError(
+                    f"run {run_uuid!r} still has parts without a converted chunk artifact"
+                )
+            advanced = self.advance_run_revision(
+                run_uuid, expected_revision=expected_revision, status=RUN_STATUS_COMPLETED
+            )
+            artifact = self.add_artifact(
+                run_uuid,
+                role=ARTIFACT_ROLE_FINAL_AUDIO,
+                path_kind=PATH_KIND_MANAGED_RELATIVE,
+                path=path,
+                mime=mime,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_metadata=media_metadata,
+            )
+            return advanced, artifact
+
     def add_artifact(
         self,
         run_uuid: str,
@@ -2042,6 +2360,43 @@ class HistoryRepository:
                 "refusing to link a second"
             )
         return artifact
+
+    def _part_role_artifact(
+        self, part_uuid: str, attempt_uuid: str, role: str
+    ) -> ArtifactRecord | None:
+        """Return the one managed artifact of ``role`` bound to this part and attempt.
+
+        More than one matching row is a conflict: the canonical history links
+        exactly one converted chunk artifact per attempt, so a duplicate is never
+        adopted or silently ignored.
+        """
+        rows = self._connection.execute(
+            "SELECT * FROM artifacts WHERE part_uuid = ? AND attempt_uuid = ? AND role = ?",
+            (part_uuid, attempt_uuid, role),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise HistoryPartCompletionConflictError(
+                f"attempt {attempt_uuid!r} carries {len(rows)} {role!r} artifacts; refusing "
+                "to add another"
+            )
+        return _row_to_artifact(rows[0])
+
+    def _run_role_artifact(self, run_uuid: str, role: str) -> ArtifactRecord | None:
+        """Return the one run-level managed artifact of ``role`` for this run."""
+        rows = self._connection.execute(
+            "SELECT * FROM artifacts WHERE run_uuid = ? AND role = ? "
+            "AND part_uuid IS NULL AND attempt_uuid IS NULL",
+            (run_uuid, role),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise HistoryRunCompletionConflictError(
+                f"run {run_uuid!r} carries {len(rows)} {role!r} artifacts; refusing to add another"
+            )
+        return _row_to_artifact(rows[0])
 
     def _find_attempt_uuid_for_part(
         self, run_uuid: str, part_uuid: str, call_type: str

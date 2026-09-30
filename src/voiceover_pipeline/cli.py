@@ -6,6 +6,8 @@ import json
 import shutil
 import sys
 import time  # noqa: F401 - shared sleep seam tests patch via cli.time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
@@ -66,6 +68,7 @@ from .gemini_dialogue import (
     is_dialogue_format,
     validate_gemini_dialogue_file,
 )
+from .history.locking import HistoryRunLockedError, acquire_run_lock
 from .history.repository import DEFAULT_QUERY_LIMIT
 from .local_runtime.contracts import OmniVoiceRequest
 from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
@@ -132,6 +135,7 @@ from .services import (
     costs,
     execution,
     finalization,
+    native_generation,
     provider_factory,
     recovery,
     transcription,
@@ -141,6 +145,7 @@ from .services.prepare import (
     bind_omnivoice_dialogue_fingerprints,
     default_voice,
     prepare_generation_identity,
+    prepare_run,
     prepare_runtime_chunks,
     prepare_script_fragments,
     resolve_script_format,
@@ -1124,134 +1129,353 @@ def generate(args: argparse.Namespace) -> None:
             }
         )
 
-    if args.resume and not args.skip_existing and paths.output_root.exists():
-        # A resume whose previous paid submit is unconfirmed must fail closed before
-        # any optional quality/timing preflight, key read, provider build, identity
-        # check, or pricing I/O: the documented PAID_SUBMIT_UNCONFIRMED envelope
-        # cannot be replaced by a key or dependency error, and no request may leave.
-        # The one exception is a paid attempt the same command can recover without
-        # a new submit: saved raw audio rebuilt locally, or a stored paid Polza
-        # media id finished with GET calls only. Both still match this exact
-        # provider/model/voice/script chunk, where a validated dialogue's voice is
-        # its first cast voice rather than the provider default. Every other marker
-        # keeps the block.
-        # ``--skip-existing`` keeps its precedence and reports an existing folder as
-        # skipped without loading run state. The same guard runs inside
-        # ``_generate_step`` for direct callers.
-        pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
-        if pending_attempt is not None:
-            resume_state, _state_unreadable = _load_status_state(paths.output_root / STATE_FILE)
-            if not _recoverable_paid_attempts(
-                resume_state,
-                provider=args.provider,
-                model=args.model,
-                voice=_resume_guard_voice(args, gemini_report),
-                chunks=chunks,
-                chunks_dir=paths.chunks_dir,
-                run_root=paths.output_root,
-            ):
-                _reject_unconfirmed_paid_resume(
-                    pending_attempt, GenerationLogger(paths.output_root / LOG_FILE)
-                )
-
-    if (
-        is_dialogue_format(script_format)
-        and args.provider == "openrouter-tts"
-        and not getattr(args, "tts_quality_provider", None)
-    ):
+    # Native history ownership is resolved before the legacy JSON recovery guards,
+    # provider construction, pricing, or any directory deletion. A committed
+    # native run row or native local evidence decides the route; a fail-closed
+    # classification stops here instead of falling back to the legacy writer.
+    native_ownership = native_generation.resolve_native_ownership(paths.output_root)
+    if native_ownership.route == "blocked":
         fail(
-            "OpenRouter dialogue requires --tts-quality-provider so every paid turn is "
-            "transcribed and checked before concat.",
-            _EXIT_ARGS,
+            native_ownership.reason or "native run ownership could not be verified.",
+            _EXIT_PROVIDER,
+            details={"error_code": native_ownership.error_code or "NATIVE_OWNERSHIP_UNVERIFIABLE"},
         )
-
-    if is_dialogue_format(script_format) and getattr(args, "tts_quality_provider", None):
-        _preflight_tts_quality_provider(args)
-
-    if getattr(args, "with_timings", False):
-        _preflight_timing_dependency(
-            getattr(args, "timing_provider", "faster-whisper"),
+    if native_ownership.route == "native_existing" or (
+        _native_route_eligible(args, script_format) and not paths.output_root.exists()
+    ):
+        _run_native_route(
+            args,
+            chunks,
+            script_format,
+            paths,
+            native_ownership,
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
         )
+        return
 
-    if paths.output_root.exists():
-        if args.skip_existing:
-            files = _list_artifact_files(paths)
-            _json_ok(
-                {
-                    "status": "skipped",
-                    "reason": "run folder exists",
-                    "run_id": paths.prefix,
-                    "files": files,
-                }
-            )
-            return
-        if args.resume:
-            pass
-        elif not args.overwrite:
-            fail(
-                f"Run folder already exists: {paths.output_root}. Use --resume to continue, --skip-existing, or --overwrite.",
-                _EXIT_PROVIDER,
-            )
-        if args.overwrite:
-            # The marker check precedes the paid-MP3 confirmation: a run that
-            # already saved one MP3 and later left an unconfirmed attempt must
-            # report the documented PAID_SUBMIT_UNCONFIRMED envelope instead of
-            # the generic paid-audio delete error.
+    # The native executor takes this same one-writer run lock, so holding it here
+    # for the whole mutable legacy tail keeps ownership selection and mutation from
+    # interleaving with a concurrent native writer for this run root.
+    with _legacy_run_lock(paths):
+        if args.resume and not args.skip_existing and paths.output_root.exists():
+            # A resume whose previous paid submit is unconfirmed must fail closed before
+            # any optional quality/timing preflight, key read, provider build, identity
+            # check, or pricing I/O: the documented PAID_SUBMIT_UNCONFIRMED envelope
+            # cannot be replaced by a key or dependency error, and no request may leave.
+            # The one exception is a paid attempt the same command can recover without
+            # a new submit: saved raw audio rebuilt locally, or a stored paid Polza
+            # media id finished with GET calls only. Both still match this exact
+            # provider/model/voice/script chunk, where a validated dialogue's voice is
+            # its first cast voice rather than the provider default. Every other marker
+            # keeps the block.
+            # ``--skip-existing`` keeps its precedence and reports an existing folder as
+            # skipped without loading run state. The same guard runs inside
+            # ``_generate_step`` for direct callers.
             pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
             if pending_attempt is not None:
-                fail(
-                    "Refusing --overwrite: "
-                    f"{paths.output_root} holds an unconfirmed paid submit "
-                    f"({pending_attempt.get('id')}, status {pending_attempt.get('status')}). "
-                    "Keep this run as evidence and use a different --run-id for an explicitly "
-                    "new attempt.",
-                    _EXIT_PROVIDER,
-                    details=_paid_submit_unconfirmed_details(pending_attempt),
-                )
-            if _has_paid_chunk_audio(paths) and not args.confirm_delete_paid_audio:
-                fail(
-                    "Refusing to delete existing paid chunk audio. Use --resume, or add --confirm-delete-paid-audio with --overwrite.",
-                    _EXIT_PROVIDER,
-                )
-            _safe_remove_run_dir(paths.output_root, args.output_dir)
+                resume_state, _state_unreadable = _load_status_state(paths.output_root / STATE_FILE)
+                if not _recoverable_paid_attempts(
+                    resume_state,
+                    provider=args.provider,
+                    model=args.model,
+                    voice=_resume_guard_voice(args, gemini_report),
+                    chunks=chunks,
+                    chunks_dir=paths.chunks_dir,
+                    run_root=paths.output_root,
+                ):
+                    _reject_unconfirmed_paid_resume(
+                        pending_attempt, GenerationLogger(paths.output_root / LOG_FILE)
+                    )
 
-    _ensure_run_dirs(paths)
+        if (
+            is_dialogue_format(script_format)
+            and args.provider == "openrouter-tts"
+            and not getattr(args, "tts_quality_provider", None)
+        ):
+            fail(
+                "OpenRouter dialogue requires --tts-quality-provider so every paid turn is "
+                "transcribed and checked before concat.",
+                _EXIT_ARGS,
+            )
 
+        if is_dialogue_format(script_format) and getattr(args, "tts_quality_provider", None):
+            _preflight_tts_quality_provider(args)
+
+        if getattr(args, "with_timings", False):
+            _preflight_timing_dependency(
+                getattr(args, "timing_provider", "faster-whisper"),
+            )
+
+        # The ownership decision was made before the run lock was taken, so a
+        # concurrent native writer can commit between that read and this write.
+        # Re-resolve with the WAL-consistent reader and fail closed, rather than let
+        # the legacy writer create, resume, overwrite, or delete a native-owned root.
+        _reject_native_owned_root_for_legacy(paths)
+
+        if paths.output_root.exists():
+            if args.skip_existing:
+                files = _list_artifact_files(paths)
+                _json_ok(
+                    {
+                        "status": "skipped",
+                        "reason": "run folder exists",
+                        "run_id": paths.prefix,
+                        "files": files,
+                    }
+                )
+                return
+            if args.resume:
+                pass
+            elif not args.overwrite:
+                fail(
+                    f"Run folder already exists: {paths.output_root}. Use --resume to continue, --skip-existing, or --overwrite.",
+                    _EXIT_PROVIDER,
+                )
+            if args.overwrite:
+                # The marker check precedes the paid-MP3 confirmation: a run that
+                # already saved one MP3 and later left an unconfirmed attempt must
+                # report the documented PAID_SUBMIT_UNCONFIRMED envelope instead of
+                # the generic paid-audio delete error.
+                pending_attempt = _unconfirmed_paid_attempt_in_existing_run(paths)
+                if pending_attempt is not None:
+                    fail(
+                        "Refusing --overwrite: "
+                        f"{paths.output_root} holds an unconfirmed paid submit "
+                        f"({pending_attempt.get('id')}, status {pending_attempt.get('status')}). "
+                        "Keep this run as evidence and use a different --run-id for an explicitly "
+                        "new attempt.",
+                        _EXIT_PROVIDER,
+                        details=_paid_submit_unconfirmed_details(pending_attempt),
+                    )
+                if _has_paid_chunk_audio(paths) and not args.confirm_delete_paid_audio:
+                    fail(
+                        "Refusing to delete existing paid chunk audio. Use --resume, or add --confirm-delete-paid-audio with --overwrite.",
+                        _EXIT_PROVIDER,
+                    )
+                _safe_remove_run_dir(paths.output_root, args.output_dir)
+
+        _ensure_run_dirs(paths)
+
+        try:
+            generation_identity = prepare_generation_identity(
+                args,
+                chunks,
+                gemini_report,
+                resolve_style_prompt=_resolve_provider_style_prompt,
+            )
+        except PreparationError as exc:
+            fail(str(exc), _EXIT_ARGS)
+        chunks = generation_identity.chunks
+        style_prompt = generation_identity.style_prompt
+        prompt_mode = generation_identity.prompt_mode
+        _preflight_dialogue_resume(args, chunks, paths, style_prompt, prompt_mode)
+        api_key = read_api_key(args)
+        provider_for_generation: Any = build_provider(args, api_key, style_prompt, prompt_mode)
+        if args.provider == "omnivoice-local" and gemini_report:
+            provider_for_generation = _bind_dialogue_voice_bank_providers(
+                provider_for_generation,
+                args.voice_bank_catalog,
+                gemini_report["speaker_voice_map"],
+            )
+        pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
+
+        _generate_step(
+            args,
+            provider_for_generation,
+            ffmpeg_path,
+            ffprobe_path,
+            chunks,
+            api_key,
+            pricing_snapshot,
+            paths,
+            style_prompt,
+            prompt_mode,
+        )
+
+
+def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool:
+    """Whether this command is the admitted DB-first native TTS route.
+
+    Only an ordinary, non-dialogue ``polza-tts`` run on the ElevenLabs ``/media``
+    model route, without integrated timing or quality processing and with the
+    fixed trimming semantics the native slice records, is executed by the native
+    executor. Every other route keeps the legacy executor and its JSON writer
+    unchanged.
+    """
+    return (
+        script_format == "markdown"
+        and getattr(args, "provider", None) == "polza-tts"
+        and isinstance(getattr(args, "model", None), str)
+        and args.model.startswith("elevenlabs/")
+        and not getattr(args, "with_timings", False)
+        and not getattr(args, "tts_quality_provider", None)
+        and not getattr(args, "no_trim", False)
+    )
+
+
+@contextmanager
+def _legacy_run_lock(paths) -> Iterator[None]:
+    """Serialize the legacy writer against every other writer of one run root.
+
+    Ownership was resolved before this lock is taken, so a concurrent native
+    writer could otherwise commit between that read and the legacy write. The
+    native executor takes this same one-writer run lock, so holding it from the
+    legacy ownership recheck through the whole legacy generation means the two
+    writers of one run root can never interleave. Contention fails closed with the
+    stable provider exit code and a bounded message that does not echo the lock
+    path or the history home.
+    """
+    try:
+        with acquire_run_lock(paths.output_root):
+            yield
+    except HistoryRunLockedError:
+        fail(
+            "another process is already writing this run directory; refusing to run two "
+            "writers for one run.",
+            _EXIT_PROVIDER,
+            details={"error_code": "NATIVE_RUN_LOCKED"},
+        )
+
+
+def _reject_native_owned_root_for_legacy(paths) -> None:
+    """Fail closed when a root the legacy writer is about to touch is native-owned.
+
+    Ownership is resolved before the run lock is taken, so a concurrent native
+    writer can commit between that early read and the legacy write. Re-resolving
+    here with the WAL-consistent reader keeps the legacy selection and its write
+    from interleaving a native owner: a native-owned or unverifiable root stops
+    with the stable ownership envelope instead of being created, resumed,
+    overwritten, or deleted by the legacy writer. A genuinely legacy root is
+    unchanged.
+    """
+    decision = native_generation.resolve_native_ownership(paths.output_root)
+    if decision.route == "legacy":
+        return
+    fail(
+        decision.reason or "this run directory is owned by native history.",
+        _EXIT_PROVIDER,
+        details={"error_code": decision.error_code or "NATIVE_OWNERSHIP_UNVERIFIABLE"},
+    )
+
+
+def _run_native_route(
+    args: argparse.Namespace,
+    chunks: list[ScriptChunk],
+    script_format: str,
+    paths,
+    ownership,
+    *,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+) -> None:
+    """Execute, resume, or re-export one native-owned run and print the result.
+
+    The provider is built lazily inside ``provider_factory`` and therefore only
+    for a fresh unattempted submit or a known-id GET recovery: a local raw rebuild
+    or a completed-run export repair never reads an API key or constructs a
+    provider. ``--overwrite`` is rejected for a native run so accepted paid
+    evidence is never deleted; ``--skip-existing`` keeps its usual precedence.
+    """
+    if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
+        fail(
+            "This run directory is owned by native history. Only an ordinary non-dialogue "
+            "polza-tts ElevenLabs /media run without timing or quality flags may continue it; "
+            "choose a different --run-id for a run with other options.",
+            _EXIT_PROVIDER,
+            details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
+        )
+    if paths.output_root.exists() and getattr(args, "skip_existing", False):
+        files = _list_artifact_files(paths)
+        _json_ok(
+            {
+                "status": "skipped",
+                "reason": "run folder exists",
+                "run_id": paths.prefix,
+                "files": files,
+            }
+        )
+    if ownership.route == "native_existing":
+        if getattr(args, "overwrite", False):
+            fail(
+                "Refusing --overwrite: this run is owned by the native history database and its "
+                "accepted paid evidence must be kept as-is. Use a different --run-id for an "
+                "explicitly new attempt.",
+                _EXIT_PROVIDER,
+                details={"error_code": "NATIVE_OVERWRITE_UNSUPPORTED"},
+            )
+        if not getattr(args, "resume", False):
+            fail(
+                f"Run folder already exists: {paths.output_root}. Use --resume to continue it, "
+                "or a different --run-id.",
+                _EXIT_PROVIDER,
+            )
     try:
         generation_identity = prepare_generation_identity(
             args,
             chunks,
-            gemini_report,
+            None,
             resolve_style_prompt=_resolve_provider_style_prompt,
         )
     except PreparationError as exc:
         fail(str(exc), _EXIT_ARGS)
     chunks = generation_identity.chunks
-    style_prompt = generation_identity.style_prompt
-    prompt_mode = generation_identity.prompt_mode
-    _preflight_dialogue_resume(args, chunks, paths, style_prompt, prompt_mode)
-    api_key = read_api_key(args)
-    provider_for_generation: Any = build_provider(args, api_key, style_prompt, prompt_mode)
-    if args.provider == "omnivoice-local" and gemini_report:
-        provider_for_generation = _bind_dialogue_voice_bank_providers(
-            provider_for_generation,
-            args.voice_bank_catalog,
-            gemini_report["speaker_voice_map"],
-        )
-    pricing_snapshot = fetch_pricing_snapshot(args.provider, api_key, args.model)
-
-    _generate_step(
-        args,
-        provider_for_generation,
-        ffmpeg_path,
-        ffprobe_path,
-        chunks,
-        api_key,
-        pricing_snapshot,
-        paths,
-        style_prompt,
-        prompt_mode,
+    prepared = prepare_run(
+        args, chunks, generation_identity.style_prompt, generation_identity.prompt_mode
     )
+    provider_cache: list[Any] = []
+
+    def provider_factory() -> Any:
+        if not provider_cache:
+            api_key = read_api_key(args)
+            provider_cache.append(
+                build_provider(
+                    args, api_key, generation_identity.style_prompt, generation_identity.prompt_mode
+                )
+            )
+        return provider_cache[0]
+
+    hooks = native_generation.NativeExecutionHooks(
+        write_audio_as_mp3=write_audio_as_mp3,
+        trim_final_silence=trim_final_silence,
+        mp3_duration_ms=mp3_duration_ms,
+        concat_audio_files=concat_audio_files,
+        sha256_file=_sha256_file,
+        progress=print if not args.json_output else (lambda _message: None),
+    )
+    try:
+        summary = native_generation.run_native_generation(
+            paths=paths,
+            prepared=prepared,
+            chunks=chunks,
+            script_format=script_format,
+            script_path=args.script,
+            output_options=native_generation.build_output_options(args.no_trim),
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+            user_label=args.run_id or None,
+            resume=bool(args.resume),
+            provider_factory=provider_factory,
+            hooks=hooks,
+        )
+    except native_generation.NativeGenerationError as exc:
+        fail(str(exc), exc.code, details={"error_code": exc.error_code})
+    if args.json_output:
+        _json_ok(
+            {
+                "status": "success",
+                "provider": args.provider,
+                "model": args.model,
+                "run_id": paths.prefix,
+                "files": summary.files,
+                "duration_ms": summary.duration_ms,
+                "segment_count": summary.segment_count,
+                "cost": {"total": summary.cost_total, "currency": summary.cost_currency},
+            }
+        )
+    print(f"Full MP3: {paths.full_mp3}")
+    print(f"Run manifest: {paths.run_json}")
+    print(f"Manifest: {paths.output_root / 'manifest.json'}")
 
 
 def _preflight_dialogue_resume(

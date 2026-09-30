@@ -322,6 +322,7 @@ def _build_snapshot_config(
     script_path: str | None,
     part_count: int,
     part_entries: list[dict[str, Any]],
+    output_options: dict[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the whitelisted structural snapshot stored in ``config_snapshot``.
 
@@ -345,7 +346,34 @@ def _build_snapshot_config(
         "part_count": part_count,
         "parts": part_entries,
     }
+    if output_options is not None:
+        snapshot["output"] = output_options
     return snapshot
+
+
+def _require_output_options(value: object) -> dict[str, Any] | None:
+    """Validate the bounded output-processing settings a resume must preserve.
+
+    Only a flat mapping of string keys to plain string, integer, or boolean
+    values is accepted: it is stored verbatim in the run snapshot so a later
+    resume can prove the trimming and assembly semantics have not changed, and a
+    nested or non-plain value would be an unreconstructable identity. ``None``
+    means the caller records no output settings.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise NativeSnapshotValidationError("output_options must be a mapping or None")
+    validated: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise NativeSnapshotValidationError("output option keys must be non-empty strings")
+        if not isinstance(item, (str, int, bool)) or isinstance(item, float):
+            raise NativeSnapshotValidationError(
+                "output option values must be strings, integers, or booleans"
+            )
+        validated[key] = item
+    return validated
 
 
 def persist_prepared_tts_snapshot(
@@ -359,6 +387,7 @@ def persist_prepared_tts_snapshot(
     script_path: Path | None,
     voice_identity: str | None = None,
     synthesis_identity: str | None = None,
+    output_options: dict[str, Any] | None = None,
 ) -> PreparedTtsSnapshot:
     """Persist one prepared TTS run, its parts, and its text sources atomically.
 
@@ -431,6 +460,7 @@ def persist_prepared_tts_snapshot(
     style_prompt = prepared.style_prompt
     if style_prompt is not None and (not isinstance(style_prompt, str) or not style_prompt):
         raise NativeSnapshotValidationError("style_prompt must be None or a non-empty string")
+    validated_output_options = _require_output_options(output_options)
 
     identity = _run_identity_payload(
         provider=provider,
@@ -509,6 +539,7 @@ def persist_prepared_tts_snapshot(
         script_path=None if script_path is None else str(script_path.resolve()),
         part_count=len(planned),
         part_entries=[item.config_entry for item in planned],
+        output_options=validated_output_options,
     )
     # The history boundary redacts secret-looking values in its own copy; if that
     # would change any whitelisted structural identity, persisting it would store
