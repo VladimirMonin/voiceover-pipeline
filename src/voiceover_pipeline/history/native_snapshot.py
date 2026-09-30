@@ -52,30 +52,27 @@ Contract:
   rolls every entity back. No transaction is ever held across a filesystem or
   network call.
 
-Known limits at this foundation stage:
+Admitted route families (the finite set ``cli._native_route_eligible`` selects):
 
-* Only the routes whose prepared run carries its full nonsecret resume identity
-  are snapshotted: ``polza-tts``, ``openrouter-tts``, the ``polza-chat-audio``
+* ``polza-tts``, ``openrouter-tts``, the ``polza-chat-audio``
   ordinary chat-audio route (its resolved ``fallback_voice``), the
   ``omnivoice-local``
   preset bank routes (the two-cast dialogue and the single-profile monologue) and
   its admitted non-preset ``auto``/``clone``/``design`` modes, and every admitted
   ``qwen-local`` local route (the
-  clone route, and the instructed preset/design routes). Every other route
-  raises :class:`NativeSnapshotValidationError` before any insert, because it
-  omits nonsecret identity a later ``history resume UUID`` would need: a
+  clone route, and the instructed preset/design routes). Any prepared run that
+  omits nonsecret identity a later ``history resume UUID`` would need raises
+  :class:`NativeSnapshotValidationError` before any insert: a
   ``qwen-local`` run with neither identity block carries no reference/mode inputs.
-  This is a temporary S05 integration gap, not a disabled live path: those routes
-  still perform their own run and JSON state writes. A further route is enabled
-  only once its missing nonsecret inputs are captured on the prepared run.
-* The run-level voice must be non-empty, so a deferred route whose identity lives
-  only in ``voice_identity`` or a per-part cast voice still needs an effective
-  run voice supplied by the execution wiring before the route is enabled.
+  A route the gate never admits (for example a ``polza-tts`` dialogue, which is a
+  usage error) is not a supported route, not a deferred one.
+* The run-level voice must be non-empty, so a route whose identity lives only in
+  ``voice_identity`` or a per-part cast voice supplies an effective
+  run voice from the execution wiring before this writer is reached.
 * The ``run_root`` collision check compares canonical resolved strings, so an
   unusual aliasing mount or a case-insensitive volume can still name one
-  directory through two strings; and no inter-process lock is taken here,
-  because the single-writer execution wiring that owns the directory does not
-  exist yet.
+  directory through two strings; the inter-process single-writer lock is taken by
+  the execution wiring that owns the run root, not by this writer.
 """
 
 from __future__ import annotations

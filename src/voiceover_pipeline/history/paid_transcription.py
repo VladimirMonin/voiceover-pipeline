@@ -209,10 +209,12 @@ class PaidTranscriptionState:
     ``snapshot`` is the bounded, non-secret operation identity the reservation
     committed (effective request options plus the caller's output locator), so a
     resume can replay the same attempt locally without re-reading the original
-    command line.
+    command line. ``run_root`` is the independently committed canonical database
+    binding used to reject a retargeted output locator before local replay.
     """
 
     run_uuid: str
+    run_root: str
     revision: int
     status: str
     attempt_uuid: str
@@ -1149,6 +1151,7 @@ def load_paid_transcription_state(run_uuid: str) -> PaidTranscriptionState:
         snapshot = run.config_snapshot if isinstance(run.config_snapshot, dict) else {}
         return PaidTranscriptionState(
             run_uuid=run.run_uuid,
+            run_root=run.run_root,
             revision=run.revision,
             status=run.status,
             attempt_uuid=attempt.attempt_uuid,
@@ -1165,6 +1168,45 @@ def load_paid_transcription_state(run_uuid: str) -> PaidTranscriptionState:
         connection.close()
 
 
+def _require_canonical_output_root(run_root: str, snapshot: dict[str, Any]) -> Path:
+    """Require the stored output locator to still name its committed DB root.
+
+    A symlink inserted into any ancestor after reservation may make a saved raw
+    body reachable at a new location without changing its bytes or database
+    rows. Refuse such a relocation before replay, receipt recovery, or artifact
+    publication; never silently follow the new location.
+    """
+    value = snapshot.get("output_root")
+    if not isinstance(value, str) or not value or not run_root:
+        raise PaidTranscriptionError(
+            "the paid transcription run does not record its output root",
+            error_code="PAID_TRANSCRIPTION_UNSUPPORTED",
+        )
+    root = Path(value)
+    if value != run_root or not root.is_absolute():
+        raise PaidTranscriptionError(
+            "the paid timing output directory no longer matches its committed root",
+            error_code="PAID_OUTPUT_UNSAFE",
+        )
+    try:
+        if root.resolve(strict=True) != root or not root.is_dir():
+            raise PaidTranscriptionError(
+                "the paid timing output directory no longer names its committed root",
+                error_code="PAID_OUTPUT_UNSAFE",
+            )
+    except (OSError, RuntimeError) as exc:
+        raise PaidTranscriptionError(
+            "the paid timing output directory cannot be verified",
+            error_code="PAID_OUTPUT_UNSAFE",
+        ) from exc
+    return root
+
+
+def require_paid_output_root(state: PaidTranscriptionState) -> Path:
+    """Validate a paid run's saved output root against the committed DB binding."""
+    return _require_canonical_output_root(state.run_root, state.snapshot)
+
+
 def reservation_from_state(state: PaidTranscriptionState) -> PaidTranscriptionReservation:
     """Rebuild the in-flight reservation a resume replays under.
 
@@ -1172,13 +1214,7 @@ def reservation_from_state(state: PaidTranscriptionState) -> PaidTranscriptionRe
     still compare-and-swaps against the same run a concurrent writer would see, and
     the canonical output root the run owns.
     """
-    output_root_value = state.snapshot.get("output_root")
-    if not isinstance(output_root_value, str) or not output_root_value:
-        raise PaidTranscriptionError(
-            "the paid transcription run does not record its output root",
-            error_code="PAID_TRANSCRIPTION_UNSUPPORTED",
-        )
-    output_root = Path(output_root_value)
+    output_root = require_paid_output_root(state)
     fingerprint = state.snapshot.get("operation_fingerprint")
     return PaidTranscriptionReservation(
         run_uuid=state.run_uuid,
@@ -1213,19 +1249,16 @@ def read_paid_transcription_raw(run_uuid: str) -> bytes:
                 "the paid transcription attempt does not carry a saved response",
                 error_code="PAID_TRANSCRIPTION_UNSUPPORTED",
             )
-        output_root_value = (
-            run.config_snapshot.get("output_root")
-            if isinstance(run.config_snapshot, dict)
-            else None
-        )
-        if not isinstance(output_root_value, str) or not output_root_value:
-            raise PaidTranscriptionError(
-                "the paid transcription run does not record its output root",
-                error_code="PAID_TRANSCRIPTION_UNSUPPORTED",
-            )
+        snapshot = run.config_snapshot if isinstance(run.config_snapshot, dict) else {}
+        output_root = _require_canonical_output_root(run.run_root, snapshot)
         relative_path = _raw_relative_path(attempt.attempt_uuid)
-        body_path = Path(output_root_value) / relative_path
+        body_path = output_root / relative_path
         try:
+            if body_path.parent.is_symlink():
+                raise PaidTranscriptionError(
+                    "the saved response directory must not be a symlink",
+                    error_code="PAID_OUTPUT_UNSAFE",
+                )
             if body_path.is_symlink() or not body_path.is_file():
                 raise PaidTranscriptionError(
                     "the saved response body is missing",
@@ -1283,12 +1316,13 @@ def recover_paid_transcription_after_crash(
     state = load_paid_transcription_state(run_uuid)
     if state.attempt_status != ATTEMPT_STATUS_SUBMITTING:
         return None
-    output_root_value = state.snapshot.get("output_root")
-    if not isinstance(output_root_value, str) or not output_root_value:
+    try:
+        output_root = require_paid_output_root(state)
+    except PaidTranscriptionError:
         return None
     fingerprint = state.snapshot.get("operation_fingerprint")
     verified = _verify_raw_evidence(
-        Path(output_root_value),
+        output_root,
         state.run_uuid,
         state.attempt_uuid,
         fingerprint if isinstance(fingerprint, str) else None,
@@ -1343,8 +1377,8 @@ def recover_paid_transcription_after_crash(
     return PaidTranscriptionReservation(
         run_uuid=state.run_uuid,
         attempt_uuid=state.attempt_uuid,
-        run_root=Path(output_root_value),
-        output_root=Path(output_root_value),
+        run_root=output_root,
+        output_root=output_root,
         revision=advanced.revision,
         operation=state.operation,
         call_type=state.call_type,
@@ -1376,11 +1410,17 @@ def atomic_write_artifact(output_root: Path | str, leaf: str, data: bytes) -> Pa
     attacker-planted symlink is never followed.
     """
     root = Path(output_root)
-    if root.is_symlink() or not root.is_dir():
+    try:
+        if root.resolve(strict=True) != root or not root.is_dir():
+            raise PaidTranscriptionError(
+                "the paid timing output directory is missing or has a symlinked ancestor",
+                error_code="PAID_OUTPUT_UNSAFE",
+            )
+    except (OSError, RuntimeError) as exc:
         raise PaidTranscriptionError(
-            "the paid timing output directory is missing or a symlink",
+            "the paid timing output directory cannot be verified",
             error_code="PAID_OUTPUT_UNSAFE",
-        )
+        ) from exc
     safe_leaf = _require_safe_artifact_leaf(leaf)
     target = root / safe_leaf
     if target.is_symlink():

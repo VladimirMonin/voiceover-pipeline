@@ -210,10 +210,10 @@ preset --voice-bank <catalog.json>` без `format: dialogue`) тоже сохр
 каноническую историю: весь сценарий сливается в одну OmniVoice session, которая
 клонирует выбранный profile, с той же durable-попыткой `local_tts_chunk`, raw-
 восстановлением и fail-closed проверкой reference. Режимы `auto`/`clone`/`design`,
-записанная семантика обрезки (`--no-trim`), локальные `--with-timings
---timing-provider faster-whisper` и установленный локальный
-`--tts-quality-provider` идут тем же нативным маршрутом; облачный timing- или
-quality-провайдер остаётся на legacy маршруте.
+записанная семантика обрезки (`--no-trim`), `--with-timings` для локального
+`faster-whisper` или платных облачных `groq-whisper`/`xai-stt` и установленный
+локальный `--tts-quality-provider` идут тем же нативным маршрутом; облачный
+quality-провайдер не-диалогового прогона остаётся на legacy маршруте.
 
 ## Voiceover metadata format
 

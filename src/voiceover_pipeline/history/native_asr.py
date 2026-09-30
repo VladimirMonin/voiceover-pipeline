@@ -4,9 +4,11 @@ Plan sections 6 and 7 require the existing ``transcribe``, ``timings``, and
 ``verify-tts`` commands to record what they observed in the canonical SQLite
 history. This module is that writer for the already-implemented *local* routes:
 the registered ASR providers (``qwen-local``, ``nemotron-local``) and the local
-``faster-whisper`` timing provider. Cloud ASR and cloud timing routes are not
-wired here: their paid-submit contract is not confirmed, so persisting them now
-would claim an outcome the project cannot yet prove.
+``faster-whisper`` timing provider. A *cloud ASR* route is not wired here: its
+paid-submit contract is not confirmed, so persisting it now would claim an
+outcome the project cannot yet prove. The standalone and integrated *cloud
+timing* routes are written by the separate paid-transcription boundary
+(:mod:`voiceover_pipeline.history.paid_transcription`), not by this local writer.
 
 Contract:
 

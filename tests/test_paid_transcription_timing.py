@@ -948,6 +948,54 @@ def test_symlinked_artifact_leaf_is_not_followed(paid_home, tmp_path, monkeypatc
     assert calls == ["post"]
 
 
+def test_resume_refuses_retargeted_output_ancestor_before_replay(
+    paid_home, tmp_path, monkeypatch, capsys
+):
+    """A renamed parent plus a symlink must not redirect a saved paid response.
+
+    The database owns the original canonical path, not whichever directory a
+    later symlink at an ancestor happens to resolve to. A valid saved raw body
+    is deliberately present so the old reader would parse and publish it.
+    """
+    audio = _audio(tmp_path)
+    calls: list[str] = []
+    monkeypatch.setattr(
+        transcription,
+        "transcribe_timing_audio",
+        _CloudTiming(body=_groq_body(), timing=_timing(), calls=calls),
+    )
+    original_write = cli._write_paid_timing_artifacts
+    remaining = {"failures": 1}
+
+    def flaky_write(*args, **kwargs):
+        if remaining["failures"]:
+            remaining["failures"] -= 1
+            raise OSError("disk full")
+        return original_write(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "_write_paid_timing_artifacts", flaky_write)
+    assert _run_timings(monkeypatch, audio, tmp_path)[0] == 50
+    run_uuid = _single_run_uuid(paid_home)
+    assert _rows(paid_home, "SELECT status FROM attempts")[0]["status"] == "raw_saved"
+    old_parent = tmp_path / "out"
+    moved_parent = tmp_path / "out-moved"
+    old_parent.rename(moved_parent)
+    before = _root_inventory(moved_parent)
+    old_parent.symlink_to(moved_parent, target_is_directory=True)
+
+    code, _stdout, error = _run_history(monkeypatch, run_uuid, "resume")
+
+    assert code == 50
+    assert error is not None
+    assert error.details["error_code"] == "PAID_OUTPUT_UNSAFE"
+    assert calls == ["post"]
+    assert _root_inventory(moved_parent) == before
+    assert _rows(paid_home, "SELECT status FROM attempts")[0]["status"] == "raw_saved"
+    with pytest.raises(paid.PaidTranscriptionError) as excinfo:
+        paid.read_paid_transcription_raw(run_uuid)
+    assert excinfo.value.error_code == "PAID_OUTPUT_UNSAFE"
+
+
 def test_source_inside_output_is_not_deleted(paid_home, tmp_path, monkeypatch, capsys):
     output_root = _output_root(tmp_path)
     output_root.mkdir(parents=True)

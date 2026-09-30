@@ -400,9 +400,9 @@ provider/model/voice/script, с которыми позднее будет за�
 платных TTS без provider-запросов; отдельный флаг разрешённого повторного
 платного POST в контракт не входит.
 
-## Нативная история для обычного Polza / OpenRouter TTS (фрагмент S05)
+## Нативная история для обычного Polza / OpenRouter TTS
 
-Узкий вертикальный срез S05 переводит на canonical SQLite обычные
+Слой native-истории переводит на canonical SQLite обычные
 не-диалоговые запуски `polza-tts` — как async `--model elevenlabs/...`
 (`/media`), так и синхронный `/audio/speech` (любая другая модель) — обычный
 не-диалоговый `polza-chat-audio` и
@@ -558,8 +558,9 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
   (`quality.complete: true, passed: false`) либо `quality.complete: false`, пока
   проверка не выполнена.
 
-Этот фрагмент не завершает S05: standalone `verify-tts` остаётся на legacy
-executor. Локальные семейства
+Standalone `verify-tts`, `transcribe` и локальный/облачный `timings` также
+записывают свой результат в canonical SQLite (см. раздел «Локальные ASR /
+timings / verify в канонической истории»). Локальные семейства
 `qwen-local`/`omnivoice-local` дополнительно допускают `format: voiceover`
 для фактически работающих сочетаний: любой режим `qwen-local` (preset сохраняет
 разрешённый voiceover-валидатором голос, clone/design подменяют его своим
@@ -576,7 +577,7 @@ OmniVoice-режимом, который отклоняет `--voice`, и с Omn
 `history resume ID` / `history sync ID`, которые восстанавливают такой прогон из
 снимка, описаны в разделе ниже.
 
-### Нативный OpenRouter Gemini dialogue (фрагмент S05)
+### Нативный OpenRouter Gemini dialogue
 
 Первый диалоговый маршрут, переведённый на canonical SQLite —
 `--provider openrouter-tts --model google/gemini-3.1-flash-tts-preview
@@ -613,7 +614,7 @@ OmniVoice-режимом, который отклоняет `--voice`, и с Omn
   `turn_index`/`speaker`/`voice`/`pause_after_ms`/`audio_sha256` и
   контентно-пустой `tts_quality` receipt (без приватного транскрипта).
 
-### Нативный локальный OmniVoice dialogue (фрагмент S05)
+### Нативный локальный OmniVoice dialogue
 
 Второй диалоговый маршрут — `--provider omnivoice-local --model
 audio-cpp/omnivoice-q8_0 --mode preset --voice-bank <catalog.json> --format
@@ -653,7 +654,7 @@ OmniVoice и любой `polza-tts` dialogue остаются на legacy execut
   переписывает совместимые JSON-экспорты из БД. Реальный локальный запуск модели
   в тестах — `NOT_RUN`.
 
-### Нативный локальный OmniVoice (фрагмент S05)
+### Нативный локальный OmniVoice
 
 Нативные не-диалоговые маршруты `--provider omnivoice-local --model
 audio-cpp/omnivoice-q8_0` (plain Markdown без frontmatter, а для preset-ветки
@@ -709,7 +710,7 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
 прогон только переписывает совместимые JSON-экспорты из БД.
 - Реальный локальный запуск модели (audio.cpp/OmniVoice) в тестах — `NOT_RUN`.
 
-### Нативный локальный Qwen (фрагмент S05)
+### Нативный локальный Qwen
 
 Третье нативное локальное семейство маршрутов — обычные не-диалоговые режимы
 `qwen-local`: клон-маршрут
@@ -761,18 +762,17 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
   завершённый прогон только переписывает совместимые JSON-экспорты из БД. Реальный
   локальный запуск модели в тестах — `NOT_RUN`.
 
-## Локальные ASR / timings / verify в канонической истории (фрагмент S05)
+## Локальные ASR / timings / verify в канонической истории
 
 Локальные маршруты `transcribe` (`qwen-local`, `nemotron-local`), `timings` с
 `--asr-provider` и локальный `--timing-provider faster-whisper`, а также
 `verify-tts` записывают наблюдаемый результат в каноническую SQLite-историю по
-умолчанию. Это **фрагмент** S05: локальные timing-маршруты и облачный
-`timings --timing-provider groq-whisper|xai-stt` сохранены (см. ниже), а
-`openrouter-whisper` (не даёт реальных таймстемпов) и будущий облачный ASR
-остаются legacy и ничего не сохраняют до подтверждённого paid-submit контракта
-(S01/S07). Облачный dialogue-QA `xai-stt` больше не на legacy: он допущен на двух
-диалоговых маршрутах через тот же платный boundary (см. раздел «Облачный
-`timings`...» и описания диалоговых маршрутов).
+умолчанию. Так же сохраняется standalone облачный
+`timings --timing-provider groq-whisper|xai-stt` через платный boundary (см.
+ниже), а облачный dialogue-QA `xai-stt` допущен на двух диалоговых маршрутах
+через тот же boundary. Вне канонической истории остаются только
+`openrouter-whisper` (не даёт реальных таймстемпов и отклоняется) и будущий
+облачный ASR-маршрут до подтверждённого paid-submit контракта (S01/S07).
 
 - Управление — `settings.toml` в текущем каталоге: `[history] enabled = false`
   отключает запись полностью, и команда работает как раньше, не создавая дом,
@@ -826,7 +826,7 @@ voiceover history list --operation asr --json
 voiceover history show <run-uuid> --json
 ```
 
-### Облачный `timings` (`groq-whisper` / `xai-stt`) — платный boundary (фрагмент S05)
+### Облачный `timings` (`groq-whisper` / `xai-stt`) — платный boundary
 
 Standalone `voiceover timings --timing-provider groq-whisper|xai-stt` теперь
 сохраняет прогон в канонической истории и защищает единственный платный POST:
@@ -900,8 +900,8 @@ voiceover history resume <run-uuid> --json   # локальный replay без 
 voiceover history sync <run-uuid> --json     # только чтение, модель не запускается
 ```
 
-**Интегрированное переиспользование (фрагмент S05).** Тот же boundary обслуживает
-два ранее не мигрированных фактически работающих облачных post-audio маршрута:
+**Интегрированное переиспользование.** Тот же boundary обслуживает два
+фактически работающих облачных post-audio маршрута:
 
 - `generate --with-timings --timing-provider groq-whisper|xai-stt` на
   допустимом нативном TTS/dialogue: платёжный timing-child коммитится в
@@ -952,8 +952,9 @@ fallback к container нет. Полный pinned receipt и ограничен�
 
 S04 добавляет локальную SQLite-историю. `history list`, `history show` и
 `history import` читают и импортируют метаданные независимо от текущего рабочего
-каталога. Они не переключают генерацию на новый writer (это S05) и не делают
-провайдерских, ASR, сетевых или платных вызовов. Локальные `transcribe`,
+каталога. Сами `list`/`show`/`import` не делают
+провайдерских, ASR, сетевых или платных вызовов; генерацию на canonical writer
+переключают native-маршруты (см. разделы выше). Локальные `transcribe`,
 `timings` и `verify-tts` добавляют прогоны операций `asr`, `timings` и `verify`
 через тот же общий слой (см. раздел «Локальные ASR / timings / verify в
 канонической истории»).
@@ -1292,7 +1293,7 @@ Dry-run сообщает найденные каталоги/записи, impor
   эхоится. Полный сценарий, prepared text, transcript, remote ID, пути и секреты
   не выводятся.
 
-## `history resume ID` / `history sync ID` — DB-first продолжение (фрагмент S05)
+## `history resume ID` / `history sync ID` — DB-first продолжение
 
 `history resume ID` и `history sync ID` восстанавливают **один уже
 закоммиченный нативный TTS-прогон** (обычный не-диалоговый `polza-tts` /
@@ -1348,12 +1349,12 @@ voiceover history sync ID --json        # без нового оплаченно
   `timing.complete`). Полный сценарий, prepared text, transcript, raw snapshot,
   подписанные URL и секреты не печатаются.
 
-Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
-из S05; live/listening-приёмка при этом не проводилась. `history costs` —
-read-only offline-учёт расходов (см. выше). S05 целиком пока не принят:
-standalone ASR/`verify-tts` остаётся на
-legacy executor; облачные timing-маршруты и облачный dialogue-QA `xai-stt` переведены
-на платный boundary (см. выше). Оба нативных диалоговых маршрута описаны ниже.
+Эти два глагола реализуют `history resume ID` и `history sync ID`; live/listening
+приёмка при этом не проводилась. `history costs` —
+read-only offline-учёт расходов (см. выше). Локальные ASR/`verify-tts` и
+облачные timing-маршруты, как и облачный dialogue-QA `xai-stt`, сохранены в
+канонической истории (см. разделы выше). Оба нативных диалоговых маршрута
+описаны ниже.
 
 ## Gemini Dialogue (machine-facing)
 

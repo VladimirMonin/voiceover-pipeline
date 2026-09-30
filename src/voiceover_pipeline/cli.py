@@ -1632,10 +1632,11 @@ def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
     voice bank and runs the same per-turn local quality gate before concat only
     when it recorded an installed local ``--tts-quality-provider``; without one it
     keeps the exact legacy behavior of no gate. Both dialogue routes also admit the
-    recorded trimming semantics of ``--no-trim`` and an integrated local
-    ``--with-timings --timing-provider faster-whisper`` step. A cloud timing
-    provider keeps both routes on the legacy executor, as does every ``polza-tts``
-    dialogue.
+    recorded trimming semantics of ``--no-trim`` and an integrated
+    ``--with-timings`` step for the local ``faster-whisper`` or the paid cloud
+    ``groq-whisper``/``xai-stt`` provider; the OpenRouter route's required gate also
+    accepts the paid cloud ``xai-stt`` quality provider. Every ``polza-tts``
+    dialogue stays on the legacy executor.
     """
     provider = getattr(args, "provider", None)
     if provider == "omnivoice-local":
@@ -2652,13 +2653,15 @@ def _verify_dialogue_turns_before_concat(
 def _timings_history_save(
     args: argparse.Namespace, audio_path: Path, files: dict[str, str]
 ) -> AsrHistorySave | None:
-    """Build the evidence one completed ``timings`` run contributes.
+    """Build the evidence one completed local ``timings`` run contributes.
 
-    Only the local routes are persisted: the registered (therefore local) ASR
-    provider route and ``faster-whisper``. A cloud timing route returns ``None``
-    so ``timings`` keeps its legacy behavior and records nothing it cannot prove.
-    The transcript and provenance are read back from the timings JSON artifact
-    the command just wrote, so the stored text is exactly what the durable
+    Only the local routes are persisted here: the registered (therefore local) ASR
+    provider route and ``faster-whisper``. Any other ``--timing-provider`` returns
+    ``None``; the standalone cloud timing route is not written by this helper at
+    all -- it commits its paid attempt, private raw body, and transcript through
+    the paid-transcription boundary, so this writer never claims a cloud outcome it
+    cannot prove. The transcript and provenance are read back from the timings JSON
+    artifact the command just wrote, so the stored text is exactly what the durable
     artifact holds and a text-only route never gains an invented span.
     """
     if args.asr_provider:
@@ -4120,21 +4123,6 @@ def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
 
 
-def _paid_output_root(
-    state: paid_transcription_history.PaidTranscriptionState,
-) -> Path | None:
-    """Return the canonical output root a paid timing run recorded, or ``None``."""
-    value = state.snapshot.get("output_root")
-    if isinstance(value, str) and value:
-        return Path(value)
-    options = state.snapshot.get("request_options")
-    if isinstance(options, dict):
-        fallback = options.get("output_dir")
-        if isinstance(fallback, str) and fallback:
-            return Path(fallback)
-    return None
-
-
 def _paid_timing_files(state: paid_transcription_history.PaidTranscriptionState) -> dict[str, str]:
     """Return the timings/SRT paths one paid timing run recorded, or an empty map."""
     options = state.snapshot.get("request_options")
@@ -4195,17 +4183,22 @@ def _paid_transcription_history_command(
         return None
     if mode == "sync" or state.status == RUN_STATUS_COMPLETED:
         return _paid_timing_payload(state, mode)
-    output_root = _paid_output_root(state)
-    if output_root is None:
-        fail(
-            "Refusing to resume: this paid timing run does not record its output location.",
-            _EXIT_PROVIDER,
-            details={"error_code": "PAID_TRANSCRIPTION_UNSUPPORTED"},
-        )
+    try:
+        # A renamed ancestor can be replaced with a symlink while the saved raw
+        # body remains readable. Check the DB-bound canonical root before even
+        # allocating a lock for a retargeted path, then re-check after locking and
+        # reloading the run so neither receipt recovery nor publication follows it.
+        output_root = paid_transcription_history.require_paid_output_root(state)
+    except paid_transcription_history.PaidTranscriptionError as exc:
+        fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
     try:
         with acquire_run_lock(output_root):
             fresh = paid_transcription_history.load_paid_transcription_state(state.run_uuid)
-            return _resume_paid_timing(fresh, output_root)
+            try:
+                locked_root = paid_transcription_history.require_paid_output_root(fresh)
+            except paid_transcription_history.PaidTranscriptionError as exc:
+                fail(str(exc), _EXIT_OUTPUT, details={"error_code": exc.error_code})
+            return _resume_paid_timing(fresh, locked_root)
     except HistoryRunLockedError:
         fail(
             "Another process is already writing this paid timing run directory; refusing to "
@@ -4303,8 +4296,10 @@ def _replay_paid_timing(
         )
     output_dir = output_root
     prefix = Path(files["timings_json"]).name[: -len(".timings.json")]
-    output_dir.mkdir(parents=True, exist_ok=True)
     try:
+        # A resume only publishes into an existing committed root; never create
+        # a replacement directory if that root was moved after admission.
+        paid_transcription_history.require_paid_output_root(state)
         source_identity = paid_transcription_history.require_readable_source(audio_path)
         _write_paid_timing_artifacts(audio_path, output_dir, prefix, timing, source_identity)
     except paid_transcription_history.PaidTranscriptionError as exc:
