@@ -209,7 +209,19 @@ _CORE_SCHEMA: Final = Migration(
     ),
 )
 
-MIGRATIONS: Final = (_CORE_SCHEMA,)
+MIGRATIONS: Final = (
+    _CORE_SCHEMA,
+    # v2 adds a monotonic per-run revision used as a compare-and-swap guard for
+    # resume and the compatibility state export. It is an additive ALTER TABLE,
+    # so it neither rewrites nor backfills existing rows: every pre-existing run
+    # reads revision 1. The v1 bytes and checksum stay frozen, so a database
+    # migrated by an earlier binary still validates unchanged.
+    Migration(
+        version=2,
+        name="add_run_revision",
+        statements=("ALTER TABLE runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",),
+    ),
+)
 LATEST_SCHEMA_VERSION: Final = max(migration.version for migration in MIGRATIONS)
 
 
@@ -286,8 +298,9 @@ def _validate_schema(
 
     Runs before any write, WAL switch, or DDL. Rejects a database whose
     ``user_version`` or ledger names a version newer than this binary knows, a
-    nonempty database without a migration ledger, and a ledger record whose name
-    or checksum no longer matches this binary.
+    nonempty database without a migration ledger, a ledger record whose name or
+    checksum no longer matches this binary, and an empty ledger or a ledger that
+    disagrees with ``user_version`` or is not a prefix of known migrations.
     """
     ordered = sorted(migrations, key=lambda migration: migration.version)
     known = {migration.version: migration for migration in ordered}
@@ -338,6 +351,31 @@ def _validate_schema(
             raise MigrationChecksumError(
                 f"migration {version} ({name}) checksum no longer matches the applied one"
             )
+
+    # A ledger table without any committed migration cannot result from our
+    # transactional bootstrap; do not adopt a foreign database simply because it
+    # happens to contain an empty table with that name.
+    if not recorded:
+        raise HistoryDatabaseError("database has an empty migration ledger; refusing to migrate it")
+
+    # Names and checksums match, so any remaining disagreement is a structural
+    # inconsistency: ``user_version`` must equal the ledger's highest applied
+    # version, and the recorded ledger must be a prefix of this binary's known
+    # migration sequence. Applying the pending migrations of a database whose
+    # ``user_version`` or ledger was tampered with would fail after the WAL
+    # switch, so it is rejected here before any write.
+    if user_version != recorded_max:
+        raise HistoryDatabaseError(
+            f"database user_version {user_version} disagrees with the recorded "
+            f"migration ledger version {recorded_max}; refusing to migrate it"
+        )
+    known_versions = [migration.version for migration in ordered]
+    recorded_versions = sorted(recorded)
+    if recorded_versions != known_versions[: len(recorded_versions)]:
+        raise HistoryDatabaseError(
+            "database migration ledger is not a prefix of this binary's known "
+            f"migrations: recorded {recorded_versions}, known {known_versions}"
+        )
     return recorded
 
 

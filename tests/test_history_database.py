@@ -15,6 +15,7 @@ import stat
 import pytest
 
 from voiceover_pipeline.history.database import (
+    MIGRATIONS,
     HistoryDatabase,
     HistoryDatabaseError,
     HistoryDatabaseReadOnlyError,
@@ -24,6 +25,10 @@ from voiceover_pipeline.history.database import (
     apply_migrations,
     connect_readonly,
 )
+
+# Frozen sha256 of the v1 core migration; the v2 revision migration must never
+# rewrite v1 bytes, so an already-migrated v1 database still validates against it.
+_V1_CHECKSUM = "e802c869914ac25365b5ae9859bcfce81a4ef4937984988b2cfcdcd867e27232"
 
 _LEDGER_DDL = (
     "CREATE TABLE schema_migrations ("
@@ -72,6 +77,66 @@ def _write_ledger_only_database(path, rows):
         connection.close()
 
 
+def _make_real_database(path, migrations):
+    """Build a genuine migrated database with the given migration sequence."""
+    with HistoryDatabase(path, migrations=migrations) as database:
+        database.migrate()
+
+
+def _force_delete_journal_and_metadata(path, *, user_version, drop_ledger_version=None):
+    """Tamper a real database into a deterministic, non-WAL inconsistent state.
+
+    Switches the journal mode back to ``delete`` so a rejected open cannot be
+    mistaken for a WAL sidecar, optionally drops one recorded ledger row, then
+    sets ``PRAGMA user_version`` to a value that no longer matches the ledger.
+    """
+    connection = sqlite3.connect(path)
+    try:
+        switched = connection.execute("PRAGMA journal_mode = DELETE").fetchone()[0]
+        assert switched.lower() == "delete"
+        if drop_ledger_version is not None:
+            connection.execute(
+                "DELETE FROM schema_migrations WHERE version = ?", (drop_ledger_version,)
+            )
+        connection.execute(f"PRAGMA user_version = {int(user_version)}")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _assert_rejected_before_wal(path, *, ledger_versions, has_revision_column):
+    """Assert migrate() rejects a tampered database without any write or WAL switch."""
+    before_bytes = path.read_bytes()
+    before_mode = stat.S_IMODE(path.stat().st_mode)
+
+    database = HistoryDatabase(path)
+    with pytest.raises(HistoryDatabaseError):
+        database.migrate()
+
+    assert path.read_bytes() == before_bytes
+    assert stat.S_IMODE(path.stat().st_mode) == before_mode
+    assert _journal_mode(path) == "delete"
+    assert not path.with_name(path.name + "-wal").exists()
+    assert not path.with_name(path.name + "-shm").exists()
+    assert not path.with_name(path.name + "-journal").exists()
+    with pytest.raises(HistoryDatabaseError):
+        _ = database.connection
+
+    connection = sqlite3.connect(path)
+    try:
+        recorded = [
+            row[0]
+            for row in connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+        ]
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
+    finally:
+        connection.close()
+    assert recorded == ledger_versions
+    assert ("revision" in columns) is has_revision_column
+
+
 def test_connection_enables_required_pragmas(tmp_path):
     database_path = tmp_path / "history.sqlite3"
 
@@ -110,15 +175,77 @@ def test_migrate_records_known_migrations_and_is_idempotent(tmp_path):
         applied_first = database.migrate()
         applied_second = database.migrate()
 
-        assert [migration.version for migration in applied_first] == [1]
+        assert [migration.version for migration in applied_first] == [1, 2]
         assert applied_second == []
-        assert database.schema_version == 1
-        assert database.connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert database.schema_version == 2
+        assert database.connection.execute("PRAGMA user_version").fetchone()[0] == 2
         row = database.connection.execute(
             "SELECT name, checksum FROM schema_migrations WHERE version = 1"
         ).fetchone()
         assert row["name"] == "create_history_core"
         assert len(row["checksum"]) == 64
+
+
+def test_v1_core_migration_bytes_and_checksum_are_frozen():
+    assert MIGRATIONS[0].version == 1
+    assert MIGRATIONS[0].name == "create_history_core"
+    assert MIGRATIONS[0].checksum == _V1_CHECKSUM
+
+
+def test_v2_upgrade_of_real_v1_database_preserves_rows_and_fks(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    run_uuid = "11111111-2222-3333-4444-555555555555"
+
+    with HistoryDatabase(database_path, migrations=[MIGRATIONS[0]]) as database:
+        database.migrate()
+        assert database.schema_version == 1
+        columns = {
+            row[1] for row in database.connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        assert "revision" not in columns
+        database.connection.execute(
+            "INSERT INTO runs (run_uuid, operation, status, run_root, created_at, updated_at) "
+            "VALUES (?, 'tts', 'completed', '/tmp/run', 't', 't')",
+            (run_uuid,),
+        )
+        database.connection.execute(
+            "INSERT INTO parts (part_uuid, run_uuid, position, created_at, updated_at) "
+            "VALUES ('part-1', ?, 1, 't', 't')",
+            (run_uuid,),
+        )
+
+    with HistoryDatabase(database_path) as database:
+        applied = database.migrate()
+        assert [migration.version for migration in applied] == [2]
+        assert database.schema_version == 2
+        assert database.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        revised = database.connection.execute(
+            "SELECT revision FROM runs WHERE run_uuid = ?", (run_uuid,)
+        ).fetchone()
+        assert revised["revision"] == 1
+        assert (
+            database.connection.execute(
+                "SELECT COUNT(*) FROM parts WHERE run_uuid = ?", (run_uuid,)
+            ).fetchone()[0]
+            == 1
+        )
+        ledger = database.connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        assert [row["version"] for row in ledger] == [1, 2]
+
+
+def test_v2_migration_is_not_reapplied_on_reopen(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+
+    with HistoryDatabase(database_path) as database:
+        assert [migration.version for migration in database.migrate()] == [1, 2]
+
+    with HistoryDatabase(database_path) as database:
+        assert database.migrate() == []
+        assert database.schema_version == 2
+        count = database.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
+        assert count == 2
 
 
 def test_migration_applied_is_logged_without_content(tmp_path, caplog):
@@ -204,6 +331,33 @@ def test_ledger_name_mismatch_is_rejected(tmp_path):
         database.migrate()
 
     assert not _has_table(database_path, "widgets")
+
+
+def test_user_version_ahead_of_ledger_is_rejected_before_wal(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    _make_real_database(database_path, [MIGRATIONS[0]])
+    _force_delete_journal_and_metadata(database_path, user_version=2)
+    assert _journal_mode(database_path) == "delete"
+
+    _assert_rejected_before_wal(database_path, ledger_versions=[1], has_revision_column=False)
+
+
+def test_user_version_behind_ledger_is_rejected_before_wal(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    _make_real_database(database_path, MIGRATIONS)
+    _force_delete_journal_and_metadata(database_path, user_version=1)
+    assert _journal_mode(database_path) == "delete"
+
+    _assert_rejected_before_wal(database_path, ledger_versions=[1, 2], has_revision_column=True)
+
+
+def test_ledger_missing_an_earlier_version_is_rejected_before_wal(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    _make_real_database(database_path, MIGRATIONS)
+    _force_delete_journal_and_metadata(database_path, user_version=2, drop_ledger_version=1)
+    assert _journal_mode(database_path) == "delete"
+
+    _assert_rejected_before_wal(database_path, ledger_versions=[2], has_revision_column=True)
 
 
 def test_ledgerless_future_user_version_is_rejected_without_writes(tmp_path):
@@ -533,6 +687,43 @@ def test_connect_readonly_rejects_stale_ledger(tmp_path):
 
     with pytest.raises(MigrationChecksumError):
         connect_readonly(database_path, migrations=[_widgets_v1()])
+
+
+@pytest.mark.parametrize("foreign_table", [False, True])
+def test_empty_migration_ledger_is_rejected_before_wal(tmp_path, foreign_table):
+    database_path = tmp_path / "history.sqlite3"
+    connection = sqlite3.connect(database_path)
+    try:
+        connection.execute(_LEDGER_DDL)
+        if foreign_table:
+            connection.execute("CREATE TABLE foreign_table (id INTEGER PRIMARY KEY)")
+        connection.commit()
+    finally:
+        connection.close()
+    before = database_path.read_bytes()
+    assert _journal_mode(database_path) == "delete"
+
+    database = HistoryDatabase(database_path)
+    with pytest.raises(HistoryDatabaseError):
+        database.migrate()
+
+    assert database_path.read_bytes() == before
+    assert _journal_mode(database_path) == "delete"
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["history.sqlite3"]
+    assert not _has_table(database_path, "runs")
+
+
+def test_connect_readonly_rejects_version_ledger_disagreement(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    _make_real_database(database_path, [MIGRATIONS[0]])
+    _force_delete_journal_and_metadata(database_path, user_version=2)
+    before = database_path.read_bytes()
+
+    with pytest.raises(HistoryDatabaseError):
+        connect_readonly(database_path)
+
+    assert database_path.read_bytes() == before
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["history.sqlite3"]
 
 
 def _file_bytes(directory):

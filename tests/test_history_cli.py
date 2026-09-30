@@ -701,6 +701,37 @@ def test_history_list_empty_database_is_empty_and_not_found(
     assert _entries(_isolated_home) == before
 
 
+def test_history_list_reads_legacy_v1_database_read_only(
+    tmp_path, monkeypatch, capsys, _isolated_home
+):
+    _isolated_home.mkdir(mode=0o700)
+    database_path = _isolated_home / "history.sqlite3"
+    run_uuid = "11111111-2222-3333-4444-555555555555"
+    with HistoryDatabase(database_path, migrations=[MIGRATIONS[0]]) as database:
+        database.migrate()
+        database.connection.execute(
+            "INSERT INTO runs (run_uuid, operation, status, run_root, created_at, updated_at) "
+            "VALUES (?, 'tts', 'completed', '/tmp/run', 't', 't')",
+            (run_uuid,),
+        )
+    before = _snapshot_tree(_isolated_home)
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "list", "--json")
+    assert code == 0
+    assert payload["count"] == 1
+    assert payload["database"]["schema_version"] == 1
+    assert payload["runs"][0]["run_uuid"] == run_uuid
+    assert "revision" not in payload["runs"][0]
+
+    code, detail, _ = _invoke(monkeypatch, capsys, "history", "show", run_uuid, "--json")
+    assert code == 0
+    assert detail["run"]["run_uuid"] == run_uuid
+
+    assert _snapshot_tree(_isolated_home) == before
+    assert not (database_path.with_name(database_path.name + "-wal")).exists()
+    assert not (database_path.with_name(database_path.name + "-shm")).exists()
+
+
 def test_history_list_corrupt_database_is_provider_error(
     tmp_path, monkeypatch, capsys, _isolated_home
 ):

@@ -13,6 +13,8 @@ execution services. It exposes:
   text sources land atomically or not at all. :meth:`HistoryRepository.create_legacy_run`
   is only valid inside that caller-managed transaction, so a failed import can
   never leave a committed run without its parts and costs.
+  :meth:`HistoryRepository.advance_run_revision` is the typed revision
+  compare-and-swap that resume and the compatibility state export build on.
 
 Money contract: an attempt's cost is stored as a ``TEXT`` decimal string.
 ``NULL`` means *unknown*; the string ``"0"`` is a real observed zero. A value
@@ -53,6 +55,14 @@ DEFAULT_QUERY_LIMIT = 50
 
 class HistoryRepositoryError(RuntimeError):
     """A repository call violated the history write contract."""
+
+
+class HistoryRevisionConflictError(HistoryRepositoryError):
+    """A compare-and-swap run update found a revision other than the expected one."""
+
+
+class HistoryRunNotFoundError(HistoryRepositoryError):
+    """A run-scoped update named a UUID that no history run carries."""
 
 
 # Documented classification values. Writes validate the ones that steer file
@@ -345,6 +355,7 @@ class RunRecord:
     parent_uuid: str | None = None
     config_snapshot: dict[str, Any] | None = None
     record_version: int = 1
+    revision: int = 1
     created_at: str = ""
     updated_at: str = ""
 
@@ -416,6 +427,9 @@ class TextSourceRecord:
 
 
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
+    # A read-only v1 snapshot has no ``revision`` column yet; project the pre-v2
+    # default 1 without mutating the schema or requiring a migration.
+    revision = int(row["revision"]) if "revision" in row.keys() else 1
     return RunRecord(
         run_uuid=row["run_uuid"],
         operation=row["operation"],
@@ -426,6 +440,7 @@ def _row_to_run(row: sqlite3.Row) -> RunRecord:
         parent_uuid=row["parent_uuid"],
         config_snapshot=_load_json(row["config_snapshot"]),
         record_version=int(row["record_version"]),
+        revision=revision,
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
@@ -642,6 +657,53 @@ class HistoryRepository:
         )
         self._insert_run(record)
         return record, True
+
+    def advance_run_revision(
+        self,
+        run_uuid: str,
+        *,
+        expected_revision: int,
+        status: str | None = None,
+    ) -> RunRecord:
+        """Compare-and-swap a run's revision and optionally its status.
+
+        The update matches only ``run_uuid`` at exactly ``expected_revision`` and
+        increments the revision by one, so a stale writer cannot advance a run
+        that another process already moved. ``updated_at`` is refreshed; ``status``
+        is written only when supplied, otherwise the stored value is kept. The
+        call joins an open :meth:`transaction` when the caller has one, so it
+        rolls back together with the caller's other writes on a later failure.
+
+        ``expected_revision`` must be a positive, non-bool integer. Raises
+        :class:`HistoryRevisionConflictError` when the run exists at a different
+        revision and :class:`HistoryRunNotFoundError` when no run carries
+        ``run_uuid``. Both leave the run unchanged: the compare-and-swap never
+        runs a bare ``UPDATE`` without the revision predicate.
+        """
+        if (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 1
+        ):
+            raise ValueError("expected_revision must be a positive integer")
+        now = utc_now()
+        with self.transaction():
+            cursor = self._connection.execute(
+                "UPDATE runs SET revision = revision + 1, updated_at = ?, "
+                "status = COALESCE(?, status) "
+                "WHERE run_uuid = ? AND revision = ?",
+                (now, status, run_uuid, expected_revision),
+            )
+            row = self._connection.execute(
+                "SELECT * FROM runs WHERE run_uuid = ?", (run_uuid,)
+            ).fetchone()
+            if cursor.rowcount != 1 or row is None:
+                if row is None:
+                    raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+                raise HistoryRevisionConflictError(
+                    f"run {run_uuid!r} is not at revision {expected_revision}"
+                )
+            return _row_to_run(row)
 
     def add_part(
         self,

@@ -30,6 +30,8 @@ from voiceover_pipeline.history.repository import (
     TEXT_KIND_TTS_SCRIPT,
     Cost,
     HistoryRepository,
+    HistoryRevisionConflictError,
+    HistoryRunNotFoundError,
 )
 
 
@@ -703,3 +705,119 @@ def test_external_absolute_path_accepts_absolute_values(repository, tmp_path, go
     )
 
     assert artifact.path == good_path
+
+
+# -- run revision compare-and-swap -------------------------------------------
+
+
+def test_new_run_starts_at_revision_one(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+
+    assert run.revision == 1
+    assert repository.get_run(run.run_uuid).revision == 1
+
+
+def test_advance_run_revision_increments_once_and_sets_status(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+
+    advanced = repository.advance_run_revision(
+        run.run_uuid, expected_revision=1, status="completed"
+    )
+
+    assert advanced.revision == 2
+    assert advanced.status == "completed"
+    reloaded = repository.get_run(run.run_uuid)
+    assert reloaded is not None
+    assert reloaded.revision == 2
+    assert reloaded.status == "completed"
+    assert reloaded.updated_at >= run.updated_at
+
+
+def test_advance_run_revision_without_status_keeps_status(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+
+    advanced = repository.advance_run_revision(run.run_uuid, expected_revision=1)
+
+    assert advanced.revision == 2
+    assert advanced.status == "running"
+
+
+def test_advance_run_revision_rejects_stale_expected_without_change(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+    repository.advance_run_revision(run.run_uuid, expected_revision=1, status="completed")
+
+    with pytest.raises(HistoryRevisionConflictError):
+        repository.advance_run_revision(run.run_uuid, expected_revision=1, status="failed")
+
+    unchanged = repository.get_run(run.run_uuid)
+    assert unchanged is not None
+    assert unchanged.revision == 2
+    assert unchanged.status == "completed"
+
+
+def test_advance_run_revision_missing_uuid_is_typed_not_found(repository):
+    with pytest.raises(HistoryRunNotFoundError):
+        repository.advance_run_revision("11111111-2222-3333-4444-555555555555", expected_revision=1)
+
+
+@pytest.mark.parametrize("bad_revision", [0, -1, True, False, 1.0, "1"])
+def test_advance_run_revision_rejects_invalid_expected_revision(repository, tmp_path, bad_revision):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+
+    with pytest.raises(ValueError):
+        repository.advance_run_revision(run.run_uuid, expected_revision=bad_revision)
+
+    unchanged = repository.get_run(run.run_uuid)
+    assert unchanged is not None
+    assert unchanged.revision == 1
+
+
+def test_advance_run_revision_rolls_back_with_outer_transaction(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+
+    with pytest.raises(RuntimeError):
+        with repository.transaction():
+            repository.advance_run_revision(run.run_uuid, expected_revision=1, status="completed")
+            raise RuntimeError("boom after advance")
+
+    unchanged = repository.get_run(run.run_uuid)
+    assert unchanged is not None
+    assert unchanged.revision == 1
+    assert unchanged.status == "running"
+
+
+def test_advance_run_revision_conflict_rolls_back_outer_transaction(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+    repository.advance_run_revision(run.run_uuid, expected_revision=1, status="completed")
+
+    with pytest.raises(HistoryRevisionConflictError):
+        with repository.transaction():
+            repository.advance_run_revision(run.run_uuid, expected_revision=1, status="failed")
+            repository.advance_run_revision(run.run_uuid, expected_revision=2, status="failed")
+
+    unchanged = repository.get_run(run.run_uuid)
+    assert unchanged is not None
+    assert unchanged.revision == 2
+    assert unchanged.status == "completed"
+
+
+def test_advance_run_revision_two_connections_serialize(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as first_database:
+        first_database.migrate()
+        with HistoryDatabase(database_path) as second_database:
+            second_database.connect()
+            first = HistoryRepository(first_database)
+            second = HistoryRepository(second_database)
+            run = first.create_run(operation="tts", run_root=str(tmp_path), status="running")
+
+            advanced = first.advance_run_revision(
+                run.run_uuid, expected_revision=1, status="completed"
+            )
+            assert advanced.revision == 2
+
+            with pytest.raises(HistoryRevisionConflictError):
+                second.advance_run_revision(run.run_uuid, expected_revision=1)
+
+            advanced_again = second.advance_run_revision(run.run_uuid, expected_revision=2)
+            assert advanced_again.revision == 3

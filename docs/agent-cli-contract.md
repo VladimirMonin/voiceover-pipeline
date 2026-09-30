@@ -487,7 +487,7 @@ voiceover history import DIR --json
 {
   "status": "success",
   "dry_run": false,
-  "database": {"path": "...", "exists": true, "schema_version": 1},
+  "database": {"path": "...", "exists": true, "schema_version": 2},
   "filters": {"label": null, "operation": null, "status": null},
   "limit": 50,
   "offset": 0,
@@ -527,7 +527,7 @@ UUID-shaped значение сначала ищется как UUID, затем
 {
   "status": "success",
   "dry_run": false,
-  "database": {"path": "...", "exists": true, "schema_version": 1},
+  "database": {"path": "...", "exists": true, "schema_version": 2},
   "run": {"run_uuid": "...", "operation": "tts", "user_label": "prod", "...": "..."},
   "parts": [
     {
