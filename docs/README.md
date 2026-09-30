@@ -4,7 +4,7 @@
 
 | Документ | Содержание |
 |---|---|
-| [Agent CLI Contract](agent-cli-contract.md) | Контракт для машинного использования: TTS, timing и generic local ASR, включая Qwen3-ASR, Nemotron, JSON-ответы, коды завершения (0/2/10/11/20/30/40/50), stdout/stderr и правила безопасности |
+| [Agent CLI Contract](agent-cli-contract.md) | Машинный контракт TTS, timing, local ASR и offline `history` CLI: JSON/exit (0/2/10/11/20/30/40/50/60), stdout/stderr и границы безопасности |
 | [Remotion Workflow](remotion-workflow.md) | Как агент Remotion использует pipeline: от сценария до captions, manifest.json как entry-point, запрет оценки duration по словам |
 | [Troubleshooting](troubleshooting.md) | Типовые ошибки: exit codes, recovery paths, зависимости |
 
@@ -20,7 +20,7 @@
 | [Native Windows Nemotron and OmniVoice plan](plans/2026-08-20-native-windows-nemotron-omnivoice-plan.md) | Серия native Windows-задач без Docker/WSL: portable runtime, package/build gates, Nemotron prompt плюс word timestamps, OmniVoice clone/design и live-приёмка; статус: in progress — offline-фундамент зафиксирован, native live-приёмка pending |
 | [Agent-first Gemini dialogue release plan](plans/2026-08-21-agent-first-gemini-dialogue-0.6.0-release-plan.md) | План релиза 0.6.0: двухголосый gemini-dialogue, cast-safe resume, JSON-контракт, OmniVoice workflows, синхронизация skill и версий — **SUPERSEDED 2026-08-22** (OpenRouter применяет один голос) |
 | [Two-voice dialogue fix plan](plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md) | Turn-by-turn: один запрос, один `voice` и точный verbatim input на реплику; per-turn ASR gate до concat. Публикация 0.6.0 разрешена владельцем до повторной live-приёмки; human audible PASS не заявлен. |
-| [VoiceOver Pipeline development plan](plans/2026-09-29-voiceover-pipeline-development-plan.md) | План последовательной доработки поверх `c64fd14`: команды озвучки и распознавания, история и расходы в SQLite, поиск по словам и по смыслу, документация, логирование, этапы с критериями закрытия и матрица проверок; целевой релиз `v0.7.0`. Статус: **IN_PROGRESS** — S00, S02 и S03 приняты офлайн, S01 проверен только по source, его live/listening остаётся blocked; S04–S12 не приняты. Фактические результаты — в stage-отчётах ниже. |
+| [VoiceOver Pipeline development plan](plans/2026-09-29-voiceover-pipeline-development-plan.md) | План последовательной доработки поверх `c64fd14`: команды озвучки и распознавания, история и расходы в SQLite, поиск по словам и по смыслу, документация, логирование, этапы с критериями закрытия и матрица проверок; целевой релиз `v0.7.0`. Статус: **IN_PROGRESS** — S00, S02, S03 и S04 приняты офлайн; S01 проверен только по source, его live/listening остаётся blocked; S05–S12 не приняты. Фактические результаты — в stage-отчётах ниже. |
 | [Local audio runtime contract](audio-cpp-runtime.md) | Контракт `LocalAudioRuntime`, закреплённая версия audio.cpp, выбор рабочего маршрута, откат и проверяемые сведения о сборке |
 | [audio.cpp Qwen ASR container recipe](audio-cpp-qwen-container-recipe.md) | Проверенный immutable CUDA image, read-only model mounts, JSON adapter и конфигурация Qwen word timestamps без inference claim |
 | [audio.cpp feasibility report](research/2026-08-15-audio-cpp-feasibility.md) | Проверенная оценка полного перехода, optional backend и изолированного spike для Qwen/Nemotron без замены Faster-Whisper |
@@ -38,6 +38,7 @@
 | [S01 source-only отчёт по внешним контрактам](reports/2026-09-29-s01-source-only.md) | Source-only проверка узких контрактов Gemini/Polza, Qwen ASR и двух embedding-режимов: что подтверждено кодом на `1ba5743`, что `BLOCKED_PROVIDER_CONTRACT`/`NOT_RUN`; live/listening не выполнялись. |
 | [S02 офлайн-приёмка оплаченных запросов](reports/2026-09-29-s02-paid-safety.md) | На `141a4d5`: точные суммы, запрет повторного paid POST, GET-only Media и сохранённый raw до FFmpeg; тесты и известные `NOT_RUN`/пробелы отдельно. |
 | [S03 офлайн-приёмка границ CLI и сервисов](reports/2026-09-29-s03-service-boundaries.md) | На `f373d54`: подготовка, единый paid TTS loop, ASR, recovery, цены и финализация вынесены в сервисы; CLI/JSON и paid-safety сохранены по офлайн-тестам, live/listening **NOT_RUN**. |
+| [S04 офлайн-приёмка SQLite-истории и импорта](reports/2026-09-29-s04-local-history.md) | На `025ff62` проверены migration/Decimal/FK/WAL, приватный home, zero-write legacy preview, идемпотентный import и metadata-only history CLI; текущая генерация остаётся на JSON до S05, live/listening **NOT_RUN**. |
 
 ## Быстрый старт
 
