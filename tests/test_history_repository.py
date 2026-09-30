@@ -6,7 +6,9 @@ that is independent of the user label, one-per-root legacy import idempotency,
 atomic multi-entity inserts through one transaction, database-enforced run
 ownership, exact ``Decimal`` and preserved legacy-number money, fail-closed
 snapshot redaction and path classification, UTF-8 text completeness, and
-bounded metadata queries.
+bounded metadata queries. The paid Polza seams cover the pre-submit reservation,
+the accepted media task id, and the provider-observed media cost that must be
+durable before a signed-URL download.
 """
 
 import json
@@ -21,7 +23,9 @@ from voiceover_pipeline.history.database import HistoryDatabase
 from voiceover_pipeline.history.repository import (
     AVAILABILITY_MISSING,
     AVAILABILITY_PRESENT,
+    COST_SOURCE_EXACT,
     COST_SOURCE_LEGACY_FLOAT,
+    COST_SOURCE_PROVIDER_OBSERVED_FLOAT,
     COST_SOURCE_UNKNOWN,
     MAX_QUERY_LIMIT,
     PATH_KIND_EXTERNAL_ABSOLUTE,
@@ -32,6 +36,7 @@ from voiceover_pipeline.history.repository import (
     Cost,
     HistoryPaidAttemptConflictError,
     HistoryPaidAttemptInTransactionError,
+    HistoryPaidMediaCostConflictError,
     HistoryPaidMediaTaskConflictError,
     HistoryPartNotFoundError,
     HistoryRepository,
@@ -1785,3 +1790,589 @@ def test_record_polza_media_task_accepted_fails_closed_when_guarded_update_is_ig
     assert unchanged is not None
     assert unchanged.remote_id is None
     assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+# -- paid Polza Media observed cost -----------------------------------------
+
+
+def _accepted_media_attempt(repository, tmp_path, *, remote_task_id="media_task_01"):
+    """Reserve and accept one paid Polza Media attempt as observation setup."""
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+    _, accepted = repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=reserved.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        remote_task_id=remote_task_id,
+    )
+    return run, part, accepted
+
+
+def test_record_polza_media_observed_cost_keeps_exact_string_and_advances_revision(
+    repository, tmp_path
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    advanced, observed = repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1000",
+    )
+
+    assert advanced.run_uuid == run.run_uuid
+    assert advanced.revision == 4
+    # The exact lexeme keeps its trailing zeros instead of collapsing to "0.1".
+    assert observed.cost.amount == "0.1000"
+    assert observed.cost.currency == "RUB"
+    assert observed.cost.source == COST_SOURCE_EXACT
+    assert observed.cost.exact_available is True
+    # The accepted id and status are untouched by the cost observation.
+    assert observed.remote_id == "media_task_01"
+    assert observed.status == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+    assert observed.provider == "polza-tts"
+
+
+@pytest.mark.parametrize(
+    "amount, expected_text",
+    [
+        (Decimal("0.0831"), "0.0831"),
+        (Decimal("0.1000"), "0.1000"),
+        (12, "12"),
+        ("3.14", "3.14"),
+    ],
+)
+def test_record_polza_media_observed_cost_accepts_exact_decimal_int_and_string(
+    repository, tmp_path, amount, expected_text
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    _, observed = repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount=amount,
+    )
+
+    assert observed.cost.amount == expected_text
+    assert observed.cost.source == COST_SOURCE_EXACT
+    assert observed.cost.exact_available is True
+
+
+@pytest.mark.parametrize("amount, expected_text", [(0, "0"), ("0.0000", "0.0000")])
+def test_record_polza_media_observed_cost_zero_is_known_not_unknown(
+    repository, tmp_path, amount, expected_text
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    _, observed = repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount=amount,
+    )
+
+    # A reported zero is a real billing fact, not the unknown NULL cost.
+    assert observed.cost.amount == expected_text
+    assert observed.cost.amount is not None
+    assert observed.cost.source == COST_SOURCE_EXACT
+    assert observed.cost.exact_available is True
+
+
+def test_record_polza_media_observed_cost_float_carries_approximate_provenance(
+    repository, tmp_path
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    _, observed = repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount=0.1,
+    )
+
+    # A binary float has no exact decimal representation: its shortest text is
+    # stored with a dedicated source and no exact guarantee, never as legacy
+    # import and never as a false exact value.
+    assert observed.cost.amount == repr(0.1)
+    assert observed.cost.amount == "0.1"
+    assert observed.cost.raw == "0.1"
+    assert observed.cost.currency == "RUB"
+    assert observed.cost.source == COST_SOURCE_PROVIDER_OBSERVED_FLOAT
+    assert observed.cost.source != COST_SOURCE_LEGACY_FLOAT
+    assert observed.cost.source != COST_SOURCE_EXACT
+    assert observed.cost.exact_available is False
+
+
+def test_record_polza_media_observed_cost_commits_before_signed_url_download(repository, tmp_path):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1000",
+    )
+
+    # A separate connection already sees the committed cost, so a crash during
+    # the synthetic signed-URL download cannot lose the reported amount.
+    connection = sqlite3.connect(tmp_path / "history.sqlite3")
+    try:
+        revision = connection.execute(
+            "SELECT revision FROM runs WHERE run_uuid = ?", (run.run_uuid,)
+        ).fetchone()[0]
+        row = connection.execute(
+            "SELECT cost, cost_currency, cost_source, cost_exact_available, status, remote_id "
+            "FROM attempts WHERE attempt_uuid = ?",
+            (accepted.attempt_uuid,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert revision == 4
+    assert row[0] == "0.1000"
+    assert row[1] == "RUB"
+    assert row[2] == COST_SOURCE_EXACT
+    assert row[3] == 1
+    assert row[4] == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+    assert row[5] == "media_task_01"
+
+
+def test_record_polza_media_observed_cost_repeats_identical_without_bump(repository, tmp_path):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1000",
+    )
+
+    # The same billed amount polled again is one observation, not a second
+    # charge: it stays idempotent and must not advance the revision.
+    current, repeated = repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=4,
+        amount="0.1000",
+    )
+
+    assert current.revision == 4
+    assert repeated.cost.amount == "0.1000"
+    assert repeated.cost.source == COST_SOURCE_EXACT
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 4
+
+
+def test_record_polza_media_observed_cost_repeat_with_stale_revision_conflicts(
+    repository, tmp_path
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1000",
+    )
+
+    with pytest.raises(HistoryRevisionConflictError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=3,
+            amount="0.1000",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 4
+
+
+def test_record_polza_media_observed_cost_refuses_a_different_price(repository, tmp_path):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1000",
+    )
+
+    with pytest.raises(HistoryPaidMediaCostConflictError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=4,
+            amount="0.2",
+        )
+
+    # The first billing observation is never silently overwritten.
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 4
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.cost.amount == "0.1000"
+    assert unchanged.cost.source == COST_SOURCE_EXACT
+
+
+def test_record_polza_media_observed_cost_stale_revision_leaves_attempt_unknown(
+    repository, tmp_path
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    with pytest.raises(HistoryRevisionConflictError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=2,
+            amount="0.1000",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 3
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.cost.amount is None
+    assert unchanged.cost.source == COST_SOURCE_UNKNOWN
+    assert unchanged.cost.exact_available is False
+
+
+def test_record_polza_media_observed_cost_none_never_erases_observed_amount(repository, tmp_path):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1000",
+    )
+
+    # A later poll that omits usage must not blank the observed amount.
+    with pytest.raises(ValueError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=4,
+            amount=None,
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 4
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount == "0.1000"
+
+
+@pytest.mark.parametrize(
+    "call_type, provider, model, status, remote_id",
+    [
+        (
+            "asr_transcript",
+            "polza-tts",
+            "elevenlabs/eleven_multilingual_v2",
+            "remote_accepted",
+            "t1",
+        ),
+        (
+            "tts_chunk",
+            "openrouter-tts",
+            "elevenlabs/eleven_multilingual_v2",
+            "remote_accepted",
+            "t1",
+        ),
+        ("tts_chunk", "polza-tts", "openai/gpt-4o-mini-tts", "remote_accepted", "t1"),
+        ("tts_chunk", "polza-tts", "elevenlabs/eleven_multilingual_v2", "submitting", None),
+        ("tts_chunk", "polza-tts", "elevenlabs/eleven_multilingual_v2", "remote_accepted", None),
+        (
+            "tts_chunk",
+            "polza-tts",
+            "elevenlabs/eleven_multilingual_v2",
+            "remote_accepted",
+            "https://cdn.example.invalid/media?X-Amz-Signature=SENTINEL",
+        ),
+    ],
+)
+def test_record_polza_media_observed_cost_rejects_wrong_identity_state_or_remote_id(
+    repository, tmp_path, call_type, provider, model, status, remote_id
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    attempt = repository.add_attempt(
+        run.run_uuid,
+        call_type=call_type,
+        part_uuid=part.part_uuid,
+        provider=provider,
+        model=model,
+        status=status,
+        remote_id=remote_id,
+    )
+
+    with pytest.raises(HistoryPaidMediaCostConflictError) as excinfo:
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            amount="0.1000",
+        )
+
+    assert "SENTINEL" not in str(excinfo.value)
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount is None
+
+
+def test_record_polza_media_observed_cost_rejects_foreign_run_attempt(repository, tmp_path):
+    run_a, part_a, accepted_a = _accepted_media_attempt(repository, tmp_path / "a")
+    run_b = repository.create_run(operation="tts", run_root=str(tmp_path / "b"))
+    part_b = repository.add_part(run_b.run_uuid, position=1)
+
+    with pytest.raises(HistoryPaidMediaCostConflictError):
+        repository.record_polza_media_observed_cost(
+            run_b.run_uuid,
+            attempt_uuid=accepted_a.attempt_uuid,
+            part_uuid=part_b.part_uuid,
+            expected_revision=1,
+            amount="0.1000",
+        )
+
+    unchanged_a = repository.get_attempt(accepted_a.attempt_uuid)
+    assert unchanged_a is not None and unchanged_a.cost.amount is None
+    reloaded_a = repository.get_run(run_a.run_uuid)
+    reloaded_b = repository.get_run(run_b.run_uuid)
+    assert reloaded_a is not None and reloaded_a.revision == 3
+    assert reloaded_b is not None and reloaded_b.revision == 1
+
+
+def test_record_polza_media_observed_cost_rejects_foreign_or_missing_part_and_attempt(
+    repository, tmp_path
+):
+    run_a, _, accepted_a = _accepted_media_attempt(repository, tmp_path / "a")
+    run_b = repository.create_run(operation="tts", run_root=str(tmp_path / "b"))
+    part_b = repository.add_part(run_b.run_uuid, position=1)
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.record_polza_media_observed_cost(
+            run_a.run_uuid,
+            attempt_uuid=accepted_a.attempt_uuid,
+            part_uuid=part_b.part_uuid,
+            expected_revision=3,
+            amount="0.1000",
+        )
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.record_polza_media_observed_cost(
+            run_a.run_uuid,
+            attempt_uuid=accepted_a.attempt_uuid,
+            part_uuid="11111111-2222-3333-4444-555555555555",
+            expected_revision=3,
+            amount="0.1000",
+        )
+    with pytest.raises(HistoryPaidMediaCostConflictError):
+        repository.record_polza_media_observed_cost(
+            run_b.run_uuid,
+            attempt_uuid="11111111-2222-3333-4444-555555555555",
+            part_uuid=part_b.part_uuid,
+            expected_revision=1,
+            amount="0.1000",
+        )
+
+    reloaded_a = repository.get_run(run_a.run_uuid)
+    reloaded_b = repository.get_run(run_b.run_uuid)
+    assert reloaded_a is not None and reloaded_a.revision == 3
+    assert reloaded_b is not None and reloaded_b.revision == 1
+
+
+@pytest.mark.parametrize(
+    "bad_amount",
+    [
+        None,
+        True,
+        False,
+        "not-a-decimal",
+        "https://cdn.example.invalid/media?X-Amz-Signature=SENTINEL",
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        Decimal("NaN"),
+        Decimal("Infinity"),
+        {"cost_rub": 1},
+        [1],
+    ],
+)
+def test_record_polza_media_observed_cost_rejects_unusable_amount_without_echo(
+    repository, tmp_path, bad_amount
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    with pytest.raises(ValueError) as excinfo:
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=3,
+            amount=bad_amount,
+        )
+
+    # The fixed message never echoes an unsafe value such as a signed URL.
+    assert str(excinfo.value) == (
+        "observed media cost must be an exact Decimal, int, or decimal string, or a finite float"
+    )
+    assert "SENTINEL" not in str(excinfo.value)
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 3
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount is None
+
+
+@pytest.mark.parametrize("bad_revision", [0, -1, True, False, 1.0, "3"])
+def test_record_polza_media_observed_cost_rejects_invalid_expected_revision(
+    repository, tmp_path, bad_revision
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    with pytest.raises(ValueError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=bad_revision,
+            amount="0.1000",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 3
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount is None
+
+
+def test_record_polza_media_observed_cost_refuses_open_outer_transaction(repository, tmp_path):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+    observed = False
+
+    # An observation inside a caller's still-open transaction could be followed
+    # by the download and then erased by a rollback, so the seam must refuse.
+    with pytest.raises(HistoryPaidAttemptInTransactionError):
+        with repository.transaction():
+            repository.record_polza_media_observed_cost(
+                run.run_uuid,
+                attempt_uuid=accepted.attempt_uuid,
+                part_uuid=part.part_uuid,
+                expected_revision=3,
+                amount="0.1000",
+            )
+            observed = True
+
+    assert observed is False
+    assert repository._connection.in_transaction is False
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 3
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount is None
+
+
+def test_record_polza_media_observed_cost_refuses_legacy_imported_run(repository, tmp_path):
+    legacy_root = str(tmp_path / "legacy-run")
+    with repository.transaction():
+        run, _ = repository.create_legacy_run(
+            operation="tts",
+            run_root=legacy_root,
+            legacy_source_root=legacy_root,
+            status="interrupted",
+        )
+        part = repository.add_part(run.run_uuid, position=1)
+        attempt = repository.add_attempt(
+            run.run_uuid,
+            call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+            part_uuid=part.part_uuid,
+            provider="polza-tts",
+            model="elevenlabs/eleven_multilingual_v2",
+            status=history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED,
+            remote_id="legacy-task",
+        )
+
+    with pytest.raises(HistoryRunNotReservableError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            amount="0.1000",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert reloaded_run.legacy_source_root is not None
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount is None
+
+
+def test_record_polza_media_observed_cost_refuses_completed_run(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="completed")
+    part = repository.add_part(run.run_uuid, position=1)
+    attempt = repository.add_attempt(
+        run.run_uuid,
+        call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+        part_uuid=part.part_uuid,
+        provider="polza-tts",
+        model="elevenlabs/eleven_multilingual_v2",
+        status=history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED,
+        remote_id="completed-task",
+    )
+
+    with pytest.raises(HistoryRunNotReservableError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            amount="0.1000",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None and unchanged.cost.amount is None
+
+
+def test_record_polza_media_observed_cost_fails_closed_when_guarded_update_is_ignored(
+    repository, tmp_path
+):
+    run, part, accepted = _accepted_media_attempt(repository, tmp_path)
+
+    # A ``BEFORE UPDATE`` trigger that silently skips the row models any database
+    # condition under which the guarded cost UPDATE affects no row. The seam must
+    # not then return a recorded amount with an advanced revision: it raises and
+    # rolls the revision bump back together with the cost write.
+    repository._connection.execute(
+        "CREATE TRIGGER attempts_ignore_observed_cost BEFORE UPDATE ON attempts "
+        "WHEN NEW.cost IS NOT NULL "
+        "BEGIN SELECT RAISE(IGNORE); END"
+    )
+
+    with pytest.raises(HistoryPaidMediaCostConflictError):
+        repository.record_polza_media_observed_cost(
+            run.run_uuid,
+            attempt_uuid=accepted.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=3,
+            amount="0.1000",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 3
+    unchanged = repository.get_attempt(accepted.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.cost.amount is None
+    assert unchanged.cost.source == COST_SOURCE_UNKNOWN

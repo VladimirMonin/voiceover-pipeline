@@ -27,14 +27,22 @@ execution services. It exposes:
   task id to that reserved attempt and advances the revision again, so a later
   process may finish the already-paid task with GET calls instead of a second
   POST. It too owns its transaction and refuses to join a caller's.
+  :meth:`HistoryRepository.record_polza_media_observed_cost` is the matching
+  billing seam: it commits the amount a completed accepted media task reported
+  before the caller may download its signed URL. The first observation is a
+  compare-and-swap write; a repeated identical amount is idempotent, and a
+  different amount is a typed conflict rather than a silent overwrite.
 
 Money contract: an attempt's cost is stored as a ``TEXT`` decimal string.
 ``NULL`` means *unknown*; the string ``"0"`` is a real observed zero. A value
 imported from a legacy number keeps its captured decimal text (or the shortest
 form of a float) but carries ``source="legacy_import"`` and
 ``exact_available=False``, so no reader can mistake it for a provider-confirmed
-exact amount. There is one cost column per attempt, so an imported legacy total
-is never counted twice.
+exact amount. A directly observed amount is ``source="exact"`` when it arrived
+as a ``Decimal``, ``int``, or decimal string; a binary float is stored as its
+shortest text with ``source="provider_observed_float"`` and
+``exact_available=False``. There is one cost column per attempt, so an imported
+legacy total is never counted twice.
 
 Safety contract: the ingestion boundary itself defends against secrets and
 unsafe paths, rather than trusting the caller. ``config_snapshot`` is redacted
@@ -102,6 +110,18 @@ class HistoryPaidMediaTaskConflictError(HistoryRepositoryError):
     """
 
 
+class HistoryPaidMediaCostConflictError(HistoryRepositoryError):
+    """An observed Polza Media cost cannot be recorded on the named attempt.
+
+    Raised when the target is not an accepted (``remote_accepted``) async
+    ``elevenlabs/`` ``tts_chunk`` attempt of the named run and part carrying a
+    bounded remote task id, or when the attempt already records a different
+    billing observation. The first observed amount is immutable, so a different
+    price is never silently written over it and no partial observation is
+    returned.
+    """
+
+
 class HistoryPaidAttemptInTransactionError(HistoryRepositoryError):
     """A paid attempt transition was attempted inside an already open transaction.
 
@@ -133,6 +153,13 @@ TEXT_COMPLETENESS_INCOMPLETE = "incomplete"
 COST_SOURCE_UNKNOWN = "unknown"
 COST_SOURCE_EXACT = "exact"
 COST_SOURCE_LEGACY_FLOAT = "legacy_import"
+# Provenance for a provider amount that arrived as a binary float. It has no
+# exact decimal representation, so only its shortest ``repr`` text is stored and
+# no exact guarantee is claimed. It is deliberately not ``legacy_import``: this
+# amount was observed during this run, not imported from an old number.
+COST_SOURCE_PROVIDER_OBSERVED_FLOAT = "provider_observed_float"
+# Polza Media bills ElevenLabs TTS in rubles.
+POLZA_MEDIA_COST_CURRENCY = "RUB"
 TEXT_KIND_TTS_SCRIPT = "tts_script"
 TEXT_KIND_TTS_DIRECTION = "tts_direction"
 TEXT_KIND_ASR_TRANSCRIPT = "asr_transcript"
@@ -297,6 +324,87 @@ def _decimal_from_value(value: Decimal | int | str) -> Decimal:
     if not decimal_value.is_finite():
         raise ValueError("cost must be a finite decimal")
     return decimal_value
+
+
+# A fixed rejection message for a directly observed amount that is not an exact
+# Decimal/int/decimal string or a finite float. It never echoes the value, so an
+# unsafe token (for example a signed URL) cannot reach a report or log.
+_OBSERVED_MEDIA_COST_REJECTED = (
+    "observed media cost must be an exact Decimal, int, or decimal string, or a finite float"
+)
+
+
+def _observed_media_cost(value: Decimal | int | float | str) -> Cost:
+    """Normalize one directly observed Polza Media amount to an exact-or-float cost.
+
+    Only a ``Decimal``, an ``int``, a decimal string, or a finite binary ``float``
+    is accepted; an unbounded usage mapping or body never reaches this seam. A
+    ``Decimal``/``int``/string keeps its captured decimal text (``"0.1000"``
+    stays ``"0.1000"``) and is marked exact. A binary float has no exact decimal
+    representation, so its shortest ``repr`` text is stored with
+    :data:`COST_SOURCE_PROVIDER_OBSERVED_FLOAT` and ``exact_available=False``.
+    An observed zero is a real fact and stays distinct from the unknown ``NULL``.
+    A ``None``, ``bool``, container, malformed string, or non-finite number is
+    rejected with a fixed message that never echoes the value.
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError(_OBSERVED_MEDIA_COST_REJECTED)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(_OBSERVED_MEDIA_COST_REJECTED)
+        text = repr(value)
+        return Cost(
+            amount=text,
+            currency=POLZA_MEDIA_COST_CURRENCY,
+            source=COST_SOURCE_PROVIDER_OBSERVED_FLOAT,
+            exact_available=False,
+            raw=text,
+        )
+    if isinstance(value, str):
+        try:
+            parsed = Decimal(value)
+        except InvalidOperation as exc:
+            raise ValueError(_OBSERVED_MEDIA_COST_REJECTED) from exc
+        if not parsed.is_finite():
+            raise ValueError(_OBSERVED_MEDIA_COST_REJECTED)
+        return Cost(
+            amount=value,
+            currency=POLZA_MEDIA_COST_CURRENCY,
+            source=COST_SOURCE_EXACT,
+            exact_available=True,
+        )
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(_OBSERVED_MEDIA_COST_REJECTED)
+        return Cost(
+            amount=str(value),
+            currency=POLZA_MEDIA_COST_CURRENCY,
+            source=COST_SOURCE_EXACT,
+            exact_available=True,
+        )
+    if isinstance(value, int):
+        return Cost(
+            amount=str(value),
+            currency=POLZA_MEDIA_COST_CURRENCY,
+            source=COST_SOURCE_EXACT,
+            exact_available=True,
+        )
+    raise ValueError(_OBSERVED_MEDIA_COST_REJECTED)
+
+
+def _same_observed_cost(stored: Cost, observed: Cost) -> bool:
+    """Whether two observed costs are the same billing observation.
+
+    Amount text, currency, provenance, and the exact guarantee must all match, so
+    a repeated identical observation is idempotent while a different price or a
+    weaker provenance is a conflict that never overwrites the first value.
+    """
+    return (
+        stored.amount == observed.amount
+        and stored.currency == observed.currency
+        and stored.source == observed.source
+        and stored.exact_available == observed.exact_available
+    )
 
 
 def _legacy_decimal_text(value: object) -> str | None:
@@ -1160,6 +1268,159 @@ class HistoryRepository:
             updated = self.get_attempt(attempt_identifier)
             if updated is None:  # pragma: no cover - the attempt was just updated
                 raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} vanished during the transition"
+                )
+            return advanced, updated
+
+    def record_polza_media_observed_cost(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        part_uuid: str,
+        expected_revision: int,
+        amount: Decimal | int | float | str,
+    ) -> tuple[RunRecord, AttemptRecord]:
+        """Commit the amount a completed accepted Polza Media task reported, before download.
+
+        This is the single billing seam for a paid ElevenLabs ``/media`` chunk. It
+        must run after :meth:`record_polza_media_task_accepted` and before the
+        caller downloads the task's signed URL, so a download that fails cannot
+        lose the cost the provider already reported. Inside one :meth:`transaction`
+        it validates that ``attempt_uuid`` is an accepted async ``elevenlabs/``
+        ``tts_chunk`` attempt of ``run_uuid`` and ``part_uuid`` whose provider is
+        ``polza-tts`` and whose bounded remote task id is present, then records the
+        first observation, compare-and-swapping the run revision through
+        :meth:`advance_run_revision`. It returns ``(current_run, attempt)``, where
+        ``current_run.revision`` is the advanced revision for a first observation
+        and the unchanged run for an idempotent repeat.
+
+        Only a direct amount value is accepted: an exact ``Decimal``, ``int``, or
+        decimal string keeps its captured text and is marked exact with currency
+        RUB, while a finite binary ``float`` is stored as its shortest ``repr``
+        text with :data:`COST_SOURCE_PROVIDER_OBSERVED_FLOAT` and
+        ``exact_available=False``. A ``None``, ``bool``, container, malformed
+        string, or non-finite number is rejected with :class:`ValueError` before
+        any write, so a missing usage never erases an observed amount and an
+        unbounded usage mapping never reaches this seam.
+
+        The first billing observation is immutable. A repeated identical amount
+        is idempotent and does not advance the revision when ``expected_revision``
+        is the run's current revision, so a GET-only resume may poll the same task
+        again safely. A different amount raises
+        :class:`HistoryPaidMediaCostConflictError` instead of silently overwriting
+        the first observation; reconciling a changed provider price is a separate,
+        explicit future concern. The guarded cost update must affect exactly one
+        row: if a trigger, constraint, or lost race makes it affect none, the seam
+        raises the same conflict so the whole transaction, including the revision
+        bump, rolls back instead of returning a partial observation.
+
+        The call owns its transaction and refuses to run inside an already open
+        one, so its committed observation cannot be erased by a caller rollback
+        after the download starts. Like the other paid seams it refuses an
+        imported legacy run and any run already in :data:`RUN_STATUS_COMPLETED`,
+        leaving both unchanged. Raises :class:`ValueError` for an invalid
+        ``expected_revision``, a non-UUID attempt or part, or an unusable amount
+        before any write; :class:`HistoryPaidAttemptInTransactionError` inside an
+        open transaction; :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign or absent part;
+        :class:`HistoryPaidMediaCostConflictError` when the attempt does not match
+        the named run, part, call type, async media route, acceptance status, and
+        bounded remote task id, when it already records a different amount, or when
+        the guarded update affects no row; and :class:`HistoryRevisionConflictError`
+        for a stale revision on a first or repeated observation. Every failure
+        leaves the run and attempt unchanged.
+        """
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_expected_revision(expected_revision)
+        observed = _observed_media_cost(amount)
+        self._require_no_open_transaction("record_polza_media_observed_cost")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            if not self._part_belongs_to_run(part_identifier, run_uuid):
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            attempt = self.get_attempt(attempt_identifier)
+            if (
+                attempt is None
+                or attempt.run_uuid != run_uuid
+                or attempt.part_uuid != part_identifier
+            ):
+                raise HistoryPaidMediaCostConflictError(
+                    f"no paid attempt {attempt_identifier!r} for run {run_uuid!r} "
+                    f"part {part_identifier!r}"
+                )
+            if (
+                attempt.call_type != ATTEMPT_CALL_TYPE_TTS_CHUNK
+                or attempt.provider != POLZA_TTS_PROVIDER_ID
+                or not _polza_media_route_model(attempt.model)
+            ):
+                raise HistoryPaidMediaCostConflictError(
+                    f"attempt {attempt_identifier!r} is not a {POLZA_TTS_PROVIDER_ID!r} "
+                    f"{ATTEMPT_CALL_TYPE_TTS_CHUNK!r} async media attempt"
+                )
+            if attempt.status != ATTEMPT_STATUS_REMOTE_ACCEPTED:
+                raise HistoryPaidMediaCostConflictError(
+                    f"attempt {attempt_identifier!r} is not {ATTEMPT_STATUS_REMOTE_ACCEPTED!r}"
+                )
+            if (
+                attempt.remote_id is None
+                or _MEDIA_TASK_ID_PATTERN.fullmatch(attempt.remote_id) is None
+            ):
+                raise HistoryPaidMediaCostConflictError(
+                    f"attempt {attempt_identifier!r} does not carry a bounded accepted remote "
+                    "task id"
+                )
+            if attempt.cost.amount is not None:
+                # The first billing observation is immutable: repeat the same
+                # amount idempotently, but never overwrite it with a different one.
+                if not _same_observed_cost(attempt.cost, observed):
+                    raise HistoryPaidMediaCostConflictError(
+                        f"attempt {attempt_identifier!r} already records a different observed "
+                        "cost; refusing to overwrite the first billing observation"
+                    )
+                # A repeat is idempotent only while the caller's revision is
+                # current, so a stale caller cannot treat a completed write as its
+                # own and skip a needed reload.
+                if run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return run, attempt
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            cursor = self._connection.execute(
+                "UPDATE attempts SET cost = ?, cost_raw = ?, cost_currency = ?, "
+                "cost_source = ?, cost_exact_available = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND status = ? AND cost IS NULL",
+                (
+                    observed.amount,
+                    observed.raw,
+                    observed.currency,
+                    observed.source,
+                    1 if observed.exact_available else 0,
+                    utc_now(),
+                    attempt_identifier,
+                    ATTEMPT_STATUS_REMOTE_ACCEPTED,
+                ),
+            )
+            # The guarded write must be the only one that records the amount. A
+            # trigger, constraint, or lost race that makes it affect no row cannot
+            # yield a successful observation with an advanced revision; raise so
+            # the whole transaction, including the revision bump, rolls back.
+            if cursor.rowcount != 1:
+                raise HistoryPaidMediaCostConflictError(
+                    f"attempt {attempt_identifier!r} did not carry an unobserved accepted cost "
+                    "during the transition; refusing a partial cost observation"
+                )
+            updated = self.get_attempt(attempt_identifier)
+            if updated is None:  # pragma: no cover - the attempt was just updated
+                raise HistoryPaidMediaCostConflictError(
                     f"attempt {attempt_identifier!r} vanished during the transition"
                 )
             return advanced, updated
