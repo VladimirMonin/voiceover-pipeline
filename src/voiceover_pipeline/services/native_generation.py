@@ -3,10 +3,11 @@
 Plan sections 5 and 6 make SQLite the single source of truth for run history:
 one native run's prepared snapshot, paid attempts, raw evidence, converted
 chunks, and final assembly live in the database, and the legacy JSON files become
-compatibility exports. This module owns the bounded executor for exactly one
-admitted route -- an ordinary, non-dialogue ``polza-tts`` run whose model uses the
-existing ``elevenlabs/`` ``/media`` route, without integrated timing or quality
-processing -- and its recovery decisions.
+compatibility exports. This module owns the bounded executor for the admitted
+routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing or
+quality processing, either its synchronous ``/audio/speech`` model or its async
+``elevenlabs/`` ``/media`` model, and the synchronous ``openrouter-tts`` route --
+and their recovery decisions.
 
 Contract:
 
@@ -28,7 +29,12 @@ Contract:
   the exact observed cost, persist the accepted bytes and their bounded receipt,
   link them, and only then convert and commit. No prior marker ever triggers a
   second POST; a known accepted task id is finished with GET calls only, and a
-  verified raw receipt is rebuilt locally with no provider work at all.
+  verified raw receipt is rebuilt locally with no provider work at all. A
+  synchronous route has no task id: it links the inline bytes and the exact
+  ``polza-tts`` cost it reported in one transaction (``openrouter-tts`` reports
+  none, so its cost stays unknown rather than being invented), and a lost or
+  uncertain synchronous response stays a durable ``submitting`` marker that
+  blocks every later resume with no repeat POST or GET.
 * Recovery decisions read and hash on-disk evidence *outside* every database
   transaction. A completed part is skipped only after its committed digest, size,
   and file presence verify; a mismatch fails closed instead of regenerating and
@@ -38,8 +44,11 @@ Contract:
   known-id GET recovery. A local raw rebuild or a completed-run export repair
   never reads an API key and never builds a provider.
 
-Known limits: this slice admits one non-dialogue provider/model route and the
-fixed trimming/assembly semantics recorded in the snapshot. Dialogue, integrated
+Known limits: this slice admits the non-dialogue ``polza-tts`` and
+``openrouter-tts`` routes and the fixed trimming/assembly semantics recorded in
+the snapshot. The crash window between a synchronous raw receipt and its database
+link (covered by local reconciliation) is the only place a synchronous observed
+cost cannot be rebuilt, because the receipt carries no cost. Dialogue, integrated
 transcription/timing, quality gating, and the other speech providers stay on the
 legacy executor until their own identity and processing paths are supported.
 """
@@ -81,6 +90,7 @@ from ..history.paths import HistoryPathsError, history_database_path
 from ..history.raw_receipt import (
     PaidRawReceipt,
     PaidRawReceiptError,
+    bounded_opaque_token,
     write_paid_raw_receipt,
 )
 from ..history.repository import (
@@ -102,6 +112,7 @@ from ..models import ScriptChunk, SynthesisResult
 from ..run_state import LOG_FILE, GenerationLogger
 from . import costs
 from .prepare import PreparedRun
+from .recovery import polza_media_route_model
 
 # Numeric exit codes duplicated from ``cli.py`` because the CLI imports this
 # service; only the documented stable codes are used here.
@@ -595,6 +606,23 @@ def _verified_raw_bytes(
 # ── executor ──────────────────────────────────────────────────────────────────
 
 
+def _sync_observed_amount(result: SynthesisResult) -> str | float | None:
+    """Return the exact cost a synchronous submit reported, or ``None`` when unknown.
+
+    Only a ``polza-tts`` ``/audio/speech`` response carries usage, and only its
+    recognized cost fields are read; ``openrouter-tts`` returns its audio inline
+    with no synchronous usage, so the amount stays unknown rather than being
+    fetched with a new remote GET or invented from a number. The exact decimal
+    text is preferred over its binary float so the stored billing fact stays exact
+    where the provider supplied one.
+    """
+    metadata = result.raw_metadata if isinstance(result.raw_metadata, dict) else {}
+    cost, cost_exact = costs.media_observed_cost(metadata.get("usage_direct"))
+    if cost is None:
+        return None
+    return cost_exact if cost_exact is not None else cost
+
+
 def _new_staging_path(target: Path) -> Path:
     """Return a fresh private staging path beside ``target`` for one output file.
 
@@ -709,6 +737,18 @@ class _Executor:
 
     def _model(self) -> str:
         return self.prepared.model
+
+    def _uses_media_route(self) -> bool:
+        """Whether this run submits to the async Polza ``elevenlabs/`` ``/media`` route.
+
+        A synchronous ``polza-tts`` model (``/audio/speech``) or an
+        ``openrouter-tts`` submit returns its audio inline and never stores a
+        remote task id, so it must not bind the media callbacks or ever reach the
+        GET-only media recovery path.
+        """
+        return self.prepared.provider == "polza-tts" and polza_media_route_model(
+            self.prepared.model
+        )
 
     # -- per-part processing --------------------------------------------------
 
@@ -862,6 +902,42 @@ class _Executor:
         self._revision = run.revision
         return updated
 
+    def _link_sync_raw(
+        self, part: NativeTtsPart, attempt: AttemptRecord, *, result: SynthesisResult
+    ) -> AttemptRecord:
+        """Link synchronous inline bytes and their observed cost with no remote id.
+
+        The bounded receipt is written first (with a known ``generation_id`` but
+        ``remote_task_id=None``), then the exact ``polza-tts`` cost the same
+        response reported is committed together with the raw artifact, before any
+        FFmpeg conversion. A crash between the receipt and this link leaves a
+        ``submitting`` marker with valid on-disk evidence that a later resume
+        reconciles locally. An ``openrouter-tts`` response reports no synchronous
+        usage, so the amount stays unknown.
+        """
+        receipt: PaidRawReceipt = write_paid_raw_receipt(
+            run_root=self.run_root,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.record.part_uuid,
+            synthesis_fingerprint=part.fingerprint,
+            chunk_id=part.chunk_id,
+            number=part.number,
+            audio_format=result.audio_format,
+            audio_bytes=result.audio_bytes,
+            remote_task_id=None,
+            generation_id=result.generation_id,
+        )
+        run, updated, _artifact = self.repository.record_polza_sync_raw_saved(
+            self._run_uuid(),
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.record.part_uuid,
+            expected_revision=self._revision,
+            receipt=receipt,
+            amount=_sync_observed_amount(result),
+        )
+        self._revision = run.revision
+        return updated
+
     def _submit_fresh_part(self, evidence: _PartEvidence) -> None:
         """Reserve, submit once, persist raw evidence, and commit the conversion."""
         part = evidence.part
@@ -875,8 +951,12 @@ class _Executor:
         )
         self._revision = run.revision
         provider = self._provider_instance()
+        uses_media = self._uses_media_route()
         accepted_id: dict[str, str] = {}
-        self._bind_media_callbacks(provider, attempt=attempt, part=part, accepted_id=accepted_id)
+        if uses_media:
+            self._bind_media_callbacks(
+                provider, attempt=attempt, part=part, accepted_id=accepted_id
+            )
         self.logger.event("info", "paid_submit_started", chunk=part.number, id=part.chunk_id)
         try:
             result = provider.synthesize_chunk(part.text, part.chunk_id)
@@ -890,14 +970,26 @@ class _Executor:
                 code=_EXIT_PROVIDER,
                 error_code=_ERROR_SYNTHESIS_FAILED,
             ) from None
-        updated = self._link_raw(
-            part,
-            attempt,
-            audio_bytes=result.audio_bytes,
-            audio_format=result.audio_format,
-            remote_task_id=accepted_id.get("id"),
-            generation_id=result.generation_id,
-        )
+        if uses_media:
+            updated = self._link_raw(
+                part,
+                attempt,
+                audio_bytes=result.audio_bytes,
+                audio_format=result.audio_format,
+                remote_task_id=accepted_id.get("id"),
+                generation_id=result.generation_id,
+            )
+        else:
+            # The synchronous provider's optional generation id is untrusted and
+            # is not required to be a bounded opaque token (a dotted, overlong, or
+            # non-ASCII ``X-Generation-Id`` is possible). The bounded receipt can
+            # only carry such a token, so an invalid id is dropped to ``None``
+            # before any receipt is written: the accepted paid audio is never
+            # lost to a strict-id rejection. The sanitized result feeds the
+            # receipt, the raw artifact link, and the conversion metadata alike, so
+            # every later verification and the export see the same dropped id.
+            result = replace(result, generation_id=bounded_opaque_token(result.generation_id))
+            updated = self._link_sync_raw(part, attempt, result=result)
         self._convert_and_commit(evidence, result, updated)
 
     def _recover_via_get(self, evidence: _PartEvidence, attempt: AttemptRecord) -> None:
@@ -998,6 +1090,53 @@ class _Executor:
         self._revision = run.revision
         return artifact
 
+    def _reconcile_sync_raw_receipt(
+        self, evidence: _PartEvidence, attempt: AttemptRecord
+    ) -> ArtifactRecord | None:
+        """Link a synchronous raw receipt left by a crash between bytes and database.
+
+        A synchronous submit has no remote task id, so a crash after the response
+        was received (bytes plus receipt written) but before the database link
+        leaves the attempt in ``submitting`` with valid evidence on disk. Re-verifying
+        that receipt and linking it under CAS here rebuilds the part locally with no
+        POST and no GET. ``None`` means the evidence is absent or does not match, so
+        the caller keeps the documented unconfirmed-submit block and never falls back
+        to a paid submit. The exact cost the response reported is not in the receipt,
+        so a cost observed in this crash window is lost and stays unknown.
+        """
+        from ..history.raw_receipt import verify_paid_raw_receipt
+
+        part = evidence.part
+        receipt_format = _raw_format_from_receipt(self.run_root, part.chunk_id, part.number)
+        if receipt_format is None:
+            return None
+        try:
+            receipt = verify_paid_raw_receipt(
+                run_root=self.run_root,
+                attempt_uuid=attempt.attempt_uuid,
+                part_uuid=part.record.part_uuid,
+                synthesis_fingerprint=part.fingerprint,
+                chunk_id=part.chunk_id,
+                number=part.number,
+                audio_format=receipt_format,
+                remote_task_id=None,
+            )
+        except (PaidRawReceiptError, ValueError):
+            return None
+        try:
+            run, _updated, artifact = self.repository.record_polza_sync_raw_saved(
+                self._run_uuid(),
+                attempt_uuid=attempt.attempt_uuid,
+                part_uuid=part.record.part_uuid,
+                expected_revision=self._revision,
+                receipt=receipt,
+                amount=None,
+            )
+        except HistoryRepositoryError:
+            return None
+        self._revision = run.revision
+        return artifact
+
     def _process_first_incomplete(self, evidence: _PartEvidence) -> None:
         """Recover or submit exactly the first part without a verified chunk file."""
         attempt = evidence.attempt
@@ -1010,6 +1149,17 @@ class _Executor:
             )
         status = attempt.status
         if status == ATTEMPT_STATUS_SUBMITTING:
+            if not self._uses_media_route():
+                # A synchronous POST with no remote task id can still have been
+                # accepted: if its response was received, the raw bytes and their
+                # receipt are already on disk. Reconcile exactly that same-attempt
+                # local evidence and rebuild the part with no POST and no GET.
+                linked = self._reconcile_sync_raw_receipt(evidence, attempt)
+                if linked is not None:
+                    self._convert_from_raw(replace(evidence, raw_artifact=linked), attempt)
+                    return
+            # No recoverable evidence exists, so the paid outcome is unknown and
+            # must never be repeated automatically.
             raise NativeGenerationError(
                 "refusing to resume: the previous paid submit for this part was never confirmed. "
                 "A paid outcome must not be repeated automatically.",

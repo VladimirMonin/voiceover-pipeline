@@ -2977,3 +2977,265 @@ def test_record_polza_media_raw_saved_rejects_run_root_change_after_verify(
         assert receipt.raw_path.read_bytes() == original_bytes
         assert (receipt.raw_path.parent / f"{receipt.raw_path.name}.receipt.json").exists()
         assert not (moved_root / "raw").exists()
+
+
+# -- paid synchronous (non-media) verified raw artifact link -------------------
+
+_SYNC_FINGERPRINT = "b" * 64
+_SYNC_AUDIO = b"SYNC-RAW-MARKER" + bytes(range(16))
+_SYNC_GENERATION_ID = "gen-sync-123"
+_SYNC_MODEL = "openai/gpt-4o-mini-tts"
+
+
+def _reserve_sync_attempt(
+    repository, run_uuid, part_uuid, *, expected_revision, provider="polza-tts", model=_SYNC_MODEL
+):
+    """Reserve one paid synchronous attempt as setup for a raw-link test."""
+    _, attempt = repository.reserve_paid_tts_attempt(
+        run_uuid,
+        part_uuid=part_uuid,
+        expected_revision=expected_revision,
+        provider=provider,
+        model=model,
+        account_alias="default",
+    )
+    return attempt
+
+
+def _write_sync_receipt(tmp_path, attempt_uuid, part_uuid, overrides=None):
+    """Write the bounded paid raw receipt for a synthetic synchronous attempt."""
+    kwargs = {
+        "run_root": str(tmp_path),
+        "attempt_uuid": attempt_uuid,
+        "part_uuid": part_uuid,
+        "synthesis_fingerprint": _SYNC_FINGERPRINT,
+        "chunk_id": "chunk_01",
+        "number": 1,
+        "audio_format": "mp3",
+        "audio_bytes": _SYNC_AUDIO,
+        "remote_task_id": None,
+        "generation_id": _SYNC_GENERATION_ID,
+    }
+    if overrides:
+        kwargs.update(overrides)
+    return write_paid_raw_receipt(**kwargs)
+
+
+def _reserved_sync_attempt_with_raw(
+    repository, tmp_path, *, provider="polza-tts", model=_SYNC_MODEL
+):
+    """Reserve a synchronous attempt and save its raw evidence."""
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_SYNC_FINGERPRINT)
+    attempt = _reserve_sync_attempt(
+        repository,
+        run.run_uuid,
+        part.part_uuid,
+        expected_revision=1,
+        provider=provider,
+        model=model,
+    )
+    receipt = _write_sync_receipt(tmp_path, attempt.attempt_uuid, part.part_uuid)
+    return run, part, attempt, receipt
+
+
+def _record_sync_raw_saved(
+    repository, run, part, attempt, receipt, *, expected_revision=2, amount=None
+):
+    """Call the synchronous raw-saved seam for the synthetic fixture."""
+    return repository.record_polza_sync_raw_saved(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=expected_revision,
+        receipt=receipt,
+        amount=amount,
+    )
+
+
+def _assert_no_sync_raw_link(repository, run, attempt, *, revision=2, status=None):
+    """Assert the synchronous seam left run, attempt, parts, and artifacts unchanged."""
+    reloaded = repository.get_run(run.run_uuid)
+    assert reloaded is not None and reloaded.revision == revision
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None
+    if status is not None:
+        assert unchanged.status == status
+    assert repository.get_artifacts(run.run_uuid) == []
+    assert all(stored_part.stage is None for stored_part in repository.get_parts(run.run_uuid))
+
+
+def test_record_polza_sync_raw_saved_links_raw_and_exact_cost(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+
+    advanced, updated, artifact = _record_sync_raw_saved(
+        repository, run, part, attempt, receipt, amount=Decimal("0.3")
+    )
+
+    assert advanced.run_uuid == run.run_uuid
+    assert advanced.revision == 3
+    assert updated.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert updated.remote_id is None
+    assert updated.provider == "polza-tts"
+    assert updated.cost.amount == "0.3"
+    assert updated.cost.source == COST_SOURCE_EXACT
+    assert updated.cost.exact_available is True
+
+    artifacts = repository.get_artifacts(run.run_uuid)
+    assert [stored.artifact_uuid for stored in artifacts] == [artifact.artifact_uuid]
+    assert artifact.role == history_repository_module.ARTIFACT_ROLE_PAID_RAW_AUDIO
+    assert artifact.path_kind == PATH_KIND_MANAGED_RELATIVE
+    assert artifact.path == "raw/chunk_01.mp3"
+    assert artifact.attempt_uuid == attempt.attempt_uuid
+    assert artifact.sha256 == receipt.sha256
+    assert artifact.size_bytes == len(_SYNC_AUDIO)
+    assert artifact.mime == "audio/mpeg"
+    assert artifact.media_metadata == {
+        "format": "mp3",
+        "chunk_id": "chunk_01",
+        "number": 1,
+        "generation_id": _SYNC_GENERATION_ID,
+    }
+    assert repository.get_parts(run.run_uuid)[0].stage == (
+        history_repository_module.PART_STAGE_RAW_SAVED
+    )
+
+
+def test_record_polza_sync_raw_saved_leaves_unknown_cost_without_amount(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(
+        repository, tmp_path, provider="openrouter-tts", model="google/gemini-3.1-flash-tts-preview"
+    )
+
+    _advanced, updated, _artifact = _record_sync_raw_saved(
+        repository, run, part, attempt, receipt, amount=None
+    )
+
+    # The provider reported no synchronous usage, so the cost stays unknown
+    # instead of being invented or fetched with a remote GET.
+    assert updated.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert updated.cost.amount is None
+    assert updated.cost.source == COST_SOURCE_UNKNOWN
+    assert updated.cost.exact_available is False
+
+
+def test_record_polza_sync_raw_saved_repeat_is_idempotent_and_cost_immutable(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+    first_run, _first_attempt, first_artifact = _record_sync_raw_saved(
+        repository, run, part, attempt, receipt, amount="0.3"
+    )
+    assert first_run.revision == 3
+
+    second_run, second_attempt, second_artifact = _record_sync_raw_saved(
+        repository, run, part, attempt, receipt, expected_revision=3, amount="0.3"
+    )
+    assert second_run.revision == 3
+    assert second_attempt.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert second_artifact.artifact_uuid == first_artifact.artifact_uuid
+    assert len(repository.get_artifacts(run.run_uuid)) == 1
+
+    # A different observed amount never overwrites the first billing observation.
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_sync_raw_saved(
+            repository, run, part, attempt, receipt, expected_revision=3, amount="0.9"
+        )
+
+    still = repository.get_attempt(attempt.attempt_uuid)
+    assert still is not None and still.cost.amount == "0.3"
+
+
+def test_record_polza_sync_raw_saved_rejects_stale_revision_without_mutation(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+    _record_sync_raw_saved(repository, run, part, attempt, receipt, amount="0.3")
+
+    with pytest.raises(HistoryRevisionConflictError):
+        _record_sync_raw_saved(
+            repository, run, part, attempt, receipt, expected_revision=2, amount="0.3"
+        )
+
+    reloaded = repository.get_run(run.run_uuid)
+    assert reloaded is not None and reloaded.revision == 3
+    assert len(repository.get_artifacts(run.run_uuid)) == 1
+
+
+def test_record_polza_sync_raw_saved_rejects_media_route_model(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_SYNC_FINGERPRINT)
+    attempt = _reserve_sync_attempt(
+        repository,
+        run.run_uuid,
+        part.part_uuid,
+        expected_revision=1,
+        model="elevenlabs/eleven_multilingual_v2",
+    )
+    receipt = _write_sync_receipt(tmp_path, attempt.attempt_uuid, part.part_uuid)
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_sync_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_sync_raw_link(repository, run, attempt)
+
+
+def test_record_polza_sync_raw_saved_rejects_unsupported_provider(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_SYNC_FINGERPRINT)
+    attempt = _reserve_sync_attempt(
+        repository, run.run_uuid, part.part_uuid, expected_revision=1, provider="polza-chat-audio"
+    )
+    receipt = _write_sync_receipt(tmp_path, attempt.attempt_uuid, part.part_uuid)
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_sync_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_sync_raw_link(repository, run, attempt)
+
+
+def test_record_polza_sync_raw_saved_rejects_non_null_remote_id(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+    # Model a stored remote id the synchronous route must never carry.
+    repository._connection.execute(
+        "UPDATE attempts SET remote_id = ? WHERE attempt_uuid = ?",
+        ("media-task-01", attempt.attempt_uuid),
+    )
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_sync_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_sync_raw_link(repository, run, attempt)
+
+
+def test_record_polza_sync_raw_saved_rejects_foreign_part(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+    other_run = repository.create_run(operation="tts", run_root=str(tmp_path / "other"))
+    other_part = repository.add_part(other_run.run_uuid, position=1, fingerprint=_SYNC_FINGERPRINT)
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.record_polza_sync_raw_saved(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=other_part.part_uuid,
+            expected_revision=2,
+            receipt=receipt,
+        )
+
+    _assert_no_sync_raw_link(repository, run, attempt)
+
+
+def test_record_polza_sync_raw_saved_rejects_unverifiable_evidence(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+    receipt.raw_path.write_bytes(b"tampered")
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_sync_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_sync_raw_link(repository, run, attempt)
+
+
+def test_record_polza_sync_raw_saved_rejects_invalid_revision_and_amount(repository, tmp_path):
+    run, part, attempt, receipt = _reserved_sync_attempt_with_raw(repository, tmp_path)
+
+    with pytest.raises(ValueError):
+        _record_sync_raw_saved(repository, run, part, attempt, receipt, expected_revision=0)
+    with pytest.raises(ValueError):
+        _record_sync_raw_saved(repository, run, part, attempt, receipt, amount="not-a-decimal")
+
+    _assert_no_sync_raw_link(repository, run, attempt)

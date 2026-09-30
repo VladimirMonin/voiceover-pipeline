@@ -497,6 +497,18 @@ def _receipt_from_payload(run_root: Path, payload: dict[str, Any]) -> PaidRawRec
     )
 
 
+def bounded_opaque_token(value: Any) -> str | None:
+    """Return a bounded opaque token, or ``None`` when the value is not one.
+
+    A receipt can only carry a bounded opaque remote or generation id. A caller
+    holding an *optional*, untrusted provider id (for example a synchronous
+    ``X-Generation-Id``) uses this to drop an invalid value to ``None`` before
+    :func:`write_paid_raw_receipt`, so accepted paid audio is never lost to a
+    strict-id rejection and the invalid value never reaches the receipt.
+    """
+    return _bounded_opaque(value)
+
+
 def _new_receipt_payload(
     *,
     attempt_uuid: str,

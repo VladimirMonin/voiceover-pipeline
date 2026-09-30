@@ -246,6 +246,12 @@ ARTIFACT_ROLE_FINAL_AUDIO = "final_audio"
 ATTEMPT_STATUS_COMPLETED = "completed"
 # The only provider route whose accepted media task id this repository records.
 POLZA_TTS_PROVIDER_ID = "polza-tts"
+# Providers whose synchronous (non-media) paid TTS route links its accepted raw
+# bytes without an accepted remote task id: ``polza-tts`` for every
+# non-ElevenLabs model (the ``/audio/speech`` route) and ``openrouter-tts``,
+# which returns the audio inline. Neither can hold a recoverable media task id,
+# so the raw link is the only durable evidence of the paid outcome.
+SYNC_TTS_PROVIDER_IDS = frozenset({POLZA_TTS_PROVIDER_ID, "openrouter-tts"})
 # A run whose work already finished. Repeating finished work creates a new run
 # with a link to the previous one, not another paid attempt on the closed run.
 RUN_STATUS_COMPLETED = "completed"
@@ -1737,6 +1743,242 @@ class HistoryRepository:
                 )
             return advanced, updated, artifact
 
+    def record_polza_sync_raw_saved(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        part_uuid: str,
+        expected_revision: int,
+        receipt: PaidRawReceipt,
+        amount: Decimal | int | float | str | None = None,
+    ) -> tuple[RunRecord, AttemptRecord, ArtifactRecord]:
+        """Link synchronous paid raw evidence and its observed cost without a remote id.
+
+        The sibling of :meth:`record_polza_media_raw_saved` for the synchronous
+        ``/audio/speech`` route, where a ``polza-tts`` non-ElevenLabs or an
+        ``openrouter-tts`` submit returns its audio inline and never yields a
+        recoverable remote task id. The caller has already received the paid
+        response with exactly one POST and saved the bytes under the deterministic
+        ``raw/<chunk-id>.<ext>`` path with their bounded receipt (``remote_task_id``
+        unknown). This seam turns that evidence into one canonical
+        ``managed_relative`` :data:`ARTIFACT_ROLE_PAID_RAW_AUDIO` artifact and moves
+        the attempt from :data:`ATTEMPT_STATUS_SUBMITTING` to
+        :data:`ATTEMPT_STATUS_RAW_SAVED` in one short transaction, so a synchronous
+        POST has durable local evidence before any FFmpeg conversion.
+
+        The caller-supplied receipt is only a locator; the on-disk receipt and raw
+        bytes are re-read and re-hashed *outside* any transaction through
+        :meth:`_verify_media_raw_receipt`, whose remote-id check is skipped because
+        a synchronous attempt has no remote id. Only then does the transaction
+        recheck the run, its ``run_root``, the part identity, the attempt guard, and
+        the verified receipt identity, apply the ``expected_revision``
+        compare-and-swap, insert exactly one artifact, optionally record the
+        observed exact cost, and move the attempt to ``raw_saved``.
+
+        ``amount`` is the exact cost the synchronous provider already reported
+        (``polza-tts`` usage) or ``None`` when it reported none (``openrouter-tts``
+        returns no synchronous usage). A non-``None`` amount is normalized by
+        :func:`_observed_media_cost` and written atomically with the raw link
+        before any conversion, so the observed billing fact survives a later FFmpeg
+        crash instead of being lost; ``None`` leaves the cost unknown rather than
+        inventing one, and no provider, network, or GET path is opened to look for
+        it. The first observation is immutable: a repeat with a different amount is
+        refused, never overwritten.
+
+        A repeated identical call whose ``expected_revision`` is still current is
+        an idempotent no-op: it advances no revision and inserts no second artifact.
+        A stale revision, a foreign or media-route attempt, a
+        non-``submitting``/``raw_saved`` status, a stored remote id, a receipt
+        number off the part position, or evidence that does not verify fails closed
+        with no database mutation. The call owns its transaction and refuses to run
+        inside an already open one. Raises :class:`ValueError` for an invalid
+        ``expected_revision``, a non-UUID attempt or part, a non-receipt, or an
+        unusable amount before any write;
+        :class:`HistoryPaidAttemptInTransactionError` inside an open transaction;
+        :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign or absent part;
+        :class:`HistoryPaidRawConflictError` for a conflicting or unverifiable
+        transition; and :class:`HistoryRevisionConflictError` for a stale revision.
+        """
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_expected_revision(expected_revision)
+        if not isinstance(receipt, PaidRawReceipt):
+            raise ValueError("receipt must be a PaidRawReceipt")
+        # Validate the observed amount before any database read, so an unbounded
+        # usage value never reaches this seam.
+        observed = None if amount is None else _observed_media_cost(amount)
+        self._require_no_open_transaction("record_polza_sync_raw_saved")
+
+        # Identity reads and the on-disk verification stay outside any
+        # transaction: hashing the raw bytes must never hold the write lock.
+        run = self.get_run(run_uuid)
+        if run is None:
+            raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+        self._require_run_paid_transition_allowed(run)
+        part = self._get_part(part_identifier)
+        if part is None or part.run_uuid != run_uuid:
+            raise HistoryPartNotFoundError(
+                f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+            )
+        attempt = self.get_attempt(attempt_identifier)
+        self._require_sync_raw_saved_attempt(attempt, run_uuid, part_identifier)
+        assert attempt is not None  # narrowed by the guard above
+        if receipt.number != part.position:
+            # The caller receipt only locates the raw bytes; its number is still
+            # bounded to the generated chunk id. Linking chunk_02 to part
+            # position 1 (equal-fingerprint parts or a caller bug) would bind the
+            # wrong paid bytes, so refuse before any hashing or database write.
+            raise HistoryPaidRawConflictError(
+                f"paid raw receipt number does not match part {part_identifier!r} position; "
+                "refusing to link it"
+            )
+        verified = self._verify_media_raw_receipt(run, part, attempt, receipt)
+
+        with self.transaction():
+            current_run = self.get_run(run_uuid)
+            if current_run is None:  # pragma: no cover - the run existed a moment ago
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(current_run)
+            # The evidence was verified on disk against ``run.run_root`` outside
+            # this transaction. A concurrent writer can change ``runs.run_root``
+            # between that verification and here, so the verified relative path
+            # would then point into a root whose bytes were never checked.
+            if current_run.run_root != run.run_root:
+                raise HistoryPaidRawConflictError(
+                    f"run {run_uuid!r} run_root changed during the raw-saved transition; "
+                    "refusing to link evidence verified against a different root"
+                )
+            current_part = self._get_part(part_identifier)
+            if (
+                current_part is None
+                or current_part.run_uuid != run_uuid
+                or current_part.fingerprint != verified.synthesis_fingerprint
+                or current_part.position != verified.number
+            ):
+                raise HistoryPaidRawConflictError(
+                    f"part {part_identifier!r} identity changed during the raw-saved transition"
+                )
+            current_attempt = self.get_attempt(attempt_identifier)
+            self._require_sync_raw_saved_attempt(current_attempt, run_uuid, part_identifier)
+            assert current_attempt is not None  # narrowed by the guard above
+            if current_attempt.remote_id != verified.remote_task_id:
+                raise HistoryPaidRawConflictError(
+                    f"attempt {attempt_identifier!r} remote identity changed during the "
+                    "raw-saved transition"
+                )
+            existing = self._raw_saved_artifact(
+                run_uuid, part_identifier, attempt_identifier, verified
+            )
+            if current_attempt.status == ATTEMPT_STATUS_RAW_SAVED:
+                # A verified duplicate is idempotent only while the caller's
+                # revision is current, so a stale caller cannot treat a
+                # committed write as its own and skip a needed reload.
+                if existing is None:
+                    raise HistoryPaidRawConflictError(
+                        f"attempt {attempt_identifier!r} records {ATTEMPT_STATUS_RAW_SAVED!r} "
+                        "but its paid raw artifact is missing"
+                    )
+                if observed is not None and not _same_observed_cost(current_attempt.cost, observed):
+                    raise HistoryPaidRawConflictError(
+                        f"attempt {attempt_identifier!r} already records a different observed "
+                        "cost; refusing to overwrite the first observation"
+                    )
+                if current_run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return current_run, current_attempt, existing
+            if existing is not None:
+                raise HistoryPaidRawConflictError(
+                    f"attempt {attempt_identifier!r} already carries a paid raw artifact but is "
+                    f"not {ATTEMPT_STATUS_RAW_SAVED!r}"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            artifact = self.add_artifact(
+                run_uuid,
+                role=ARTIFACT_ROLE_PAID_RAW_AUDIO,
+                path_kind=PATH_KIND_MANAGED_RELATIVE,
+                path=verified.relative_path,
+                part_uuid=part_identifier,
+                attempt_uuid=attempt_identifier,
+                mime=_RAW_AUDIO_MIME_BY_FORMAT[verified.audio_format],
+                size_bytes=verified.size,
+                sha256=verified.sha256,
+                media_metadata={
+                    "format": verified.audio_format,
+                    "chunk_id": verified.chunk_id,
+                    "number": verified.number,
+                    "generation_id": verified.generation_id,
+                },
+            )
+            if observed is not None:
+                # The observed amount is written in the same transaction as the raw
+                # link, before any conversion, so a later FFmpeg failure cannot lose
+                # the billing fact. ``remote_id IS NULL`` is required, unlike the
+                # media seam where ``= ?`` would never match a NULL.
+                cost_cursor = self._connection.execute(
+                    "UPDATE attempts SET cost = ?, cost_raw = ?, cost_currency = ?, "
+                    "cost_source = ?, cost_exact_available = ?, updated_at = ? "
+                    "WHERE attempt_uuid = ? AND status = ? AND remote_id IS NULL "
+                    "AND cost IS NULL",
+                    (
+                        observed.amount,
+                        observed.raw,
+                        observed.currency,
+                        observed.source,
+                        1 if observed.exact_available else 0,
+                        utc_now(),
+                        attempt_identifier,
+                        ATTEMPT_STATUS_SUBMITTING,
+                    ),
+                )
+                # The guarded write must be the only one that records the amount;
+                # otherwise the whole transaction rolls back rather than returning a
+                # partial cost observation.
+                if cost_cursor.rowcount != 1:
+                    raise HistoryPaidRawConflictError(
+                        f"attempt {attempt_identifier!r} did not carry an unobserved "
+                        "synchronous submitting state during the transition; refusing a "
+                        "partial cost observation"
+                    )
+            cursor = self._connection.execute(
+                "UPDATE attempts SET status = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND status = ? AND remote_id IS NULL",
+                (
+                    ATTEMPT_STATUS_RAW_SAVED,
+                    utc_now(),
+                    attempt_identifier,
+                    ATTEMPT_STATUS_SUBMITTING,
+                ),
+            )
+            # The guarded write must be the only one that marks the raw saved. A
+            # trigger, constraint, or lost race that makes it affect no row cannot
+            # yield a linked artifact with an advanced revision: raise so the whole
+            # transaction, including the artifact and revision bump, rolls back.
+            if cursor.rowcount != 1:
+                raise HistoryPaidRawConflictError(
+                    f"attempt {attempt_identifier!r} was not an unlinked "
+                    f"{ATTEMPT_STATUS_SUBMITTING!r} attempt during the raw-saved "
+                    "transition; refusing a partial artifact"
+                )
+            # Best-effort coherence for a part that never had a stage: an
+            # imported or already-staged part keeps its own, so a zero rowcount
+            # here is legitimate and not an error.
+            self._connection.execute(
+                "UPDATE parts SET stage = ?, updated_at = ? "
+                "WHERE part_uuid = ? AND run_uuid = ? AND stage IS NULL",
+                (PART_STAGE_RAW_SAVED, utc_now(), part_identifier, run_uuid),
+            )
+            updated = self.get_attempt(attempt_identifier)
+            if updated is None:  # pragma: no cover - the attempt was just updated
+                raise HistoryPaidRawConflictError(
+                    f"attempt {attempt_identifier!r} vanished during the transition"
+                )
+            return advanced, updated, artifact
+
     def record_tts_part_completed(
         self,
         run_uuid: str,
@@ -2276,6 +2518,50 @@ class HistoryRepository:
         if attempt.remote_id is None or _MEDIA_TASK_ID_PATTERN.fullmatch(attempt.remote_id) is None:
             raise HistoryPaidRawConflictError(
                 f"attempt {attempt.attempt_uuid!r} does not carry a bounded accepted remote task id"
+            )
+
+    def _require_sync_raw_saved_attempt(
+        self, attempt: AttemptRecord | None, run_uuid: str, part_uuid: str
+    ) -> None:
+        """Fail closed unless the attempt may carry a synchronous paid raw artifact.
+
+        The target must be a ``tts_chunk`` attempt of the named run and part whose
+        provider is in :data:`SYNC_TTS_PROVIDER_IDS`, whose model does *not* use
+        the async ``elevenlabs/`` ``/media`` route, whose ``remote_id`` is unknown
+        (a synchronous submit never stores one), and whose status is
+        :data:`ATTEMPT_STATUS_SUBMITTING` (before the link) or
+        :data:`ATTEMPT_STATUS_RAW_SAVED` (an idempotent repeat). Any other status
+        is refused so a partial or already-finished attempt is never relinked.
+        """
+        if attempt is None or attempt.run_uuid != run_uuid or attempt.part_uuid != part_uuid:
+            raise HistoryPaidRawConflictError(
+                f"no paid attempt for run {run_uuid!r} part {part_uuid!r}"
+            )
+        if (
+            attempt.call_type != ATTEMPT_CALL_TYPE_TTS_CHUNK
+            or attempt.provider not in SYNC_TTS_PROVIDER_IDS
+        ):
+            raise HistoryPaidRawConflictError(
+                f"attempt {attempt.attempt_uuid!r} is not a synchronous paid "
+                f"{ATTEMPT_CALL_TYPE_TTS_CHUNK!r} attempt"
+            )
+        # Only a Polza ``elevenlabs/`` model uses the async ``/media`` route and
+        # belongs to the sibling media seam; every other synchronous model keeps
+        # this route with no remote task id.
+        if attempt.provider == POLZA_TTS_PROVIDER_ID and _polza_media_route_model(attempt.model):
+            raise HistoryPaidRawConflictError(
+                f"attempt {attempt.attempt_uuid!r} model uses the async Polza /media route; "
+                "its accepted evidence belongs to the media raw-saved seam"
+            )
+        if attempt.status not in (ATTEMPT_STATUS_SUBMITTING, ATTEMPT_STATUS_RAW_SAVED):
+            raise HistoryPaidRawConflictError(
+                f"attempt {attempt.attempt_uuid!r} is {attempt.status!r}, not "
+                f"{ATTEMPT_STATUS_SUBMITTING!r} or {ATTEMPT_STATUS_RAW_SAVED!r}"
+            )
+        if attempt.remote_id is not None:
+            raise HistoryPaidRawConflictError(
+                f"attempt {attempt.attempt_uuid!r} carries a remote task id; a synchronous "
+                "submit never stores one"
             )
 
     def _verify_media_raw_receipt(

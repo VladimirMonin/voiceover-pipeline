@@ -2015,6 +2015,9 @@ def test_paid_submit_overwrite_after_timeout_is_refused_and_keeps_evidence(
             str(args.output_dir),
             "--run-id",
             "paid-overwrite-fresh",
+            # ``--no-trim`` keeps this separate run on the legacy JSON writer so
+            # the marker isolation contract below is asserted where it lives.
+            "--no-trim",
             "--json",
         ],
     )

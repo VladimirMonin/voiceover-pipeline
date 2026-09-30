@@ -1295,23 +1295,26 @@ def generate(args: argparse.Namespace) -> None:
 
 
 def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool:
-    """Whether this command is the admitted DB-first native TTS route.
+    """Whether this command is an admitted DB-first native TTS route.
 
-    Only an ordinary, non-dialogue ``polza-tts`` run on the ElevenLabs ``/media``
-    model route, without integrated timing or quality processing and with the
-    fixed trimming semantics the native slice records, is executed by the native
-    executor. Every other route keeps the legacy executor and its JSON writer
-    unchanged.
+    An ordinary, non-dialogue ``polza-tts`` run on either its async ``elevenlabs/``
+    ``/media`` model route or its synchronous ``/audio/speech`` model route, and an
+    ordinary ``openrouter-tts`` run, are executed by the native executor when they
+    use no integrated timing or quality processing and the fixed trimming
+    semantics the native slice records. Every other route keeps the legacy
+    executor and its JSON writer unchanged.
     """
-    return (
-        script_format == "markdown"
-        and getattr(args, "provider", None) == "polza-tts"
-        and isinstance(getattr(args, "model", None), str)
-        and args.model.startswith("elevenlabs/")
-        and not getattr(args, "with_timings", False)
-        and not getattr(args, "tts_quality_provider", None)
-        and not getattr(args, "no_trim", False)
-    )
+    if script_format != "markdown":
+        return False
+    if (
+        getattr(args, "with_timings", False)
+        or getattr(args, "tts_quality_provider", None)
+        or getattr(args, "no_trim", False)
+    ):
+        return False
+    if not isinstance(getattr(args, "model", None), str):
+        return False
+    return getattr(args, "provider", None) in ("polza-tts", "openrouter-tts")
 
 
 @contextmanager
@@ -1372,15 +1375,16 @@ def _run_native_route(
     """Execute, resume, or re-export one native-owned run and print the result.
 
     The provider is built lazily inside ``provider_factory`` and therefore only
-    for a fresh unattempted submit or a known-id GET recovery: a local raw rebuild
-    or a completed-run export repair never reads an API key or constructs a
-    provider. ``--overwrite`` is rejected for a native run so accepted paid
-    evidence is never deleted; ``--skip-existing`` keeps its usual precedence.
+    for a fresh unattempted submit (async media or synchronous) or a known-id
+    media GET recovery: a local raw rebuild or a completed-run export repair never
+    reads an API key or constructs a provider. ``--overwrite`` is rejected for a
+    native run so accepted paid evidence is never deleted; ``--skip-existing``
+    keeps its usual precedence.
     """
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an ordinary non-dialogue "
-            "polza-tts ElevenLabs /media run without timing or quality flags may continue it; "
+            "polza-tts or openrouter-tts run without timing or quality flags may continue it; "
             "choose a different --run-id for a run with other options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},

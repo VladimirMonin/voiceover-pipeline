@@ -299,15 +299,16 @@ voiceover list timing-providers --json
 | Папка существует без флагов | Ошибка exit code 30 |
 | Папка — нативный прогон | Свойства: `--overwrite` отклоняется (exit 30); `--skip-existing` возвращает `skipped`; без `--resume` — ошибка; `--resume` идёт по canonical SQLite (см. ниже) |
 
-### Нативный прогон `polza-tts` + `elevenlabs/...`
+### Нативный прогон `polza-tts` / `openrouter-tts`
 
-Если запуск — обычный не-диалоговый `polza-tts` с моделью `elevenlabs/...` без
-`--with-timings`, `--tts-quality-provider` и `--no-trim`, то история становится
-canonical: части, попытки, оплаченные байты и финальная сборка хранятся в
-SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON пишутся как
-совместимый экспорт с `history_run_uuid` и `history_revision`. Владелец
-каталога определяется до чтения ключа, цен и удаления: committed прогон по
-`run_root` или крошечный `.voiceover-native-history.json`. Нативный след при
+Если запуск — обычный не-диалоговый `polza-tts` (модель `elevenlabs/...` через
+async `/media` либо любая другая через синхронный `/audio/speech`) или
+`openrouter-tts`, без `--with-timings`, `--tts-quality-provider` и `--no-trim`,
+то история становится canonical: части, попытки, оплаченные байты и финальная
+сборка хранятся в SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON
+пишутся как совместимый экспорт с `history_run_uuid` и `history_revision`.
+Владелец каталога определяется до чтения ключа, цен и удаления: committed прогон
+по `run_root` или крошечный `.voiceover-native-history.json`. Нативный след при
 нечитаемой/отсутствующей БД и дескриптор без своего прогона дают fail-closed
 (exit 30, `details.error_code = NATIVE_OWNERSHIP_UNVERIFIABLE` /
 `NATIVE_OWNERSHIP_RUN_MISSING`) без фоллбэка на JSON. Провайдер строится
@@ -317,7 +318,18 @@ SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON пишутся к�
 exit 50 с `details.error_code = NATIVE_EXPORT_FAILED`. Изменённый текст,
 голос или модель блокируются до сети (`NATIVE_RESUME_IDENTITY_CHANGED`),
 занятый run lock — exit 30 `NATIVE_RUN_LOCKED`. Обратный переход к legacy
-JSON для такого каталога запрещён.
+JSON для такого каталога запрещён. Существующие legacy-каталоги не захватываются:
+свежий native-запуск требует ещё не созданного `run_root`.
+
+Синхронный `polza-tts` (`/audio/speech`) и `openrouter-tts` не дают
+восстановимого task id. Их принятые байты связываются с БД с
+`remote_task_id = null`; точная стоимость ответа `polza-tts` пишется до FFmpeg,
+а `openrouter-tts` не отдаёт синхронного usage, поэтому его стоимость остаётся
+неизвестной без нового сетевого GET и не выдумывается. Неопределённый
+синхронный ответ оставляет маркер `submitting` и блокирует `--resume` без
+повторного POST/GET; крах между записью `raw/` и его связыванием с БД
+пересобирается локально по тому же receipt. В этом узком окне наблюдённая
+стоимость теряется и остаётся `null`, а не ложной.
 
 ### Платный submit и маркер `pending_attempt`
 

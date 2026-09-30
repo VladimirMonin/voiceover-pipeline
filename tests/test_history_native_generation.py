@@ -8,6 +8,7 @@ statuses, so a slice that silently re-submits or loses evidence fails here.
 """
 
 import json
+import sqlite3
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -64,20 +65,36 @@ class FakeMediaProvider:
 
 
 class FakeSyncProvider:
-    """Offline stand-in for the legacy synchronous synthesis seam."""
+    """Offline stand-in for a synchronous (non-media) TTS submit.
 
-    def __init__(self) -> None:
+    ``usage`` seeds the Polza ``/audio/speech`` ``usage_direct`` metadata so the
+    exact-cost path is exercised; ``script`` lets a test replace one call, for
+    example to raise before or after a response.
+    """
+
+    def __init__(self, usage: dict | None = None) -> None:
         self.calls: list[str] = []
+        self.usage = usage
+        self.script = None
 
-    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
-        self.calls.append(chunk_id)
+    def _result(self, text: str, chunk_id: str) -> SynthesisResult:
+        raw_metadata: dict[str, object] = {}
+        if self.usage is not None:
+            raw_metadata["usage_direct"] = self.usage
         return SynthesisResult(
             audio_bytes=f"{chunk_id}-audio".encode(),
             audio_format="mp3",
             transcript=text,
             generation_id=f"gen-{chunk_id}",
             client_path="requests",
+            raw_metadata=raw_metadata,
         )
+
+    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
+        self.calls.append(chunk_id)
+        if self.script is not None:
+            return self.script(self, text, chunk_id)
+        return self._result(text, chunk_id)
 
 
 def _write_mp3(_ffmpeg: str, data: bytes, _fmt: str, path: Path) -> None:
@@ -118,13 +135,14 @@ def _generate_argv(
     *,
     model: str = POLZA_MEDIA_MODEL,
     voice: str = "Rachel",
+    provider: str = "polza-tts",
     extra=(),
 ):
     return [
         "voiceover-pipeline",
         "generate",
         "--provider",
-        "polza-tts",
+        provider,
         "--model",
         model,
         "--voice",
@@ -162,6 +180,22 @@ def _install_provider(monkeypatch, provider):
 
     monkeypatch.setattr(cli, "build_provider", fake_build)
     return builds
+
+
+def _patch_legacy_finalization(monkeypatch) -> None:
+    """Replace the legacy-only cost enrichment and concat seams."""
+    monkeypatch.setattr(
+        cli,
+        "attach_costs",
+        lambda _provider, _key, _model, _started, chunks: chunks,
+    )
+    monkeypatch.setattr(
+        cli,
+        "concat_mp3_chunks",
+        lambda ffmpeg, chunks_dir, output: _concat(
+            ffmpeg, sorted(chunks_dir.glob("chunk_*.mp3")), output
+        ),
+    )
 
 
 def _history_show(run_uuid: str) -> dict:
@@ -243,6 +277,461 @@ def test_native_fresh_route_never_calls_legacy_pricing_or_key_early(
     assert code == 0
     assert builds == ["built"]
     assert provider.submits == ["chunk_01"]
+
+
+# ── synchronous Polza /audio/speech and OpenRouter routes ─────────────────────
+
+
+def _chunk_costs(history_db: Path) -> dict[int, str | None]:
+    """Read the committed per-part cost column from the open history database."""
+    connection = sqlite3.connect(history_db)
+    try:
+        rows = connection.execute(
+            "SELECT p.position, a.cost FROM attempts a "
+            "JOIN parts p ON p.part_uuid = a.part_uuid ORDER BY p.position"
+        ).fetchall()
+    finally:
+        connection.close()
+    return {position: cost for position, cost in rows}
+
+
+def _artifact_media_metadata(history_db: Path) -> dict[str, dict]:
+    """Read each linked artifact's metadata JSON from the open history database."""
+    connection = sqlite3.connect(history_db)
+    try:
+        rows = connection.execute("SELECT role, media_metadata_json FROM artifacts").fetchall()
+    finally:
+        connection.close()
+    return {role: json.loads(metadata) for role, metadata in rows if metadata is not None}
+
+
+def test_native_sync_polza_two_parts_persist_exact_cost_before_conversion(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A fresh sync Polza run writes the exact observed cost before every FFmpeg step."""
+    provider = FakeSyncProvider(usage={"cost_rub": Decimal("0.3")})
+    _install_provider(monkeypatch, provider)
+    monkeypatch.setattr(
+        cli,
+        "attach_costs",
+        lambda *_args, **_kwargs: pytest.fail("the native route must not GET an enriched cost"),
+    )
+    history_db = native_env / "history.sqlite3"
+    seen: list[dict[int, str | None]] = []
+
+    def record_then_write(_ffmpeg, data, _fmt, path):
+        # Snapshot the committed cost column right before each chunk is converted,
+        # so the amount must already be durable when FFmpeg starts.
+        seen.append(_chunk_costs(history_db))
+        path.write_bytes(data)
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", record_then_write)
+    script = _script(tmp_path, ["Первый фрагмент.", "Второй фрагмент."])
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(tmp_path, script, "native-sync-cost", model=POLZA_SYNC_MODEL, voice="alloy"),
+    )
+
+    assert code == 0
+    assert payload["status"] == "success"
+    assert provider.calls == ["chunk_01", "chunk_02"]
+    assert seen[0] == {1: "0.3"}
+    assert seen[1] == {1: "0.3", 2: "0.3"}
+
+    run_root = tmp_path / "out" / "native-sync-cost"
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    assert (run_root / "chunks" / "chunk_02.mp3").read_bytes() == b"chunk_02-audio"
+    detail = _history_show(_run_uuid("native-sync-cost"))
+    assert detail["run"]["status"] == "completed"
+    assert all(attempt["status"] == "completed" for attempt in detail["attempts"])
+    assert all(attempt["remote_id"] is None for attempt in detail["attempts"])
+    assert all(attempt["cost"]["amount"] == "0.3" for attempt in detail["attempts"])
+    assert all(attempt["cost"]["exact_available"] is True for attempt in detail["attempts"])
+    roles = {artifact["role"] for artifact in detail["artifacts"]}
+    assert {"paid_raw_audio", "chunk_audio", "final_audio"} <= roles
+
+
+def test_native_sync_openrouter_links_raw_without_cost_or_generation_get(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """An OpenRouter sync run links raw with no remote id and an unknown cost."""
+    provider = FakeSyncProvider()  # the inline audio carries no synchronous usage
+    _install_provider(monkeypatch, provider)
+    monkeypatch.setattr(
+        cli,
+        "attach_costs",
+        lambda *_args, **_kwargs: pytest.fail("a sync run must not fetch a generation cost"),
+    )
+    script = _script(tmp_path, ["Один фрагмент."])
+
+    code, _payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path,
+            script,
+            "native-openrouter",
+            provider="openrouter-tts",
+            model="google/gemini-3.1-flash-tts-preview",
+            voice="Puck",
+        ),
+    )
+
+    assert code == 0
+    assert provider.calls == ["chunk_01"]
+    run_root = tmp_path / "out" / "native-openrouter"
+    receipt = json.loads(
+        (run_root / "raw" / "chunk_01.mp3.receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["remote_task_id"] is None
+    assert receipt["generation_id"] == "gen-chunk_01"
+    attempt = _history_show(_run_uuid("native-openrouter"))["attempts"][0]
+    assert attempt["provider"] == "openrouter-tts"
+    assert attempt["remote_id"] is None
+    assert attempt["status"] == "completed"
+    assert attempt["cost"]["amount"] is None
+    assert attempt["cost"]["source"] == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("provider_name", "model", "voice", "run_id", "invalid_id", "usage", "expected_cost"),
+    [
+        (
+            "polza-tts",
+            POLZA_SYNC_MODEL,
+            "alloy",
+            "native-sync-id-dotted",
+            "generation.123",
+            {"cost_rub": Decimal("0.3")},
+            "0.3",
+        ),
+        (
+            "polza-tts",
+            POLZA_SYNC_MODEL,
+            "alloy",
+            "native-sync-id-overlong",
+            "g" * 129,
+            {"cost_rub": Decimal("0.3")},
+            "0.3",
+        ),
+        (
+            "openrouter-tts",
+            "google/gemini-3.1-flash-tts-preview",
+            "Puck",
+            "native-sync-id-unicode",
+            "gen-\u03a9-123",
+            None,
+            None,
+        ),
+    ],
+)
+def test_native_sync_drops_invalid_optional_generation_id(
+    tmp_path,
+    monkeypatch,
+    capsys,
+    native_env,
+    provider_name,
+    model,
+    voice,
+    run_id,
+    invalid_id,
+    usage,
+    expected_cost,
+):
+    """A dotted, overlong, or non-ASCII sync generation id is dropped, not fatal.
+
+    The optional id a synchronous provider reports is untrusted and not required
+    to be a bounded opaque token. It must be discarded to ``None`` before the
+    bounded receipt is written: the accepted paid audio, its raw receipt, the
+    database link, the local conversion, and the export all survive, and the
+    invalid value never reaches the receipt, the database, or the export.
+    """
+    provider = FakeSyncProvider(usage=usage)
+
+    def invalid_result(_inner, text, chunk_id):
+        raw_metadata = {} if usage is None else {"usage_direct": usage}
+        return SynthesisResult(
+            audio_bytes=f"{chunk_id}-audio".encode(),
+            audio_format="mp3",
+            transcript=text,
+            generation_id=invalid_id,
+            client_path="requests",
+            raw_metadata=raw_metadata,
+        )
+
+    provider.script = invalid_result
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Один фрагмент."])
+    argv = _generate_argv(
+        tmp_path,
+        script,
+        run_id,
+        provider=provider_name,
+        model=model,
+        voice=voice,
+    )
+
+    code, payload = _json_run(monkeypatch, capsys, argv)
+
+    # Exactly one paid POST, no second request, and the run completes locally.
+    assert code == 0, payload
+    assert payload["status"] == "success"
+    assert provider.calls == ["chunk_01"]
+
+    run_root = tmp_path / "out" / run_id
+    raw_dir = run_root / "raw"
+    assert (raw_dir / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    receipt_text = (raw_dir / "chunk_01.mp3.receipt.json").read_text(encoding="utf-8")
+    receipt = json.loads(receipt_text)
+    assert receipt["remote_task_id"] is None
+    assert receipt["generation_id"] is None
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+
+    attempt = _history_show(_run_uuid(run_id))["attempts"][0]
+    assert attempt["status"] == "completed"
+    assert attempt["remote_id"] is None
+    assert attempt["cost"]["amount"] == expected_cost
+
+    # The receipt, the raw artifact, and the converted chunk metadata all carry
+    # the same dropped (``None``) id, so no verification path can mismatch.
+    artifacts = _artifact_media_metadata(native_env / "history.sqlite3")
+    assert artifacts["paid_raw_audio"]["generation_id"] is None
+    assert artifacts["chunk_audio"]["generation_id"] is None
+
+    chunks_manifest = json.loads((run_root / "chunks" / "chunks.json").read_text(encoding="utf-8"))
+    export_text = json.dumps(chunks_manifest)
+    assert chunks_manifest["chunks"][0].get("generation_id") is None
+    assert invalid_id not in receipt_text
+    assert invalid_id not in json.dumps(payload)
+    assert invalid_id not in export_text
+
+
+def test_native_sync_unknown_submit_blocks_without_repeat(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A synchronous submit whose outcome is unknown blocks resume with no repeat."""
+    provider = FakeSyncProvider()
+
+    def fail_after_reserve(_inner, _text, _chunk_id):
+        raise requests.Timeout("response lost")
+
+    provider.script = fail_after_reserve
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Неопределённый исход."])
+    argv = _generate_argv(
+        tmp_path, script, "native-sync-unknown", model=POLZA_SYNC_MODEL, voice="alloy"
+    )
+
+    code, payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_SYNTHESIS_FAILED"
+    assert provider.calls == ["chunk_01"]
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("an unconfirmed sync submit must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-sync-unknown",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--resume"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert provider.calls == ["chunk_01"]
+
+
+def test_native_sync_resume_reconciles_raw_receipt_written_before_db_link(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A crash between sync raw bytes and their DB link rebuilds locally, no POST/GET."""
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    provider = FakeSyncProvider(usage={"cost_rub": Decimal("0.3")})
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Окно между raw и БД."])
+
+    real_link = HistoryRepository.record_polza_sync_raw_saved
+    calls = {"n": 0}
+
+    def flaky_link(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("crash between raw bytes and the database row")
+        return real_link(self, *args, **kwargs)
+
+    monkeypatch.setattr(HistoryRepository, "record_polza_sync_raw_saved", flaky_link)
+    argv = _generate_argv(
+        tmp_path, script, "native-sync-reconcile", model=POLZA_SYNC_MODEL, voice="alloy"
+    )
+    code, _payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 30
+    assert provider.calls == ["chunk_01"]
+    raw_dir = tmp_path / "out" / "native-sync-reconcile" / "raw"
+    assert (raw_dir / "chunk_01.mp3").exists()
+    assert (raw_dir / "chunk_01.mp3.receipt.json").exists()
+
+    monkeypatch.setattr(HistoryRepository, "record_polza_sync_raw_saved", real_link)
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("reconciling an on-disk sync receipt must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-sync-reconcile",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--resume"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0, payload
+    assert provider.calls == ["chunk_01"]
+    run_root = tmp_path / "out" / "native-sync-reconcile"
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    # The cost observed in the crash window is unrecoverable: the receipt carries
+    # no cost, so the rebuilt attempt keeps an unknown cost rather than a false one.
+    assert (
+        _history_show(_run_uuid("native-sync-reconcile"))["attempts"][0]["cost"]["amount"] is None
+    )
+
+
+def test_native_sync_resume_rebuilds_from_raw_artifact_without_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A committed sync raw artifact is rebuilt locally with no provider construction."""
+    provider = FakeSyncProvider(usage={"cost_rub": Decimal("0.3")})
+    _install_provider(monkeypatch, provider)
+    calls = {"n": 0}
+
+    def flaky_write(_ffmpeg, data, _fmt, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("conversion boom")
+        path.write_bytes(data)
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
+    script = _script(tmp_path, ["Сохранённый raw."])
+    argv = _generate_argv(
+        tmp_path, script, "native-sync-raw", model=POLZA_SYNC_MODEL, voice="alloy"
+    )
+    code, payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 50
+    assert payload["details"]["error_code"] == "NATIVE_CONVERSION_FAILED"
+    assert provider.calls == ["chunk_01"]
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", _write_mp3)
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("a local sync raw rebuild must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-sync-raw",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--resume"],
+    )
+    code, _payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 0
+    assert provider.calls == ["chunk_01"]
+    assert (
+        tmp_path / "out" / "native-sync-raw" / "chunks" / "chunk_01.mp3"
+    ).read_bytes() == b"chunk_01-audio"
+    detail = _history_show(_run_uuid("native-sync-raw"))
+    assert detail["run"]["status"] == "completed"
+    # The exact cost linked before conversion survives the failed conversion.
+    assert detail["attempts"][0]["cost"]["amount"] == "0.3"
+
+
+def test_native_sync_resume_corrupted_raw_fails_closed(tmp_path, monkeypatch, capsys, native_env):
+    """A tampered synchronous raw file never permits a second paid submit."""
+    provider = FakeSyncProvider(usage={"cost_rub": Decimal("0.3")})
+    _install_provider(monkeypatch, provider)
+    calls = {"n": 0}
+
+    def flaky_write(_ffmpeg, data, _fmt, path):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("conversion boom")
+        path.write_bytes(data)
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", flaky_write)
+    script = _script(tmp_path, ["Повреждённый raw."])
+    argv = _generate_argv(
+        tmp_path, script, "native-sync-corrupt", model=POLZA_SYNC_MODEL, voice="alloy"
+    )
+    code, payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 50
+    assert payload["details"]["error_code"] == "NATIVE_CONVERSION_FAILED"
+    assert provider.calls == ["chunk_01"]
+
+    raw = tmp_path / "out" / "native-sync-corrupt" / "raw" / "chunk_01.mp3"
+    assert raw.exists()
+    raw.write_bytes(b"tampered-paid-bytes")
+
+    monkeypatch.setattr(cli, "write_audio_as_mp3", _write_mp3)
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("a corrupt raw file must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    resume_argv = _generate_argv(
+        tmp_path,
+        script,
+        "native-sync-corrupt",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--resume"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_RAW_EVIDENCE_INVALID"
+    assert provider.calls == ["chunk_01"]
+
+
+def test_native_sync_resume_changed_text_blocks_before_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Changed spoken text fails the sync identity preflight before a provider exists."""
+    provider = FakeSyncProvider(usage={"cost_rub": Decimal("0.3")})
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Исходный текст."])
+    argv = _generate_argv(
+        tmp_path, script, "native-sync-text", model=POLZA_SYNC_MODEL, voice="alloy"
+    )
+    code, _payload = _json_run(monkeypatch, capsys, argv)
+    assert code == 0
+
+    def explode(*_args, **_kwargs):  # pragma: no cover - must never run
+        raise AssertionError("a blocked resume must not build a provider")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    changed = _script(tmp_path, ["Совсем другой текст."])
+    resume_argv = _generate_argv(
+        tmp_path,
+        changed,
+        "native-sync-text",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--resume"],
+    )
+    code, payload = _json_run(monkeypatch, capsys, resume_argv)
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_RESUME_IDENTITY_CHANGED"
+    assert provider.calls == ["chunk_01"]
 
 
 # ── resume: identity and evidence ─────────────────────────────────────────────
@@ -611,30 +1100,42 @@ def test_native_run_with_missing_history_database_fails_closed(
     assert root_db.exists()
 
 
-def test_legacy_non_media_route_stays_on_the_json_writer(tmp_path, monkeypatch, capsys, native_env):
-    """A non-media polza-tts model keeps the legacy executor and JSON state."""
+def test_legacy_existing_sync_directory_stays_on_the_json_writer(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """An on-disk legacy sync run is never captured by the native executor.
+
+    A fresh eligible sync run is native, but a directory that already carries
+    legacy JSON state with no native trace must stay on the legacy writer: the
+    fresh-native branch needs a run root that does not exist yet, and ownership
+    resolves the existing root to legacy before any deletion.
+    """
     provider = FakeSyncProvider()
     _install_provider(monkeypatch, provider)
-    monkeypatch.setattr(
-        cli,
-        "attach_costs",
-        lambda _provider, _key, _model, _started, chunks: chunks,
-    )
-    monkeypatch.setattr(
-        cli,
-        "concat_mp3_chunks",
-        lambda ffmpeg, chunks_dir, output: _concat(
-            ffmpeg, sorted(chunks_dir.glob("chunk_*.mp3")), output
-        ),
-    )
+    _patch_legacy_finalization(monkeypatch)
     script = _script(tmp_path, ["Легаси-прогон."])
 
-    argv = _generate_argv(tmp_path, script, "legacy-run", model=POLZA_SYNC_MODEL, voice="alloy")
+    # A pre-existing legacy run directory with only its JSON state and no native
+    # descriptor, native history row, or paid raw receipt.
+    run_root = tmp_path / "out" / "legacy-sync"
+    run_root.mkdir(parents=True)
+    (run_root / "run_state.json").write_text(
+        json.dumps({"status": "running", "chunks": [], "run_id": "legacy-sync"}),
+        encoding="utf-8",
+    )
+
+    argv = _generate_argv(
+        tmp_path,
+        script,
+        "legacy-sync",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--overwrite"],
+    )
     code, payload = _json_run(monkeypatch, capsys, argv)
 
     assert code == 0
     assert payload["status"] == "success"
-    run_root = tmp_path / "out" / "legacy-run"
     state = json.loads((run_root / "run_state.json").read_text(encoding="utf-8"))
     assert "native_history" not in state
     assert not (run_root / ".voiceover-native-history.json").exists()
@@ -659,7 +1160,7 @@ def test_native_descriptor_is_required_for_ownership(monkeypatch, tmp_path, nati
 
 
 def test_native_run_parts_shape_is_valid() -> None:
-    """The native route is admitted only for the ordinary non-dialogue media run."""
+    """The native route is admitted for the ordinary non-dialogue sync and media runs."""
     import argparse
 
     args = argparse.Namespace(
@@ -670,6 +1171,14 @@ def test_native_run_parts_shape_is_valid() -> None:
         no_trim=False,
     )
     assert cli._native_route_eligible(args, "markdown") is True
+    # A synchronous polza-tts model and an openrouter-tts run are admitted too.
+    args.model = POLZA_SYNC_MODEL
+    assert cli._native_route_eligible(args, "markdown") is True
+    args.provider = "openrouter-tts"
+    args.model = "google/gemini-3.1-flash-tts-preview"
+    assert cli._native_route_eligible(args, "markdown") is True
+    args.provider = "polza-tts"
+    args.model = POLZA_MEDIA_MODEL
     args.with_timings = True
     assert cli._native_route_eligible(args, "markdown") is False
     args.with_timings = False
@@ -677,6 +1186,9 @@ def test_native_run_parts_shape_is_valid() -> None:
     assert cli._native_route_eligible(args, "markdown") is False
     args.no_trim = False
     assert cli._native_route_eligible(args, "dialogue") is False
+    # A provider outside the admitted set keeps the legacy executor.
+    args.provider = "polza-chat-audio"
+    assert cli._native_route_eligible(args, "markdown") is False
 
 
 def test_polza_provider_type_is_referenceable() -> None:
@@ -1004,18 +1516,13 @@ def test_legacy_writer_holds_run_lock_across_ownership_recheck(
 
     provider = FakeSyncProvider()
     _install_provider(monkeypatch, provider)
-    monkeypatch.setattr(
-        cli, "attach_costs", lambda _provider, _key, _model, _started, chunks: chunks
-    )
-    monkeypatch.setattr(
-        cli,
-        "concat_mp3_chunks",
-        lambda ffmpeg, chunks_dir, output: _concat(
-            ffmpeg, sorted(chunks_dir.glob("chunk_*.mp3")), output
-        ),
-    )
+    _patch_legacy_finalization(monkeypatch)
     script = _script(tmp_path, ["Легаси под локом."])
-    argv = _generate_argv(tmp_path, script, "legacy-lock", model=POLZA_SYNC_MODEL, voice="alloy")
+    # ``--no-trim`` keeps this sync run on the legacy writer so the lock interval
+    # around the legacy ownership recheck is still exercised.
+    argv = _generate_argv(
+        tmp_path, script, "legacy-lock", model=POLZA_SYNC_MODEL, voice="alloy", extra=["--no-trim"]
+    )
 
     observed: dict[str, object] = {}
     real_reject = cli._reject_native_owned_root_for_legacy
