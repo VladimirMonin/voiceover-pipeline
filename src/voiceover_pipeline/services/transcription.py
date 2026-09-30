@@ -32,7 +32,7 @@ from ..models import (
     ScriptChunk,
     TimingResult,
 )
-from ..providers.asr_registry import ASRProviderSpec
+from ..providers.asr_registry import ASRProviderSpec, get_asr_provider_spec
 from ..providers.base import ASRProvider, TranscriptionProvider, validate_asr_response
 from ..run_state import atomic_write_json
 from ..tts_quality import evaluate_tts_transcript
@@ -189,6 +189,50 @@ def transcribe_generic_asr_timing(
         result,
         source_audio=str(audio_path.resolve()),
         source_duration_s=source_duration_s,
+    )
+
+
+def transcribe_local_asr_quality(
+    *,
+    provider_id: str,
+    audio_path: Path,
+    model: str | None,
+    device: str,
+    compute: str,
+    runtime: str,
+    language: str | None,
+) -> ASRResult:
+    """Run one local ASR verification request and return its observed result.
+
+    This is the small route-specific adapter the native quality step uses: it
+    reuses the same registered-spec lookup, runtime probe, provider construction,
+    long-form orchestration, and declared-capability validation as ``transcribe``
+    instead of adding a second ASR persistence or execution path. The request asks
+    for no timestamps, because a quality check only compares transcripts; the
+    caller owns the expected text and the comparison thresholds and never invents
+    either.
+    """
+    from ..asr_longform import transcribe_prerecorded_long_form, uses_long_form_orchestration
+
+    spec = get_asr_provider_spec(provider_id)
+    model_id = model or next((item["id"] for item in spec.models if item.get("default")), None)
+    request = ASRRequest(
+        audio_path=audio_path,
+        model_id=model_id,
+        language=language,
+        device=device,
+        compute=compute,
+        timestamp_mode="none",
+        runtime_choice=cast(ASRRuntimeChoice, runtime),
+    )
+    provider = resolve_asr_provider(spec, request)
+    return transcribe_asr_request(
+        provider,
+        spec,
+        request,
+        long_form=uses_long_form_orchestration(spec.provider_id),
+        long_form_transcribe=transcribe_prerecorded_long_form,
+        capability_check=True,
     )
 
 

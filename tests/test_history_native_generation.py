@@ -1294,11 +1294,23 @@ def test_native_run_parts_shape_is_valid() -> None:
     assert cli._native_route_eligible(args, "markdown") is False
     args.with_timings = False
     args.timing_provider = "faster-whisper"
+    # ``--no-trim`` is recorded as the run's own trimming semantics.
     args.no_trim = True
-    assert cli._native_route_eligible(args, "markdown") is False
+    assert cli._native_route_eligible(args, "markdown") is True
     args.no_trim = False
+    # An installed local ASR quality provider is admitted for the same route.
     args.tts_quality_provider = "qwen-local"
+    assert cli._native_route_eligible(args, "markdown") is True
+    args.tts_quality_provider = "nemotron-local"
+    assert cli._native_route_eligible(args, "markdown") is True
+    # A cloud ASR quality provider keeps the legacy executor.
+    args.tts_quality_provider = "xai-stt"
     assert cli._native_route_eligible(args, "markdown") is False
+    # Asking for local timings and local quality at once is not part of the slice.
+    args.tts_quality_provider = "qwen-local"
+    args.with_timings = True
+    assert cli._native_route_eligible(args, "markdown") is False
+    args.with_timings = False
     args.tts_quality_provider = None
     assert cli._native_route_eligible(args, "dialogue") is False
     # A provider outside the admitted set keeps the legacy executor.
@@ -1633,10 +1645,16 @@ def test_legacy_writer_holds_run_lock_across_ownership_recheck(
     _install_provider(monkeypatch, provider)
     _patch_legacy_finalization(monkeypatch)
     script = _script(tmp_path, ["Легаси под локом."])
-    # ``--no-trim`` keeps this sync run on the legacy writer so the lock interval
-    # around the legacy ownership recheck is still exercised.
+    # ``--tts-quality-provider xai-stt`` is a cloud ASR provider, so this sync
+    # non-dialogue run keeps the legacy writer; the lock interval around the legacy
+    # ownership recheck is still exercised.
     argv = _generate_argv(
-        tmp_path, script, "legacy-lock", model=POLZA_SYNC_MODEL, voice="alloy", extra=["--no-trim"]
+        tmp_path,
+        script,
+        "legacy-lock",
+        model=POLZA_SYNC_MODEL,
+        voice="alloy",
+        extra=["--tts-quality-provider", "xai-stt"],
     )
 
     observed: dict[str, object] = {}

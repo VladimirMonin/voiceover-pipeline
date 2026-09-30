@@ -4,10 +4,13 @@ Plan sections 5 and 6 make SQLite the single source of truth for run history:
 one native run's prepared snapshot, paid attempts, raw evidence, converted
 chunks, and final assembly live in the database, and the legacy JSON files become
 compatibility exports. This module owns the bounded executor for the admitted
-routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing or
-quality processing, either its synchronous ``/audio/speech`` model or its async
+routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing
+processing, either its synchronous ``/audio/speech`` model or its async
 ``elevenlabs/`` ``/media`` model, and the synchronous ``openrouter-tts`` route --
-and their recovery decisions.
+and their recovery decisions. Two orthogonal integrated steps are admitted for
+that same ordinary route: the recorded silence-trimming semantics (``--no-trim``
+vs the default trim) and one local post-audio step -- either local
+``faster-whisper`` timings or, separately, a local ASR quality verification.
 
 Contract:
 
@@ -45,12 +48,12 @@ Contract:
   never reads an API key and never builds a provider.
 
 Known limits: this slice admits the non-dialogue ``polza-tts`` and
-``openrouter-tts`` routes and the fixed trimming/assembly semantics recorded in
+``openrouter-tts`` routes and the recorded trimming/timing/quality semantics in
 the snapshot. The crash window between a synchronous raw receipt and its database
 link (covered by local reconciliation) is the only place a synchronous observed
-cost cannot be rebuilt, because the receipt carries no cost. Dialogue, integrated
-transcription/timing, quality gating, and the other speech providers stay on the
-legacy executor until their own identity and processing paths are supported.
+cost cannot be rebuilt, because the receipt carries no cost. Dialogue, cloud ASR,
+cloud timing, and the other speech providers stay on the legacy executor until
+their own identity and processing paths are supported.
 """
 
 from __future__ import annotations
@@ -79,12 +82,15 @@ from ..history.native_asr import (
     ARTIFACT_ROLE_SRT,
     ARTIFACT_ROLE_TIMINGS_JSON,
     ATTEMPT_CALL_TYPE_TIMING,
+    ATTEMPT_CALL_TYPE_VERIFY,
     NATIVE_ASR_ORIGIN,
     OPERATION_TIMINGS,
+    OPERATION_VERIFY,
     AsrHistoryArtifact,
     AsrHistorySave,
     AsrHistoryText,
     persist_asr_history,
+    sha256_text,
 )
 from ..history.native_export import build_native_export, write_native_export
 from ..history.native_resume import NativeResumeError, preflight_native_tts_resume
@@ -119,14 +125,16 @@ from ..history.repository import (
     TEXT_COMPLETENESS_COMPLETE,
     TEXT_COMPLETENESS_INCOMPLETE,
     TEXT_KIND_ASR_TRANSCRIPT,
+    TEXT_KIND_VERIFICATION_TRANSCRIPT,
     ArtifactRecord,
     AttemptRecord,
     HistoryRepository,
     HistoryRepositoryError,
     RunRecord,
 )
-from ..models import RunPaths, ScriptChunk, SynthesisResult
+from ..models import ASRResult, RunPaths, ScriptChunk, SynthesisResult
 from ..run_state import LOG_FILE, GenerationLogger
+from ..tts_quality import TTSQualityResult, evaluate_tts_transcript
 from . import costs
 from .prepare import PreparedPart, PreparedRun
 from .recovery import polza_media_route_model
@@ -137,6 +145,7 @@ _EXIT_ARGS = 2
 _EXIT_MISSING_DEP = 10
 _EXIT_PROVIDER = 30
 _EXIT_OUTPUT = 50
+_EXIT_QUALITY = 60
 
 # Run-local ownership descriptor. It identifies the committed native run and
 # carries no progress and no execution permission; the run lock serializes writers
@@ -186,6 +195,18 @@ _ERROR_TIMING_PROVIDER_UNSUPPORTED = "NATIVE_TIMING_PROVIDER_UNSUPPORTED"
 _ERROR_TIMING_MODEL_UNAVAILABLE = "NATIVE_TIMING_MODEL_UNAVAILABLE"
 _ERROR_TIMING_ARTIFACT_FAILED = "NATIVE_TIMING_ARTIFACT_FAILED"
 _ERROR_TIMING_CONFLICT = "NATIVE_TIMING_CONFLICT"
+# Local quality verification (after the committed final audio) has its own bounded
+# codes: a recorded-quality block a run cannot rebuild, an unsupported/unregistered
+# provider, an unavailable local model, a failed local transcription, a comparison
+# mismatch, a linked-history persistence failure, and duplicate linked verification
+# evidence each report their own stable code.
+_ERROR_QUALITY_OPTIONS_INVALID = "NATIVE_QUALITY_OPTIONS_INVALID"
+_ERROR_QUALITY_PROVIDER_UNSUPPORTED = "NATIVE_QUALITY_PROVIDER_UNSUPPORTED"
+_ERROR_QUALITY_MODEL_UNAVAILABLE = "NATIVE_QUALITY_MODEL_UNAVAILABLE"
+_ERROR_QUALITY_ASR_FAILED = "NATIVE_QUALITY_ASR_FAILED"
+_ERROR_QUALITY_FAILED = "NATIVE_QUALITY_FAILED"
+_ERROR_QUALITY_HISTORY_FAILED = "NATIVE_QUALITY_HISTORY_FAILED"
+_ERROR_QUALITY_CONFLICT = "NATIVE_QUALITY_CONFLICT"
 
 # Stable mode names for the two history entry points.
 _MODE_RESUME = "resume"
@@ -353,6 +374,147 @@ def _preflight_local_timing(options: NativeTimingOptions) -> None:
         )
 
 
+# Flat keys recorded in a native run's output options so a resume can prove the
+# exact local quality-verification settings instead of inferring them from the
+# current command line. Like the timing fields they are plain scalars, so the
+# snapshot's redaction boundary and the verified view accept them unchanged, and a
+# run that requested no quality keeps its original output options byte-for-byte.
+_QUALITY_ENABLED_KEY = "quality_enabled"
+_QUALITY_PROVIDER_KEY = "quality_provider"
+_QUALITY_MODEL_KEY = "quality_model"
+_QUALITY_DEVICE_KEY = "quality_device"
+_QUALITY_COMPUTE_KEY = "quality_compute"
+_QUALITY_RUNTIME_KEY = "quality_runtime"
+_QUALITY_LANGUAGE_KEY = "quality_language"
+
+# The only quality providers a native run admits: the installed local ASR routes
+# whose dependency probe inspects local assets and never downloads. A cloud ASR
+# provider keeps the legacy executor, exactly as it did before this step.
+NATIVE_LOCAL_QUALITY_PROVIDERS = frozenset({"qwen-local", "nemotron-local"})
+
+
+@dataclass(frozen=True)
+class NativeQualityOptions:
+    """The local quality-verification settings a native run records and must match.
+
+    Only an installed local ASR provider is admitted for native quality; a cloud
+    ASR provider stays on the legacy executor. ``model`` and ``language`` are
+    ``None`` when the command left them unset, in which case the provider default
+    and the provider's own language detection apply.
+    """
+
+    provider: str
+    model: str | None
+    device: str
+    compute: str
+    runtime: str
+    language: str | None
+
+
+def _quality_output_fields(quality: NativeQualityOptions | None) -> dict[str, Any]:
+    """Return the flat output-option fields for a quality run, or nothing."""
+    if quality is None:
+        return {}
+    return {
+        _QUALITY_ENABLED_KEY: True,
+        _QUALITY_PROVIDER_KEY: quality.provider,
+        _QUALITY_MODEL_KEY: quality.model or "",
+        _QUALITY_DEVICE_KEY: quality.device,
+        _QUALITY_COMPUTE_KEY: quality.compute,
+        _QUALITY_RUNTIME_KEY: quality.runtime,
+        _QUALITY_LANGUAGE_KEY: quality.language or "",
+    }
+
+
+def quality_options_from_output_options(
+    options: dict[str, Any] | None,
+) -> NativeQualityOptions | None:
+    """Return the recorded local quality settings, or ``None`` when quality is off.
+
+    A run that recorded no quality, or an older snapshot written before quality was
+    part of the output options, reports ``None`` and a resume performs no local
+    verification. A present but malformed quality block fails closed instead of
+    silently dropping the requested work.
+    """
+    if not isinstance(options, dict) or not options.get(_QUALITY_ENABLED_KEY):
+        return None
+    provider = options.get(_QUALITY_PROVIDER_KEY)
+    model = options.get(_QUALITY_MODEL_KEY)
+    device = options.get(_QUALITY_DEVICE_KEY)
+    compute = options.get(_QUALITY_COMPUTE_KEY)
+    runtime = options.get(_QUALITY_RUNTIME_KEY)
+    language = options.get(_QUALITY_LANGUAGE_KEY)
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(model, str)
+        or not isinstance(device, str)
+        or not device
+        or not isinstance(compute, str)
+        or not compute
+        or not isinstance(runtime, str)
+        or not runtime
+        or not isinstance(language, str)
+    ):
+        raise NativeGenerationError(
+            "the recorded local quality settings are malformed; refusing to run a partial "
+            "verification step.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_QUALITY_OPTIONS_INVALID,
+        )
+    return NativeQualityOptions(
+        provider=provider,
+        model=model or None,
+        device=device,
+        compute=compute,
+        runtime=runtime,
+        language=language or None,
+    )
+
+
+def _preflight_local_quality(options: NativeQualityOptions) -> None:
+    """Fail closed before any paid submit when local quality cannot run offline.
+
+    Only an installed local ASR provider is admitted. The probe inspects the
+    registered provider's installed package and local model assets without
+    downloading or calling a provider, so an unavailable dependency or an absent
+    local model stops the command before the paid TTS POST instead of after the
+    audio is already paid for.
+    """
+    if options.provider not in NATIVE_LOCAL_QUALITY_PROVIDERS:
+        raise NativeGenerationError(
+            "only an installed local ASR provider is admitted for native quality "
+            "verification; cloud ASR providers stay on the legacy executor.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_QUALITY_PROVIDER_UNSUPPORTED,
+        )
+    from ..providers.asr_registry import ASRProviderNotFoundError, get_asr_provider_spec
+
+    try:
+        spec = get_asr_provider_spec(options.provider)
+    except ASRProviderNotFoundError:
+        raise NativeGenerationError(
+            "the selected local quality provider is not a registered ASR provider.",
+            code=_EXIT_ARGS,
+            error_code=_ERROR_QUALITY_PROVIDER_UNSUPPORTED,
+        ) from None
+    health = spec.dependency_probe()
+    if not health.available:
+        raise NativeGenerationError(
+            health.remediation or "the local quality ASR model is unavailable.",
+            code=_EXIT_MISSING_DEP,
+            error_code=_ERROR_QUALITY_MODEL_UNAVAILABLE,
+        )
+
+
+@dataclass(frozen=True)
+class NativeLinkedQuality:
+    """One verified linked local quality-verification run and its verdict."""
+
+    run_uuid: str
+    passed: bool
+
+
 @dataclass(frozen=True)
 class NativeLinkedTiming:
     """One verified linked local-timing run and its on-disk artifacts."""
@@ -376,6 +538,9 @@ class NativeGenerationSummary:
     cost_currency: str | None
     timing_requested: bool = False
     timing_complete: bool = False
+    quality_requested: bool = False
+    quality_complete: bool = False
+    quality_passed: bool | None = None
 
 
 class _ReadOnlyConnection:
@@ -616,21 +781,26 @@ def resolve_native_ownership(
 
 
 def build_output_options(
-    no_trim: bool, *, timing: NativeTimingOptions | None = None
+    no_trim: bool,
+    *,
+    timing: NativeTimingOptions | None = None,
+    quality: NativeQualityOptions | None = None,
 ) -> dict[str, Any]:
     """Return the fixed output-processing settings the native route records.
 
-    The native slice always trims final silence; ``--no-trim`` is rejected before
-    any provider work, so the recorded settings prove a later resume used the same
-    semantics rather than inferring them from the current command line. When the
-    run requested local timings, the effective timing settings are recorded
-    alongside so a resume proves they did not change either.
+    The recorded ``trim_final_silence`` is the exact semantics this run uses, so a
+    later resume proves it did not change instead of inferring it from the current
+    command line: the default trims each converted part while ``--no-trim`` keeps
+    the provider's final silence. When the run requested local timings or local
+    quality verification, those effective settings are recorded alongside so a
+    resume proves they did not change either.
     """
     options: dict[str, Any] = {
         "trim_final_silence": not no_trim,
         "processing_version": OUTPUT_PROCESSING_VERSION,
     }
     options.update(_timing_output_fields(timing))
+    options.update(_quality_output_fields(quality))
     return options
 
 
@@ -889,6 +1059,7 @@ class _Executor:
         resume: bool,
         paid_submit_allowed: bool = True,
         local_timing_allowed: bool = True,
+        local_quality_allowed: bool = True,
     ) -> None:
         self.repository = repository
         self.view = view
@@ -900,6 +1071,7 @@ class _Executor:
         self.script_path = script_path
         self.output_options = output_options
         self.timing_options = timing_options_from_output_options(output_options)
+        self.quality_options = quality_options_from_output_options(output_options)
         self.ffmpeg_path = ffmpeg_path
         self.ffprobe_path = ffprobe_path
         self.provider_factory = provider_factory
@@ -908,6 +1080,12 @@ class _Executor:
         self.resume = resume
         self.paid_submit_allowed = paid_submit_allowed
         self.local_timing_allowed = local_timing_allowed
+        self.local_quality_allowed = local_quality_allowed
+        # The recorded semantics, never the current command line: a run that
+        # recorded ``trim_final_silence`` false keeps every converted part's
+        # provider-issued silence, and a resume proved that setting unchanged
+        # before reaching this executor.
+        self.trim_final_silence = bool(output_options.get("trim_final_silence", True))
         self._revision = view.run.revision
         self._provider: Any = None
 
@@ -1006,7 +1184,8 @@ class _Executor:
             self.hooks.write_audio_as_mp3(
                 self.ffmpeg_path, result.audio_bytes, result.audio_format, staged
             )
-            self.hooks.trim_final_silence(self.ffmpeg_path, self.ffprobe_path, staged)
+            if self.trim_final_silence:
+                self.hooks.trim_final_silence(self.ffmpeg_path, self.ffprobe_path, staged)
             duration_ms = self.hooks.mp3_duration_ms(self.ffprobe_path, staged)
             sha256 = self.hooks.sha256_file(staged)
             size_bytes = staged.stat().st_size
@@ -1830,6 +2009,215 @@ class _Executor:
             )
         self.logger.event("info", "timings_complete", segments=len(timing.segments))
 
+    # -- linked local quality verification ------------------------------------
+
+    def _linked_quality(self) -> NativeLinkedQuality | None:
+        """Return the verified linked local quality evidence for this run, else ``None``.
+
+        Quality is persisted as a separate ``verify`` run whose ``parent_uuid`` is
+        this TTS run, so the link is read from committed rows rather than a JSON
+        marker. The evidence counts only when exactly one child run exists, it
+        completed, and its one private ``verification_transcript`` source still
+        matches its stored hash next to a recorded boolean verdict; a duplicate or
+        altered source reports no usable verification, and two child runs fail
+        closed instead of being told apart.
+        """
+        children = self.repository.find_runs_by_parent(self._run_uuid(), limit=MAX_QUERY_LIMIT)
+        quality_runs = [
+            run
+            for run in children
+            if run.operation == OPERATION_VERIFY and run.legacy_source_root is None
+        ]
+        if len(quality_runs) > 1:
+            raise NativeGenerationError(
+                "more than one linked local quality-verification run belongs to this run; "
+                "refusing to choose one.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_QUALITY_CONFLICT,
+            )
+        if not quality_runs:
+            return None
+        run = quality_runs[0]
+        if run.status != RUN_STATUS_COMPLETED:
+            return None
+        snapshot = run.config_snapshot if isinstance(run.config_snapshot, dict) else {}
+        passed = snapshot.get("quality_passed")
+        if not isinstance(passed, bool):
+            return None
+        transcripts = [
+            source
+            for source in self.repository.get_text_sources(run.run_uuid)
+            if source.kind == TEXT_KIND_VERIFICATION_TRANSCRIPT
+        ]
+        if len(transcripts) != 1:
+            return None
+        transcript_content = transcripts[0].content
+        if not isinstance(transcript_content, str):
+            return None
+        if transcripts[0].content_hash != sha256_text(transcript_content):
+            return None
+        return NativeLinkedQuality(run_uuid=run.run_uuid, passed=passed)
+
+    def preflight_quality(self) -> None:
+        """Fail closed before any paid submit when the pending local quality cannot run.
+
+        A run whose verification is already linked, or one that runs under
+        ``history sync`` (where local model inference is not allowed), needs no
+        local model and is skipped. Otherwise the dependency and local-asset probe
+        runs before ``run_parts`` so an unavailable or absent local model stops the
+        command before the paid TTS POST.
+        """
+        options = self.quality_options
+        if options is None or not self.local_quality_allowed:
+            return
+        if self._linked_quality() is not None:
+            return
+        _preflight_local_quality(options)
+
+    def _quality_history_save(
+        self, result: ASRResult, quality: TTSQualityResult, audio_path: Path
+    ) -> AsrHistorySave:
+        """Build the linked quality-history evidence from one observed verification.
+
+        The observed verification transcript is stored as its own private
+        ``verification_transcript`` role and the expected script text is never
+        re-stored, so a check can never overwrite or impersonate the run's own
+        script. The run snapshot is the content-free receipt: the observed ASR
+        identity plus the verdict, similarity, and failure reasons, with no
+        transcript text. ``parent_run_root`` links the child run to this TTS run
+        through ``parent_uuid`` instead of fabricating TTS parts or a second TTS
+        attempt.
+        """
+        execution = result.execution
+        snapshot: dict[str, Any] = {
+            "operation_origin": NATIVE_ASR_ORIGIN,
+            "provider": result.provider_id,
+            "model": result.model_id,
+            "language": result.language or None,
+            "runtime": execution.runtime,
+            "model_revision": execution.model_revision,
+            "device": execution.resolved_device,
+            "compute": execution.resolved_compute,
+            "quality_passed": bool(quality.passed),
+            "similarity": float(quality.similarity),
+            "failure_reasons": [str(reason) for reason in quality.failure_reasons],
+            "expected_text_persisted": False,
+        }
+        return AsrHistorySave(
+            operation=OPERATION_VERIFY,
+            attempt_call_type=ATTEMPT_CALL_TYPE_VERIFY,
+            provider=result.provider_id,
+            model=result.model_id,
+            config_snapshot=snapshot,
+            text_sources=(
+                AsrHistoryText(
+                    kind=TEXT_KIND_VERIFICATION_TRANSCRIPT,
+                    content=result.transcript,
+                    language=result.language or None,
+                    text_completeness=(
+                        TEXT_COMPLETENESS_COMPLETE
+                        if result.transcript.strip()
+                        else TEXT_COMPLETENESS_INCOMPLETE
+                    ),
+                ),
+            ),
+            parent_run_root=self.run_root,
+            source_audio=audio_path,
+            source_audio_mime="audio/mpeg",
+        )
+
+    def ensure_quality(self) -> None:
+        """Run the pending local quality verification for a completed run, once only.
+
+        The step runs only when the run recorded local quality, the verification is
+        not already linked, and this execution may run a local model (``generate``,
+        ``generate --resume``, and ``history resume``; never ``history sync``). The
+        comparison is the existing ``verify-tts`` one -- the same default similarity
+        and word-ratio thresholds against the run's own committed script text -- so
+        no new threshold is invented. The observed verdict -- PASS or FAIL -- is
+        persisted through the same linked ``verify`` helper before the outcome is
+        reported, so a failed check is durable: a later ``generate --resume`` or
+        ``history resume`` re-reports the recorded failure as the same quality exit
+        with no second local model run, and ``history sync`` reports the persisted
+        verdict without running the model at all. A mismatch keeps the completed TTS
+        audio, its paid raw bytes, and its cost untouched; a local transcription
+        failure or a linked-history persistence failure keeps the same evidence and
+        reports the fixed partial error instead of claiming a stored verdict.
+        """
+        options = self.quality_options
+        if options is None:
+            return
+        linked = self._linked_quality()
+        if linked is not None:
+            # A recorded failure is re-surfaced by every command that may run a
+            # local model; ``history sync`` is a state reader, so it reports the
+            # persisted verdict through the summary instead of failing.
+            if not linked.passed and self.local_quality_allowed:
+                raise NativeGenerationError(
+                    "the voiceover audio is complete, but the linked local TTS quality "
+                    "verification recorded a failure.",
+                    code=_EXIT_QUALITY,
+                    error_code=_ERROR_QUALITY_FAILED,
+                )
+            return
+        if not self.local_quality_allowed:
+            return
+        self._reload_view()
+        audio_path = self._final_audio_path()
+        from .transcription import transcribe_local_asr_quality
+
+        try:
+            result = transcribe_local_asr_quality(
+                provider_id=options.provider,
+                audio_path=audio_path,
+                model=options.model,
+                device=options.device,
+                compute=options.compute,
+                runtime=options.runtime,
+                language=options.language,
+            )
+        except Exception as exc:
+            self.logger.event("error", "quality_transcription_failed", error=type(exc).__name__)
+            raise NativeGenerationError(
+                "the voiceover audio is complete, but the local quality transcription failed.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_ASR_FAILED,
+            ) from None
+        quality = evaluate_tts_transcript(
+            expected_text=self.view.script_text,
+            actual_transcript=result.transcript,
+        )
+        # Persist the observed verification before any outcome is reported, so the
+        # verdict is durable and a failed check is never silently claimed. A write
+        # failure reports the fixed partial error and keeps the provider response.
+        try:
+            persist_asr_history(self._quality_history_save(result, quality, audio_path))
+        except Exception:
+            self.logger.event("error", "quality_history_failed")
+            raise NativeGenerationError(
+                "the local quality verification ran, but the linked verification history "
+                "could not be stored; the paid audio and cost were kept.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_HISTORY_FAILED,
+            ) from None
+        if self._linked_quality() is None:
+            raise NativeGenerationError(
+                "the linked quality-verification history could not be verified after it was "
+                "written.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_HISTORY_FAILED,
+            )
+        if not quality.passed:
+            self.logger.event("warning", "quality_failed", reasons=len(quality.failure_reasons))
+            raise NativeGenerationError(
+                "the voiceover audio is complete, but the local TTS quality verification "
+                "did not pass; the paid audio and cost were kept and the failed verification "
+                "was recorded.",
+                code=_EXIT_QUALITY,
+                error_code=_ERROR_QUALITY_FAILED,
+            )
+        self.logger.event("info", "quality_verified", similarity=float(quality.similarity))
+
     def export(self) -> NativeGenerationSummary:
         """Project one verified committed view onto the compatibility JSON files."""
         self._reload_view()
@@ -1874,6 +2262,10 @@ class _Executor:
             files["timings_json"] = str(timing.timings_json)
             files["srt"] = str(timing.srt)
             segment_count = timing.segment_count
+        # The private verification transcript is never projected into a result, the
+        # JSON exports, or the compatibility manifests: only the content-free
+        # verdict and whether a linked verification exists at all.
+        quality = self._linked_quality()
         return NativeGenerationSummary(
             run_uuid=view.run.run_uuid,
             revision=view.run.revision,
@@ -1884,6 +2276,9 @@ class _Executor:
             cost_currency=export.chunks_manifest.get("cost_currency"),
             timing_requested=self.timing_options is not None,
             timing_complete=timing is not None,
+            quality_requested=self.quality_options is not None,
+            quality_complete=quality is not None,
+            quality_passed=quality.passed if quality is not None else None,
         )
 
 
@@ -1974,6 +2369,7 @@ def execute_native_tts(
     expected_run_uuid: str | None = None,
     paid_submit_allowed: bool = True,
     local_timing_allowed: bool = True,
+    local_quality_allowed: bool = True,
 ) -> NativeGenerationSummary:
     """Run one locked native TTS generation, resume, or completed-run export.
 
@@ -1991,6 +2387,8 @@ def execute_native_tts(
     then fails closed on an unattempted part instead of submitting it.
     ``local_timing_allowed`` is ``False`` for ``history sync`` so it never runs a
     local timing model; the pending timing work stays for an explicit resume.
+    ``local_quality_allowed`` is likewise ``False`` for ``history sync`` so it never
+    runs a local quality model either.
     """
     canonical_root = str(run_root.resolve())
     existing = _find_native_run_in_repository(repository, canonical_root)
@@ -2095,11 +2493,14 @@ def execute_native_tts(
         resume=resume,
         paid_submit_allowed=paid_submit_allowed,
         local_timing_allowed=local_timing_allowed,
+        local_quality_allowed=local_quality_allowed,
     )
     executor.preflight_timing()
+    executor.preflight_quality()
     executor.run_parts()
     executor.ensure_complete()
     executor.ensure_timing()
+    executor.ensure_quality()
     return executor.export()
 
 
@@ -2121,14 +2522,16 @@ def run_native_generation(
     expected_run_uuid: str | None = None,
     paid_submit_allowed: bool = True,
     local_timing_allowed: bool = True,
+    local_quality_allowed: bool = True,
 ) -> NativeGenerationSummary:
     """Hold the run lock and the history database around one native execution.
 
     The generation logger is constructed here, after the run lock is taken, so the
     native route creates no file in the run root before the lock and the ownership
-    recheck inside :func:`execute_native_tts`. ``local_timing_allowed`` is threaded
-    to :func:`execute_native_tts` so an explicit resume may run the pending local
-    timing while ``history sync`` never runs a local model.
+    recheck inside :func:`execute_native_tts`. ``local_timing_allowed`` and
+    ``local_quality_allowed`` are threaded to :func:`execute_native_tts` so an
+    explicit resume may run the pending local timing or quality verification while
+    ``history sync`` never runs a local model.
     """
     try:
         with acquire_run_lock(paths.output_root):
@@ -2153,6 +2556,7 @@ def run_native_generation(
                     expected_run_uuid=expected_run_uuid,
                     paid_submit_allowed=paid_submit_allowed,
                     local_timing_allowed=local_timing_allowed,
+                    local_quality_allowed=local_quality_allowed,
                 )
     except HistoryRunLockedError as exc:
         raise NativeGenerationError(
@@ -2302,11 +2706,16 @@ def run_native_history_generation(
 
     ``history resume`` may submit a truly unattempted part, so it is potentially
     paid; it still skips every verified part, finishes a known Media task id with
-    GET calls only, and rebuilds a part locally from verified raw evidence.
+    GET calls only, rebuilds a part locally from verified raw evidence, and may run
+    the pending local timing or quality verification.
     ``history sync`` never starts a new paid submit: it repairs the compatibility
     exports of a completed run, finishes a known Media id with GET calls only, and
     rebuilds a part locally from verified raw evidence, but fails closed on an
-    unattempted part or an unconfirmed submit before any provider or key exists.
+    unattempted part or an unconfirmed submit before any provider or key exists, and
+    runs no local model, so a pending timing or quality verification stays
+    incomplete for an explicit resume. A quality verification already recorded as a
+    failure is reported by ``history sync`` as that persisted verdict
+    (``quality.passed: false``) without running the model.
 
     A completed run whose committed final audio is missing or changed fails closed
     before any write, so the export repair never re-runs assembly over committed
@@ -2357,4 +2766,5 @@ def run_native_history_generation(
         expected_run_uuid=view.run.run_uuid,
         paid_submit_allowed=(mode == _MODE_RESUME),
         local_timing_allowed=(mode == _MODE_RESUME),
+        local_quality_allowed=(mode == _MODE_RESUME),
     )

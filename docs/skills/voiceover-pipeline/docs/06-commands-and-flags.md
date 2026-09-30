@@ -306,10 +306,16 @@ voiceover list timing-providers --json
 
 Если запуск — обычный не-диалоговый `polza-tts` (модель `elevenlabs/...` через
 async `/media` либо любая другая через синхронный `/audio/speech`) или
-`openrouter-tts`, без `--with-timings`, `--tts-quality-provider` и `--no-trim`,
-то история становится canonical: части, попытки, оплаченные байты и финальная
+`openrouter-tts` без неподдерживаемого сочетания опций, то история становится
+canonical: части, попытки, оплаченные байты и финальная
 сборка хранятся в SQLite, а `run_state.json`, `chunks.json`, run/manifest JSON
 пишутся как совместимый экспорт с `history_run_uuid` и `history_revision`.
+Этого маршрута касаются: `--no-trim`, локальные
+`--with-timings --timing-provider faster-whisper` и — отдельно — установленный
+локальный `--tts-quality-provider` (`qwen-local`/`nemotron-local`); dialogue,
+облачный или незарегистрированный `--tts-quality-provider`, облачные
+`--timing-provider` и одновременный запрос локальных таймингов и локальной
+проверки остаются на legacy JSON-writer.
 Владелец каталога определяется до чтения ключа, цен и удаления: committed прогон
 по `run_root` или крошечный `.voiceover-native-history.json`. Нативный след при
 нечитаемой/отсутствующей БД и дескриптор без своего прогона дают fail-closed
@@ -333,6 +339,26 @@ JSON для такого каталога запрещён. Существующ
 повторного POST/GET; крах между записью `raw/` и его связыванием с БД
 пересобирается локально по тому же receipt. В этом узком окне наблюдённая
 стоимость теряется и остаётся `null`, а не ложной.
+
+На этом маршруте `--no-trim` записывается в снимок как семантика обрезки, поэтому
+`--resume` обязан повторить то же значение, иначе exit 30
+`NATIVE_PROCESSING_UNSUPPORTED` до провайдера. Локальная проверка качества идёт
+после готового аудио: сначала проверяется наличие установленной локальной модели
+без скачивания (иначе exit 10 `NATIVE_QUALITY_MODEL_UNAVAILABLE` до платного POST),
+потом существующей семантикой `verify-tts` сравнивается транскрипт с собственным
+записанным текстом сценария. Приватный транскрипт хранится как
+`verification_transcript` связанного прогона `verify` (`parent_uuid`), ожидаемый
+текст не сохраняется, а контентно-пустой вердикт возвращается как
+`quality: {complete, passed}`. Несовпадение сохраняет аудио и стоимость,
+записывает наблюдённый FAIL тем же связанным прогоном `verify` (в снимке
+`quality_passed: false`, без ожидаемого текста) и даёт exit 60
+`NATIVE_QUALITY_FAILED`; сбой локальной транскрипции — exit 50
+`NATIVE_QUALITY_ASR_FAILED`; сбой записи связанной истории — exit 50
+`NATIVE_QUALITY_HISTORY_FAILED` (сохранённый FAIL не заявляется).
+`history resume UUID` доигрывает только недостающую локальную проверку, а
+записанный FAIL повторно сообщается тем же exit 60; `history sync UUID` её не
+запускает и сообщает записанный вердикт (`quality.complete: true, passed: false`)
+либо `quality.complete: false`, пока проверка не выполнена.
 
 ### Платный submit и маркер `pending_attempt`
 

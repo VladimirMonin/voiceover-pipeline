@@ -1365,22 +1365,31 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     An ordinary, non-dialogue ``polza-tts`` run on either its async ``elevenlabs/``
     ``/media`` model route or its synchronous ``/audio/speech`` model route, and an
     ordinary ``openrouter-tts`` run, are executed by the native executor when they
-    use no integrated quality processing and the fixed trimming semantics the
-    native slice records. The one integrated step admitted here is a local
-    ``--with-timings --timing-provider faster-whisper`` request, whose audio plus
-    local captions run in one command; every cloud timing provider, ``dialogue``,
-    ``--tts-quality-provider``, and ``--no-trim`` keeps the legacy executor and its
-    JSON writer unchanged.
+    use no unsupported option mixture. Two bounded integrated steps are admitted
+    for that same route: an installed *local* ``--tts-quality-provider``
+    (``qwen-local``/``nemotron-local``), and the recorded trimming semantics of
+    ``--no-trim``. ``--with-timings --timing-provider faster-whisper`` stays
+    admitted as before. Every other route and mixture -- a dialogue script, a cloud
+    or unregistered quality provider, a cloud timing provider, and any command that
+    asks for local timings *and* local quality at once -- keeps the legacy executor
+    and its JSON writer unchanged.
     """
     if script_format != "markdown":
         return False
-    if getattr(args, "tts_quality_provider", None) or getattr(args, "no_trim", False):
+    quality_provider = getattr(args, "tts_quality_provider", None)
+    if quality_provider is not None and quality_provider not in (
+        native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
+    ):
         return False
     if not isinstance(getattr(args, "model", None), str):
         return False
     if getattr(args, "provider", None) not in ("polza-tts", "openrouter-tts"):
         return False
     if getattr(args, "with_timings", False):
+        if quality_provider is not None:
+            # Two pending local post-audio steps in one run are not part of this
+            # bounded slice; the combination keeps the legacy executor.
+            return False
         # Only the local timing provider is admitted; a cloud timing route stays on
         # the legacy executor until its paid-submit contract is confirmed.
         return getattr(args, "timing_provider", "faster-whisper") == "faster-whisper"
@@ -1454,8 +1463,7 @@ def _run_native_route(
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an ordinary non-dialogue "
-            "polza-tts or openrouter-tts run with quality flags off and either no timings or "
-            "--timing-provider faster-whisper may continue it; choose a different --run-id for "
+            "polza-tts or openrouter-tts run may continue it; choose a different --run-id for "
             "other options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
@@ -1512,7 +1520,9 @@ def _run_native_route(
 
     hooks = _native_execution_hooks(args)
     output_options = native_generation.build_output_options(
-        args.no_trim, timing=_native_timing_options(args)
+        args.no_trim,
+        timing=_native_timing_options(args),
+        quality=_native_quality_options(args),
     )
     try:
         summary = native_generation.run_native_generation(
@@ -1544,6 +1554,11 @@ def _run_native_route(
         }
         if summary.timing_requested:
             payload["timing"] = {"complete": summary.timing_complete}
+        if summary.quality_requested:
+            payload["quality"] = {
+                "complete": summary.quality_complete,
+                "passed": summary.quality_passed if summary.quality_complete else None,
+            }
         _json_ok(payload)
     print(f"Full MP3: {paths.full_mp3}")
     print(f"Run manifest: {paths.run_json}")
@@ -3154,6 +3169,31 @@ def _native_timing_options(
     )
 
 
+def _native_quality_options(
+    args: argparse.Namespace,
+) -> native_generation.NativeQualityOptions | None:
+    """Return the recorded local quality settings for a native run, or ``None``.
+
+    Only an installed local ASR provider (``qwen-local`` or ``nemotron-local``)
+    reaches a native run; ``_native_route_eligible`` already sent every other
+    quality provider to the legacy executor. A run without
+    ``--tts-quality-provider`` records nothing and keeps its output options
+    byte-for-byte, so a completed run written before this route stays resumable and
+    a non-dialogue legacy run keeps ignoring the flag exactly as before.
+    """
+    provider_id = getattr(args, "tts_quality_provider", None)
+    if not provider_id:
+        return None
+    return native_generation.NativeQualityOptions(
+        provider=provider_id,
+        model=getattr(args, "tts_quality_model", None),
+        device=args.tts_quality_device,
+        compute=args.tts_quality_compute,
+        runtime=args.tts_quality_runtime,
+        language=getattr(args, "tts_quality_language", None),
+    )
+
+
 def _native_execution_hooks(args: argparse.Namespace) -> native_generation.NativeExecutionHooks:
     """The local media seams both native routes present to the executor.
 
@@ -3197,9 +3237,10 @@ def _history_native_command(args: argparse.Namespace, mode: str) -> dict[str, An
     provider is built only when the executor actually needs one, so a completed-run
     export repair and a local raw rebuild read no API key. ``history resume`` may
     submit a truly unattempted part and is therefore potentially paid; it may also
-    run the pending local faster-whisper timing for the completed audio. ``history
-    sync`` never starts a new paid submit and never runs a local timing model, so a
-    missing timing stays incomplete for an explicit resume.
+    run the pending local faster-whisper timing or the pending local quality
+    verification for the completed audio. ``history sync`` never starts a new paid
+    submit and never runs a local model, so a missing timing or verification stays
+    incomplete (``quality.complete`` is ``false``) for an explicit resume.
     """
     view = history_commands.load_native_history_view(args.run)
     try:
@@ -3228,6 +3269,11 @@ def _history_native_command(args: argparse.Namespace, mode: str) -> dict[str, An
     }
     if summary.timing_requested:
         payload["timing"] = {"complete": summary.timing_complete}
+    if summary.quality_requested:
+        payload["quality"] = {
+            "complete": summary.quality_complete,
+            "passed": summary.quality_passed if summary.quality_complete else None,
+        }
     return payload
 
 
