@@ -22,6 +22,8 @@
 | `history resume ID` | Возобновить нативный TTS-прогон из сохранённого снимка (потенциально платно) | да |
 | `history sync ID` | Получить сохранённое состояние/результат известного нативного прогона без нового оплаченного submit | да |
 | `history import DIR [--dry-run]` | Безопасный offline-импорт старых `out/<run-id>` каталогов | да |
+| `search QUERY --mode lexical` | Offline FTS5-поиск по сохранённым сценариям, транскрипциям и меткам | да |
+| `index status\|build\|rebuild` | Состояние, добор и полная пересборка производного поискового индекса | да |
 
 Все команды можно вызвать с `--json` для машинно-читаемого вывода.
 
@@ -1074,7 +1076,7 @@ voiceover history costs --json
 {
   "status": "success",
   "dry_run": false,
-  "database": {"path": "...", "exists": true, "schema_version": 2},
+  "database": {"path": "...", "exists": true, "schema_version": 3},
   "filters": {"label": null, "operation": null, "status": null},
   "limit": 50,
   "offset": 0,
@@ -1114,7 +1116,7 @@ UUID-shaped значение сначала ищется как UUID, затем
 {
   "status": "success",
   "dry_run": false,
-  "database": {"path": "...", "exists": true, "schema_version": 2},
+  "database": {"path": "...", "exists": true, "schema_version": 3},
   "run": {"run_uuid": "...", "operation": "tts", "user_label": "prod", "...": "..."},
   "parts": [
     {
@@ -1282,7 +1284,7 @@ Dry-run сообщает найденные каталоги/записи, impor
 {
   "status": "success",
   "dry_run": false,
-  "database": {"path": "...", "exists": true, "schema_version": 2},
+  "database": {"path": "...", "exists": true, "schema_version": 3},
   "attempts": 4,
   "totals": [
     {
@@ -1825,6 +1827,177 @@ out/<run-id>/
 1. `.timings.json` → `segments[].start_ms, end_ms, duration_ms` → scene durations
 2. `.srt` → captions
 3. `chunks.json` → `chunks[].start_ms, end_ms, transcript` → per-chunk alignment
+
+## Поиск по истории и offline-индекс (S08)
+
+S08 добавляет производный полнотекстовый слой поверх канонической SQLite-истории.
+Поиск работает по **сохранённым текстам, связанным с аудио** (сценарий, ASR
+транскрипт, verify-транскрипт и короткая метка запуска), а не по звуковому
+сигналу. Он не требует API-ключей, FFmpeg, Torch или `sqlite-vec`, не делает
+сетевых и платных вызовов и не сканирует пользовательские файлы: индекс
+пересобирается только из SQLite.
+
+```bash
+voiceover search "индексы SQLite" --mode lexical --limit 10 --json
+voiceover search "транзакции" --mode lexical --kind asr_transcript --json
+voiceover search "спокойный" --mode lexical --scope directions --json
+voiceover index status --json
+voiceover index build --json
+voiceover index rebuild --json
+```
+
+### Поведение `search`
+
+- Пользовательская строка обрабатывается как набор **буквальных** слов: кавычки,
+  дефисы, пунктуация и SQL-подобные фрагменты разбираются в токены и не являются
+  ни произвольным выражением MATCH, ни SQL-инъекцией. Пустой по токенам запрос →
+  exit `2` `SEARCH_EMPTY_QUERY`.
+- Роли и scope: `label`, `speech` (сценарий), `asr` (ASR и verify транскрипты),
+  `directions` (режиссёрские инструкции). `--scope` — `speech` (default,
+  speech+asr+label), `directions` (добавляет directions) или `all`. Приватный
+  ASR-контекст (`asr_context`, подсказка-промпт) в индекс **не попадает**.
+- Поисковая нормализация `ё → е` и регистра применяется **только** к производному
+  индексу, не изменяя сохранённый текст: сниппет срезан из оригинала. Это не
+  морфологический поиск (формы слова не гарантированно совпадают).
+- `--kind`, `--role`, `--run`, `--operation`, `--provider`, `--since`, `--until`
+  применяются в SQL **до** `--limit`; `--since`/`--until` задают строго
+  нуль-дополненные даты `YYYY-MM-DD` включительно (включая весь день `--until`);
+  `--limit` — `1..500` (default `20`). `--provider` выбирает прогоны с
+  попыткой этого provider до `--limit`, но сам по себе не утверждает, что
+  каждый найденный текст принадлежит именно этой попытке.
+- Результат содержит `run_uuid`, `user_label`, `kind`, `role`, `text_source_uuid`,
+  `part_uuid`, `artifact_uuid`, `chunk_index`, `char_start/char_end`,
+  `start_ms/end_ms` (только если временной диапазон реально известен, иначе
+  `null`), `text_hash`, `provider`, `model`, `created_at`, `snippet` и `audio` —
+  ссылку на аудио с `availability` (`present`/`missing`). `provider`/`model`
+  берутся только из подходящей типу текста и части **однозначной** попытки
+  (сценарий TTS, transcript ASR, verification quality ASR); если таких попыток
+  несколько с разными маршрутом/моделью или нет, поля равны `null`, а не
+  произвольной попытке прогона.
+- ASR/timings/verify-транскрипт и метка ссылаются на собственное
+  `asr_source_audio`: для нового платного прогона ссылка — артефакт, записанный
+  вместе с durable `submitting` marker до POST; для более старого платного прогона
+  без такого артефакта — сохранённый абсолютный путь из его канонического
+  identity-snapshot (`audio.artifact_uuid: null`). Завершённый TTS-прогон
+  ссылается на итоговое аудио; в незавершённом — только на аудио **той же** части,
+  а не соседней, либо `audio: null`, если своё аудио ещё не создано.
+  Отсутствующий локальный файл, в том числе удалённый **после сохранения**, не
+  скрывает текст из истории: результат
+  возвращается с `audio.availability = "missing"`. Сохранённый как `missing`
+  артефакт не повышается до `present` без подтверждения байтов. Временные метки
+  не выдумываются.
+- Отсутствующая БД или непересобранный индекс (`search_chunks` ещё нет) → exit `0`
+  с пустым результатом и предупреждением про `voiceover index build`; ничего не
+  создаётся. Старые тексты после upgrade v2→v3, не охваченные немедленной
+  индексацией новых источников, pending-источники, пропущенные label-чанки,
+  неполные тексты без сохранённого содержимого и несовпадение версии chunker
+  отмечаются отдельно в `warnings`; `index build` добирает индексируемые тексты,
+  а `index rebuild` исправляет версию. Источник без сохранённого текста
+  невозможно восстановить одной пересборкой.
+- `--mode semantic|hybrid` явно отклоняется (`SEARCH_MODE_DEFERRED`, exit `2`):
+  embedding-бэкенды и гибридное ранжирование — этап S09, здесь их нет.
+
+### Поведение `index`
+
+- `index status` открывает БД read-only (никаких sidecar-записей) и отдаёт
+  честные счётчики: `sources_indexable`, `sources_indexed`, `sources_pending`,
+  `sources_private_excluded` (приватный `asr_context`), `sources_incomplete`
+  (только hash, без текста), `indexed_chunks`, `label_runs`, `labels_missing`,
+  `chunker_version`, `built_chunker_version`, `complete`, `needs_rebuild`.
+- `complete: false`, пока есть pending, неполный импортированный корпус
+  (`sources_incomplete > 0`), пропущенная короткая метка прогона
+  (`labels_missing > 0`) или индекс собран другой версией chunking. Старый
+  импортированный неполный корпус **не** объявляется полностью проиндексированным.
+- `index build` доиндексирует только отсутствующее (idempotent), `index rebuild`
+  полностью пересобирает производный слой из `text_sources` и `runs`. Обе команды
+  идут одной `BEGIN IMMEDIATE` транзакцией: сбой оставляет прежний индекс
+  неизменным. Приватный `asr_context` не считается вновь проиндексированным
+  при повторном build/rebuild. Удаление канонического прогона/текста убирает
+  его FTS-термы через SQL-триггер, не оставляя скрытых производных копий после
+  каскада.
+- Обычное сохранение текста индексируется сразу. Если производная запись не
+  удалась, канонический текст остаётся закоммиченным, источник помечается
+  `search_index_pending` с предупреждением, и `index build` доберёт его. Для
+  label-only прогона без текстового источника `index status` обнаружит
+  пропущенную метку через `labels_missing` и `index build` восстановит её.
+- Числа чанков: около 1200 Unicode-символов с перекрытием до 150 по границам
+  абзацев/предложений; это настройки поискового слоя, они **не меняют** TTS-части,
+  аудио и стоимость синтеза. Версия алгоритма (`chunker_version`) хранится вместе
+  с индексом.
+
+### `search --json`
+
+```json
+{
+  "status": "success",
+  "dry_run": false,
+  "database": {"path": "...", "exists": true, "schema_version": 3},
+  "query": "индексы SQLite",
+  "mode": "lexical",
+  "scope": "speech",
+  "filters": {"kind": null, "role": null, "run_uuid": null, "operation": null, "provider": null, "since": null, "until": null},
+  "limit": 20,
+  "count": 1,
+  "results": [
+    {
+      "run_uuid": "...",
+      "user_label": "prod",
+      "operation": "asr",
+      "kind": "asr_transcript",
+      "role": "asr",
+      "text_source_uuid": "...",
+      "part_uuid": null,
+      "artifact_uuid": null,
+      "chunk_index": 0,
+      "char_start": 0,
+      "char_end": 42,
+      "start_ms": null,
+      "end_ms": null,
+      "text_hash": "...",
+      "provider": "qwen-local",
+      "model": null,
+      "created_at": "...",
+      "snippet": "...",
+      "audio": {"artifact_uuid": "...", "role": "asr_source_audio", "path": "...", "path_kind": "external_absolute", "availability": "present"}
+    }
+  ],
+  "warnings": []
+}
+```
+
+### `index status --json`
+
+```json
+{
+  "status": "success",
+  "dry_run": false,
+  "available": true,
+  "database": {"path": "...", "exists": true, "schema_version": 3},
+  "chunker_version": 1,
+  "built_chunker_version": 1,
+  "last_build_at": "...",
+  "last_build_mode": "build",
+  "sources_total": 3,
+  "sources_indexable": 2,
+  "sources_indexed": 2,
+  "sources_pending": 0,
+  "sources_private_excluded": 1,
+  "sources_incomplete": 0,
+  "label_runs": 1,
+  "labels_missing": 0,
+  "indexed_chunks": 3,
+  "complete": true,
+  "needs_rebuild": false
+}
+```
+
+### Коды ошибок S08
+
+Все новые причины передаются стабильной строкой `details.error_code` при обычных
+числовых кодах `2`/`30`/`50`: `SEARCH_EMPTY_QUERY`, `SEARCH_MODE_DEFERRED`,
+`SEARCH_INVALID_LIMIT`, `SEARCH_INVALID_SCOPE`, `SEARCH_INVALID_ROLE`,
+`SEARCH_INVALID_KIND`, `SEARCH_INVALID_RUN`, `SEARCH_INVALID_DATE` (все exit `2`),
+плюс унаследованные `HISTORY_DATABASE_*`/`HISTORY_HOME_*` при чтении/записи БД.
 
 ## Safe Defaults
 

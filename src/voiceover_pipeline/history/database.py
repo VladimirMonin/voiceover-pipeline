@@ -222,6 +222,57 @@ MIGRATIONS: Final = (
         name="add_run_revision",
         statements=("ALTER TABLE runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",),
     ),
+    # v3 adds the derived lexical-search layer of plan section 8 stage S08. It is
+    # additive: the canonical ``text_sources`` content is untouched, and every
+    # table here can be dropped and rebuilt from SQLite alone. ``search_chunks``
+    # is the chunk unit shared by FTS and (later) embeddings, ``search_fts`` is a
+    # plain FTS5 index kept in the same transaction as its chunks (including
+    # cascaded canonical deletions via the chunk-delete mirror trigger), and
+    # ``search_index_state`` / ``search_index_pending`` record the algorithm
+    # version and any source whose derived index could not be written. A label
+    # chunk has a NULL ``text_source_uuid`` because a run label is not one text
+    # source, so the column is nullable while its run link stays enforced.
+    Migration(
+        version=3,
+        name="add_search_chunks",
+        statements=(
+            "CREATE TABLE search_chunks ("
+            "chunk_id INTEGER PRIMARY KEY, "
+            "text_source_uuid TEXT REFERENCES text_sources(text_source_uuid) ON DELETE CASCADE, "
+            "run_uuid TEXT NOT NULL REFERENCES runs(run_uuid) ON DELETE CASCADE, "
+            "part_uuid TEXT, "
+            "artifact_uuid TEXT, "
+            "kind TEXT, "
+            "role TEXT NOT NULL, "
+            "chunk_index INTEGER NOT NULL, "
+            "char_start INTEGER NOT NULL, "
+            "char_end INTEGER NOT NULL, "
+            "text TEXT NOT NULL, "
+            "text_hash TEXT NOT NULL, "
+            "start_ms INTEGER, "
+            "end_ms INTEGER, "
+            "chunker_version INTEGER NOT NULL, "
+            "created_at TEXT NOT NULL)",
+            "CREATE INDEX idx_search_chunks_source ON search_chunks (text_source_uuid)",
+            "CREATE INDEX idx_search_chunks_run ON search_chunks (run_uuid)",
+            "CREATE INDEX idx_search_chunks_role ON search_chunks (role)",
+            "CREATE VIRTUAL TABLE search_fts USING fts5(normalized_text, tokenize = 'unicode61')",
+            "CREATE TRIGGER trg_search_chunks_fts_delete AFTER DELETE ON search_chunks "
+            "BEGIN DELETE FROM search_fts WHERE rowid = OLD.chunk_id; END",
+            "CREATE TABLE search_index_state ("
+            "id INTEGER PRIMARY KEY CHECK (id = 1), "
+            "chunker_version INTEGER NOT NULL, "
+            "last_build_at TEXT, "
+            "last_build_mode TEXT, "
+            "last_build_sources INTEGER NOT NULL DEFAULT 0, "
+            "last_build_chunks INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE search_index_pending ("
+            "text_source_uuid TEXT PRIMARY KEY "
+            "REFERENCES text_sources(text_source_uuid) ON DELETE CASCADE, "
+            "reason TEXT NOT NULL, "
+            "created_at TEXT NOT NULL)",
+        ),
+    ),
 )
 LATEST_SCHEMA_VERSION: Final = max(migration.version for migration in MIGRATIONS)
 

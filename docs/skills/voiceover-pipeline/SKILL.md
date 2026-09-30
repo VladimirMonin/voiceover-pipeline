@@ -181,6 +181,7 @@ description: >
 | Генерирует озвучку через любой из 5 провайдеров с provider-specific retry, safe rerun и manifest/log | Рендерит Remotion-видео |
 | Извлекает тайминги через локальный faster-whisper ИЛИ облачные OpenRouter/Groq/xAI Whisper | Правит исходники voiceover-pipeline |
 | Читает сохранённые ASR/timing/verify-метаданные через `history list/show/costs` | Печатает приватный transcript или ожидаемый текст из БД |
+| Ищет по сохранённым текстам офлайн: `search` и `index status/build/rebuild` | Не делает семантический/векторный поиск (S09) и не сканирует файлы как транскрипт |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
 | Объясняет провайдеров, модели, голоса, цены (7 TTS + 6 STT моделей) | Гарантирует будущие цены провайдеров |
 | Диагностирует ошибки по exit codes | Правит исходники voiceover-pipeline |
@@ -246,6 +247,33 @@ voiceover generate --script ./podcast.yaml --format speech-parts --run-id podcas
   голосов или выпуск 0.6.0 без двух PASS.
 - Полный workflow: `docs/08-workflows.md` → «Agent Podcast Workflow»;
   формат: `docs/04-input-format.md`; пример: `examples/gemini-dialogue-podcast.md`.
+
+## Поиск по сохранённому тексту (S08)
+
+Когда нужно найти ранее сохранённую озвучку или расшифровку по словам:
+
+```bash
+voiceover search "индексы SQLite" --mode lexical --limit 10 --json
+voiceover search "транзакции" --mode lexical --kind asr_transcript --json
+voiceover index status --json
+voiceover index build --json
+```
+
+- Поиск идёт по сохранённым текстам (сценарий, ASR/verify-транскрипт, короткая
+  метка), а не по звуку; работает офлайн без ключей, FFmpeg, Torch и сети.
+- Запрос — буквальные слова: кавычки, дефисы и пунктуация безопасны. По умолчанию
+  ищется речь и распознавание; `--scope directions` добавляет режиссёрские
+  инструкции. Приватный ASR-промпт в индекс не попадает.
+- Фильтры `--since`/`--until` включают названный день. Ссылка ASR/timings
+  ведёт к исходному аудио (в старой платной истории — через saved identity);
+  незавершённая часть не ссылается на соседнюю. Если файл пропал, текст остаётся
+  в поиске, а `audio.availability` становится `missing`.
+- Обычное сохранение индексируется сразу; старые тексты после upgrade и
+  пропущенные метки помечаются в `warnings` и `index status`; `index build`
+  доберёт их, а `index rebuild` пересобирает индекс только из SQLite. Без
+  сохранённого текста старую hash-only запись переиндексировать невозможно.
+- `--mode semantic|hybrid` — этап S09: команда явно отказывает (exit `2`), а не
+  возвращает пустой результат.
 
 ## Чеклист готового навыка
 

@@ -176,10 +176,10 @@ def test_migrate_records_known_migrations_and_is_idempotent(tmp_path):
         applied_first = database.migrate()
         applied_second = database.migrate()
 
-        assert [migration.version for migration in applied_first] == [1, 2]
+        assert [migration.version for migration in applied_first] == [1, 2, 3]
         assert applied_second == []
-        assert database.schema_version == 2
-        assert database.connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert database.schema_version == 3
+        assert database.connection.execute("PRAGMA user_version").fetchone()[0] == 3
         row = database.connection.execute(
             "SELECT name, checksum FROM schema_migrations WHERE version = 1"
         ).fetchone()
@@ -217,8 +217,8 @@ def test_v2_upgrade_of_real_v1_database_preserves_rows_and_fks(tmp_path):
 
     with HistoryDatabase(database_path) as database:
         applied = database.migrate()
-        assert [migration.version for migration in applied] == [2]
-        assert database.schema_version == 2
+        assert [migration.version for migration in applied] == [2, 3]
+        assert database.schema_version == 3
         assert database.connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         revised = database.connection.execute(
             "SELECT revision FROM runs WHERE run_uuid = ?", (run_uuid,)
@@ -233,20 +233,20 @@ def test_v2_upgrade_of_real_v1_database_preserves_rows_and_fks(tmp_path):
         ledger = database.connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert [row["version"] for row in ledger] == [1, 2]
+        assert [row["version"] for row in ledger] == [1, 2, 3]
 
 
 def test_v2_migration_is_not_reapplied_on_reopen(tmp_path):
     database_path = tmp_path / "history.sqlite3"
 
     with HistoryDatabase(database_path) as database:
-        assert [migration.version for migration in database.migrate()] == [1, 2]
+        assert [migration.version for migration in database.migrate()] == [1, 2, 3]
 
     with HistoryDatabase(database_path) as database:
         assert database.migrate() == []
-        assert database.schema_version == 2
+        assert database.schema_version == 3
         count = database.connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
-        assert count == 2
+        assert count == 3
 
 
 def test_migration_applied_is_logged_without_content(tmp_path, caplog):
@@ -349,7 +349,7 @@ def test_user_version_behind_ledger_is_rejected_before_wal(tmp_path):
     _force_delete_journal_and_metadata(database_path, user_version=1)
     assert _journal_mode(database_path) == "delete"
 
-    _assert_rejected_before_wal(database_path, ledger_versions=[1, 2], has_revision_column=True)
+    _assert_rejected_before_wal(database_path, ledger_versions=[1, 2, 3], has_revision_column=True)
 
 
 def test_ledger_missing_an_earlier_version_is_rejected_before_wal(tmp_path):
@@ -358,7 +358,7 @@ def test_ledger_missing_an_earlier_version_is_rejected_before_wal(tmp_path):
     _force_delete_journal_and_metadata(database_path, user_version=2, drop_ledger_version=1)
     assert _journal_mode(database_path) == "delete"
 
-    _assert_rejected_before_wal(database_path, ledger_versions=[2], has_revision_column=True)
+    _assert_rejected_before_wal(database_path, ledger_versions=[2, 3], has_revision_column=True)
 
 
 def test_ledgerless_future_user_version_is_rejected_without_writes(tmp_path):

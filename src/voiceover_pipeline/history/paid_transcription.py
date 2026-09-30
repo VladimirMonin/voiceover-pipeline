@@ -10,7 +10,8 @@ submit. This module is that boundary and nothing else.
 Lifecycle (three durable phases, one run):
 
 1. :func:`reserve_paid_transcription` commits the run row, its bounded operation
-   identity, and one ``submitting`` attempt marker *before* the caller may POST,
+   identity, source-audio artifact, and one ``submitting`` attempt marker *before*
+   the caller may POST,
    and writes a run-local ownership descriptor into the output root. A failure
    here means the caller makes zero requests.
 2. :func:`record_paid_transcription_raw` writes a bounded private receipt and then
@@ -67,6 +68,7 @@ from .database import (
     readonly_schema_is_empty,
 )
 from .native_asr import (
+    ARTIFACT_ROLE_SOURCE_AUDIO,
     OPERATION_TIMINGS,
     OPERATION_VERIFY,
     AsrHistoryArtifact,
@@ -762,8 +764,9 @@ def reserve_paid_transcription(request: PaidTranscriptionRequest) -> PaidTranscr
     The readable regular source audio is validated first, and a run root already
     committed to a native TTS run is refused before the reservation; then the run
     row, its ``running`` status, the operation identity snapshot (including the
-    canonical output root binding), and one ``submitting`` attempt are written in a
-    single transaction, and the run-local ownership descriptor is written after it
+    canonical output root binding), source-audio artifact, and one ``submitting``
+    attempt are written in a single transaction; the run-local ownership descriptor
+    is written after it
     commits. The caller may only start the provider request *after* this returns; a
     failure here raises :class:`PaidTranscriptionError` and the caller makes zero
     requests.
@@ -826,6 +829,21 @@ def reserve_paid_transcription(request: PaidTranscriptionRequest) -> PaidTranscr
                 model=request.model,
                 status=ATTEMPT_STATUS_SUBMITTING,
                 cost=Cost.unknown(),
+            )
+            # Link the already-validated source in the *same* durable reservation
+            # as the submitting attempt, before any provider POST. No source
+            # bytes are copied or re-read inside the transaction; the observed
+            # size/digest were captured by require_readable_source above.
+            repository.add_artifact(
+                run.run_uuid,
+                role=ARTIFACT_ROLE_SOURCE_AUDIO,
+                path_kind=PATH_KIND_EXTERNAL_ABSOLUTE,
+                path=resolved_source,
+                attempt_uuid=attempt.attempt_uuid,
+                mime=request.source_audio_mime,
+                size_bytes=size,
+                sha256=digest,
+                availability=AVAILABILITY_PRESENT,
             )
     except PaidTranscriptionError:
         raise

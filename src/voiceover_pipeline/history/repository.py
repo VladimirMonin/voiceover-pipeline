@@ -61,6 +61,7 @@ or text source may only link to a parent belonging to the same run.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
 import sqlite3
@@ -74,6 +75,8 @@ from typing import Any
 
 from .database import HistoryDatabase, utc_now
 from .raw_receipt import PaidRawReceipt, PaidRawReceiptError, verify_paid_raw_receipt
+
+_logger = logging.getLogger("voiceover_pipeline.history")
 
 MAX_QUERY_LIMIT = 500
 DEFAULT_QUERY_LIMIT = 50
@@ -925,13 +928,22 @@ class HistoryRepository:
     def __init__(self, database: HistoryDatabase) -> None:
         self._database = database
         self._connection = database.connection
+        # Text sources and run labels committed by the current outermost
+        # transaction, indexed best-effort after that transaction commits. The
+        # canonical data never waits on the derived index: a failed index write is
+        # recorded as pending for a later offline rebuild.
+        self._pending_index_sources: list[TextSourceRecord] = []
+        self._pending_label_runs: list[str] = []
 
     @contextmanager
     def transaction(self) -> Iterator[HistoryRepository]:
         """Run a group of writes as one transaction, rolling back on failure.
 
         Nested use inside an already open transaction simply joins that
-        transaction, so insert methods can be called from within this block.
+        transaction, so insert methods can be called from within this block. After
+        the outermost transaction commits, any text source it saved is indexed into
+        the derived lexical layer best-effort; a rollback discards them. An index
+        failure never unsaves the committed text source.
         """
         connection = self._connection
         if connection.in_transaction:
@@ -942,8 +954,51 @@ class HistoryRepository:
             yield self
         except BaseException:
             connection.execute("ROLLBACK")
+            self._pending_index_sources.clear()
+            self._pending_label_runs.clear()
             raise
         connection.execute("COMMIT")
+        self._flush_pending_index()
+
+    def _flush_pending_index(self) -> None:
+        """Index text sources and run labels the finished transaction committed.
+
+        Runs outside the canonical transaction, so a failure here cannot roll back
+        the saved rows. On failure the affected sources are recorded in
+        ``search_index_pending`` when possible, and a bounded warning is logged; the
+        canonical content stays committed and ``index build`` retries it.
+        """
+        pending = self._pending_index_sources
+        pending_labels = self._pending_label_runs
+        if not pending and not pending_labels:
+            return
+        self._pending_index_sources = []
+        self._pending_label_runs = []
+        text_source_uuids = [record.text_source_uuid for record in pending]
+        try:
+            from ..search.indexing import index_committed_text_sources
+
+            index_committed_text_sources(
+                self._connection, text_source_uuids, run_uuids=pending_labels
+            )
+        except Exception:
+            # A derived-index failure must never surface as a failed canonical
+            # save: the text is already durable and a rebuild can recover it.
+            _logger.warning(
+                "search_index_failed sources=%d reason=derived_write_failed",
+                len(text_source_uuids),
+            )
+            try:
+                from ..search.indexing import mark_text_sources_pending
+
+                mark_text_sources_pending(
+                    self._connection, text_source_uuids, reason="derived_write_failed"
+                )
+            except Exception:
+                _logger.warning(
+                    "search_index_pending_unrecorded sources=%d",
+                    len(text_source_uuids),
+                )
 
     def _require_outer_transaction(self, method: str) -> None:
         """Fail closed unless the caller already opened :meth:`transaction`.
@@ -1035,6 +1090,7 @@ class HistoryRepository:
         )
         with self.transaction():
             self._insert_run(record)
+            self._pending_label_runs.append(record.run_uuid)
         return record
 
     def create_legacy_run(
@@ -1080,6 +1136,7 @@ class HistoryRepository:
             legacy_source_root=canonical_root,
         )
         self._insert_run(record)
+        self._pending_label_runs.append(record.run_uuid)
         return record, True
 
     def advance_run_revision(
@@ -2909,6 +2966,7 @@ class HistoryRepository:
         )
         with self.transaction():
             self._insert_text_source(record)
+            self._pending_index_sources.append(record)
         return record
 
     # -- reads ----------------------------------------------------------------

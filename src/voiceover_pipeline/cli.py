@@ -26,6 +26,7 @@ from .asr_longform import (
     uses_long_form_orchestration,
 )
 from .commands import history as history_commands
+from .commands import search as search_commands
 from .commands.split import ScriptNotFoundError, prepare_split_chunks
 from .config import (
     DEFAULT_ASR_COMPUTE,
@@ -297,6 +298,10 @@ def main() -> None:
             list_cmd(args)
         elif args.command == "history":
             history_cmd(args)
+        elif args.command == "search":
+            search_cmd(args)
+        elif args.command == "index":
+            index_cmd(args)
     except CliError as exc:
         _emit_error(args, str(exc), exc.code, details=exc.details)
     except SystemExit:
@@ -766,6 +771,61 @@ def build_parser() -> argparse.ArgumentParser:
         "costs", help="Read-only money totals grouped by currency and operation."
     )
     hist_costs.add_argument("--json", dest="json_output", action="store_true")
+
+    # --------------- search ---------------
+    search = subparsers.add_parser(
+        "search",
+        help="Search saved speech history offline with FTS5 (lexical mode).",
+        description=(
+            "Search the saved scripts, transcripts, and run labels in the local SQLite "
+            "history. Default scope searches speech and recognized text; --scope directions "
+            "adds the director instructions. Runs offline without keys, FFmpeg, or Torch."
+        ),
+    )
+    search.add_argument("query", metavar="QUERY", help="Search terms (treated as literal words).")
+    search.add_argument(
+        "--mode",
+        choices=["lexical", "semantic", "hybrid"],
+        default="lexical",
+        help="Search mode. semantic/hybrid are deferred; lexical is the offline FTS5 path.",
+    )
+    search.add_argument(
+        "--scope",
+        choices=list(search_commands.SCOPES),
+        default=search_commands.DEFAULT_SCOPE,
+        help="Role scope: speech (default) or directions, or all.",
+    )
+    search.add_argument("--limit", type=int, default=search_commands.DEFAULT_SEARCH_LIMIT)
+    search.add_argument("--kind", default=None, help="Exact text-source kind filter.")
+    search.add_argument("--role", default=None, help="Exact search role filter.")
+    search.add_argument("--run", dest="run_uuid", default=None, help="Exact run UUID filter.")
+    search.add_argument("--operation", default=None, help="Exact run operation filter.")
+    search.add_argument(
+        "--provider", default=None, help="Run carries an attempt with this provider."
+    )
+    search.add_argument("--since", default=None, help="Only runs created on/after this ISO date.")
+    search.add_argument("--until", default=None, help="Only runs created on/before this ISO date.")
+    search.add_argument("--json", dest="json_output", action="store_true")
+
+    # --------------- index ---------------
+    index = subparsers.add_parser(
+        "index",
+        help="Inspect or rebuild the offline lexical index (no models, no network).",
+    )
+    index_sub = index.add_subparsers(dest="index_command")
+    index_sub.required = True
+    index_status = index_sub.add_parser(
+        "status", help="Report truthful derived-index counts without writing anything."
+    )
+    index_status.add_argument("--json", dest="json_output", action="store_true")
+    index_build = index_sub.add_parser(
+        "build", help="Index everything not yet indexed, offline and idempotently."
+    )
+    index_build.add_argument("--json", dest="json_output", action="store_true")
+    index_rebuild = index_sub.add_parser(
+        "rebuild", help="Drop and rebuild the whole derived index from SQLite only."
+    )
+    index_rebuild.add_argument("--json", dest="json_output", action="store_true")
 
     return parser
 
@@ -4253,6 +4313,102 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
     print(
         f"  imported={payload['imported_count']} skipped={payload['skipped_count']} "
         f"rejected={payload['rejected_count']}"
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# search / index
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def search_cmd(args: argparse.Namespace) -> None:
+    """Dispatch one ``search`` invocation to its handler."""
+    try:
+        payload = search_commands.search_history(
+            args.query,
+            mode=args.mode,
+            scope=args.scope,
+            limit=args.limit,
+            kind=args.kind,
+            role=args.role,
+            run_uuid=args.run_uuid,
+            operation=args.operation,
+            provider=args.provider,
+            since=args.since,
+            until=args.until,
+        )
+    except search_commands.SearchCommandError as exc:
+        fail(str(exc), exc.code, details=exc.details)
+
+    if args.json_output:
+        _json_ok(payload)
+    _print_search(payload)
+
+
+def _print_search(payload: dict[str, Any]) -> None:
+    results = payload["results"]
+    if not results:
+        print(f"No matches for {payload['query']!r}.")
+    else:
+        print(f"Search results ({payload['count']}):")
+        for result in results:
+            label = result["user_label"] if result["user_label"] is not None else "-"
+            print(
+                f"  {result['run_uuid']}  role={result['role']}  label={label}  "
+                f"kind={result['kind']}"
+            )
+            print(f"    {result['snippet']}")
+            audio = result["audio"]
+            if audio is not None:
+                print(f"    audio: {audio['path']} ({audio['availability']}, {audio['role']})")
+    for warning in payload["warnings"]:
+        print(f"Warning: {warning}")
+
+
+def index_cmd(args: argparse.Namespace) -> None:
+    """Dispatch one ``index`` subcommand to its handler."""
+    try:
+        if args.index_command == "status":
+            payload = search_commands.index_status_report()
+        elif args.index_command == "build":
+            payload = search_commands.build_lexical_index()
+        elif args.index_command == "rebuild":
+            payload = search_commands.rebuild_lexical_index()
+        else:
+            fail("Unknown index subcommand.", _EXIT_ARGS)
+    except search_commands.SearchCommandError as exc:
+        fail(str(exc), exc.code, details=exc.details)
+
+    if args.json_output:
+        _json_ok(payload)
+    _print_index(args.index_command, payload)
+
+
+def _print_index(subcommand: str, payload: dict[str, Any]) -> None:
+    if not payload.get("available", True):
+        print(f"Lexical index: not built. Database: {payload['database']['path']}")
+        return
+    status = payload.get("status", payload)
+    if subcommand == "build":
+        print(
+            f"Indexed {status['sources_indexed']} source(s), {status['indexed_chunks']} chunk(s)."
+        )
+    elif subcommand == "rebuild":
+        print(f"Rebuilt {status['indexed_chunks']} chunk(s).")
+    print(f"Lexical index (database: {payload['database']['path']})")
+    print(
+        f"  chunker_version={status['chunker_version']} built={status['built_chunker_version']} "
+        f"mode={status['last_build_mode']} at={status['last_build_at']}"
+    )
+    print(
+        f"  sources: indexable={status['sources_indexable']} indexed={status['sources_indexed']} "
+        f"pending={status['sources_pending']} private_excluded={status['sources_private_excluded']} "
+        f"incomplete={status['sources_incomplete']}"
+    )
+    print(
+        f"  chunks={status['indexed_chunks']} label_runs={status['label_runs']} "
+        f"labels_missing={status['labels_missing']} complete={status['complete']} "
+        f"needs_rebuild={status['needs_rebuild']}"
     )
 
 

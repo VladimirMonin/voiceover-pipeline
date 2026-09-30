@@ -31,6 +31,7 @@ import pytest
 import voiceover_pipeline.cli as cli
 import voiceover_pipeline.history.paid_transcription as paid
 import voiceover_pipeline.services.native_generation as native_generation
+from voiceover_pipeline.commands.search import search_history
 from voiceover_pipeline.history.database import MIGRATIONS, Migration
 from voiceover_pipeline.history.native_snapshot import NATIVE_SNAPSHOT_ORIGIN
 from voiceover_pipeline.history.paths import history_database_path
@@ -395,6 +396,66 @@ def test_xai_adapter_hands_raw_body_before_parsing(monkeypatch, tmp_path):
 # -- standalone paid timing lifecycle -----------------------------------------
 
 
+def test_paid_timing_search_links_source_audio_new_and_snapshot_only_legacy(
+    paid_home, tmp_path, monkeypatch
+):
+    source_audio = _audio(tmp_path)
+    calls: list[str] = []
+    fake = _CloudTiming(body=_groq_body(), timing=_timing(), calls=calls)
+
+    def _before_paid_post(**kwargs):
+        # The source link is in the same durable reservation as the attempt;
+        # a simulated POST cannot precede it.
+        linked = _rows(
+            paid_home,
+            "SELECT role, path FROM artifacts WHERE role = 'asr_source_audio'",
+        )
+        assert len(linked) == 1
+        assert linked[0]["path"] == str(source_audio.resolve())
+        return fake(**kwargs)
+
+    monkeypatch.setattr(transcription, "transcribe_timing_audio", _before_paid_post)
+    code, error = _run_timings(monkeypatch, source_audio, tmp_path)
+    assert code == 0 and error is None and calls == ["post"]
+    run_uuid = _single_run_uuid(paid_home)
+    database_path = history_database_path()
+
+    new_result = search_history(TRANSCRIPT, database_path=database_path)
+    assert new_result["count"] == 1
+    assert new_result["results"][0]["run_uuid"] == run_uuid
+    new_link = new_result["results"][0]["audio"]
+    assert new_link["artifact_uuid"] is not None
+    assert new_link["role"] == "asr_source_audio"
+    assert new_link["path"] == str(source_audio.resolve())
+    assert new_link["availability"] == "present"
+    run_label = search_history("timing", database_path=database_path)["results"]
+    assert len(run_label) == 1
+    assert run_label[0]["role"] == "label"
+    assert run_label[0]["audio"]["path"] == str(source_audio.resolve())
+
+    # Existing paid runs predate the source-audio artifact but retain its
+    # verified canonical path and observed availability in the run snapshot.
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("DELETE FROM artifacts WHERE role = 'asr_source_audio'")
+    legacy_result = search_history(TRANSCRIPT, database_path=database_path)
+    assert legacy_result["count"] == 1
+    old_link = legacy_result["results"][0]["audio"]
+    assert old_link["artifact_uuid"] is None
+    assert old_link["role"] == "asr_source_audio"
+    assert old_link["path"] == str(source_audio.resolve())
+    assert old_link["availability"] == "present"
+    legacy_label = search_history("timing", database_path=database_path)["results"][0]
+    assert legacy_label["audio"]["artifact_uuid"] is None
+    assert legacy_label["audio"]["path"] == str(source_audio.resolve())
+    source_audio.unlink()
+    assert (
+        search_history(TRANSCRIPT, database_path=database_path)["results"][0]["audio"][
+            "availability"
+        ]
+        == "missing"
+    )
+
+
 def test_standalone_cloud_timing_persists_marker_raw_and_transcript(
     paid_home, tmp_path, monkeypatch, capsys
 ):
@@ -437,7 +498,10 @@ def test_standalone_cloud_timing_persists_marker_raw_and_transcript(
 
     artifacts = _rows(paid_home, "SELECT * FROM artifacts")
     roles = sorted(row["role"] for row in artifacts)
-    assert roles == ["provider_raw_response", "srt", "timings_json"]
+    assert roles == ["asr_source_audio", "provider_raw_response", "srt", "timings_json"]
+    source_link = next(row for row in artifacts if row["role"] == "asr_source_audio")
+    assert source_link["path"] == str(audio.resolve())
+    assert source_link["sha256"] == hashlib.sha256(AUDIO_BYTES).hexdigest()
     raw = next(row for row in artifacts if row["role"] == "provider_raw_response")
     assert raw["path"] == f"raw/{attempts[0]['attempt_uuid']}.body"
     assert raw["sha256"] == hashlib.sha256(_groq_body()).hexdigest()
@@ -716,7 +780,11 @@ def test_crash_after_body_reconciles_same_attempt_without_second_post(
     raw_dir = _output_root(tmp_path) / "raw"
     assert (raw_dir / f"{attempt_uuid}.body").is_file()
     assert (raw_dir / f"{attempt_uuid}.body.receipt").is_file()
-    assert _rows(paid_home, "SELECT * FROM artifacts") == []
+    # The source link was reserved before POST; the provider body has not been
+    # committed as an artifact yet.
+    assert [row["role"] for row in _rows(paid_home, "SELECT * FROM artifacts")] == [
+        "asr_source_audio"
+    ]
 
     monkeypatch.setattr(paid, "_open_database", original)
     resume_code, resume_stdout, _resume_error = _run_history(monkeypatch, run_uuid, "resume")
@@ -852,7 +920,9 @@ def test_oversized_body_is_refused_before_parse(paid_home, tmp_path, monkeypatch
     assert code == 40
     assert calls == ["post"]
     assert _rows(paid_home, "SELECT status FROM attempts")[0]["status"] == "submitting"
-    assert _rows(paid_home, "SELECT * FROM artifacts") == []
+    assert [row["role"] for row in _rows(paid_home, "SELECT * FROM artifacts")] == [
+        "asr_source_audio"
+    ]
 
 
 # -- source and output identity -----------------------------------------------
