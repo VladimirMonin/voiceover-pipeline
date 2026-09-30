@@ -280,6 +280,8 @@ def test_candidate_model_is_blocked_before_any_key_or_provider(media_env, capsys
     )
     assert code == 30
     assert payload["details"]["error_code"] == "BLOCKED_PROVIDER_CONTRACT"
+    assert "catalog-confirmed ID" in payload["error"]
+    assert "endpoint" in payload["error"].lower()
 
 
 def test_a_late_over_limit_part_posts_nothing(media_env, capsys, monkeypatch):

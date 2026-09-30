@@ -1,13 +1,13 @@
 """Offline admission policy for the ``speech-parts`` / ``--text`` request route.
 
-The Gemini speech-parts contract through Polza is **not verified**. The S01
-source-only report could not confirm the real Polza model id, endpoint, the field
-a per-part instruction travels in, the voices, the audio container, or the price,
-and the Flash-Lite id is unknown entirely. This module therefore keeps the
-candidate route inert: it names the candidate model so the format can be validated
-and its character budget checked fully offline, and it refuses a live submit with
-a fixed ``BLOCKED_PROVIDER_CONTRACT`` before any API key is read or any request is
-built.
+The Gemini speech-parts contract through Polza is **not verified**. One approved
+``/models`` catalog GET observed both Flash and Flash-Lite model IDs, but did not
+establish the endpoint, per-part instruction field, supported voices, audio
+container, applicable price, or a safe upper cost bound. This module therefore
+keeps the Flash candidate route inert: it names the candidate model so the format
+can be validated and its character budget checked fully offline, and it refuses
+a live submit with a fixed ``BLOCKED_PROVIDER_CONTRACT`` before any API key is read
+or any request is built.
 
 Two independent facts decide admission of a real request:
 
@@ -28,10 +28,11 @@ from dataclasses import dataclass
 
 BLOCKED_PROVIDER_CONTRACT = "BLOCKED_PROVIDER_CONTRACT"
 
-# The one candidate model the plan names. Its Polza id, endpoint, instruction
-# field, voices, container, and cost are all UNVERIFIED; Flash-Lite has no id at
-# all and is deliberately absent. Registering a stable model-list entry would
-# advertise an unconfirmed route, so neither appears there.
+# The one candidate model the plan names. Its ID was observed in a permitted
+# catalog GET, but its endpoint, instruction field, voices, container, and cost
+# ceiling remain UNVERIFIED. Flash-Lite's ID was also observed but is deliberately
+# absent from this candidate route. Registering either as a stable model-list entry
+# would advertise an unconfirmed route, so neither appears there.
 _CANDIDATE_GEMINI_SPEECH_PARTS_MODEL = "google/gemini-3.8-flash-tts"
 
 # Routes on which a per-part cast voice is already confirmed: the OpenRouter Gemini
@@ -121,10 +122,12 @@ def require_confirmed_speech_parts_route(
     if route is not None and not route.verified:
         raise SpeechPartsRouteError(
             f"BLOCKED_PROVIDER_CONTRACT: the provider/model route {provider}/{model} is a "
-            "candidate only; its real Polza id, endpoint, instruction field, voices, audio "
-            "container, and price are unverified, so this application will not submit a paid "
-            "request on an assumed payload. Confirm the route with one approved live probe, or "
-            "use an existing confirmed route. No request was sent and no API key was read."
+            "candidate only; its catalog-confirmed ID is not a verified speech-parts route. "
+            "Endpoint, instruction field, voices, audio container, applicable price, and "
+            "upper cost bound remain unverified; no paid request will be sent on an assumed "
+            "payload. Further provider probes require separate owner approval and a documented "
+            "cost ceiling. Use an existing confirmed route instead. No request was sent and no "
+            "API key was read."
         )
     if has_vibe:
         raise SpeechPartsRouteError(
