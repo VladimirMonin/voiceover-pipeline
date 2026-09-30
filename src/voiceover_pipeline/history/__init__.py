@@ -33,6 +33,14 @@ from .legacy_import import (
     import_legacy_runs,
     preview_legacy_import,
 )
+from .locking import (
+    LOCK_FILE_MODE,
+    LOCKS_DIR_NAME,
+    HistoryRunLockedError,
+    HistoryRunLockError,
+    acquire_run_lock,
+    run_lock_path,
+)
 from .paths import (
     APP_DIR_NAME,
     HISTORY_DATABASE_FILENAME,
@@ -87,6 +95,8 @@ __all__ = [
     "LATEST_SCHEMA_VERSION",
     "LEGACY_OPERATION",
     "LEGACY_ORIGIN",
+    "LOCK_FILE_MODE",
+    "LOCKS_DIR_NAME",
     "MAX_QUERY_LIMIT",
     "MIGRATIONS",
     "PATH_KIND_EXTERNAL_ABSOLUTE",
@@ -109,6 +119,8 @@ __all__ = [
     "HistoryRepository",
     "HistoryRepositoryError",
     "HistoryRevisionConflictError",
+    "HistoryRunLockError",
+    "HistoryRunLockedError",
     "HistoryRunNotFoundError",
     "LegacyChunkPreview",
     "LegacyImportPreview",
@@ -121,6 +133,7 @@ __all__ = [
     "RunRecord",
     "SchemaVersionTooNewError",
     "TextSourceRecord",
+    "acquire_run_lock",
     "apply_migrations",
     "backup_database",
     "default_history_home",
@@ -134,5 +147,6 @@ __all__ = [
     "import_legacy_runs",
     "preview_legacy_import",
     "resolve_history_home",
+    "run_lock_path",
     "utc_now",
 ]
