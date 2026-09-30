@@ -36,7 +36,7 @@
 | `20` | no key | Нет POLZA_API_KEY или OPENROUTER_API_KEY |
 | `30` | provider/run error | API error, папка существует без --overwrite |
 | `40` | whisper error | Whisper timing не удался |
-| `50` | output error | Ошибка записи/удаления файлов |
+| `50` | output error | Ошибка записи/удаления файлов или сбой сохранения уже полученного результата в локальную историю (`details.error_code` = `HISTORY_PERSISTENCE_FAILED`) |
 | `60` | TTS quality failed | ASR-сверка нашла существенный пропуск, вставку или повтор; аудио и receipt сохранены |
 
 ## Stdout/Stderr Contract
@@ -479,6 +479,67 @@ JSON-writer без изменений.
 `history resume ID` / `history sync ID`, которые восстанавливают такой прогон из
 снимка, описаны в разделе ниже.
 
+## Локальные ASR / timings / verify в канонической истории (фрагмент S05)
+
+Локальные маршруты `transcribe` (`qwen-local`, `nemotron-local`), `timings` с
+`--asr-provider` и локальный `--timing-provider faster-whisper`, а также
+`verify-tts` записывают наблюдаемый результат в каноническую SQLite-историю по
+умолчанию. Это **фрагмент** S05: облачные timing-маршруты (`groq-whisper`,
+`xai-stt`, `openrouter-whisper`) и будущий облачный ASR остаются legacy и ничего
+не сохраняют до подтверждённого paid-submit контракта (S01/S07).
+
+- Управление — `settings.toml` в текущем каталоге: `[history] enabled = false`
+  отключает запись полностью, и команда работает как раньше, не создавая дом,
+  БД, `runs/` и sidecar. Отсутствие файла, секции или ключа означает
+  `enabled = true`. Нечитаемый `settings.toml` или не-boolean `enabled`
+  fail-closed: результат отдаётся, но помечается сбоем сохранения.
+- Операции: `asr` (`transcribe`), `timings` (локальный `timings`),
+  `verify` (`verify-tts`). `history list --operation asr|timings|verify`
+  фильтрует их, `history show ID` рендерит попытку, артефакты и текстовые роли.
+- `run_root` — приватный `0700` каталог managed `VOICEOVER_HOME/runs/<uuid>`, а
+  не пользовательский `out/<run-id>`: ASR-прогон не делит каталог с
+  legacy/native TTS-прогоном и не может быть удалён его `--overwrite`.
+- Исходное аудио не копируется: сохраняются внешний абсолютный путь, размер и
+  SHA-256. Если файл исчез до записи, артефакт получает
+  `availability: "missing"` без выдуманного размера/хеша, а уже сохранённый
+  transcript остаётся валидным.
+- Попытка одна, `status: "completed"`, цена `null` (неизвестная): локальные
+  маршруты не имеют внешнего API-начисления, и `history costs` считает такую
+  попытку в `local_attempts_without_api_charge`.
+- Приватные роли текста: `asr_transcript` (распознанная речь), `asr_context`
+  (переданный `--context`/`--context-file` prompt), `verification_transcript`
+  (фактическая проверка). `verify-tts` **никогда** не сохраняет ожидаемый
+  TTS-текст и не перезаписывает исходный сценарий; при совпадении audio с
+  native TTS-run сохраняется связь `parent_uuid`.
+- Наблюдаемые сегменты и происхождение попадают в приватный
+  `config_snapshot` (модель, runtime, `timestamp_mode`/`timestamp_basis`,
+  сегменты с их собственными `null`-границами). Выдуманные spans не создаются,
+  text-only результат не становится SRT, а пустой transcript сохраняется как
+  `""` с `text_completeness: "incomplete"`.
+- Файловые артефакты ссылаются только на реально существующие файлы:
+  `timings_json`/`srt` появляются в истории лишь когда команда их записала.
+- `--json` при успешном сохранении сохраняет прежние поля и exit code и
+  добавляет безопасный блок `"history": {"saved": true, "run_uuid": "..."}`.
+  Если запись в БД не удалась, команда **не** заявляет о сохранении: она
+  отдаёт уже полученный результат (transcript, файлы, receipt) с
+  `"status": "partial"` и
+  `"history": {"saved": false, "error_code": "HISTORY_PERSISTENCE_FAILED"}`,
+  завершается exit `50` и не вызывает провайдера повторно. `verify-tts` в этом
+  случае тоже возвращает `50` вместо `0`/`60`, а качество остаётся видно в
+  `receipt.status`.
+- Приватность: `history.sqlite3` — plaintext-БД, не зашифрованный сейф.
+  `list`/`show`/`costs` показывают только метаданные: роль текста, язык,
+  `has_content` и хеш, но не сам transcript, не context prompt и не подписанные
+  URL.
+
+```bash
+voiceover transcribe --audio recording.wav --provider qwen-local --json
+voiceover timings --audio recording.wav --asr-provider qwen-local --output-dir out --run-id rec-timings --json
+voiceover verify-tts --audio out/prod/full.mp3 --expected-file script.md --provider qwen-local --json
+voiceover history list --operation asr --json
+voiceover history show <run-uuid> --json
+```
+
 ## `verify-tts` — fail-closed quality gate
 
 Команда запускает явно выбранный зарегистрированный ASR route и сравнивает
@@ -488,7 +549,10 @@ JSON-writer без изменений.
 stdout/`--receipt` содержат только hashes, counts, ASR identity и audio SHA-256.
 `0` означает technical PASS, `60` — quality FAIL. Недоступный ASR остаётся
 exit `10`/`30`; decode-only PASS не подменяет эту проверку. Даже technical PASS
-содержит `human_listening_required: true`.
+содержит `human_listening_required: true`. Успешный прогон также сохраняет
+приватный `verification_transcript` в каноническую историю (см. раздел
+«Локальные ASR / timings / verify в канонической истории»); ожидаемый текст не
+сохраняется.
 
 ```bash
 voiceover verify-tts --audio out/run/full.mp3 --expected-file script.md \
@@ -510,7 +574,10 @@ fallback к container нет. Полный pinned receipt и ограничен�
 S04 добавляет локальную SQLite-историю. `history list`, `history show` и
 `history import` читают и импортируют метаданные независимо от текущего рабочего
 каталога. Они не переключают генерацию на новый writer (это S05) и не делают
-провайдерских, ASR, сетевых или платных вызовов.
+провайдерских, ASR, сетевых или платных вызовов. Локальные `transcribe`,
+`timings` и `verify-tts` добавляют прогоны операций `asr`, `timings` и `verify`
+через тот же общий слой (см. раздел «Локальные ASR / timings / verify в
+канонической истории»).
 
 ```bash
 voiceover history list [--label L] [--operation O] [--status S] [--limit N] [--offset N] --json
@@ -1031,6 +1098,12 @@ orphan dialogue MP3 без trusted state, fail closed.
 }
 ```
 
+Локальный маршрут (`--asr-provider` или `--timing-provider faster-whisper`)
+дополнительно сохраняет прогон операции `timings` в каноническую историю и
+добавляет блок `history` (см. раздел «Локальные ASR / timings / verify в
+канонической истории»). Облачные `--timing-provider` остаются legacy и блок
+`history` не добавляют.
+
 ## `transcribe --audio --json`
 
 `transcribe` — отдельная ASR-команда для конечного аудиофайла. Она не вызывает
@@ -1107,6 +1180,12 @@ voiceover transcribe `
 Если native ASR route запросил word timestamps, `execution` дополнительно
 может содержать `raw_timestamp_entries`: неизменённые записи runtime до
 нормализации в canonical VOP words. Поле отсутствует у text-only результатов.
+
+Локальный `transcribe` также сохраняет наблюдаемый результат в каноническую
+историю (операция `asr`) и при успешном сохранении добавляет в `--json` только
+безопасный блок `"history": {"saved": true, "run_uuid": "..."}`; остальные
+поля и exit code не меняются. Сбой сохранения, отключённая история и приватность
+описаны в разделе «Локальные ASR / timings / verify в канонической истории».
 
 Для `qwen-local` и `nemotron-local` источник длиннее 120 s планируется с
 target 110 s в рабочем окне 90–120 s и hard maximum 120 s. Запросы с word

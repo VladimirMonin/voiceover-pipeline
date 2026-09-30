@@ -9,6 +9,9 @@ layout; :mod:`voiceover_pipeline.history.legacy_import` safely imports old
 ``out/<run-id>`` trees without touching them;
 :mod:`voiceover_pipeline.history.native_snapshot` atomically persists a native
 prepared TTS run before any provider request exists;
+:mod:`voiceover_pipeline.history.native_asr` records the observed result of the
+already-implemented local ``transcribe``, ``timings``, and ``verify-tts``
+commands (operations ``asr``, ``timings``, ``verify``);
 :mod:`voiceover_pipeline.history.native_view` reads one verified view of such a
 run; and :mod:`voiceover_pipeline.history.native_resume` preflights a resume by
 comparing a candidate prepared run against that stored synthesis identity.
@@ -45,6 +48,26 @@ from .locking import (
     HistoryRunLockError,
     acquire_run_lock,
     run_lock_path,
+)
+from .native_asr import (
+    ARTIFACT_ROLE_QUALITY_RECEIPT,
+    ARTIFACT_ROLE_SOURCE_AUDIO,
+    ARTIFACT_ROLE_SRT,
+    ARTIFACT_ROLE_TIMINGS_JSON,
+    ATTEMPT_CALL_TYPE_ASR,
+    ATTEMPT_CALL_TYPE_TIMING,
+    ATTEMPT_CALL_TYPE_VERIFY,
+    HISTORY_PERSISTENCE_FAILED,
+    NATIVE_ASR_ORIGIN,
+    OPERATION_ASR,
+    OPERATION_TIMINGS,
+    OPERATION_VERIFY,
+    AsrHistoryArtifact,
+    AsrHistoryError,
+    AsrHistorySave,
+    AsrHistorySaveResult,
+    AsrHistoryText,
+    persist_asr_history,
 )
 from .native_resume import (
     NativeResumeError,
@@ -101,6 +124,7 @@ from .repository import (
     REDACTED_VALUE,
     TEXT_COMPLETENESS_COMPLETE,
     TEXT_COMPLETENESS_INCOMPLETE,
+    TEXT_KIND_ASR_CONTEXT,
     TEXT_KIND_ASR_TRANSCRIPT,
     TEXT_KIND_TTS_DIRECTION,
     TEXT_KIND_TTS_SCRIPT,
@@ -126,12 +150,20 @@ from .repository import (
 
 __all__ = [
     "APP_DIR_NAME",
+    "ARTIFACT_ROLE_QUALITY_RECEIPT",
+    "ARTIFACT_ROLE_SOURCE_AUDIO",
+    "ARTIFACT_ROLE_SRT",
+    "ARTIFACT_ROLE_TIMINGS_JSON",
+    "ATTEMPT_CALL_TYPE_ASR",
+    "ATTEMPT_CALL_TYPE_TIMING",
+    "ATTEMPT_CALL_TYPE_VERIFY",
     "COST_SOURCE_EXACT",
     "COST_SOURCE_LEGACY_FLOAT",
     "COST_SOURCE_UNKNOWN",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "DEFAULT_QUERY_LIMIT",
     "HISTORY_DATABASE_FILENAME",
+    "HISTORY_PERSISTENCE_FAILED",
     "LATEST_SCHEMA_VERSION",
     "LEGACY_OPERATION",
     "LEGACY_ORIGIN",
@@ -139,20 +171,30 @@ __all__ = [
     "LOCKS_DIR_NAME",
     "MAX_QUERY_LIMIT",
     "MIGRATIONS",
+    "NATIVE_ASR_ORIGIN",
     "NATIVE_SNAPSHOT_FINGERPRINT_VERSION",
     "NATIVE_SNAPSHOT_OPERATION",
     "NATIVE_SNAPSHOT_ORIGIN",
+    "OPERATION_ASR",
+    "OPERATION_TIMINGS",
+    "OPERATION_VERIFY",
     "PATH_KIND_EXTERNAL_ABSOLUTE",
     "PATH_KIND_MANAGED_RELATIVE",
     "PRIVATE_DIR_MODE",
     "REDACTED_VALUE",
     "TEXT_COMPLETENESS_COMPLETE",
     "TEXT_COMPLETENESS_INCOMPLETE",
+    "TEXT_KIND_ASR_CONTEXT",
     "TEXT_KIND_ASR_TRANSCRIPT",
     "TEXT_KIND_TTS_DIRECTION",
     "TEXT_KIND_TTS_SCRIPT",
     "TEXT_KIND_VERIFICATION_TRANSCRIPT",
     "ArtifactRecord",
+    "AsrHistoryArtifact",
+    "AsrHistoryError",
+    "AsrHistorySave",
+    "AsrHistorySaveResult",
+    "AsrHistoryText",
     "AttemptRecord",
     "Cost",
     "HistoryDatabase",
@@ -212,6 +254,7 @@ __all__ = [
     "history_runs_dir",
     "import_legacy_runs",
     "load_native_tts_view",
+    "persist_asr_history",
     "persist_prepared_tts_snapshot",
     "preflight_native_tts_resume",
     "preview_legacy_import",

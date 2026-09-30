@@ -6,12 +6,13 @@ import json
 import shutil
 import sys
 import time  # noqa: F401 - shared sleep seam tests patch via cli.time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
+from . import settings as settings_module
 from .artifacts import (
     build_run_paths,
     build_srt,
@@ -69,7 +70,34 @@ from .gemini_dialogue import (
     validate_gemini_dialogue_file,
 )
 from .history.locking import HistoryRunLockedError, acquire_run_lock
-from .history.repository import DEFAULT_QUERY_LIMIT
+from .history.native_asr import (
+    ARTIFACT_ROLE_QUALITY_RECEIPT,
+    ARTIFACT_ROLE_SRT,
+    ARTIFACT_ROLE_TIMINGS_JSON,
+    ATTEMPT_CALL_TYPE_ASR,
+    ATTEMPT_CALL_TYPE_TIMING,
+    ATTEMPT_CALL_TYPE_VERIFY,
+    NATIVE_ASR_ORIGIN,
+    OPERATION_ASR,
+    OPERATION_TIMINGS,
+    OPERATION_VERIFY,
+    AsrHistoryArtifact,
+    AsrHistorySave,
+    AsrHistorySaveResult,
+    AsrHistoryText,
+    failed_history_result,
+    inactive_history_result,
+    persist_asr_history,
+    saved_history_result,
+)
+from .history.repository import (
+    DEFAULT_QUERY_LIMIT,
+    TEXT_COMPLETENESS_COMPLETE,
+    TEXT_COMPLETENESS_INCOMPLETE,
+    TEXT_KIND_ASR_CONTEXT,
+    TEXT_KIND_ASR_TRANSCRIPT,
+    TEXT_KIND_VERIFICATION_TRANSCRIPT,
+)
 from .local_runtime.contracts import OmniVoiceRequest
 from .local_tts_text import merge_omnivoice_session_fragments, prepare_local_tts_chunks
 from .media import (
@@ -1910,14 +1938,164 @@ def _transcribe_result(args: argparse.Namespace) -> tuple[ASRResult, Path]:
     return result, audio_path
 
 
+def _persist_history(
+    build_save: Callable[[], AsrHistorySave | None],
+) -> AsrHistorySaveResult:
+    """Persist one completed local result without ever raising into the command.
+
+    ``build_save`` returns the evidence to store, or ``None`` when history does
+    not apply to this command or route (history disabled in ``settings.toml``, or
+    a cloud timing route that stays legacy). Every failure -- an unreadable
+    settings file, a managed-home or database failure, or a validation error --
+    reports the same fixed machine-visible persistence failure instead of
+    claiming a save. The provider response the command already produced is kept
+    and no provider is called again.
+    """
+    try:
+        if not settings_module.load_history_settings().enabled:
+            return inactive_history_result()
+        save = build_save()
+        if save is None:
+            return inactive_history_result()
+        return saved_history_result(persist_asr_history(save))
+    except Exception:
+        return failed_history_result()
+
+
+def _report_persistence_failure(*, json_output: bool) -> None:
+    """Exit with the fixed persistence failure code after the result was emitted."""
+    if not json_output:
+        print(
+            "History was not saved; the observed result above is unchanged "
+            "(HISTORY_PERSISTENCE_FAILED).",
+            file=sys.stderr,
+        )
+    sys.exit(_EXIT_OUTPUT)
+
+
+def _transcript_completeness(transcript: str) -> str:
+    """Mark a blank transcript ``incomplete`` so it never reads as full text."""
+    return TEXT_COMPLETENESS_COMPLETE if transcript.strip() else TEXT_COMPLETENESS_INCOMPLETE
+
+
+def _context_provenance(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    """Return the ASR context prompt and how it was supplied, if at all.
+
+    ``(None, None)`` means the caller supplied no context. The text is re-resolved
+    from the already validated arguments so the persisted prompt is exactly the
+    one the request carried; a resolved blank value is treated as absent.
+    """
+    if getattr(args, "context", None) is not None:
+        source = "inline"
+    elif getattr(args, "context_file", None) is not None:
+        source = "file"
+    else:
+        return None, None
+    context_text = _resolve_asr_context(args).context_text
+    if context_text is None or not context_text.strip():
+        return None, None
+    return context_text, source
+
+
+def _asr_run_snapshot(
+    result: ASRResult,
+    *,
+    context_source: str | None,
+    context_prompt_present: bool,
+) -> dict[str, Any]:
+    """Build the bounded non-secret provenance map stored on an ASR run.
+
+    Only observed values are copied: the reported timestamp origin, the actual
+    segments with their own ``null`` bounds, and the runtime receipt. A text-only
+    result therefore carries no span it did not report.
+    """
+    execution = result.execution
+    snapshot: dict[str, Any] = {
+        "operation_origin": NATIVE_ASR_ORIGIN,
+        "provider": result.provider_id,
+        "model": result.model_id,
+        "language": result.language or None,
+        "runtime": execution.runtime,
+        "runtime_version": execution.runtime_version,
+        "model_revision": execution.model_revision,
+        "device": execution.resolved_device,
+        "compute": execution.resolved_compute,
+        "timestamp_mode": result.alignment_origin or "none",
+        "duration_s": result.duration_s,
+        "segment_count": len(result.segments),
+        "segments_with_timestamps": sum(
+            1 for segment in result.segments if segment.start_s is not None
+        ),
+        "segments": [
+            {"text": segment.text, "start_s": segment.start_s, "end_s": segment.end_s}
+            for segment in result.segments
+        ],
+        "word_count": len(result.words),
+        "context_source": context_source,
+        "context_prompt_present": context_prompt_present,
+        "runtime_measurements": dict(execution.measurements) or None,
+    }
+    if execution.long_form is not None:
+        # The long-form receipt is already JSON-shaped; normalize it through JSON
+        # so the history boundary can redact a copy of a plain structure only.
+        snapshot["long_form"] = json.loads(json.dumps(dict(execution.long_form)))
+    return snapshot
+
+
+def _transcribe_history_save(
+    args: argparse.Namespace, result: ASRResult, audio_path: Path
+) -> AsrHistorySave:
+    """Build the evidence one completed local ``transcribe`` run contributes."""
+    context_text, context_source = _context_provenance(args)
+    texts = [
+        AsrHistoryText(
+            kind=TEXT_KIND_ASR_TRANSCRIPT,
+            content=result.transcript,
+            language=result.language or None,
+            text_completeness=_transcript_completeness(result.transcript),
+        )
+    ]
+    if context_text is not None:
+        texts.append(
+            AsrHistoryText(
+                kind=TEXT_KIND_ASR_CONTEXT,
+                content=context_text,
+                text_completeness=TEXT_COMPLETENESS_COMPLETE,
+            )
+        )
+    return AsrHistorySave(
+        operation=OPERATION_ASR,
+        attempt_call_type=ATTEMPT_CALL_TYPE_ASR,
+        provider=result.provider_id,
+        model=result.model_id,
+        config_snapshot=_asr_run_snapshot(
+            result,
+            context_source=context_source,
+            context_prompt_present=context_text is not None,
+        ),
+        text_sources=tuple(texts),
+        source_audio=audio_path,
+    )
+
+
 def transcribe_cmd(args: argparse.Namespace) -> None:
     result, audio_path = _transcribe_result(args)
 
     data = _asr_result_payload(result, audio_path)
+    save = _persist_history(lambda: _transcribe_history_save(args, result, audio_path))
+    history_block = save.metadata()
+    if history_block is not None:
+        data["history"] = history_block
+        if not save.saved:
+            data["status"] = "partial"
     if args.json_output:
-        _json_ok(data)
+        print(json.dumps(data, ensure_ascii=False))
     else:
         print(result.transcript)
+    if history_block is not None and not save.saved:
+        _report_persistence_failure(json_output=args.json_output)
+    if args.json_output:
+        sys.exit(_EXIT_OK)
 
 
 def _expected_tts_text(args: argparse.Namespace) -> str:
@@ -1931,6 +2109,62 @@ def _expected_tts_text(args: argparse.Namespace) -> str:
     if expected_text is None or not expected_text.strip():
         fail("Expected TTS text must not be blank", _EXIT_ARGS)
     return expected_text
+
+
+def _verify_history_save(
+    result: ASRResult,
+    audio_path: Path,
+    receipt_path: Path | None,
+    quality,
+) -> AsrHistorySave:
+    """Build the evidence one ``verify-tts`` run contributes.
+
+    The observed verification transcript is stored as its own private
+    ``verification_transcript`` role; the expected TTS text is deliberately never
+    stored, so a check can never overwrite or impersonate the source script. The
+    audio's parent directory is offered as the parent run root so audio verified
+    inside a native TTS run root links to that run, and the content-free quality
+    receipt is referenced only when the caller asked for and got one.
+    """
+    execution = result.execution
+    artifacts: list[AsrHistoryArtifact] = []
+    if receipt_path is not None:
+        artifacts.append(
+            AsrHistoryArtifact(role=ARTIFACT_ROLE_QUALITY_RECEIPT, path=Path(receipt_path))
+        )
+    snapshot: dict[str, Any] = {
+        "operation_origin": NATIVE_ASR_ORIGIN,
+        "provider": result.provider_id,
+        "model": result.model_id,
+        "language": result.language or None,
+        "runtime": execution.runtime,
+        "model_revision": execution.model_revision,
+        "device": execution.resolved_device,
+        "compute": execution.resolved_compute,
+        "quality_passed": bool(quality.passed),
+        "similarity": float(quality.similarity),
+        "failure_reasons": [str(reason) for reason in quality.failure_reasons],
+        "receipt_recorded": receipt_path is not None,
+        "expected_text_persisted": False,
+    }
+    return AsrHistorySave(
+        operation=OPERATION_VERIFY,
+        attempt_call_type=ATTEMPT_CALL_TYPE_VERIFY,
+        provider=result.provider_id,
+        model=result.model_id,
+        config_snapshot=snapshot,
+        text_sources=(
+            AsrHistoryText(
+                kind=TEXT_KIND_VERIFICATION_TRANSCRIPT,
+                content=result.transcript,
+                language=result.language or None,
+                text_completeness=_transcript_completeness(result.transcript),
+            ),
+        ),
+        artifacts=tuple(artifacts),
+        source_audio=audio_path,
+        parent_run_root=audio_path.parent,
+    )
 
 
 def verify_tts_cmd(args: argparse.Namespace) -> None:
@@ -1954,10 +2188,16 @@ def verify_tts_cmd(args: argparse.Namespace) -> None:
     receipt_path = getattr(args, "receipt", None)
     if receipt_path is not None:
         atomic_write_json(Path(receipt_path), receipt)
+    save = _persist_history(lambda: _verify_history_save(result, audio_path, receipt_path, quality))
+    history_block = save.metadata()
+    if history_block is not None:
+        receipt["history"] = history_block
     if args.json_output:
         print(json.dumps(receipt, ensure_ascii=False))
     else:
         print("TTS quality PASS" if quality.passed else "TTS quality FAIL")
+    if history_block is not None and not save.saved:
+        _report_persistence_failure(json_output=args.json_output)
     sys.exit(_EXIT_OK if quality.passed else _EXIT_QUALITY)
 
 
@@ -2002,6 +2242,75 @@ def _verify_dialogue_turns_before_concat(
         transcribe_quality_audio=_transcribe_dialogue_quality_audio,
         sha256_file=_sha256_file,
         fail_quality=lambda message, receipt: fail(message, _EXIT_QUALITY, details=receipt),
+    )
+
+
+def _timings_history_save(
+    args: argparse.Namespace, audio_path: Path, files: dict[str, str]
+) -> AsrHistorySave | None:
+    """Build the evidence one completed ``timings`` run contributes.
+
+    Only the local routes are persisted: the registered (therefore local) ASR
+    provider route and ``faster-whisper``. A cloud timing route returns ``None``
+    so ``timings`` keeps its legacy behavior and records nothing it cannot prove.
+    The transcript and provenance are read back from the timings JSON artifact
+    the command just wrote, so the stored text is exactly what the durable
+    artifact holds and a text-only route never gains an invented span.
+    """
+    if args.asr_provider:
+        provider_id = args.asr_provider
+        timestamp_basis = "asr_word_spans"
+    else:
+        if args.timing_provider != "faster-whisper":
+            return None
+        provider_id = args.timing_provider
+        timestamp_basis = "provider_segment_timestamps"
+    manifest = json.loads(Path(files["timings_json"]).read_text(encoding="utf-8"))
+    segments = manifest.get("segments") or []
+    transcript = " ".join(str(segment.get("text") or "") for segment in segments).strip()
+    snapshot: dict[str, Any] = {
+        "operation_origin": NATIVE_ASR_ORIGIN,
+        "provider": manifest.get("provider") or provider_id,
+        "model": manifest.get("model"),
+        "backend": manifest.get("backend"),
+        "device": manifest.get("device"),
+        "compute_type": manifest.get("compute_type"),
+        "language": manifest.get("language") or None,
+        "timestamp_basis": timestamp_basis,
+        "word_timestamps_requested": bool(getattr(args, "word_timestamps", False)),
+        "segment_count": len(segments),
+        "total_duration_ms": manifest.get("total_duration_ms"),
+        "source_audio": str(audio_path.resolve()),
+        "timings_json": files["timings_json"],
+        "srt": files["srt"],
+    }
+    return AsrHistorySave(
+        operation=OPERATION_TIMINGS,
+        attempt_call_type=ATTEMPT_CALL_TYPE_TIMING,
+        provider=provider_id,
+        model=manifest.get("model") or args.model,
+        config_snapshot=snapshot,
+        text_sources=(
+            AsrHistoryText(
+                kind=TEXT_KIND_ASR_TRANSCRIPT,
+                content=transcript,
+                language=manifest.get("language") or None,
+                text_completeness=_transcript_completeness(transcript),
+            ),
+        ),
+        artifacts=(
+            AsrHistoryArtifact(
+                role=ARTIFACT_ROLE_TIMINGS_JSON,
+                path=Path(files["timings_json"]),
+                mime="application/json",
+            ),
+            AsrHistoryArtifact(
+                role=ARTIFACT_ROLE_SRT,
+                path=Path(files["srt"]),
+                mime="application/x-subrip",
+            ),
+        ),
+        source_audio=audio_path,
     )
 
 
@@ -2085,19 +2394,26 @@ def run_timings(args: argparse.Namespace) -> None:
         "timings_json": str(output_dir / f"{run_id}.timings.json"),
         "srt": str(output_dir / f"{run_id}.srt"),
     }
+    save = _persist_history(lambda: _timings_history_save(args, audio_path, files))
+    history_block = save.metadata()
     if args.json_output:
-        _json_ok(
-            {
-                "status": "success",
-                "files": files,
-                "segment_count": timing["segment_count"],
-                "duration_ms": timing["total_duration_ms"],
-            }
-        )
+        payload: dict[str, Any] = {
+            "status": "success" if (save.saved or not save.active) else "partial",
+            "files": files,
+            "segment_count": timing["segment_count"],
+            "duration_ms": timing["total_duration_ms"],
+        }
+        if history_block is not None:
+            payload["history"] = history_block
+        print(json.dumps(payload, ensure_ascii=False))
     else:
         print(f"Timings JSON: {files['timings_json']}")
         print(f"SRT: {files['srt']}")
         print(f"Segments: {timing['segment_count']}")
+    if history_block is not None and not save.saved:
+        _report_persistence_failure(json_output=args.json_output)
+    if args.json_output:
+        sys.exit(_EXIT_OK)
 
 
 def status_cmd(args: argparse.Namespace) -> None:

@@ -122,7 +122,15 @@ description: >
    Если тайминги нужны отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
    не перезаписывай папку платного прогона:
    `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --output-dir "out" --run-id "prod-timings" --json`.
-8. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
+8. **Локальная история.** Локальные `transcribe`, `timings` (без облачного
+   `--timing-provider`) и `verify-tts` сохраняют наблюдаемый результат в приватную
+   SQLite-историю по умолчанию; `history list --operation asr|timings|verify`,
+   `history show <uuid>`, `history costs` читают только метаданные (текст остаётся
+   приватным, `has_content: true`). Отключить запись: `settings.toml` рядом с CWD
+   с `[history] enabled = false`. Если сохранение не удалось, `--json` даёт
+   `status: "partial"` и `history.error_code = "HISTORY_PERSISTENCE_FAILED"` с
+   exit `50` — результат не потерян, но и не объявлен сохранённым.
+9. **Статус/артефакты.** `voiceover status --run-id "prod" --json`; прочитай `manifest.json`, `run_state.json`, `generation.log`.
    В receipt проверь `execution_source`: source kind, revision/dirty и package-tree SHA-256.
 
 ## Security-first правила
@@ -152,6 +160,7 @@ description: >
 | Валидирует Markdown-сценарий | Выдумывает несвязанный творческий контент |
 | Генерирует озвучку через любой из 5 провайдеров с provider-specific retry, safe rerun и manifest/log | Рендерит Remotion-видео |
 | Извлекает тайминги через локальный faster-whisper ИЛИ облачные OpenRouter/Groq/xAI Whisper | Правит исходники voiceover-pipeline |
+| Читает сохранённые ASR/timing/verify-метаданные через `history list/show/costs` | Печатает приватный transcript или ожидаемый текст из БД |
 | Читает manifest.json → артефакты | Использует words-per-second при наличии timings |
 | Объясняет провайдеров, модели, голоса, цены (7 TTS + 6 STT моделей) | Гарантирует будущие цены провайдеров |
 | Диагностирует ошибки по exit codes | Правит исходники voiceover-pipeline |

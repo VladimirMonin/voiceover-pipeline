@@ -209,6 +209,10 @@ TEXT_KIND_TTS_SCRIPT = "tts_script"
 TEXT_KIND_TTS_DIRECTION = "tts_direction"
 TEXT_KIND_ASR_TRANSCRIPT = "asr_transcript"
 TEXT_KIND_VERIFICATION_TRANSCRIPT = "verification_transcript"
+# The optional ASR prompt (``--context``/``--context-file``) is preserved as its
+# own private source: it is not recognized speech, so it never shares a role
+# with ``asr_transcript``.
+TEXT_KIND_ASR_CONTEXT = "asr_context"
 # Call type and stage of the paid TTS attempt marker this repository commits
 # before a network submit. The marker shares the legacy importer's chunk call
 # type, so imported and native attempts are guarded by one predicate.
