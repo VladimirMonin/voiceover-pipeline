@@ -24,6 +24,7 @@
 | `history resume ID` | Возобновить нативный TTS-прогон из снимка (потенциально платно) | Да |
 | `history sync ID` | Получить сохранённое состояние/результат без нового платного submit | Да |
 | `history import DIR` | Безопасный offline-импорт старых каталогов (`--dry-run`) | Да |
+| `history costs` | Read-only итоги расходов по валютам и операциям | Да |
 
 Все команды поддерживают `--json` для машинно-читаемого вывода.
 
@@ -396,6 +397,16 @@ UUID и отсутствующая БД не создают ничего, `--ove
 подписанных URL и Authorization. Отсутствующая БД не создаётся; `--dry-run`
 не пишет ничего и при WAL/иностранной/будущей БД сообщает неизвестный статус;
 повторный импорт не дублирует расходы.
+
+`voiceover history costs --json` — read-only глобальный отчёт: итоги по валютам
+(`totals`) и разбивка по операции × валюте (`operations`), плюс `completeness` и
+`local_attempts_without_api_charge`. Одна строка БД — одна уникальная
+финансовая попытка, суммы накоплены `Decimal` (без float). Известная сумма не
+выдаётся за exact: `exact_attempts`/`non_exact_attempts` видны, `"0"` отличимо
+от `null` (unknown), отсутствующая валюта — отдельный bucket. Локальные
+провайдеры из явного allowlist не считаются облачным unknown. Команда offline и
+ничего не пишет, читает WAL-consistent и не выводит текст, пути, signed URL или
+секреты; malformed decimal/небезопасная валюта — fail-closed exit `30`.
 
 Фильтры, JSON-поля, коды ошибок и денежный контракт (exact/zero/null) — в
 [Agent CLI Contract](../../../agent-cli-contract.md).

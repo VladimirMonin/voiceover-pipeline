@@ -17,6 +17,10 @@ Read guarantees:
 * Reads go through the narrow :func:`voiceover_pipeline.history.database.connect_readonly`
   seam, so no migration, DDL, WAL switch, or sidecar write happens and a
   corrupt, foreign, or newer database fails closed instead of being queried.
+* ``history costs`` reads the same way but through the WAL-consistent
+  :func:`voiceover_pipeline.history.database.connect_readonly_consistent` seam, so
+  an attempt a run in progress just committed (a live ``-wal``) is never missed;
+  it still runs no migration, DDL, or sidecar write of its own.
 * :func:`load_native_history_view` returns one verified read-only native
   prepared-TTS view for ``history resume ID``/``history sync ID``; a UUID that is
   not such a snapshot fails closed with a fixed, content-free ``NATIVE_HISTORY_UNSUPPORTED``
@@ -60,6 +64,7 @@ import re
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, cast
 
@@ -70,6 +75,7 @@ from ..history.database import (
     MigrationChecksumError,
     SchemaVersionTooNewError,
     connect_readonly,
+    connect_readonly_consistent,
 )
 from ..history.legacy_import import (
     LegacyImportPreview,
@@ -140,6 +146,16 @@ _UNSAFE_PUBLIC_TEXT_MARKERS = ("://", "?", "#", "@")
 # A provider remote ID is an opaque token, never a URL or a path.
 _OPAQUE_REMOTE_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
+# Local providers run inference on this machine, so their attempts can never carry
+# an external API charge. This is the documented local allowlist, drawn from the
+# provider registry and the CLI provider choices: TTS ``qwen-local`` and
+# ``omnivoice-local``; ASR ``qwen-local``, ``nemotron-local``, and
+# ``faster-whisper``. Any other value -- including an unrecognized provider --
+# stays a potentially paid attempt, so an unknown provider is never assumed free.
+_LOCAL_PROVIDER_IDS = frozenset(
+    {"qwen-local", "omnivoice-local", "nemotron-local", "faster-whisper"}
+)
+
 
 class HistoryCommandError(RuntimeError):
     """A history command failed with a stable numeric code and error code.
@@ -182,8 +198,15 @@ def _resolve_database_path(database_path: Path | str | None) -> Path:
         raise HistoryCommandError(str(exc), _EXIT_ARGS, error_code="HISTORY_HOME_INVALID") from exc
 
 
-def _open_history(database_path: Path) -> _OpenHistory:
-    """Open the database read-only, or report it absent/empty without writing."""
+def _open_history(database_path: Path, *, consistent: bool = False) -> _OpenHistory:
+    """Open the database read-only, or report it absent/empty without writing.
+
+    ``consistent`` selects the WAL-consistent reader for ``history costs``: it
+    accepts a live ``-wal``/``-shm`` pair written by a run in progress, because an
+    aggregate must never miss a just-committed attempt or create a sidecar of its
+    own. The default reader pins ``immutable=1`` and refuses any adjacent
+    sidecar, so ``list``/``show`` keep their post-run semantics.
+    """
     if database_path.is_symlink() or database_path.parent.is_symlink():
         raise HistoryCommandError(
             f"History database must not be a symlink: {database_path}",
@@ -192,8 +215,9 @@ def _open_history(database_path: Path) -> _OpenHistory:
         )
     if not database_path.exists():
         return _OpenHistory(database_path, None, None, None)
+    opener = connect_readonly_consistent if consistent else connect_readonly
     try:
-        connection = connect_readonly(database_path)
+        connection = opener(database_path)
     except FileNotFoundError:
         return _OpenHistory(database_path, None, None, None)
     except SchemaVersionTooNewError as exc:
@@ -590,6 +614,173 @@ def show_history(
     finally:
         if open_history.connection is not None:
             open_history.connection.close()
+
+
+# -- costs --------------------------------------------------------------------
+
+# A stored cost the aggregate cannot read as an exact decimal or a stored
+# currency it cannot render safely fails closed with one fixed message, so no
+# malformed value is echoed and no inexact value is silently rounded or dropped.
+_COST_UNREADABLE_MESSAGE = "A stored cost could not be read as an exact decimal."
+
+
+@dataclass
+class _CostBucket:
+    """Accumulated money observations for one currency or ``(operation, currency)``.
+
+    ``known_total`` is a :class:`~decimal.Decimal` sum of the stored decimal
+    texts, so ``0.1 + 0.2`` stays ``0.3`` and a binary float never enters the
+    money path. It stays ``None`` until a known amount arrives, so a group with
+    only unknown attempts reports ``known_amount: null`` instead of an invented
+    zero. ``exact_attempts`` and ``non_exact_attempts`` split the known attempts
+    by the stored ``exact_available`` guarantee; a non-exact legacy lexeme still
+    contributes to ``known_amount`` but is never counted as exact.
+    """
+
+    known_total: Decimal | None = None
+    known_attempts: int = 0
+    exact_attempts: int = 0
+    non_exact_attempts: int = 0
+    unknown_attempts: int = 0
+
+    def observe_known(self, amount: Decimal, *, exact: bool) -> None:
+        self.known_total = amount if self.known_total is None else self.known_total + amount
+        self.known_attempts += 1
+        if exact:
+            self.exact_attempts += 1
+        else:
+            self.non_exact_attempts += 1
+
+    def observe_unknown(self) -> None:
+        self.unknown_attempts += 1
+
+    def project(self) -> dict[str, Any]:
+        return {
+            "known_amount": None if self.known_total is None else str(self.known_total),
+            "known_attempts": self.known_attempts,
+            "exact_attempts": self.exact_attempts,
+            "non_exact_attempts": self.non_exact_attempts,
+            "unknown_attempts": self.unknown_attempts,
+        }
+
+
+def _cost_decimal(amount: str) -> Decimal:
+    """Parse one stored cost text exactly, or fail closed without echoing it."""
+    try:
+        value = Decimal(amount)
+    except (InvalidOperation, ValueError) as exc:
+        raise HistoryCommandError(
+            _COST_UNREADABLE_MESSAGE, _EXIT_PROVIDER, error_code="HISTORY_COST_UNREADABLE"
+        ) from exc
+    if not value.is_finite():
+        raise HistoryCommandError(
+            _COST_UNREADABLE_MESSAGE, _EXIT_PROVIDER, error_code="HISTORY_COST_UNREADABLE"
+        )
+    return value
+
+
+def _safe_cost_currency(currency: str | None) -> str | None:
+    """Return the safe currency label, or ``None`` for a missing currency.
+
+    A stored currency that cannot be safely rendered (a URL, whitespace, or a
+    secret-shaped value) is neither echoed nor silently folded into a real
+    currency: the read fails closed instead. A genuinely missing currency
+    (``None``) stays its own unknown-currency bucket, never an implicit ``RUB``.
+    """
+    if currency is None:
+        return None
+    safe = _safe_public_value(currency)
+    if safe is None:
+        raise HistoryCommandError(
+            "A stored cost currency could not be read safely.",
+            _EXIT_PROVIDER,
+            error_code="HISTORY_COST_UNREADABLE",
+        )
+    return safe
+
+
+def _sorted_currencies(buckets: dict[str | None, _CostBucket]) -> list[str | None]:
+    """Order currency buckets deterministically with the unknown bucket last."""
+    return sorted(buckets, key=lambda currency: (currency is None, currency or ""))
+
+
+def _sorted_operation_keys(
+    buckets: dict[tuple[str | None, str | None], _CostBucket],
+) -> list[tuple[str | None, str | None]]:
+    """Order ``(operation, currency)`` buckets deterministically."""
+    return sorted(
+        buckets,
+        key=lambda key: (key[0] is None, key[0] or "", key[1] is None, key[1] or ""),
+    )
+
+
+def costs_history(*, database_path: Path | str | None = None) -> dict[str, Any]:
+    """Return read-only money totals grouped by currency and operation.
+
+    Every attempt row is one unique financial attempt: summed exactly once, never
+    parent plus child, and a repeated status observation stays on the same row.
+    The stored decimal text is accumulated with :class:`~decimal.Decimal`, so an
+    exact total is reported and a binary float never enters the money path. A
+    ``NULL`` amount is an unknown attempt and stays distinct from a real ``"0"``.
+
+    ``known_amount`` is the sum of the stored non-NULL observations, including a
+    non-exact legacy lexeme, and does not claim those were exact; ``exact_attempts``
+    and ``non_exact_attempts`` expose the split and ``completeness`` is ``partial``
+    when any cloud attempt is unknown or any known amount is not exact. A local
+    provider attempt (the documented local allowlist) with no amount is counted in
+    ``local_attempts_without_api_charge``, not as a cloud unknown. The read uses
+    the WAL-consistent reader, so a run in progress is still visible, and it
+    creates nothing for an absent database.
+    """
+    resolved = _resolve_database_path(database_path)
+    open_history = _open_history(resolved, consistent=True)
+    exists = open_history.connection is not None or resolved.exists()
+    totals: dict[str | None, _CostBucket] = {}
+    operations: dict[tuple[str | None, str | None], _CostBucket] = {}
+    attempts = 0
+    local_attempts_without_api_charge = 0
+    try:
+        if open_history.repository is not None:
+            for row in open_history.repository.iter_attempt_costs():
+                attempts += 1
+                operation = _safe_public_text(row.operation)
+                if row.amount is None:
+                    provider = _safe_public_value(row.provider)
+                    if provider is not None and provider in _LOCAL_PROVIDER_IDS:
+                        local_attempts_without_api_charge += 1
+                        continue
+                    currency = _safe_cost_currency(row.currency)
+                    operations.setdefault((operation, currency), _CostBucket()).observe_unknown()
+                    totals.setdefault(currency, _CostBucket()).observe_unknown()
+                    continue
+                amount = _cost_decimal(row.amount)
+                currency = _safe_cost_currency(row.currency)
+                exact = row.exact_available
+                operations.setdefault((operation, currency), _CostBucket()).observe_known(
+                    amount, exact=exact
+                )
+                totals.setdefault(currency, _CostBucket()).observe_known(amount, exact=exact)
+    finally:
+        if open_history.connection is not None:
+            open_history.connection.close()
+    unknown_attempts = sum(bucket.unknown_attempts for bucket in totals.values())
+    non_exact_attempts = sum(bucket.non_exact_attempts for bucket in totals.values())
+    operation_rows: list[dict[str, Any]] = []
+    for operation, currency in _sorted_operation_keys(operations):
+        bucket = operations[(operation, currency)]
+        operation_rows.append({"operation": operation, "currency": currency, **bucket.project()})
+    return {
+        "dry_run": False,
+        "database": _database_metadata(open_history, exists=exists),
+        "attempts": attempts,
+        "totals": [
+            {"currency": currency, **totals[currency].project()}
+            for currency in _sorted_currencies(totals)
+        ],
+        "operations": operation_rows,
+        "completeness": "partial" if unknown_attempts or non_exact_attempts else "complete",
+        "local_attempts_without_api_charge": local_attempts_without_api_charge,
+    }
 
 
 # -- reconstructable native view ----------------------------------------------

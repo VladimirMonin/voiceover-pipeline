@@ -765,6 +765,25 @@ class TextSourceRecord:
     created_at: str = ""
 
 
+@dataclass(frozen=True)
+class AttemptCostRecord:
+    """One attempt's stored cost joined with its run operation.
+
+    A read-only projection for the ``history costs`` aggregate. It carries only
+    the money observation (``amount`` as the stored decimal text or ``None`` for
+    unknown, ``currency``, and the exactness guarantee) plus the dimensions needed
+    to group and classify it (the run ``operation`` and the ``provider`` used for
+    the local allowlist). It never carries prepared text, a remote id, an
+    artifact path, or a usage blob, so an aggregate can never surface a secret.
+    """
+
+    amount: str | None
+    currency: str | None
+    exact_available: bool
+    operation: str
+    provider: str | None
+
+
 def _row_to_run(row: sqlite3.Row) -> RunRecord:
     # A read-only v1 snapshot has no ``revision`` column yet; project the pre-v2
     # default 1 without mutating the schema or requiring a migration.
@@ -2408,6 +2427,36 @@ class HistoryRepository:
             "SELECT * FROM attempts WHERE attempt_uuid = ?", (attempt_uuid,)
         ).fetchone()
         return _row_to_attempt(row) if row is not None else None
+
+    def iter_attempt_costs(self) -> Iterator[AttemptCostRecord]:
+        """Stream every attempt's stored cost joined with its run operation.
+
+        A global money total must not be truncated by :data:`MAX_QUERY_LIMIT` and
+        must not issue one query per run, so this is one read-only ``SELECT`` over
+        ``attempts`` joined to ``runs``. The rows are yielded from a cursor rather
+        than materialized, so a history of any size is aggregated without a full
+        in-memory copy. One attempt row is one unique financial attempt: a
+        repeated status observation stays on the same row and is therefore never
+        counted twice, and a legacy run total is mutually exclusive with its
+        per-chunk rows at import time, so no parent and child sum twice here.
+
+        The caller must consume the iterator before closing the connection.
+        """
+        cursor = self._connection.execute(
+            "SELECT a.cost AS cost, a.cost_currency AS cost_currency, "
+            "a.cost_exact_available AS cost_exact_available, "
+            "a.provider AS provider, r.operation AS operation "
+            "FROM attempts AS a JOIN runs AS r ON r.run_uuid = a.run_uuid "
+            "ORDER BY r.operation ASC, a.attempt_uuid ASC"
+        )
+        for row in cursor:
+            yield AttemptCostRecord(
+                amount=row["cost"],
+                currency=row["cost_currency"],
+                exact_available=bool(row["cost_exact_available"]),
+                operation=row["operation"],
+                provider=row["provider"],
+            )
 
     def get_artifacts(self, run_uuid: str) -> list[ArtifactRecord]:
         """Return a run's artifacts ordered by creation time."""

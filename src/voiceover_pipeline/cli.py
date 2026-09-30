@@ -672,6 +672,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hist_import.add_argument("--json", dest="json_output", action="store_true")
 
+    hist_costs = hist_sub.add_parser(
+        "costs", help="Read-only money totals grouped by currency and operation."
+    )
+    hist_costs.add_argument("--json", dest="json_output", action="store_true")
+
     return parser
 
 
@@ -2667,9 +2672,10 @@ def list_cmd(args: argparse.Namespace) -> None:
 def history_cmd(args: argparse.Namespace) -> None:
     """Dispatch a ``history`` subcommand to its handler.
 
-    ``list``/``show``/``import`` are read-only or import-only; ``resume``/``sync``
-    reconstruct one committed native run and run the shared native executor, so
-    they are the only branches that can open the history database for writing.
+    ``list``/``show``/``import``/``costs`` are read-only or import-only;
+    ``resume``/``sync`` reconstruct one committed native run and run the shared
+    native executor, so they are the only branches that can open the history
+    database for writing.
     """
     try:
         if args.history_command == "list":
@@ -2687,6 +2693,8 @@ def history_cmd(args: argparse.Namespace) -> None:
                 payload = history_commands.preview_history_import(args.source)
             else:
                 payload = history_commands.run_history_import(args.source)
+        elif args.history_command == "costs":
+            payload = history_commands.costs_history()
         elif args.history_command in ("resume", "sync"):
             payload = _history_native_command(args, args.history_command)
         else:
@@ -2738,6 +2746,30 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
                 f"status={attempt['status']} cost={cost['amount']} {currency} "
                 f"({cost['source']}, exact={cost['exact_available']})"
             )
+        return
+
+    if subcommand == "costs":
+        print(f"History costs (database: {payload['database']['path']})")
+        if not payload["totals"]:
+            print("  No costed attempts found.")
+        else:
+            for total in payload["totals"]:
+                currency = total["currency"] if total["currency"] is not None else "unknown"
+                amount = total["known_amount"] if total["known_amount"] is not None else "unknown"
+                print(
+                    f"  {currency}: known={amount} "
+                    f"(exact={total['exact_attempts']}, non_exact={total['non_exact_attempts']}) "
+                    f"unknown_attempts={total['unknown_attempts']}"
+                )
+        for row in payload["operations"]:
+            operation = row["operation"] if row["operation"] is not None else "unknown"
+            currency = row["currency"] if row["currency"] is not None else "unknown"
+            amount = row["known_amount"] if row["known_amount"] is not None else "unknown"
+            print(f"  {operation}/{currency}: known={amount} unknown={row['unknown_attempts']}")
+        print(
+            f"  completeness: {payload['completeness']}  attempts: {payload['attempts']}  "
+            f"local_attempts_without_api_charge: {payload['local_attempts_without_api_charge']}"
+        )
         return
 
     if subcommand in ("resume", "sync"):

@@ -517,6 +517,7 @@ voiceover history list [--label L] [--operation O] [--status S] [--limit N] [--o
 voiceover history show ID --json
 voiceover history import DIR --dry-run --json
 voiceover history import DIR --json
+voiceover history costs --json
 ```
 
 - `--json` ставится в конце конкретной leaf-команды, не глобально. Как и везде,
@@ -765,6 +766,73 @@ Dry-run сообщает найденные каталоги/записи, impor
   Ошибка записи → exit `50` `HISTORY_WRITE_ERROR`; нечитаемая/более новая/
   иностранная БД → exit `30`.
 
+### `history costs --json` — read-only учёт расходов
+
+`history costs` — глобальный read-only отчёт по каноническому `attempts`:
+итоги по валютам и разбивка по операции × валюте. Синтаксис минимальный — без
+фильтров, только `--json` в конце leaf-команды. Команда offline: без
+провайдеров, ASR, сети и платных вызовов; она ничего не пишет — ни БД, ни
+миграцию, ни sidecar.
+
+```json
+{
+  "status": "success",
+  "dry_run": false,
+  "database": {"path": "...", "exists": true, "schema_version": 2},
+  "attempts": 4,
+  "totals": [
+    {
+      "currency": "RUB",
+      "known_amount": "12.3400",
+      "known_attempts": 2,
+      "exact_attempts": 1,
+      "non_exact_attempts": 1,
+      "unknown_attempts": 2
+    }
+  ],
+  "operations": [
+    {
+      "operation": "tts",
+      "currency": "RUB",
+      "known_amount": "12.3400",
+      "known_attempts": 2,
+      "exact_attempts": 1,
+      "non_exact_attempts": 1,
+      "unknown_attempts": 0
+    }
+  ],
+  "completeness": "partial",
+  "local_attempts_without_api_charge": 3
+}
+```
+
+- Одна строка `attempts` — одна уникальная финансовая попытка: сумма считается
+  ровно один раз, никогда как родитель + ребёнок. Повторный запрос статуса
+  обновляет ту же строку (идемпотентно), поэтому не раздувает итог, а legacy
+  run-total и per-chunk-цены взаимно исключают друг друга уже при импорте.
+- Каждый `known_amount` — сумма сохранённых decimal-строк, накопленная
+  `Decimal` (не binary float): `0.1 + 0.2` даёт `0.3`. `known_amount` включает
+  non-exact legacy-lexeme и не утверждает их точность; `exact_attempts` и
+  `non_exact_attempts` показывают разбивку, а `completeness` = `partial`, если
+  есть cloud-unknown **или** non-exact попытка; иначе `complete`. `"0"` —
+  реальный наблюдаемый ноль; `known_amount: null` в группе означает, что
+  наблюдаемых сумм в ней нет (не выдуманный ноль).
+- Группировка — по записанной валюте и операции. Отсутствующая валюта остаётся
+  отдельным bucket `currency: null`, а не подставляется как RUB. `totals`
+  агрегирует операции по валюте, `operations` — по паре (операция, валюта).
+- `local_attempts_without_api_charge` считает попытки только из явного локального
+  allowlist (`qwen-local`, `omnivoice-local`, `nemotron-local`, `faster-whisper`)
+  без сохранённой суммы: локальное исполнение не даёт внешнего API-списания.
+  Любой другой провайдер — потенциально платный, и облачный unknown остаётся в
+  `unknown_attempts`.
+- Чтение идёт WAL-consistent reader'ом, поэтому попытка, закоммиченная живым
+  прогоном, видна без создания sidecar. Пустая БД → пустые `totals`/`operations`
+  и `completeness: "complete"`; отсутствующая БД ничего не создаёт.
+- malformed decimal в `cost` или небезопасная (URL/секрет-подобная) валюта
+  падают fail-closed: exit `30` `HISTORY_COST_UNREADABLE`, значение не
+  эхоится. Полный сценарий, prepared text, transcript, remote ID, пути и секреты
+  не выводятся.
+
 ## `history resume ID` / `history sync ID` — DB-first продолжение (фрагмент S05)
 
 `history resume ID` и `history sync ID` восстанавливают **один уже
@@ -812,9 +880,9 @@ voiceover history sync ID --json        # без нового оплаченно
   transcript, raw snapshot, подписанные URL и секреты не печатаются.
 
 Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
-из S05; live/listening-приёмка при этом не проводилась. S05 целиком пока не
-принят: `history costs`, ASR/timing/verify, dialogue и остальные провайдеры
-остаются на legacy executor.
+из S05; live/listening-приёмка при этом не проводилась. `history costs` —
+read-only offline-учёт расходов (см. выше). S05 целиком пока не принят:
+ASR/timing/verify, dialogue и остальные провайдеры остаются на legacy executor.
 
 ## Gemini Dialogue (machine-facing)
 

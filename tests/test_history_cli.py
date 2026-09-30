@@ -16,6 +16,7 @@ import logging
 import socket
 import sqlite3
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -1450,6 +1451,511 @@ def test_history_show_not_found_does_not_echo_signed_url_identifier(
 
     assert code == 2
     assert payload["details"]["error_code"] == "HISTORY_RUN_NOT_FOUND"
+    assert _SENTINEL not in out
+    assert _SENTINEL not in err
+    assert "signature=" not in out
+
+
+# -- costs --------------------------------------------------------------------
+
+
+def _seed_run_with_attempts(database_path, attempts):
+    """Seed one run per named operation and its attempts; return the run UUIDs.
+
+    ``attempts`` is a list of ``(operation, call_type, provider, cost)`` tuples;
+    every attempt with a distinct operation lands on its own run, which is how a
+    real TTS/ASR history is shaped. The database is closed before the caller reads
+    it through the CLI.
+    """
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    database = HistoryDatabase(database_path)
+    database.migrate()
+    run_uuids: dict[str, str] = {}
+    try:
+        repository = HistoryRepository(database)
+        with repository.transaction():
+            for operation, call_type, provider, cost in attempts:
+                run_uuid = run_uuids.get(operation)
+                if run_uuid is None:
+                    run_uuid = repository.create_run(
+                        operation=operation, run_root=f"/tmp/{operation}", status="completed"
+                    ).run_uuid
+                    run_uuids[operation] = run_uuid
+                repository.add_attempt(run_uuid, call_type=call_type, provider=provider, cost=cost)
+    finally:
+        database.close()
+    return run_uuids
+
+
+def test_history_parser_accepts_costs_json_leaf():
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["history", "costs", "--json"])
+
+    assert args.command == "history"
+    assert args.history_command == "costs"
+    assert args.json_output is True
+
+
+def test_history_costs_sums_exact_decimal_per_currency_and_operation(
+    tmp_path, monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.1"), currency="RUB")),
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.2"), currency="RUB")),
+        ],
+    )
+
+    code, payload, out = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["attempts"] == 2
+    assert payload["totals"] == [
+        {
+            "currency": "RUB",
+            "known_amount": "0.3",
+            "known_attempts": 2,
+            "exact_attempts": 2,
+            "non_exact_attempts": 0,
+            "unknown_attempts": 0,
+        }
+    ]
+    assert payload["operations"] == [
+        {
+            "operation": "tts",
+            "currency": "RUB",
+            "known_amount": "0.3",
+            "known_attempts": 2,
+            "exact_attempts": 2,
+            "non_exact_attempts": 0,
+            "unknown_attempts": 0,
+        }
+    ]
+    assert payload["completeness"] == "complete"
+
+
+def test_history_costs_marks_unknown_attempts_and_partial_completeness(
+    tmp_path, monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.1"), currency="RUB")),
+            ("tts", "tts_chunk", "polza-tts", Cost.unknown()),
+        ],
+    )
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["completeness"] == "partial"
+    known = next(total for total in payload["totals"] if total["currency"] == "RUB")
+    assert known["known_amount"] == "0.1"
+    assert known["unknown_attempts"] == 0
+    unknown = next(total for total in payload["totals"] if total["currency"] is None)
+    assert unknown["known_amount"] is None
+    assert unknown["unknown_attempts"] == 1
+
+
+def test_history_costs_zero_is_known_not_unknown(monkeypatch, capsys, _isolated_home):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0"), currency="RUB"))],
+    )
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["totals"][0]["known_amount"] == "0"
+    assert payload["totals"][0]["unknown_attempts"] == 0
+    assert payload["completeness"] == "complete"
+
+
+def test_history_costs_non_exact_lexeme_is_summed_but_marked_partial(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [
+            ("tts", "tts_chunk", "polza-tts", Cost.legacy_float("0.1000", currency="RUB")),
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.2"), currency="RUB")),
+        ],
+    )
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    total = payload["totals"][0]
+    assert total["known_amount"] == "0.3000"
+    assert total["exact_attempts"] == 1
+    assert total["non_exact_attempts"] == 1
+    assert payload["completeness"] == "partial"
+
+
+def test_history_costs_legacy_run_total_is_not_double_counted(
+    tmp_path, monkeypatch, capsys, _isolated_home
+):
+    source = tmp_path / "out"
+    root = _write_legacy_run(source, run_id="prod", chunks=[_default_chunk(number=1, cost=None)])
+    state_path = root / "run_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["cost_total"] = "1.5000"
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    _, imported, _ = _invoke(monkeypatch, capsys, "history", "import", str(source), "--json")
+    assert imported["imported_count"] == 1
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["attempts"] == 1
+    assert payload["totals"][0]["currency"] == "RUB"
+    assert payload["totals"][0]["known_amount"] == "1.5000"
+    assert payload["operations"][0]["operation"] == "tts"
+
+
+def test_history_costs_repeated_observation_counts_once(monkeypatch, capsys, _isolated_home):
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    repository = HistoryRepository(database)
+    run = repository.create_run(operation="tts", run_root="/tmp/run", status="running")
+    part = repository.add_part(run.run_uuid, position=1)
+    advanced, marker = repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=run.revision,
+        provider="polza-tts",
+        model="elevenlabs/tts",
+        account_alias="acct",
+    )
+    accepted_run, accepted = repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=marker.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=advanced.revision,
+        remote_task_id="task_ABC123",
+    )
+    observed_run, _ = repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=accepted_run.revision,
+        amount=Decimal("0.25"),
+    )
+    # A repeated identical status observation is idempotent: no second charge.
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=observed_run.revision,
+        amount=Decimal("0.25"),
+    )
+    database.close()
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["attempts"] == 1
+    assert payload["totals"][0]["known_amount"] == "0.25"
+    assert payload["totals"][0]["exact_attempts"] == 1
+
+
+def test_history_costs_counts_in_progress_observed_and_unknown_marker(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    repository = HistoryRepository(database)
+    run = repository.create_run(operation="tts", run_root="/tmp/run", status="running")
+    billed = repository.add_part(run.run_uuid, position=1)
+    pending = repository.add_part(run.run_uuid, position=2)
+    advanced, marker = repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=billed.part_uuid,
+        expected_revision=run.revision,
+        provider="polza-tts",
+        model="elevenlabs/tts",
+        account_alias="acct",
+    )
+    accepted_run, accepted = repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=marker.attempt_uuid,
+        part_uuid=billed.part_uuid,
+        expected_revision=advanced.revision,
+        remote_task_id="task_ABC123",
+    )
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=accepted.attempt_uuid,
+        part_uuid=billed.part_uuid,
+        expected_revision=accepted_run.revision,
+        amount=Decimal("0.5"),
+    )
+    # A second part is still only a pre-submit marker with an unknown cost.
+    repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=pending.part_uuid,
+        expected_revision=accepted_run.revision + 1,
+        provider="polza-tts",
+        model="elevenlabs/tts",
+        account_alias="acct",
+    )
+    database.close()
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["attempts"] == 2
+    assert payload["completeness"] == "partial"
+    known = next(total for total in payload["totals"] if total["currency"] == "RUB")
+    assert known["known_amount"] == "0.5"
+    unknown = next(total for total in payload["totals"] if total["currency"] is None)
+    assert unknown["unknown_attempts"] == 1
+
+
+def test_history_costs_local_provider_unknown_is_not_a_cloud_unknown(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [
+            ("tts", "tts_chunk", "qwen-local", Cost.unknown()),
+            ("tts", "tts_chunk", "mystery-provider", Cost.unknown()),
+        ],
+    )
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["local_attempts_without_api_charge"] == 1
+    unknown = next(total for total in payload["totals"] if total["currency"] is None)
+    assert unknown["unknown_attempts"] == 1
+    assert payload["completeness"] == "partial"
+
+
+def test_history_costs_keeps_currencies_and_operations_separate(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.1"), currency="RUB")),
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.2"), currency="USD")),
+            ("asr", "asr_transcript", "qwen-local", Cost.exact(Decimal("0.3"), currency="USD")),
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.4"))),
+        ],
+    )
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    by_currency = {total["currency"]: total["known_amount"] for total in payload["totals"]}
+    assert by_currency == {"RUB": "0.1", "USD": "0.5", None: "0.4"}
+    by_operation = {
+        (row["operation"], row["currency"]): row["known_amount"] for row in payload["operations"]
+    }
+    assert by_operation == {
+        ("tts", "RUB"): "0.1",
+        ("tts", "USD"): "0.2",
+        ("asr", "USD"): "0.3",
+        ("tts", None): "0.4",
+    }
+
+
+def test_history_costs_reads_every_attempt_past_the_query_limit(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost, HistoryRepository
+
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    repository = HistoryRepository(database)
+    run = repository.create_run(operation="tts", run_root="/tmp/run", status="completed")
+    with repository.transaction():
+        for _ in range(501):
+            repository.add_attempt(
+                run.run_uuid,
+                call_type="tts_chunk",
+                provider="polza-tts",
+                cost=Cost.exact(Decimal("0.001"), currency="RUB"),
+            )
+    database.close()
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["attempts"] == 501
+    assert payload["totals"][0]["known_amount"] == "0.501"
+
+
+def test_history_costs_reads_committed_rows_from_a_live_wal(monkeypatch, capsys, _isolated_home):
+    from voiceover_pipeline.history.repository import Cost, HistoryRepository
+
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    repository = HistoryRepository(database)
+    run = repository.create_run(operation="tts", run_root="/tmp/run", status="completed")
+    repository.add_attempt(
+        run.run_uuid,
+        call_type="tts_chunk",
+        provider="polza-tts",
+        cost=Cost.exact(Decimal("0.1"), currency="RUB"),
+    )
+    # The writer is still open, so a live -wal holds the committed attempt and the
+    # immutable reader would refuse this database.
+    assert (_isolated_home / "history.sqlite3-wal").exists()
+    try:
+        code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+    finally:
+        database.close()
+
+    assert code == 0
+    assert payload["totals"][0]["known_amount"] == "0.1"
+
+
+def test_history_costs_human_output_lists_totals(monkeypatch, capsys, _isolated_home):
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.1"), currency="RUB"))],
+    )
+
+    code, payload, out = _invoke(monkeypatch, capsys, "history", "costs")
+
+    assert code == 0
+    assert payload is None
+    assert "RUB" in out
+    assert "completeness: complete" in out
+
+
+def test_history_costs_absent_database_is_empty_and_creates_nothing(
+    monkeypatch, capsys, _isolated_home
+):
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["totals"] == []
+    assert payload["operations"] == []
+    assert payload["attempts"] == 0
+    assert payload["completeness"] == "complete"
+    assert payload["database"]["exists"] is False
+    assert not _isolated_home.exists()
+
+
+def test_history_costs_symlinked_database_fails_closed_without_sidecar(
+    tmp_path, monkeypatch, capsys, _isolated_home
+):
+    _isolated_home.mkdir(mode=0o700)
+    real = tmp_path / "real.sqlite3"
+    _seed_run(real)
+    (_isolated_home / "history.sqlite3").symlink_to(real)
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "HISTORY_DATABASE_UNREADABLE"
+    assert not (_isolated_home / "history.sqlite3-wal").exists()
+    assert not (_isolated_home / "history.sqlite3-shm").exists()
+
+
+def test_history_costs_malformed_decimal_fails_closed(monkeypatch, capsys, _isolated_home):
+    from voiceover_pipeline.history.repository import Cost
+
+    sentinel = "NOT_A_DECIMAL_SENTINEL"
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [("tts", "tts_chunk", "polza-tts", Cost(amount=sentinel, currency="RUB"))],
+    )
+
+    code, payload, out, err = _invoke_streams(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "HISTORY_COST_UNREADABLE"
+    assert sentinel not in out
+    assert sentinel not in err
+
+
+def test_history_costs_unsafe_currency_fails_closed_without_echo(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost
+
+    signed_currency = f"https://example.invalid/?signature={_SENTINEL}"
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [("tts", "tts_chunk", "polza-tts", Cost(amount="0.5", currency=signed_currency))],
+    )
+
+    code, payload, out, err = _invoke_streams(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "HISTORY_COST_UNREADABLE"
+    assert _SENTINEL not in out
+    assert _SENTINEL not in err
+    assert "signature=" not in out
+
+
+def test_history_costs_does_not_echo_prepared_text_or_remote_id(
+    monkeypatch, capsys, _isolated_home
+):
+    from voiceover_pipeline.history.repository import Cost, HistoryRepository
+
+    text_sentinel = "PREPARED_TEXT_SENTINEL_DO_NOT_ECHO"
+    remote_sentinel = f"https://provider.invalid/audio?signature={_SENTINEL}"
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    repository = HistoryRepository(database)
+    run = repository.create_run(operation="tts", run_root="/tmp/run", status="completed")
+    repository.add_part(run.run_uuid, position=1, prepared_text=text_sentinel)
+    repository.add_attempt(
+        run.run_uuid,
+        call_type="tts_chunk",
+        provider="polza-tts",
+        remote_id=remote_sentinel,
+        cost=Cost.exact(Decimal("0.1"), currency="RUB"),
+    )
+    database.close()
+
+    code, payload, out, err = _invoke_streams(monkeypatch, capsys, "history", "costs", "--json")
+
+    assert code == 0
+    assert payload["totals"][0]["known_amount"] == "0.1"
+    assert text_sentinel not in out
+    assert text_sentinel not in err
     assert _SENTINEL not in out
     assert _SENTINEL not in err
     assert "signature=" not in out
