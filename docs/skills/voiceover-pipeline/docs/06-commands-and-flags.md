@@ -19,6 +19,9 @@
 | `verify-tts --audio --expected-file` | Проверить пропуски/вставки/повторы через ASR без публикации transcript | Да |
 | `status --run-id` | Проверить partial/resumable run | Да |
 | `concat --run-id` | Склеить существующие chunks в partial/full файл | Да |
+| `history list` | Метаданные прогонов из локальной SQLite-истории (не CWD-bound) | Да |
+| `history show ID` | Один прогон по внутреннему UUID или точной метке | Да |
+| `history import DIR` | Безопасный offline-импорт старых каталогов (`--dry-run`) | Да |
 
 Все команды поддерживают `--json` для машинно-читаемого вывода.
 
@@ -332,6 +335,23 @@ voiceover list timing-providers --json
   гарантирует, что конкретный следующий `--resume` пройдёт.
 - `polza-chat-audio` не делает автоматический второй POST с `--fallback-voice`;
   выбор другого голоса требует нового явного запуска.
+
+## Команда `history` — локальная история (S04)
+
+`voiceover history list --json`, `voiceover history show ID --json` и
+`voiceover history import DIR [--dry-run] --json` работают offline без
+провайдеров, ASR и платных вызовов. `--json` — в конце leaf-команды.
+Генерация пишет прежние JSON-артефакты до S05; импорт не меняет оригиналы.
+
+Заданный `VOICEOVER_HOME` должен быть абсолютным (иначе exit `2`); без него
+используется системный data-каталог. Дом приватный (`0700`), SQLite **не зашифрована** и хранит доступный
+текст. Публичный list/show выводит только метаданные без сценария, transcript,
+подписанных URL и Authorization. Отсутствующая БД не создаётся; `--dry-run`
+не пишет ничего и при WAL/иностранной/будущей БД сообщает неизвестный статус;
+повторный импорт не дублирует расходы.
+
+Фильтры, JSON-поля, коды ошибок и денежный контракт (exact/zero/null) — в
+[Agent CLI Contract](../../../agent-cli-contract.md).
 
 ## Safe defaults
 

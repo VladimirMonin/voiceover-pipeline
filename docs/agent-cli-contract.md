@@ -17,6 +17,9 @@
 | `timings --audio` | Тайминги из готового MP3 | да |
 | `transcribe --audio` | Распознать конечный локальный аудиофайл через ASR registry | да |
 | `verify-tts --audio --expected-file` | Fail-closed проверка пропусков, посторонней речи и повторов через локальный ASR | да |
+| `history list` | Метаданные прогонов из локальной SQLite-истории | да |
+| `history show ID` | Один прогон по внутреннему UUID или точной метке | да |
+| `history import DIR [--dry-run]` | Безопасный offline-импорт старых `out/<run-id>` каталогов | да |
 
 Все команды можно вызвать с `--json` для машинно-читаемого вывода.
 
@@ -418,6 +421,266 @@ controls для этого provider fail closed. На Windows Docker/WSL не в
 Отсутствующий, несовпавший SHA-256 или closure даёт unavailable route;
 fallback к container нет. Полный pinned receipt и ограничения
 лицензии: [OmniVoice Local TTS](omnivoice-local-tts.md).
+
+## `history` — локальная история прогонов (S04)
+
+S04 добавляет локальную SQLite-историю. `history list`, `history show` и
+`history import` читают и импортируют метаданные независимо от текущего рабочего
+каталога. Они не переключают генерацию на новый writer (это S05) и не делают
+провайдерских, ASR, сетевых или платных вызовов.
+
+```bash
+voiceover history list [--label L] [--operation O] [--status S] [--limit N] [--offset N] --json
+voiceover history show ID --json
+voiceover history import DIR --dry-run --json
+voiceover history import DIR --json
+```
+
+- `--json` ставится в конце конкретной leaf-команды, не глобально. Как и везде,
+  при `--json` stdout содержит ровно один JSON object, диагностика идёт в stderr,
+  а exit code остаётся семантическим.
+- `list`/`show`/`import` используют только существующие числовые коды `0`, `2`,
+  `30`, `50`; стабильная машиночитаемая причина передаётся строкой
+  `details.error_code`, без echo сохранённых строк БД.
+- `--limit` — целое `1..500` (default `50`), `--offset` — неотрицательное целое.
+  Неверное значение → exit `2` `HISTORY_INVALID_LIMIT` / `HISTORY_INVALID_OFFSET`.
+
+### Дом истории и приватность
+
+- Дом берётся из `VOICEOVER_HOME` и обязан быть абсолютным; относительное значение
+  отклоняется exit `2` `HISTORY_HOME_INVALID` до любого чтения/записи. Без override
+  используется системный data directory (`$XDG_DATA_HOME/voiceover-pipeline`,
+  macOS `~/Library/Application Support/voiceover-pipeline`, Windows
+  `%LOCALAPPDATA%\voiceover-pipeline`) — расположение не зависит от CWD.
+- Управляемые каталоги создаются с приватным режимом `0700`. Существующий
+  POSIX-каталог, доступный группе или миру (например `0755`), отклоняется
+  (`HISTORY_HOME_PERMISSION`, exit `50`) вместо `chmod` чужого дерева и до записи
+  plaintext-БД.
+- `history.sqlite3` — обычная SQLite-БД и **не** зашифрованный сейф. Приватная БД
+  намеренно хранит доступные тексты (сценарий, произносимый текст, инструкции,
+  transcript); защита — права ОС, а не шифрование.
+- Публичный вывод list/show остаётся content-free: полный сценарий, prepared text,
+  transcript, raw snapshots, config snapshot и секрет-подобные значения
+  (подписанные URL, Authorization) не печатаются. Присутствие текста/ошибки
+  сообщается булевым полем (`has_content`, `has_error`), а не значением.
+
+### Ноль-записывающее чтение и sidecar
+
+- Отсутствующая БД: `list` возвращает пустой список (`runs: []`, `count: 0`,
+  `database.exists: false`), `show` — `HISTORY_RUN_NOT_FOUND` (exit `2`); ни дом,
+  ни `runs/`, ни БД не создаются.
+- Reader открывает существующую БД `mode=ro&immutable=1` и не запускает миграции,
+  DDL или WAL-switch. Если рядом лежит живой `-wal`/`-journal` sidecar, чтение
+  отказывается (`HISTORY_DATABASE_UNREADABLE`, exit `30`), чтобы не отдать
+  устаревший снимок и не создать sidecar. Иностранная, повреждённая или более
+  новая БД тоже fail-closed: `HISTORY_DATABASE_TOO_NEW` /
+  `HISTORY_DATABASE_CHECKSUM_MISMATCH` (exit `30`).
+- `import --dry-run` ничего не пишет: не создаёт БД, каталоги, sidecar и не меняет
+  оригиналы. При нечитаемой/WAL/иностранной БД dry-run возвращает exit `0`,
+  помечает `database.readable: false` и добавляет `database_status_unknown` в
+  `scan_conflicts`, а `already_imported` становится `null` (unknown), а не
+  выдуманным `false`.
+
+### `history list --json`
+
+```json
+{
+  "status": "success",
+  "dry_run": false,
+  "database": {"path": "...", "exists": true, "schema_version": 1},
+  "filters": {"label": null, "operation": null, "status": null},
+  "limit": 50,
+  "offset": 0,
+  "count": 1,
+  "runs": [
+    {
+      "run_uuid": "...",
+      "operation": "tts",
+      "user_label": "prod",
+      "parent_uuid": null,
+      "status": "completed",
+      "run_root": "...",
+      "legacy_source_root": "...",
+      "record_version": 1,
+      "created_at": "...",
+      "updated_at": "...",
+      "legacy_import": true
+    }
+  ]
+}
+```
+
+`--label`/`--operation`/`--status` — точные фильтры, не подстроки. `config_snapshot`
+не публикуется.
+
+### `history show ID --json`
+
+`ID` — внутренний `run_uuid` или точная пользовательская метка (`user_label`).
+UUID-shaped значение сначала ищется как UUID, затем как метка.
+
+- Не найдено → exit `2` `HISTORY_RUN_NOT_FOUND`.
+- Метка совпала в нескольких roots → exit `2` `HISTORY_LABEL_AMBIGUOUS` с
+  `candidate_count` и ограниченным списком `candidates`; первый кандидат не
+  выбирается автоматически. Одинаковая метка в разных roots — разные UUID (§6).
+
+```json
+{
+  "status": "success",
+  "dry_run": false,
+  "database": {"path": "...", "exists": true, "schema_version": 1},
+  "run": {"run_uuid": "...", "operation": "tts", "user_label": "prod", "...": "..."},
+  "parts": [
+    {
+      "part_uuid": "...",
+      "position": 1,
+      "voice": "alloy",
+      "fingerprint": "...",
+      "stage": "completed",
+      "has_prepared_text": true,
+      "has_shared_vibe": false,
+      "has_specific_vibe": false,
+      "has_effective_vibe": false
+    }
+  ],
+  "attempts": [
+    {
+      "attempt_uuid": "...",
+      "part_uuid": "...",
+      "call_type": "tts_chunk",
+      "provider": "polza-tts",
+      "model": "...",
+      "remote_id": "...",
+      "status": "completed",
+      "cost": {
+        "amount": "0.1000",
+        "currency": "RUB",
+        "source": "legacy_import",
+        "exact_available": false,
+        "raw": "0.1000"
+      },
+      "has_usage": false,
+      "has_error": false,
+      "created_at": "...",
+      "updated_at": "..."
+    }
+  ],
+  "artifacts": [
+    {
+      "artifact_uuid": "...",
+      "role": "chunk_audio",
+      "path_kind": "external_absolute",
+      "path": "...",
+      "mime": "audio/mpeg",
+      "size_bytes": 8,
+      "sha256": "...",
+      "availability": "present",
+      "has_media_metadata": false
+    }
+  ],
+  "text_sources": [
+    {
+      "text_source_uuid": "...",
+      "part_uuid": "...",
+      "artifact_uuid": null,
+      "kind": "tts_script",
+      "origin": "legacy_import",
+      "content_hash": "...",
+      "language": null,
+      "text_completeness": "complete",
+      "has_content": true
+    }
+  ]
+}
+```
+
+Контракт денег (§5/§6): `amount` — десятичная строка; `"0"`/`"0.0"` — реальный
+наблюдённый ноль, `null` — неизвестная цена. `exact_available: false` с
+`source: "legacy_import"` означает сохранённый legacy-lexeme без гарантии
+точности (`"0.1000"` сохраняется verbatim, `raw` держит исходный токен);
+провайдерски подтверждённая exact-строка несёт `exact_available: true`.
+Неизвестная цена остаётся отличима от нуля.
+
+### `history import DIR --dry-run --json`
+
+```json
+{
+  "status": "success",
+  "dry_run": true,
+  "source": "...",
+  "database": {"path": "...", "exists": false, "readable": true},
+  "discovered_count": 1,
+  "importable_count": 1,
+  "already_imported_count": 0,
+  "missing_text_count": 0,
+  "missing_audio_count": 0,
+  "scan_conflicts": [],
+  "runs": [
+    {
+      "source_root": "...",
+      "run_id": "prod",
+      "operation": "tts",
+      "status": "completed",
+      "provider": "polza-tts",
+      "model": "...",
+      "voice": "alloy",
+      "chunk_count": 1,
+      "chunks_with_text": 1,
+      "chunks_missing_text": 0,
+      "chunks_with_audio": 1,
+      "chunks_missing_audio": 0,
+      "chunks_with_cost": 1,
+      "cost_total": "0.1000",
+      "cost_total_exact": null,
+      "cost_currency": "RUB",
+      "script_text_available": true,
+      "already_imported": false,
+      "importable": true,
+      "conflicts": []
+    }
+  ]
+}
+```
+
+Dry-run сообщает найденные каталоги/записи, importable/уже импортировано,
+отсутствующие тексты и аудио, конфликты. `already_imported` — `true`/`false`
+только при читаемой БД, иначе `null`. Полный текст не печатается.
+
+### `history import DIR --json` (реальный импорт)
+
+```json
+{
+  "status": "success",
+  "dry_run": false,
+  "source": "...",
+  "database": {"path": "..."},
+  "imported_count": 1,
+  "skipped_count": 0,
+  "rejected_count": 0,
+  "runs": [
+    {
+      "source_root": "...",
+      "run_uuid": "...",
+      "created": true,
+      "parts": 1,
+      "attempts": 1,
+      "artifacts": 6,
+      "text_sources": 2,
+      "conflicts": []
+    }
+  ]
+}
+```
+
+- Импорт полностью offline: без TTS/ASR/embeddings/сети/платных вызовов и без
+  изменения оригинальных файлов.
+- Каждый run пишется одной транзакцией; повторный импорт того же root идемпотентно
+  пропускается (`imported_count: 0`, `skipped_count: 1`, тот же `run_uuid`) и не
+  дублирует части, costs или text_sources. `rejected_count` — каталоги, чья
+  идентичность не проходит fail-closed.
+- Импорт в существующую приватную БД требует дом `0700`; доступный группе/миру дом
+  отклоняется (`HISTORY_HOME_PERMISSION`, exit `50`) до создания plaintext-БД.
+  Ошибка записи → exit `50` `HISTORY_WRITE_ERROR`; нечитаемая/более новая/
+  иностранная БД → exit `30`.
 
 ## Gemini Dialogue (machine-facing)
 
