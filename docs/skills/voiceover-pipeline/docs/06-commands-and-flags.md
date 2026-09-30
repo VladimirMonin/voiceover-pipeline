@@ -114,13 +114,16 @@
 | `--sample` | str | — | Путь к референс-аудио для clone |
 | `--sample-text` | str | `""` | Текст референса для clone (точнее) |
 
-- `--mode clone` для обычного не-диалогового сценария идёт через canonical SQLite
-  (нативный локальный маршрут): снимок хранит локатор референс-файла, его SHA-256
-  и размер, reference text и выбранный рантайм/язык; `generate --resume` и
-  `history resume ID` доказывают ту же идентичность, а референс и установленный
-  локальный рантайм проверяются до первой локальной части; `history sync ID`
-  модель не запускает. `preset`/`auto`/`design`, `--no-trim`, `--with-timings` и
-  `--tts-quality-provider` остаются на legacy-маршруте. Подробности — в
+- Обычные не-диалоговые режимы `clone`, `preset` и `design` идут через canonical
+  SQLite (нативный локальный маршрут): для `clone` снимок хранит локатор
+  референс-файла, его SHA-256 и размер, reference text и выбранный рантайм/язык;
+  для `preset`/`design` — режим, модель (CustomVoice/VoiceDesign), голос пресета
+  (или маркер `design`), точную инструкцию, рантайм и язык. `generate --resume` и
+  `history resume ID` доказывают ту же идентичность, а установленный локальный
+  рантайм и (для `clone`) референс проверяются до первой локальной части;
+  `history sync ID` модель не запускает. `--mode auto` (не разрешает модель),
+  `--no-trim`, `--with-timings` и `--tts-quality-provider` остаются на
+  legacy-маршруте. Подробности — в
   [Agent CLI Contract](../../../agent-cli-contract.md).
 
 ### OmniVoice-local опции (локальный)

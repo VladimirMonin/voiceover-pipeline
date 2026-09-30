@@ -176,6 +176,7 @@ from .services.prepare import (
     PreparedRun,
     bind_omnivoice_dialogue_fingerprints,
     build_qwen_clone_identity,
+    build_qwen_mode_identity,
     default_voice,
     prepare_generation_identity,
     prepare_run,
@@ -1396,7 +1397,7 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     if script_format != "markdown":
         return False
     if getattr(args, "provider", None) == "qwen-local":
-        return _native_qwen_clone_route_eligible(args)
+        return _native_qwen_local_route_eligible(args)
     quality_provider = getattr(args, "tts_quality_provider", None)
     if quality_provider is not None and quality_provider not in (
         native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
@@ -1422,30 +1423,59 @@ def _qwen_tts_runtime() -> str:
     return os.environ.get("VOICEOVER_QWEN_TTS_RUNTIME", "python").strip()
 
 
-def _native_qwen_clone_route_eligible(args: argparse.Namespace) -> bool:
-    """Whether this command is the admitted local Qwen clone native route.
+def _native_qwen_local_route_eligible(args: argparse.Namespace) -> bool:
+    """Whether this command is an admitted local Qwen native route.
 
-    Only the ordinary non-dialogue ``qwen-local`` clone mode with a reference
-    sample, the default trimming semantics, and no integrated timing or quality
-    step is admitted. The ``preset``/``auto``/``design`` modes, ``--no-trim``,
-    ``--with-timings``, a quality provider, and an unrecognized
-    ``VOICEOVER_QWEN_TTS_RUNTIME`` value all keep the legacy executor, because the
-    native route records the mode and runtime as part of its clone identity.
+    Three ordinary non-dialogue ``qwen-local`` modes are admitted, each with the
+    default trimming semantics and no integrated timing or quality step:
+
+    * ``clone`` with a reference ``--sample``;
+    * ``preset`` with the CustomVoice model; and
+    * ``design`` with the VoiceDesign model.
+
+    The instructed ``preset``/``design`` modes additionally require a non-empty
+    instruction (the ``--qwen-instruct`` value, or the ``QWEN_INSTRUCT`` default),
+    because the runtime needs one and the snapshot stores it as the run's style
+    identity. ``auto`` (which resolves no model), an unexpected model, a missing
+    sample, ``--no-trim``, ``--with-timings``, a quality provider, and an
+    unrecognized ``VOICEOVER_QWEN_TTS_RUNTIME`` all keep the legacy executor,
+    because the native route records the mode, model, voice, instruction, and
+    runtime as part of its identity.
     """
-    if getattr(args, "mode", None) != "clone":
-        return False
-    if getattr(args, "model", None) != QWEN_MODEL_BASE:
-        return False
     if getattr(args, "no_trim", False):
         return False
     if getattr(args, "with_timings", False):
         return False
     if getattr(args, "tts_quality_provider", None):
         return False
-    sample = getattr(args, "sample", None)
-    if not isinstance(sample, str) or not sample.strip():
+    if _qwen_tts_runtime() not in ("python", "audio-cpp"):
         return False
-    return _qwen_tts_runtime() in ("python", "audio-cpp")
+    mode = getattr(args, "mode", None)
+    if mode == "clone":
+        if getattr(args, "model", None) != QWEN_MODEL_BASE:
+            return False
+        sample = getattr(args, "sample", None)
+        return isinstance(sample, str) and bool(sample.strip())
+    if mode == "preset":
+        if getattr(args, "model", None) != QWEN_MODEL_CUSTOMVOICE:
+            return False
+        return _qwen_instruct_admissible(args)
+    if mode == "design":
+        if getattr(args, "model", None) != QWEN_MODEL_VOICE_DESIGN:
+            return False
+        return _qwen_instruct_admissible(args)
+    return False
+
+
+def _qwen_instruct_admissible(args: argparse.Namespace) -> bool:
+    """Whether an admitted instructed ``qwen-local`` mode has a usable instruction.
+
+    An unset ``--qwen-instruct`` means the ``QWEN_INSTRUCT`` default; an explicit
+    empty or whitespace instruction keeps the run on the legacy executor instead of
+    reaching the runtime or the snapshot's non-empty style-prompt rule.
+    """
+    instruct = getattr(args, "qwen_instruct", None)
+    return instruct is None or (isinstance(instruct, str) and bool(instruct.strip()))
 
 
 def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
@@ -1561,8 +1591,8 @@ def _run_native_route(
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an admitted native "
-            "polza-tts, openrouter-tts, local Qwen clone, or local OmniVoice dialogue run may "
-            "continue it; choose a different --run-id for other options.",
+            "polza-tts, openrouter-tts, local Qwen clone/preset/design, or local OmniVoice "
+            "dialogue run may continue it; choose a different --run-id for other options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
         )
@@ -1602,18 +1632,32 @@ def _run_native_route(
         fail(str(exc), _EXIT_ARGS)
     chunks = generation_identity.chunks
     qwen_clone_identity = None
+    qwen_mode_identity = None
     if args.provider == "qwen-local":
-        # The clone reference is read and hashed here, before the snapshot, so a
+        # A clone reference is read and hashed here, before the snapshot, so a
         # missing sample fails as a usage error and the committed identity always
-        # carries a locator and digest this run actually read.
+        # carries a locator and digest this run actually read. The instructed
+        # preset/design routes carry no external file: their identity is the
+        # resolved mode/model/voice and the exact style instruction the run speaks
+        # with, captured here before any provider exists.
         try:
-            qwen_clone_identity = build_qwen_clone_identity(
-                model=args.model,
-                sample_path=args.sample,
-                sample_text=getattr(args, "sample_text", None) or "",
-                runtime=_qwen_tts_runtime(),
-                language=QWEN_LANGUAGE,
-            )
+            if args.mode == "clone":
+                qwen_clone_identity = build_qwen_clone_identity(
+                    model=args.model,
+                    sample_path=args.sample,
+                    sample_text=getattr(args, "sample_text", None) or "",
+                    runtime=_qwen_tts_runtime(),
+                    language=QWEN_LANGUAGE,
+                )
+            else:
+                qwen_mode_identity = build_qwen_mode_identity(
+                    mode=args.mode,
+                    model=args.model,
+                    voice=args.voice,
+                    instruct=generation_identity.style_prompt,
+                    runtime=_qwen_tts_runtime(),
+                    language=QWEN_LANGUAGE,
+                )
         except PreparationError as exc:
             fail(str(exc), _EXIT_ARGS)
     prepared = prepare_run(
@@ -1622,6 +1666,7 @@ def _run_native_route(
         generation_identity.style_prompt,
         generation_identity.prompt_mode,
         qwen_clone_identity=qwen_clone_identity,
+        qwen_mode_identity=qwen_mode_identity,
     )
     provider_cache: list[Any] = []
 
@@ -3399,31 +3444,44 @@ def _build_native_omnivoice_dialogue_provider(prepared: PreparedRun, api_key: st
     return _bind_dialogue_voice_bank_providers(base, catalog, cast)
 
 
-def _build_native_qwen_clone_provider(prepared: PreparedRun) -> Any:
-    """Rebuild the local Qwen clone provider for a reconstructed run.
+def _build_native_qwen_local_provider(prepared: PreparedRun) -> Any:
+    """Rebuild the local Qwen provider for a reconstructed run.
 
-    The committed clone identity supplies the reference locator and text and the
-    selected mode, so the provider re-reads the exact sample the run committed to.
-    The executor already proved the sample still matches the committed digest and
-    size, and the runtime is available offline, before any local model runs, so this
-    only reconstructs the already-admitted route. A run without a committed clone
-    identity cannot be resumed and fails closed.
+    The committed identity selects the admitted route and supplies its exact
+    settings. A clone run re-reads the reference locator and text it committed to;
+    a preset/design run rebuilds the mode, model, voice, and instruction it spoke
+    with. The executor already proved the identity still matches and the runtime is
+    available offline before any local model runs, so this only reconstructs the
+    already-admitted route. A run without a committed identity cannot be resumed and
+    fails closed.
     """
-    identity = prepared.qwen_clone_identity
-    if identity is None:
-        fail(
-            "this local Qwen clone run records no clone identity; refusing to resume it.",
-            _EXIT_PROVIDER,
+    clone_identity = prepared.qwen_clone_identity
+    if clone_identity is not None:
+        identity_args = argparse.Namespace(
+            provider="qwen-local",
+            model=prepared.model,
+            voice=prepared.voice,
+            mode=clone_identity.mode,
+            sample=clone_identity.sample_path,
+            sample_text=clone_identity.sample_text,
+            qwen_instruct=prepared.style_prompt,
         )
-    identity_args = argparse.Namespace(
-        provider="qwen-local",
-        model=prepared.model,
-        voice=prepared.voice,
-        mode=identity.mode,
-        sample=identity.sample_path,
-        sample_text=identity.sample_text,
-        qwen_instruct=prepared.style_prompt,
-    )
+    else:
+        mode_identity = prepared.qwen_mode_identity
+        if mode_identity is None:
+            fail(
+                "this local Qwen run records no mode identity; refusing to resume it.",
+                _EXIT_PROVIDER,
+            )
+        identity_args = argparse.Namespace(
+            provider="qwen-local",
+            model=prepared.model,
+            voice=prepared.voice,
+            mode=mode_identity.mode,
+            sample=None,
+            sample_text=None,
+            qwen_instruct=mode_identity.instruct,
+        )
     api_key = read_api_key(identity_args)
     return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
 
@@ -3439,7 +3497,7 @@ def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     repair or a local raw rebuild.
     """
     if prepared.provider == "qwen-local":
-        return _build_native_qwen_clone_provider(prepared)
+        return _build_native_qwen_local_provider(prepared)
     identity_args = argparse.Namespace(
         provider=prepared.provider, model=prepared.model, voice=prepared.voice
     )

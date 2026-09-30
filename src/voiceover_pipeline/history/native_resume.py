@@ -68,6 +68,7 @@ from ..services.prepare import (
     PreparedPart,
     PreparedRun,
     QwenCloneVoiceIdentity,
+    QwenModeVoiceIdentity,
 )
 from .native_snapshot import (
     _is_generated_chunk_id,
@@ -116,6 +117,10 @@ _VOICE_BANK_CONFLICT = (
 _QWEN_CLONE_CONFLICT = (
     "native resume identity conflict: the qwen-local clone reference sample, reference text, "
     "mode, model, runtime, or language changed"
+)
+_QWEN_MODE_CONFLICT = (
+    "native resume identity conflict: the qwen-local preset/design mode, model, voice, "
+    "instruction, runtime, or language changed"
 )
 _PART_COUNT_CONFLICT = "native resume identity conflict: part count changed"
 _PART_ORDER_CONFLICT = (
@@ -189,6 +194,11 @@ def _require_prepared(prepared: object) -> PreparedRun:
     if qwen_clone is not None and not isinstance(qwen_clone, QwenCloneVoiceIdentity):
         raise NativeResumeValidationError(
             "prepared qwen clone identity must be None or a QwenCloneVoiceIdentity"
+        )
+    qwen_mode = prepared.qwen_mode_identity
+    if qwen_mode is not None and not isinstance(qwen_mode, QwenModeVoiceIdentity):
+        raise NativeResumeValidationError(
+            "prepared qwen mode identity must be None or a QwenModeVoiceIdentity"
         )
     return prepared
 
@@ -313,6 +323,12 @@ def preflight_native_tts_resume(
     )
     if committed_qwen_clone != candidate_qwen_clone:
         raise NativeResumeIdentityConflictError(_QWEN_CLONE_CONFLICT)
+    committed_qwen_mode = config.get("qwen_mode")
+    candidate_qwen_mode = (
+        None if candidate.qwen_mode_identity is None else candidate.qwen_mode_identity.to_payload()
+    )
+    if committed_qwen_mode != candidate_qwen_mode:
+        raise NativeResumeIdentityConflictError(_QWEN_MODE_CONFLICT)
 
     if len(candidate.parts) != len(view.parts):
         raise NativeResumeIdentityConflictError(_PART_COUNT_CONFLICT)
@@ -330,6 +346,7 @@ def preflight_native_tts_resume(
         synthesis_identity=candidate_synthesis_identity,
         voice_bank=candidate_voice_bank,
         qwen_clone=candidate_qwen_clone,
+        qwen_mode=candidate_qwen_mode,
     )
     for position, part in enumerate(candidate.parts, start=1):
         chunk = part.chunk

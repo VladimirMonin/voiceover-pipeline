@@ -56,12 +56,13 @@ Known limits at this foundation stage:
 
 * Only the routes whose prepared run carries its full nonsecret resume identity
   are snapshotted: ``polza-tts``, ``openrouter-tts``, the ``omnivoice-local``
-  preset dialogue route, and the ``qwen-local`` clone route. Every other route
+  preset dialogue route, and every admitted ``qwen-local`` local route (the
+  clone route, and the instructed preset/design routes). Every other route
   raises :class:`NativeSnapshotValidationError` before any insert, because it
   omits nonsecret identity a later ``history resume UUID`` would need:
   ``omnivoice-local`` non-dialogue modes carry no catalog locator or reference
-  fingerprint, ``qwen-local`` preset/design modes carry no clone sample
-  locator/hash or reference text, and ``polza-chat-audio`` carries no
+  fingerprint, a ``qwen-local`` run with neither identity block carries no
+  reference/mode inputs, and ``polza-chat-audio`` carries no
   ``fallback_voice``. This is a temporary S05 integration gap, not a disabled
   live path: those routes still perform their own run and JSON state writes. A
   further route is enabled only once its missing nonsecret inputs are captured on
@@ -86,10 +87,13 @@ from typing import Any
 
 from ..models import ScriptChunk
 from ..services.prepare import (
+    QWEN_CLONE_MODE,
+    QWEN_INSTRUCT_MODES,
     OmniVoiceVoiceBankIdentity,
     PreparedPart,
     PreparedRun,
     QwenCloneVoiceIdentity,
+    QwenModeVoiceIdentity,
 )
 from .repository import (
     TEXT_COMPLETENESS_COMPLETE,
@@ -123,12 +127,16 @@ _REDACTED_IDENTITY_REJECTED = (
 #   * ``omnivoice-local`` -- the admitted preset dialogue route, whose
 #     ``PreparedRun.voice_bank_identity`` carries the catalog locator and each
 #     referenced profile's reference locator, digest, text, and language.
-#   * ``qwen-local`` -- the admitted clone route, whose
+#   * ``qwen-local`` -- an admitted local route. Its clone mode's
 #     ``PreparedRun.qwen_clone_identity`` carries the reference sample locator,
-#     digest, and size, the reference text, and the runtime/language knobs.
+#     digest, and size, the reference text, and the runtime/language knobs, and
+#     its instructed preset/design modes' ``PreparedRun.qwen_mode_identity``
+#     carries the mode/model/voice, the exact instruction, and the
+#     runtime/language knobs. Exactly one block is present per run.
 # Every other route fails closed before any insert, whether it is a known route
-# whose resume inputs ``PreparedRun`` does not carry (a non-clone ``qwen-local``
-# mode, a non-dialogue ``omnivoice-local`` mode, or ``polza-chat-audio``) or an
+# whose resume inputs ``PreparedRun`` does not carry (a ``qwen-local`` run with
+# neither identity block, a non-dialogue ``omnivoice-local`` mode, or
+# ``polza-chat-audio``) or an
 # unknown identifier. A supported provider whose route-specific identity block is
 # missing fails the same way, so only a run that captured its full identity is
 # persisted. The rejection is one fixed message because an unknown identifier is
@@ -277,6 +285,7 @@ def _run_identity_payload(
     synthesis_identity: str | None,
     voice_bank: dict[str, Any] | None = None,
     qwen_clone: dict[str, Any] | None = None,
+    qwen_mode: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "version": NATIVE_SNAPSHOT_FINGERPRINT_VERSION,
@@ -299,6 +308,12 @@ def _run_identity_payload(
         # voice bank, the key is added only when present so every other route keeps
         # its committed version-1 payload byte-for-byte.
         payload["qwen_clone"] = qwen_clone
+    if qwen_mode is not None:
+        # Only the instructed ``qwen-local`` preset/design routes record a mode
+        # identity. As above, the key is added only when present so every other
+        # route -- including the committed ``qwen-local`` clone route -- keeps its
+        # version-1 payload byte-for-byte.
+        payload["qwen_mode"] = qwen_mode
     return payload
 
 
@@ -354,6 +369,7 @@ def _build_snapshot_config(
     output_options: dict[str, Any] | None,
     voice_bank: dict[str, Any] | None = None,
     qwen_clone: dict[str, Any] | None = None,
+    qwen_mode: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the whitelisted structural snapshot stored in ``config_snapshot``.
 
@@ -381,6 +397,8 @@ def _build_snapshot_config(
         snapshot["voice_bank"] = voice_bank
     if qwen_clone is not None:
         snapshot["qwen_clone"] = qwen_clone
+    if qwen_mode is not None:
+        snapshot["qwen_mode"] = qwen_mode
     if output_options is not None:
         snapshot["output"] = output_options
     return snapshot
@@ -461,30 +479,53 @@ def _require_dialogue_bank_consistency(
             )
 
 
-def _require_qwen_clone_identity(prepared: PreparedRun, provider: str) -> dict[str, Any] | None:
-    """Return the committed clone identity payload, or ``None`` when the run has none.
+def _require_qwen_route_identity(
+    prepared: PreparedRun, provider: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return the committed local-Qwen identity payloads for this run, if any.
 
-    Only the admitted ``qwen-local`` clone route carries one, and it must always
-    carry one: any other ``qwen-local`` mode (or a run of another provider) that
-    somehow reached this writer would otherwise commit an identity whose clone
-    inputs were never captured. The identity's own ``mode``/``model`` must agree
-    with the run route, so a mismatched block fails the same fixed message. The
-    rejection echoes no value.
+    ``qwen-local`` has three admitted modes: ``clone`` carries a
+    :class:`QwenCloneVoiceIdentity`; the instructed ``preset``/``design`` modes
+    carry a :class:`QwenModeVoiceIdentity`. Exactly one must be present for a
+    ``qwen-local`` run: a run with neither (any other mode) or with both fails the
+    fixed route-rejection message, and an identity whose mode/model/voice/instruct
+    disagrees with the run route fails the same way, so a resume can never build a
+    provider for an identity the run never captured. Every other provider must
+    carry neither block. The rejection echoes no value.
     """
-    identity = prepared.qwen_clone_identity
-    if provider == "qwen-local":
+    clone = prepared.qwen_clone_identity
+    mode = prepared.qwen_mode_identity
+    if provider != "qwen-local":
+        if clone is not None:
+            raise NativeSnapshotValidationError(
+                "a qwen clone identity is only valid for the local Qwen clone route"
+            )
+        if mode is not None:
+            raise NativeSnapshotValidationError(
+                "a qwen mode identity is only valid for the local Qwen preset/design route"
+            )
+        return None, None
+    if clone is not None and mode is not None:
+        raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
+    if clone is not None:
         if (
-            not isinstance(identity, QwenCloneVoiceIdentity)
-            or identity.mode != "clone"
-            or identity.model != prepared.model
+            not isinstance(clone, QwenCloneVoiceIdentity)
+            or clone.mode != QWEN_CLONE_MODE
+            or clone.model != prepared.model
         ):
             raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
-        return identity.to_payload()
-    if identity is not None:
-        raise NativeSnapshotValidationError(
-            "a qwen clone identity is only valid for the local Qwen clone route"
-        )
-    return None
+        return clone.to_payload(), None
+    if mode is not None:
+        if (
+            not isinstance(mode, QwenModeVoiceIdentity)
+            or mode.mode not in QWEN_INSTRUCT_MODES
+            or mode.model != prepared.model
+            or mode.voice != prepared.voice
+            or mode.instruct != prepared.style_prompt
+        ):
+            raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
+        return None, mode.to_payload()
+    raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
 
 
 def persist_prepared_tts_snapshot(
@@ -532,9 +573,11 @@ def persist_prepared_tts_snapshot(
 
     Only an admitted route whose prepared run carries its full nonsecret resume
     identity is accepted: ``polza-tts``, ``openrouter-tts``, the
-    ``omnivoice-local`` preset dialogue route, and the ``qwen-local`` clone route.
+    ``omnivoice-local`` preset dialogue route, and an admitted ``qwen-local`` local
+    route (the clone route or the instructed preset/design routes).
     Any other provider, or a supported provider whose route-specific identity
-    block is missing -- a non-clone ``qwen-local`` mode, a non-dialogue
+    block is missing -- a ``qwen-local`` run with neither identity block, a
+    non-dialogue
     ``omnivoice-local`` mode, ``polza-chat-audio``, or an unknown identifier -- is
     rejected with :class:`NativeSnapshotValidationError` before any insert: its
     resume identity inputs are not persisted on ``PreparedRun``, so the snapshot
@@ -548,10 +591,10 @@ def persist_prepared_tts_snapshot(
         # known-but-unreconstructable routes and any unknown provider; the fixed
         # message never echoes the identifier. See the module docstring.
         raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
-    # The route-specific identity block is validated before the run voice, so a
+    # The route-specific identity blocks are validated before the run voice, so a
     # route whose identity was never captured still fails with the fixed
     # route-rejection message even when another field would also fail.
-    qwen_clone_payload = _require_qwen_clone_identity(prepared, provider)
+    qwen_clone_payload, qwen_mode_payload = _require_qwen_route_identity(prepared, provider)
     model = _require_nonempty_text(prepared.model, "model")
     voice = _require_nonempty_text(prepared.voice, "voice")
     prompt_mode = _require_nonempty_text(prepared.prompt_mode, "prompt_mode")
@@ -594,6 +637,7 @@ def persist_prepared_tts_snapshot(
         synthesis_identity=synthesis_identity,
         voice_bank=voice_bank_payload,
         qwen_clone=qwen_clone_payload,
+        qwen_mode=qwen_mode_payload,
     )
 
     planned: list[_PlannedPart] = []
@@ -666,6 +710,7 @@ def persist_prepared_tts_snapshot(
         output_options=validated_output_options,
         voice_bank=voice_bank_payload,
         qwen_clone=qwen_clone_payload,
+        qwen_mode=qwen_mode_payload,
     )
     # The history boundary redacts secret-looking values in its own copy; if that
     # would change any whitelisted structural identity, persisting it would store

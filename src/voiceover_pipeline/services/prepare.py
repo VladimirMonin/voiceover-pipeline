@@ -214,6 +214,83 @@ class QwenCloneVoiceIdentity:
 QWEN_CLONE_MODE = "clone"
 
 
+QWEN_PRESET_MODE = "preset"
+QWEN_DESIGN_MODE = "design"
+# The two instructed ``qwen-local`` modes whose identity is the run's model, its
+# preset speaker (or the ``design`` marker), and the per-run instruction plus the
+# selected runtime/language. ``auto`` is a CLI choice that resolves no model, so it
+# never reaches a provider and is not part of this family.
+QWEN_INSTRUCT_MODES = frozenset({QWEN_PRESET_MODE, QWEN_DESIGN_MODE})
+
+
+@dataclass(frozen=True)
+class QwenModeVoiceIdentity:
+    """The immutable inputs one instructed local Qwen preset/design run commits to.
+
+    The standard run identity already covers the run's ``provider``, ``voice`` (the
+    preset speaker, or the ``design`` marker), ``model``, and ``style_prompt`` (the
+    verbatim instruction). This block adds the remaining nonsecret knobs that also
+    change the synthesized bytes -- the mode, the exact instruction, and the runtime
+    and language -- and restates the effective mode/model/voice so a later resume
+    can prove the whole identity from one committed block instead of re-deriving the
+    mode from the model. A changed instruction is therefore refused before any local
+    model call, not just after the run identity already differs.
+    """
+
+    mode: str
+    model: str
+    voice: str
+    instruct: str
+    runtime: str
+    language: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "mode": self.mode,
+            "model": self.model,
+            "voice": self.voice,
+            "instruct": self.instruct,
+            "runtime": self.runtime,
+            "language": self.language,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "QwenModeVoiceIdentity":
+        if not isinstance(payload, Mapping):
+            raise ValueError("qwen mode identity must be a mapping")
+        fields = {
+            key: payload.get(key)
+            for key in ("mode", "model", "voice", "instruct", "runtime", "language")
+        }
+        if any(not isinstance(value, str) or not value for value in fields.values()):
+            raise ValueError("qwen mode identity fields must be non-empty strings")
+        return cls(**fields)  # type: ignore[arg-type]
+
+
+def build_qwen_mode_identity(
+    *, mode: str, model: str, voice: str, instruct: str | None, runtime: str, language: str
+) -> QwenModeVoiceIdentity:
+    """Capture one instructed ``qwen-local`` preset/design run's immutable settings.
+
+    The instruction is the exact text the runtime speaks with, so it must be
+    non-empty; an empty or whitespace instruction is refused here as a usage error
+    before any provider or snapshot exists, mirroring the runtime's own
+    ``VoiceDesign`` requirement and the snapshot's style-prompt rule.
+    """
+    if mode not in QWEN_INSTRUCT_MODES:
+        raise PreparationError("qwen-local instructed mode must be 'preset' or 'design'.")
+    if not isinstance(instruct, str) or not instruct.strip():
+        raise PreparationError("qwen-local preset/design mode requires a non-empty instruction.")
+    return QwenModeVoiceIdentity(
+        mode=mode,
+        model=model,
+        voice=voice,
+        instruct=instruct,
+        runtime=runtime,
+        language=language,
+    )
+
+
 def build_qwen_clone_identity(
     *, model: str, sample_path: str, sample_text: str, runtime: str, language: str
 ) -> QwenCloneVoiceIdentity:
@@ -251,7 +328,8 @@ class PreparedRun:
     ``voice`` is the run-level voice the CLI already resolved; a part without
     its own cast voice falls back to it. ``voice_bank_identity`` is present only
     for the admitted ``omnivoice-local`` preset dialogue route, and
-    ``qwen_clone_identity`` only for the admitted ``qwen-local`` clone route.
+    ``qwen_clone_identity``/``qwen_mode_identity`` only for the admitted
+    ``qwen-local`` local routes (clone, or the instructed preset/design modes).
     """
 
     provider: str
@@ -262,6 +340,7 @@ class PreparedRun:
     parts: tuple[PreparedPart, ...]
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
     qwen_clone_identity: QwenCloneVoiceIdentity | None = None
+    qwen_mode_identity: QwenModeVoiceIdentity | None = None
 
 
 def default_voice(args: argparse.Namespace) -> str | None:
@@ -421,12 +500,14 @@ def prepare_run(
     prompt_mode: str,
     *,
     qwen_clone_identity: QwenCloneVoiceIdentity | None = None,
+    qwen_mode_identity: QwenModeVoiceIdentity | None = None,
 ) -> PreparedRun:
     """Wrap the already-resolved run identity and chunks without changing them.
 
     ``qwen_clone_identity`` is supplied only by the admitted local Qwen clone
-    route, which has already read and hashed its reference sample; every other
-    caller leaves it ``None``.
+    route, which has already read and hashed its reference sample; the instructed
+    local Qwen preset/design routes supply ``qwen_mode_identity`` instead. Every
+    other caller leaves both ``None``.
     """
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
     if args.provider == "omnivoice-local" and is_dialogue_format(
@@ -452,6 +533,7 @@ def prepare_run(
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
         voice_bank_identity=voice_bank_identity,
         qwen_clone_identity=qwen_clone_identity,
+        qwen_mode_identity=qwen_mode_identity,
     )
 
 

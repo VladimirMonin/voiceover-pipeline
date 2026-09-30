@@ -47,6 +47,7 @@ from voiceover_pipeline.services.prepare import (
     PreparedPart,
     PreparedRun,
     QwenCloneVoiceIdentity,
+    QwenModeVoiceIdentity,
 )
 
 _DEFAULT_SCRIPT_TEXT = "Первый.\n\nВторой."
@@ -287,6 +288,10 @@ def test_persists_exact_parts_text_voice_and_structural_snapshot(repository, tmp
     assert snapshot["voice"] == "alloy"
     assert snapshot["prompt_mode"] == "plain"
     assert snapshot["snapshot_fingerprint"] == result.fingerprint
+    # No local route-specific identity block leaks into a paid-route snapshot.
+    assert "qwen_mode" not in snapshot
+    assert "qwen_clone" not in snapshot
+    assert "voice_bank" not in snapshot
     assert snapshot["part_count"] == 2
     assert [entry["number"] for entry in snapshot["parts"]] == [1, 2]
     assert [entry["position"] for entry in snapshot["parts"]] == [1, 2]
@@ -792,6 +797,95 @@ def test_qwen_clone_identity_mismatch_is_rejected_before_write(repository, tmp_p
 
     with pytest.raises(NativeSnapshotValidationError) as excinfo:
         _persist(repository, prepared, tmp_path / "runs" / "qwen-clone-mismatch")
+
+    assert str(excinfo.value) == _UNSUPPORTED_TTS_ROUTE_REJECTED
+    assert _row_count(repository, "runs") == 0
+
+
+_QWEN_PRESET_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+
+
+def _qwen_mode_prepared(
+    *, mode="preset", model=_QWEN_PRESET_MODEL, voice="Serena", instruct="Read warmly."
+):
+    """A valid-looking local Qwen instructed run with its committed mode identity."""
+    chunk = ScriptChunk(number=1, id="chunk_01", text="Одиночный текст.", voice=voice)
+    parts = (PreparedPart(chunk=chunk, voice=chunk.voice),)
+    return PreparedRun(
+        provider="qwen-local",
+        model=model,
+        voice=voice,
+        style_prompt=instruct,
+        prompt_mode="plain",
+        parts=parts,
+        qwen_mode_identity=QwenModeVoiceIdentity(
+            mode=mode,
+            model=model,
+            voice=voice,
+            instruct=instruct,
+            runtime="python",
+            language="Russian",
+        ),
+    )
+
+
+def test_qwen_mode_route_is_accepted_and_reconstructable(repository, tmp_path):
+    prepared = _qwen_mode_prepared()
+
+    result = _persist(repository, prepared, tmp_path / "runs" / "qwen-mode")
+
+    snapshot = result.run.config_snapshot
+    assert snapshot["provider"] == "qwen-local"
+    assert snapshot["model"] == _QWEN_PRESET_MODEL
+    assert snapshot["voice"] == "Serena"
+    assert snapshot["qwen_mode"] == {
+        "mode": "preset",
+        "model": _QWEN_PRESET_MODEL,
+        "voice": "Serena",
+        "instruct": "Read warmly.",
+        "runtime": "python",
+        "language": "Russian",
+    }
+    # The instructed-mode block is added only for this route, so a committed polza
+    # or clone run keeps its version-1 payload byte-for-byte.
+    assert "qwen_clone" not in snapshot
+    # A changed instruction produces a different identity (the block and the run's
+    # hashed style prompt both move).
+    assert prepared.qwen_mode_identity is not None
+    variant = replace(
+        prepared,
+        style_prompt="Read coldly.",
+        qwen_mode_identity=replace(prepared.qwen_mode_identity, instruct="Read coldly."),
+    )
+    other = _persist(repository, variant, tmp_path / "runs" / "qwen-mode-b")
+    assert other.fingerprint != result.fingerprint
+
+
+def test_qwen_mode_identity_disagreement_with_the_run_is_rejected_before_write(
+    repository, tmp_path
+):
+    # A committed mode identity whose instruction disagrees with the run's hashed
+    # style prompt would let a resume speak with an instruction the run never used.
+    prepared = _qwen_mode_prepared()
+    assert prepared.qwen_mode_identity is not None
+    prepared = replace(
+        prepared, qwen_mode_identity=replace(prepared.qwen_mode_identity, instruct="Other.")
+    )
+
+    with pytest.raises(NativeSnapshotValidationError) as excinfo:
+        _persist(repository, prepared, tmp_path / "runs" / "qwen-mode-mismatch")
+
+    assert str(excinfo.value) == _UNSUPPORTED_TTS_ROUTE_REJECTED
+    assert _row_count(repository, "runs") == 0
+
+
+def test_qwen_clone_and_mode_blocks_are_mutually_exclusive(repository, tmp_path):
+    prepared = replace(
+        _qwen_clone_prepared(), qwen_mode_identity=_qwen_mode_prepared().qwen_mode_identity
+    )
+
+    with pytest.raises(NativeSnapshotValidationError) as excinfo:
+        _persist(repository, prepared, tmp_path / "runs" / "qwen-both")
 
     assert str(excinfo.value) == _UNSUPPORTED_TTS_ROUTE_REJECTED
     assert _row_count(repository, "runs") == 0
