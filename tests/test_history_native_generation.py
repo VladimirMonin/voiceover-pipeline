@@ -7,9 +7,11 @@ The tests assert paid-submit counts and committed history rather than only
 statuses, so a slice that silently re-submits or loses evidence fails here.
 """
 
+import hashlib
 import json
 import sqlite3
 import sys
+import uuid
 from decimal import Decimal
 from pathlib import Path
 
@@ -211,6 +213,108 @@ def _run_uuid(prefix: str) -> str:
     matches = [run for run in runs if run["user_label"] == prefix]
     assert len(matches) == 1, matches
     return matches[0]["run_uuid"]
+
+
+def _history_argv(run_uuid: str, verb: str, *, extra=()) -> list[str]:
+    return ["voiceover-pipeline", "history", verb, run_uuid, *extra, "--json"]
+
+
+def _run_row(home: Path, run_uuid: str) -> tuple[str, int]:
+    connection = sqlite3.connect(home / "history.sqlite3")
+    try:
+        row = connection.execute(
+            "SELECT status, revision FROM runs WHERE run_uuid = ?", (run_uuid,)
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return row[0], row[1]
+
+
+def _evidence_counts(home: Path, run_uuid: str) -> dict[str, int]:
+    connection = sqlite3.connect(home / "history.sqlite3")
+    try:
+        return {
+            table: connection.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE run_uuid = ?", (run_uuid,)
+            ).fetchone()[0]
+            for table in ("parts", "attempts", "artifacts")
+        }
+    finally:
+        connection.close()
+
+
+def _write_legacy_tree(root: Path, run_id: str = "legacy-run") -> Path:
+    """Write one minimal legacy run tree so ``history import`` can adopt it."""
+    slug = "openai-gpt-4o-mini-tts"
+    source = root / run_id
+    chunks_dir = source / "chunks"
+    chunks_dir.mkdir(parents=True)
+    text = "Legacy text."
+    entry = {
+        "status": "completed",
+        "number": 1,
+        "id": "chunk_01",
+        "file": "chunk_01.mp3",
+        "duration_ms": 1200,
+        "text": text,
+        "text_hash": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "cost": 0.1,
+        "cost_currency": "RUB",
+    }
+    (chunks_dir / "chunk_01.mp3").write_bytes(b"ID3chunk")
+    full_mp3 = source / f"{run_id}-voiceover-{slug}.mp3"
+    full_mp3.write_bytes(b"ID3full")
+    run_json = source / f"{run_id}-voiceover-{slug}.json"
+    state = {
+        "artifact_type": "voiceover-run-state",
+        "status": "completed",
+        "run_id": run_id,
+        "provider": "polza-tts",
+        "model": "openai/gpt-4o-mini-tts",
+        "voice": "alloy",
+        "script": str(source / "missing-script.md"),
+        "script_hash": "a" * 64,
+        "chunk_count": 1,
+        "completed_count": 1,
+        "chunks": [entry],
+    }
+    (source / "run_state.json").write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    run_json.write_text(
+        json.dumps({**state, "artifact_type": "voiceover-run", "full_mp3": str(full_mp3)}),
+        encoding="utf-8",
+    )
+    (chunks_dir / "chunks.json").write_text(
+        json.dumps(
+            {
+                "artifact_type": "voiceover-chunks",
+                "provider": "polza-tts",
+                "model": "openai/gpt-4o-mini-tts",
+                "voice": "alloy",
+                "chunk_count": 1,
+                "chunks": [entry],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (source / "manifest.json").write_text(
+        json.dumps(
+            {
+                "artifact_type": "voiceover-production-bundle",
+                "run_id": run_id,
+                "full_mp3": str(full_mp3),
+                "run_json": str(run_json),
+                "chunks_json": str(chunks_dir / "chunks.json"),
+                "duration_ms": 1200,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return source
+
+
+def _explode(*_args, **_kwargs):  # pragma: no cover - asserted never to run
+    raise AssertionError("this path must not build a provider or read an API key")
 
 
 # ── fresh generation ──────────────────────────────────────────────────────────
@@ -1565,3 +1669,444 @@ def test_script_chunk_helpers_are_stable() -> None:
     """Sanity check that the native snapshot consumes plain generated chunk ids."""
     chunk = ScriptChunk(number=1, id="chunk_01", text="x")
     assert chunk.id == "chunk_01"
+
+
+# ── history resume / history sync (DB-first user journey) ─────────────────────
+
+
+def test_history_resume_and_sync_parser_and_help_envelopes(monkeypatch, capsys, native_env):
+    """Both verbs parse, state their paid semantics, and reject unknown flags."""
+    import voiceover_pipeline.cli as cli_module
+
+    for verb in ("resume", "sync"):
+        monkeypatch.setattr(sys, "argv", ["voiceover-pipeline", "history", verb, "--help"])
+        with pytest.raises(SystemExit) as excinfo:
+            cli_module.main()
+        assert excinfo.value.code == 0
+        help_text = capsys.readouterr().out
+        assert "--json" in help_text
+
+    monkeypatch.setattr(sys, "argv", ["voiceover-pipeline", "history", "resume", "--help"])
+    with pytest.raises(SystemExit):
+        cli_module.main()
+    assert "potentially paid" in " ".join(capsys.readouterr().out.split())
+
+    monkeypatch.setattr(sys, "argv", ["voiceover-pipeline", "history", "sync", "--help"])
+    with pytest.raises(SystemExit):
+        cli_module.main()
+    assert "without a new paid submit" in " ".join(capsys.readouterr().out.split())
+
+    # A missing run id and an unknown flag are ordinary argparse usage errors.
+    code, payload = _json_run(
+        monkeypatch, capsys, ["voiceover-pipeline", "history", "resume", "--json"]
+    )
+    assert code == 2
+    assert payload == {"status": "error", "error": "Invalid command-line arguments", "code": 2}
+
+    code, payload = _json_run(
+        monkeypatch,
+        capsys,
+        ["voiceover-pipeline", "history", "resume", str(uuid.uuid4()), "--overwrite", "--json"],
+    )
+    assert code == 2
+    assert payload["code"] == 2
+
+
+def test_history_sync_completed_run_repairs_exports_without_provider_or_script(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A completed run syncs by rewriting the four JSON exports with no provider."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый фрагмент.", "Второй фрагмент."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-sync-done")
+    )
+    assert code == 0
+    assert provider.submits == ["chunk_01", "chunk_02"]
+
+    run_root = tmp_path / "out" / "hist-sync-done"
+    run_uuid = _run_uuid("hist-sync-done")
+    _, revision_before = _run_row(native_env, run_uuid)
+    evidence_before = _evidence_counts(native_env, run_uuid)
+    # The original script is gone, and the exports are deleted to force a rebuild.
+    script.unlink()
+    (run_root / "run_state.json").unlink()
+    (run_root / "chunks" / "chunks.json").unlink()
+
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    monkeypatch.setattr(cli, "fetch_pricing_snapshot", _explode)
+
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 0
+    assert payload["status"] == "success"
+    assert payload["run_uuid"] == run_uuid
+    assert payload["mode"] == "sync"
+    assert payload["revision"] == revision_before
+    files = payload["files"]
+    assert set(files) == {"full_mp3", "run_json", "chunks_json", "manifest_json"}
+    first = {name: Path(path).read_bytes() for name, path in files.items()}
+    assert all(data for data in first.values())
+
+    # A repeated sync is byte-identical, adds no paid evidence, and bumps no revision.
+    code, second_payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+    assert code == 0
+    assert second_payload["revision"] == revision_before
+    second = {name: Path(path).read_bytes() for name, path in files.items()}
+    assert second == first
+    assert provider.submits == ["chunk_01", "chunk_02"]
+    assert _evidence_counts(native_env, run_uuid) == evidence_before
+
+    # The projection still carries the stored (now missing) script path, never re-read.
+    state = json.loads((run_root / "run_state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "completed"
+    assert "pending_attempt" not in state
+    assert state["native_history"]["history_run_uuid"] == run_uuid
+
+    # ``history resume`` of the same completed run is also export-only and free.
+    code, resume_payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "resume"))
+    assert code == 0
+    assert resume_payload["mode"] == "resume"
+    assert _evidence_counts(native_env, run_uuid) == evidence_before
+
+
+def test_history_resume_submits_only_the_unattempted_part_without_original_script(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Resume rebuilds the snapshot and submits exactly the unattempted part."""
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый.", "Второй."])
+
+    real_reserve = HistoryRepository.reserve_paid_tts_attempt
+    calls = {"n": 0}
+
+    def flaky_reserve(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("crash before the second reserve")
+        return real_reserve(self, *args, **kwargs)
+
+    monkeypatch.setattr(HistoryRepository, "reserve_paid_tts_attempt", flaky_reserve)
+    code, _payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-resume"))
+    assert code == 30
+    assert provider.submits == ["chunk_01"]
+    monkeypatch.setattr(HistoryRepository, "reserve_paid_tts_attempt", real_reserve)
+
+    run_root = tmp_path / "out" / "hist-resume"
+    run_uuid = _run_uuid("hist-resume")
+    script.unlink()
+
+    resume_provider = FakeMediaProvider()
+    _install_provider(monkeypatch, resume_provider)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "resume"))
+
+    assert code == 0, payload
+    # Part 1 was skipped; only the unattempted part was submitted.
+    assert resume_provider.submits == ["chunk_02"]
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    assert (run_root / "chunks" / "chunk_02.mp3").read_bytes() == b"chunk_02-audio"
+    assert payload["mode"] == "resume"
+    status, _revision = _run_row(native_env, run_uuid)
+    assert status == "completed"
+
+
+def test_history_sync_known_media_id_is_get_only(tmp_path, monkeypatch, capsys, native_env):
+    """Sync finishes a stored Media task id with GET recovery and never a POST."""
+    provider = FakeMediaProvider()
+
+    def accept_then_fail(inner, text, chunk_id):
+        inner.on_media_task_accepted(f"task-{chunk_id}")
+        raise requests.Timeout("poll timed out")
+
+    provider.script = accept_then_fail
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Фрагмент для GET."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-sync-get")
+    )
+    assert code == 30
+    assert provider.submits == ["chunk_01"]
+
+    run_uuid = _run_uuid("hist-sync-get")
+    sync_provider = FakeMediaProvider()
+    _install_provider(monkeypatch, sync_provider)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 0, payload
+    assert sync_provider.submits == []
+    assert sync_provider.recovers == ["task-chunk_01"]
+
+
+def test_history_sync_reconciles_on_disk_raw_without_db_link(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A crash between raw bytes and the DB row is repaired locally with no network."""
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Окно между raw и БД."])
+
+    real_link = HistoryRepository.record_polza_media_raw_saved
+    calls = {"n": 0}
+
+    def flaky_link(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("crash between raw bytes and the database row")
+        return real_link(self, *args, **kwargs)
+
+    monkeypatch.setattr(HistoryRepository, "record_polza_media_raw_saved", flaky_link)
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-sync-raw")
+    )
+    assert code == 30
+    monkeypatch.setattr(HistoryRepository, "record_polza_media_raw_saved", real_link)
+
+    run_root = tmp_path / "out" / "hist-sync-raw"
+    run_uuid = _run_uuid("hist-sync-raw")
+    assert (run_root / "raw" / "chunk_01.mp3.receipt.json").exists()
+
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 0, payload
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"chunk_01-audio"
+    assert provider.submits == ["chunk_01"]
+
+
+def test_history_sync_blocks_unattempted_part_before_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Sync never starts a new paid submit for an unattempted part."""
+    from voiceover_pipeline.history.repository import HistoryRepository
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый.", "Второй."])
+
+    real_reserve = HistoryRepository.reserve_paid_tts_attempt
+    calls = {"n": 0}
+
+    def flaky_reserve(self, *args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("crash before the second reserve")
+        return real_reserve(self, *args, **kwargs)
+
+    monkeypatch.setattr(HistoryRepository, "reserve_paid_tts_attempt", flaky_reserve)
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-sync-unattempted")
+    )
+    assert code == 30
+    monkeypatch.setattr(HistoryRepository, "reserve_paid_tts_attempt", real_reserve)
+
+    run_uuid = _run_uuid("hist-sync-unattempted")
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_SYNC_PAID_SUBMIT_REQUIRED"
+    assert provider.submits == ["chunk_01"]
+
+
+def test_history_sync_blocks_uncertain_sync_submit_before_provider(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Sync blocks a synchronous submit that was never confirmed, with zero requests."""
+    provider = FakeSyncProvider()
+
+    def fail_before_accept(_inner, _text, _chunk_id):
+        raise requests.Timeout("read timed out")
+
+    provider.script = fail_before_accept
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Неопределённый платный исход."])
+    code, _payload = _json_run(
+        monkeypatch,
+        capsys,
+        _generate_argv(
+            tmp_path, script, "hist-sync-uncertain", model=POLZA_SYNC_MODEL, voice="alloy"
+        ),
+    )
+    assert code == 30
+    assert provider.calls == ["chunk_01"]
+
+    run_uuid = _run_uuid("hist-sync-uncertain")
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
+    assert provider.calls == ["chunk_01"]
+
+
+def test_history_sync_fails_closed_on_changed_db_text(tmp_path, monkeypatch, capsys, native_env):
+    """A tampered committed text fails the verified view before any provider."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Текст, который потом изменят."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-sync-tamper")
+    )
+    assert code == 0
+    run_uuid = _run_uuid("hist-sync-tamper")
+
+    connection = sqlite3.connect(native_env / "history.sqlite3")
+    try:
+        connection.execute(
+            "UPDATE text_sources SET content = content || 'x' "
+            "WHERE kind = 'tts_script' AND part_uuid IS NOT NULL"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 30
+    assert payload["details"]["error_code"] == "NATIVE_HISTORY_UNSUPPORTED"
+    assert provider.submits == ["chunk_01"]
+
+
+def test_history_sync_missing_completed_final_audio_fails_closed(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A completed run whose final audio is gone fails closed and preserves the DB."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Готовый прогон."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-sync-final")
+    )
+    assert code == 0
+    run_root = tmp_path / "out" / "hist-sync-final"
+    run_uuid = _run_uuid("hist-sync-final")
+    final_mp3 = next(run_root.glob("*-voiceover-*.mp3"))
+    final_mp3.unlink()
+    evidence_before = _evidence_counts(native_env, run_uuid)
+
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+
+    assert code == 50
+    assert payload["details"]["error_code"] == "NATIVE_FINAL_AUDIO_MISSING"
+    assert not final_mp3.exists()
+    status, _revision = _run_row(native_env, run_uuid)
+    assert status == "completed"
+    assert _evidence_counts(native_env, run_uuid) == evidence_before
+
+
+def test_history_sync_and_resume_reject_unknown_and_invalid_identifiers(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A malformed id and an unknown UUID fail before any run or write exists."""
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Известный прогон."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-identifiers")
+    )
+    assert code == 0
+    run_uuid = _run_uuid("hist-identifiers")
+    evidence_before = _evidence_counts(native_env, run_uuid)
+
+    code, payload = _json_run(monkeypatch, capsys, _history_argv("not-a-uuid", "resume"))
+    assert code == 2
+    assert payload["details"]["error_code"] == "HISTORY_INVALID_RUN_ID"
+
+    unknown = str(uuid.uuid4())
+    for verb in ("resume", "sync"):
+        code, payload = _json_run(monkeypatch, capsys, _history_argv(unknown, verb))
+        assert code == 2
+        assert payload["details"]["error_code"] == "HISTORY_RUN_NOT_FOUND"
+
+    assert _evidence_counts(native_env, run_uuid) == evidence_before
+    assert provider.submits == ["chunk_01"]
+
+
+def test_history_resume_absent_database_creates_nothing(monkeypatch, capsys, native_env):
+    """An absent database reports not-found and creates no home, DB, or run."""
+    identifier = str(uuid.uuid4())
+    code, payload = _json_run(monkeypatch, capsys, _history_argv(identifier, "resume"))
+
+    assert code == 2
+    assert payload["details"]["error_code"] == "HISTORY_RUN_NOT_FOUND"
+    assert not (native_env / "history.sqlite3").exists()
+
+
+def test_history_resume_rejects_an_imported_legacy_run(tmp_path, monkeypatch, capsys, native_env):
+    """An imported legacy run is refused instead of being reconstructed."""
+    from voiceover_pipeline.commands.history import run_history_import
+
+    source = tmp_path / "legacy-source"
+    source.mkdir()
+    _write_legacy_tree(source)
+    imported = run_history_import(source)
+    imported_uuid = imported["runs"][0]["run_uuid"]
+
+    from voiceover_pipeline.commands.history import list_history
+
+    count_before = list_history()["count"]
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(cli, "read_api_key", _explode)
+    for verb in ("resume", "sync"):
+        code, payload = _json_run(monkeypatch, capsys, _history_argv(imported_uuid, verb))
+        assert code == 30
+        assert payload["details"]["error_code"] == "NATIVE_HISTORY_UNSUPPORTED"
+    assert list_history()["count"] == count_before
+
+
+def test_history_resume_and_sync_are_blocked_by_the_run_lock(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A held run lock fails both verbs closed instead of double-writing."""
+    from voiceover_pipeline.history.locking import acquire_run_lock
+
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Конкурентный писатель."])
+    code, _payload = _json_run(monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-lock"))
+    assert code == 0
+    run_uuid = _run_uuid("hist-lock")
+    run_root = tmp_path / "out" / "hist-lock"
+
+    with acquire_run_lock(run_root):
+        for verb in ("resume", "sync"):
+            code, payload = _json_run(monkeypatch, capsys, _history_argv(run_uuid, verb))
+            assert code == 30
+            assert payload["details"]["error_code"] == "NATIVE_RUN_LOCKED"
+
+
+def test_history_sync_output_is_metadata_only(tmp_path, monkeypatch, capsys, native_env):
+    """The sync JSON output never echoes committed text, secrets, or signed URLs."""
+    marker = "СЕКРЕТНЫЙ_МАРКЕР_ФРАГМЕНТА"
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, [f"Первый {marker}."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-privacy")
+    )
+    assert code == 0
+    run_uuid = _run_uuid("hist-privacy")
+
+    monkeypatch.setattr(sys, "argv", _history_argv(run_uuid, "sync"))
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+    assert excinfo.value.code == 0
+    printed = capsys.readouterr().out
+    assert marker not in printed
+    assert "Authorization" not in printed
+    assert "http" not in printed
+    assert "signature" not in printed

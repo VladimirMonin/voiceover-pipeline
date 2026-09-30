@@ -142,6 +142,7 @@ from .services import (
 )
 from .services.prepare import (
     PreparationError,
+    PreparedRun,
     bind_omnivoice_dialogue_fingerprints,
     default_voice,
     prepare_generation_identity,
@@ -632,6 +633,37 @@ def build_parser() -> argparse.ArgumentParser:
     hist_show = hist_sub.add_parser("show", help="Show one run metadata by UUID or label.")
     hist_show.add_argument("run", metavar="ID")
     hist_show.add_argument("--json", dest="json_output", action="store_true")
+
+    hist_resume = hist_sub.add_parser(
+        "resume",
+        help=(
+            "Resume one committed native TTS run from its stored snapshot (potentially paid: "
+            "an unattempted part may be submitted)."
+        ),
+        description=(
+            "Resume one committed native TTS run from its stored snapshot. The original script "
+            "file is not re-read. This is potentially paid: an unattempted part may be submitted "
+            "in the normal order, while a known remote id is finished with GET calls only and a "
+            "verified raw receipt is rebuilt locally. --overwrite is never accepted."
+        ),
+    )
+    hist_resume.add_argument("run", metavar="ID", help="Internal UUID of a native TTS run.")
+    hist_resume.add_argument("--json", dest="json_output", action="store_true")
+
+    hist_sync = hist_sub.add_parser(
+        "sync",
+        help=(
+            "Retrieve the stored state/result of a known native TTS run without a new paid submit."
+        ),
+        description=(
+            "Retrieve the stored state/result of a known native TTS run without a new paid "
+            "submit: repair the compatibility JSON exports of a completed run, rebuild a part "
+            "from verified raw evidence, or finish a known remote id with GET calls only. An "
+            "unattempted part or an unconfirmed submit blocks before any provider or key."
+        ),
+    )
+    hist_sync.add_argument("run", metavar="ID", help="Internal UUID of a native TTS run.")
+    hist_sync.add_argument("--json", dest="json_output", action="store_true")
 
     hist_import = hist_sub.add_parser("import", help="Import legacy out/<run-id> trees.")
     hist_import.add_argument("source", metavar="DIR")
@@ -1439,14 +1471,7 @@ def _run_native_route(
             )
         return provider_cache[0]
 
-    hooks = native_generation.NativeExecutionHooks(
-        write_audio_as_mp3=write_audio_as_mp3,
-        trim_final_silence=trim_final_silence,
-        mp3_duration_ms=mp3_duration_ms,
-        concat_audio_files=concat_audio_files,
-        sha256_file=_sha256_file,
-        progress=print if not args.json_output else (lambda _message: None),
-    )
+    hooks = _native_execution_hooks(args)
     try:
         summary = native_generation.run_native_generation(
             paths=paths,
@@ -2640,7 +2665,12 @@ def list_cmd(args: argparse.Namespace) -> None:
 
 
 def history_cmd(args: argparse.Namespace) -> None:
-    """Dispatch a ``history`` subcommand to its read-only or import handler."""
+    """Dispatch a ``history`` subcommand to its handler.
+
+    ``list``/``show``/``import`` are read-only or import-only; ``resume``/``sync``
+    reconstruct one committed native run and run the shared native executor, so
+    they are the only branches that can open the history database for writing.
+    """
     try:
         if args.history_command == "list":
             payload = history_commands.list_history(
@@ -2657,6 +2687,8 @@ def history_cmd(args: argparse.Namespace) -> None:
                 payload = history_commands.preview_history_import(args.source)
             else:
                 payload = history_commands.run_history_import(args.source)
+        elif args.history_command in ("resume", "sync"):
+            payload = _history_native_command(args, args.history_command)
         else:
             fail("Unknown history subcommand.", _EXIT_ARGS)
     except history_commands.HistoryCommandError as exc:
@@ -2708,6 +2740,15 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
             )
         return
 
+    if subcommand in ("resume", "sync"):
+        files = payload["files"]
+        verb = "Resumed" if subcommand == "resume" else "Synced"
+        print(f"{verb} run {payload['run_uuid']} (revision {payload['revision']})")
+        print(f"  Full MP3: {files['full_mp3']}")
+        print(f"  Run manifest: {files['run_json']}")
+        print(f"  Manifest: {files['manifest_json']}")
+        return
+
     if payload["dry_run"]:
         print(f"Dry run for {payload['source']} (database: {payload['database']['path']})")
         print(
@@ -2730,6 +2771,78 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 # helpers
 # ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _native_execution_hooks(args: argparse.Namespace) -> native_generation.NativeExecutionHooks:
+    """The local media seams both native routes present to the executor.
+
+    ``generate`` and ``history resume``/``history sync`` share the exact same
+    presentation and hashing seams, so a reconstructed run behaves identically to
+    the route that created it.
+    """
+    return native_generation.NativeExecutionHooks(
+        write_audio_as_mp3=write_audio_as_mp3,
+        trim_final_silence=trim_final_silence,
+        mp3_duration_ms=mp3_duration_ms,
+        concat_audio_files=concat_audio_files,
+        sha256_file=_sha256_file,
+        progress=print if not args.json_output else (lambda _message: None),
+    )
+
+
+def _native_history_provider_builder(prepared: PreparedRun) -> Any:
+    """Build the provider a reconstructed native run needs, lazily from its snapshot.
+
+    ``history resume`` and ``history sync`` recover the provider identity from the
+    committed snapshot, so an admitted ``polza-tts`` or ``openrouter-tts`` provider
+    is built from those stored values only. The API key is read when the executor
+    first calls the factory -- for a fresh unattempted submit or a known-id GET
+    recovery -- and never for an export repair or a local raw rebuild.
+    """
+    identity_args = argparse.Namespace(
+        provider=prepared.provider, model=prepared.model, voice=prepared.voice
+    )
+    api_key = read_api_key(identity_args)
+    return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
+
+
+def _history_native_command(args: argparse.Namespace, mode: str) -> dict[str, Any]:
+    """Resume or sync one committed native TTS run from its stored snapshot.
+
+    The verified view is loaded first with a read-only seam, so an unknown or
+    legacy UUID, an absent database, and a non-native snapshot all fail before any
+    write. The snapshot alone supplies the prepared parts, run paths, script
+    format, and script path; the original script file is never re-read. The
+    provider is built only when the executor actually needs one, so a completed-run
+    export repair and a local raw rebuild read no API key. ``history resume`` may
+    submit a truly unattempted part and is therefore potentially paid; ``history
+    sync`` never starts a new paid submit.
+    """
+    view = history_commands.load_native_history_view(args.run)
+    try:
+        ffmpeg_path, ffprobe_path = check_media_tools()
+    except RuntimeError as exc:
+        fail(str(exc), _EXIT_NO_FFMPEG)
+    try:
+        summary = native_generation.run_native_history_generation(
+            view=view,
+            mode=mode,
+            provider_builder=_native_history_provider_builder,
+            hooks=_native_execution_hooks(args),
+            ffmpeg_path=ffmpeg_path,
+            ffprobe_path=ffprobe_path,
+        )
+    except native_generation.NativeGenerationError as exc:
+        fail(str(exc), exc.code, details={"error_code": exc.error_code})
+    return {
+        "dry_run": False,
+        "mode": mode,
+        "run_uuid": summary.run_uuid,
+        "revision": summary.revision,
+        "files": summary.files,
+        "duration_ms": summary.duration_ms,
+        "cost": {"total": summary.cost_total, "currency": summary.cost_currency},
+    }
 
 
 def _preflight_timing_dependency(timing_provider: str = "faster-whisper") -> None:

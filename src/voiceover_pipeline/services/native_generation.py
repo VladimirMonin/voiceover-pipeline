@@ -66,6 +66,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, cast
 
+from ..artifacts import build_run_paths
 from ..execution_identity import build_execution_identity
 from ..history.database import (
     HistoryDatabase,
@@ -108,10 +109,10 @@ from ..history.repository import (
     HistoryRepositoryError,
     RunRecord,
 )
-from ..models import ScriptChunk, SynthesisResult
+from ..models import RunPaths, ScriptChunk, SynthesisResult
 from ..run_state import LOG_FILE, GenerationLogger
 from . import costs
-from .prepare import PreparedRun
+from .prepare import PreparedPart, PreparedRun
 from .recovery import polza_media_route_model
 
 # Numeric exit codes duplicated from ``cli.py`` because the CLI imports this
@@ -147,6 +148,19 @@ _ERROR_EXPORT_FAILED = "NATIVE_EXPORT_FAILED"
 _ERROR_OUTPUT_UNAVAILABLE = "NATIVE_OUTPUT_UNAVAILABLE"
 _ERROR_HISTORY_UNAVAILABLE = "NATIVE_HISTORY_UNAVAILABLE"
 _ERROR_HISTORY_CONFLICT = "NATIVE_HISTORY_CONFLICT"
+# ``history resume``/``history sync`` reconstruct one committed run from its
+# snapshot alone, so a stored identity they cannot rebuild, a run root that no
+# longer resolves to the requested committed run, a completed run whose final
+# audio is gone, and an unattempted part that ``history sync`` must not submit all
+# fail closed with their own stable code.
+_ERROR_HISTORY_INCOMPLETE = "NATIVE_HISTORY_RECONSTRUCTION_FAILED"
+_ERROR_HISTORY_RUN_MISMATCH = "NATIVE_HISTORY_RUN_MISMATCH"
+_ERROR_FINAL_AUDIO_MISSING = "NATIVE_FINAL_AUDIO_MISSING"
+_ERROR_SYNC_SUBMIT_REQUIRED = "NATIVE_SYNC_PAID_SUBMIT_REQUIRED"
+
+# Stable mode names for the two history entry points.
+_MODE_RESUME = "resume"
+_MODE_SYNC = "sync"
 
 # Recovery route of one part.
 _ROUTE_LEGACY = "legacy"
@@ -705,6 +719,7 @@ class _Executor:
         hooks: NativeExecutionHooks,
         logger: GenerationLogger,
         resume: bool,
+        paid_submit_allowed: bool = True,
     ) -> None:
         self.repository = repository
         self.view = view
@@ -721,6 +736,7 @@ class _Executor:
         self.hooks = hooks
         self.logger = logger
         self.resume = resume
+        self.paid_submit_allowed = paid_submit_allowed
         self._revision = view.run.revision
         self._provider: Any = None
 
@@ -1211,7 +1227,10 @@ class _Executor:
         Only the first part without a verified converted chunk may carry
         recoverable evidence. Any later part that already carries paid evidence
         while an earlier part is unfinished fails closed, so a partially written
-        history can never be extended by a new paid submit.
+        history can never be extended by a new paid submit. An executor created by
+        ``history sync`` (``paid_submit_allowed`` is ``False``) fails closed on an
+        unattempted part instead of submitting it, so sync never starts new paid
+        work.
         """
         evidence = _collect_evidence(self.view)
         first_incomplete_done = False
@@ -1239,8 +1258,19 @@ class _Executor:
             )
             if _has_paid_evidence(item):
                 self._process_first_incomplete(item)
-            else:
+            elif self.paid_submit_allowed:
                 self._submit_fresh_part(item)
+            else:
+                # ``history sync`` retrieves the state/result of known operations
+                # only. An unattempted part needs a new paid submit, which sync
+                # never performs, so it fails closed here before any provider or
+                # key exists instead of running the rest of the run.
+                raise NativeGenerationError(
+                    "refusing to sync: an unattempted part remains and history sync never starts "
+                    "a new paid submit. Use history resume to synthesize it.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_SYNC_SUBMIT_REQUIRED,
+                )
             first_incomplete_done = True
 
     # -- assembly and export --------------------------------------------------
@@ -1478,6 +1508,8 @@ def execute_native_tts(
     provider_factory: Callable[[], Any],
     hooks: NativeExecutionHooks,
     logger: GenerationLogger,
+    expected_run_uuid: str | None = None,
+    paid_submit_allowed: bool = True,
 ) -> NativeGenerationSummary:
     """Run one locked native TTS generation, resume, or completed-run export.
 
@@ -1487,9 +1519,24 @@ def execute_native_tts(
     identity and output settings before any paid action; a completed run is only
     re-exported. The provider factory is invoked lazily and never for a local raw
     rebuild or an export-only repair.
+
+    ``expected_run_uuid`` binds the call to one already-committed run: the run
+    found for this run directory must be exactly that run, so ``history
+    resume``/``history sync`` can neither create a new run nor silently switch to
+    another one. ``paid_submit_allowed`` is ``False`` for ``history sync``, which
+    then fails closed on an unattempted part instead of submitting it.
     """
     canonical_root = str(run_root.resolve())
     existing = _find_native_run_in_repository(repository, canonical_root)
+    if expected_run_uuid is not None and (
+        existing is None or existing.run_uuid != expected_run_uuid
+    ):
+        raise NativeGenerationError(
+            "the committed history run for this run directory does not match the run being "
+            "resumed or synced; refusing to create or switch a history run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_RUN_MISMATCH,
+        )
     if existing is None and not _fresh_run_root_available(run_root):
         raise NativeGenerationError(
             "the run directory already carries local run state; refusing to start a "
@@ -1580,6 +1627,7 @@ def execute_native_tts(
         hooks=hooks,
         logger=logger,
         resume=resume,
+        paid_submit_allowed=paid_submit_allowed,
     )
     executor.run_parts()
     executor.ensure_complete()
@@ -1601,6 +1649,8 @@ def run_native_generation(
     provider_factory: Callable[[], Any],
     hooks: NativeExecutionHooks,
     database_path: Path | None = None,
+    expected_run_uuid: str | None = None,
+    paid_submit_allowed: bool = True,
 ) -> NativeGenerationSummary:
     """Hold the run lock and the history database around one native execution.
 
@@ -1628,6 +1678,8 @@ def run_native_generation(
                     provider_factory=provider_factory,
                     hooks=hooks,
                     logger=logger,
+                    expected_run_uuid=expected_run_uuid,
+                    paid_submit_allowed=paid_submit_allowed,
                 )
     except HistoryRunLockedError as exc:
         raise NativeGenerationError(
@@ -1636,3 +1688,199 @@ def run_native_generation(
             code=_EXIT_PROVIDER,
             error_code="NATIVE_RUN_LOCKED",
         ) from exc
+
+
+# ── reconstruction from committed history ─────────────────────────────────────
+
+
+def _stored_identity_str(config: dict[str, Any], key: str) -> str:
+    """Return one required stored identity field, or fail closed.
+
+    The verified view already guarantees these fields, so this only narrows the
+    type and keeps the failure a bounded native error rather than an unexpected
+    exception. The message echoes no stored value.
+    """
+    value = config.get(key)
+    if not isinstance(value, str) or not value:
+        raise NativeGenerationError(
+            "the committed snapshot is missing an identity field a resume needs; refusing to "
+            "reconstruct the run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        )
+    return value
+
+
+@dataclass(frozen=True)
+class NativeRunReconstruction:
+    """The prepared synthesis inputs rebuilt from one committed native view.
+
+    ``prepared`` and ``chunks`` are the exact identity the run's own fingerprint
+    commits to, so a later identity preflight either passes unchanged or fails
+    closed. ``paths`` is rebuilt with the same run-path builder the fresh route
+    uses. ``script_path`` is the stored source path only: it is never read, so a
+    deleted or moved original script does not matter.
+    """
+
+    prepared: PreparedRun
+    chunks: list[ScriptChunk]
+    paths: RunPaths
+    script_path: Path
+
+
+def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
+    """Rebuild one committed native run's synthesis inputs from its verified view.
+
+    Every value comes from the committed rows the view already verified and
+    fingerprinted: the ordered parts with their exact text, cast voice, speaker,
+    and pause, plus the run provider, model, voice, style prompt, and prompt mode.
+    The run paths are rebuilt with :func:`voiceover_pipeline.artifacts.build_run_paths`
+    from the stored canonical run root, so they match the fresh route exactly. The
+    original script file is never opened: only its stored path string is returned
+    as the compatibility ``script`` field, and a snapshot that records no source
+    path at all fails closed instead of guessing one.
+    """
+    config = view.run.config_snapshot
+    if not isinstance(config, dict):  # pragma: no cover - a verified view guarantees this
+        raise NativeGenerationError(
+            "the committed snapshot is not a mapping; refusing to reconstruct the run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        )
+    chunks = [
+        ScriptChunk(
+            number=part.number,
+            id=part.chunk_id,
+            text=part.text,
+            speaker=part.speaker,
+            voice=part.cast_voice,
+            voice_fingerprint=part.voice_fingerprint,
+            pause_after_ms=part.pause_after_ms,
+        )
+        for part in view.parts
+    ]
+    model = _stored_identity_str(config, "model")
+    prepared = PreparedRun(
+        provider=_stored_identity_str(config, "provider"),
+        model=model,
+        voice=_stored_identity_str(config, "voice"),
+        style_prompt=view.style_prompt,
+        prompt_mode=_stored_identity_str(config, "prompt_mode"),
+        parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
+    )
+    run_root = Path(view.run.run_root)
+    paths = build_run_paths(run_root.parent, model, run_root.name)
+    script_path_value = view.script_path
+    if script_path_value is None:
+        raise NativeGenerationError(
+            "the committed snapshot records no source script path for its compatibility export; "
+            "refusing to guess one.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        )
+    return NativeRunReconstruction(
+        prepared=prepared,
+        chunks=chunks,
+        paths=paths,
+        script_path=Path(script_path_value),
+    )
+
+
+def _completed_final_verified(view: NativeTtsView, hooks: NativeExecutionHooks) -> bool:
+    """Whether a completed run's one final audio artifact is present and unchanged.
+
+    The export repair is the only work a completed history run may do, so a
+    completed run whose final audio is missing or tampered must fail closed
+    instead of re-running FFmpeg assembly over committed evidence.
+    """
+    finals = [artifact for artifact in view.artifacts if artifact.role == ARTIFACT_ROLE_FINAL_AUDIO]
+    if len(finals) != 1:
+        return False
+    final = finals[0]
+    if final.sha256 is None or final.size_bytes is None:
+        return False
+    path = Path(view.run.run_root) / final.path
+    if not path.is_file():
+        return False
+    try:
+        return path.stat().st_size == final.size_bytes and hooks.sha256_file(path) == final.sha256
+    except OSError:
+        return False
+
+
+def run_native_history_generation(
+    *,
+    view: NativeTtsView,
+    mode: str,
+    provider_builder: Callable[[PreparedRun], Any],
+    hooks: NativeExecutionHooks,
+    ffmpeg_path: str,
+    ffprobe_path: str,
+    database_path: Path | None = None,
+) -> NativeGenerationSummary:
+    """Resume or sync one committed native run reconstructed from its snapshot.
+
+    ``mode`` is ``"resume"`` or ``"sync"``. The synthesis inputs, run paths, script
+    format, and script path are rebuilt from ``view`` alone through
+    :func:`reconstruct_native_run`, so the original script file is never re-read.
+    ``provider_builder`` is invoked lazily and only when the executor actually needs
+    a provider, so a completed-run export repair or a local raw rebuild reads no API
+    key.
+
+    ``history resume`` may submit a truly unattempted part, so it is potentially
+    paid; it still skips every verified part, finishes a known Media task id with
+    GET calls only, and rebuilds a part locally from verified raw evidence.
+    ``history sync`` never starts a new paid submit: it repairs the compatibility
+    exports of a completed run, finishes a known Media id with GET calls only, and
+    rebuilds a part locally from verified raw evidence, but fails closed on an
+    unattempted part or an unconfirmed submit before any provider or key exists.
+
+    A completed run whose committed final audio is missing or changed fails closed
+    before any write, so the export repair never re-runs assembly over committed
+    evidence. The call is bound to ``view.run.run_uuid`` so it can neither create a
+    new run nor switch to another run on the same run root.
+    """
+    if mode not in (_MODE_RESUME, _MODE_SYNC):
+        raise NativeGenerationError(
+            "history mode must be 'resume' or 'sync'.",
+            code=_EXIT_ARGS,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        )
+    reconstruction = reconstruct_native_run(view)
+    if view.run.status == "completed" and not _completed_final_verified(view, hooks):
+        raise NativeGenerationError(
+            "refusing to resume or sync: this run is recorded as completed but its final audio "
+            "is missing or does not match the committed history. Restore the final audio and "
+            "retry.",
+            code=_EXIT_OUTPUT,
+            error_code=_ERROR_FINAL_AUDIO_MISSING,
+        )
+    provider_cache: list[Any] = []
+
+    def provider_factory() -> Any:
+        if not provider_cache:
+            provider_cache.append(provider_builder(reconstruction.prepared))
+        return provider_cache[0]
+
+    output_options = (
+        view.output_options
+        if view.output_options is not None
+        else build_output_options(no_trim=False)
+    )
+    return run_native_generation(
+        paths=reconstruction.paths,
+        prepared=reconstruction.prepared,
+        chunks=reconstruction.chunks,
+        script_format=view.script_format,
+        script_path=reconstruction.script_path,
+        output_options=output_options,
+        ffmpeg_path=ffmpeg_path,
+        ffprobe_path=ffprobe_path,
+        user_label=view.run.user_label,
+        resume=True,
+        provider_factory=provider_factory,
+        hooks=hooks,
+        database_path=database_path,
+        expected_run_uuid=view.run.run_uuid,
+        paid_submit_allowed=(mode == _MODE_RESUME),
+    )

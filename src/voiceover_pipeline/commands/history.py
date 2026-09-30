@@ -1,19 +1,26 @@
-"""Read and import command handlers for the local SQLite history.
+"""Read, import, resume, and sync command handlers for the local SQLite history.
 
-Plan section 6 stage S04 exposes the canonical history through three commands:
-``history list`` and ``history show ID`` read run metadata, and
-``history import DIR [--dry-run]`` previews or performs a safe offline import of
-old ``out/<run-id>`` trees. The handlers here stay free of CLI printing and exit
-codes; :mod:`voiceover_pipeline.cli` owns the machine envelope and human output.
+Plan section 6 stages S04 and S05 expose the canonical history through the CLI:
+``history list`` and ``history show ID`` read run metadata, ``history import DIR
+[--dry-run]`` previews or performs a safe offline import of old ``out/<run-id>``
+trees, and ``history resume ID``/``history sync ID`` load one committed native TTS
+run so the CLI can reconstruct and continue or inspect it. The handlers here stay
+free of CLI printing and exit codes; :mod:`voiceover_pipeline.cli` owns the machine
+envelope and human output.
 
 Read guarantees:
 
 * Nothing is created for an absent database. ``history list`` reports an empty
-  history and ``history show`` reports a missing run without creating the home
-  directory or the database file.
+  history, ``history show`` reports a missing run, and ``history resume``/
+  ``history sync`` report a missing run, all without creating the home directory or
+  the database file.
 * Reads go through the narrow :func:`voiceover_pipeline.history.database.connect_readonly`
   seam, so no migration, DDL, WAL switch, or sidecar write happens and a
   corrupt, foreign, or newer database fails closed instead of being queried.
+* :func:`load_native_history_view` returns one verified read-only native
+  prepared-TTS view for ``history resume ID``/``history sync ID``; a UUID that is
+  not such a snapshot fails closed with a fixed, content-free ``NATIVE_HISTORY_UNSUPPORTED``
+  reason instead of reconstructing a run whose identity was never captured.
 * stdout metadata omits prepared/source text, transcripts, raw snapshots, signed
   URLs, and secrets. Text sources and parts report completeness as booleans; a
   run's ``config_snapshot`` is never emitted. Free-form stored values
@@ -70,6 +77,13 @@ from ..history.legacy_import import (
     LegacyRunPreview,
     import_legacy_runs,
     preview_legacy_import,
+)
+from ..history.native_view import (
+    NativeTtsView,
+    NativeViewError,
+    NativeViewNotFoundError,
+    NativeViewValidationError,
+    load_native_tts_view,
 )
 from ..history.paths import (
     HistoryHomePermissionError,
@@ -573,6 +587,60 @@ def show_history(
             "database": _database_metadata(open_history, exists=True),
             **_run_detail(repository, candidates[0]),
         }
+    finally:
+        if open_history.connection is not None:
+            open_history.connection.close()
+
+
+# -- reconstructable native view ----------------------------------------------
+
+
+def load_native_history_view(
+    identifier: str, *, database_path: Path | str | None = None
+) -> NativeTtsView:
+    """Load one verified native TTS view for ``history resume``/``history sync``.
+
+    ``identifier`` must be the internal run UUID; a label is not resolved here,
+    because resume and sync mutate one exact run rather than reporting metadata.
+    The run is read through the same read-only seam as ``history show``, so an
+    absent database reports ``HISTORY_RUN_NOT_FOUND`` and an unreadable, too-new,
+    or foreign database fails closed without creating anything. A UUID that is not
+    a native prepared-TTS snapshot -- a legacy-imported run, another operation, an
+    unsupported route, or a tampered snapshot -- is refused with a fixed message
+    that echoes no stored value, so the caller never reconstructs a run whose
+    identity was never captured. Reading never creates the home directory, the
+    database, or a run row.
+    """
+    try:
+        canonical_uuid = str(uuid.UUID(identifier))
+    except (ValueError, AttributeError, TypeError):
+        raise HistoryCommandError(
+            "history resume and history sync require the internal run UUID.",
+            _EXIT_ARGS,
+            error_code="HISTORY_INVALID_RUN_ID",
+        ) from None
+    resolved = _resolve_database_path(database_path)
+    open_history = _open_history(resolved)
+    try:
+        if open_history.repository is None:
+            raise _run_not_found_error(identifier)
+        try:
+            return load_native_tts_view(open_history.repository, canonical_uuid)
+        except NativeViewNotFoundError:
+            raise _run_not_found_error(identifier) from None
+        except NativeViewValidationError:
+            raise HistoryCommandError(
+                "history resume and history sync require the internal run UUID.",
+                _EXIT_ARGS,
+                error_code="HISTORY_INVALID_RUN_ID",
+            ) from None
+        except NativeViewError:
+            raise HistoryCommandError(
+                "This history run is not a reconstructable native TTS snapshot; only an ordinary "
+                "non-dialogue polza-tts or openrouter-tts native run can be resumed or synced.",
+                _EXIT_PROVIDER,
+                error_code="NATIVE_HISTORY_UNSUPPORTED",
+            ) from None
     finally:
         if open_history.connection is not None:
             open_history.connection.close()

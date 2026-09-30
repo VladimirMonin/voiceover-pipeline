@@ -19,6 +19,8 @@
 | `verify-tts --audio --expected-file` | Fail-closed проверка пропусков, посторонней речи и повторов через локальный ASR | да |
 | `history list` | Метаданные прогонов из локальной SQLite-истории | да |
 | `history show ID` | Один прогон по внутреннему UUID или точной метке | да |
+| `history resume ID` | Возобновить нативный TTS-прогон из сохранённого снимка (потенциально платно) | да |
+| `history sync ID` | Получить сохранённое состояние/результат известного нативного прогона без нового оплаченного submit | да |
 | `history import DIR [--dry-run]` | Безопасный offline-импорт старых `out/<run-id>` каталогов | да |
 
 Все команды можно вызвать с `--json` для машинно-читаемого вывода.
@@ -473,7 +475,9 @@ JSON-writer без изменений.
   провайдера (`NATIVE_OPTIONS_UNSUPPORTED`).
 
 Этот фрагмент не завершает S05: ASR/timing/verify, dialogue и остальные
-провайдеры остаются на legacy executor.
+провайдеры остаются на legacy executor. Пользовательские глаголы
+`history resume ID` / `history sync ID`, которые восстанавливают такой прогон из
+снимка, описаны в разделе ниже.
 
 ## `verify-tts` — fail-closed quality gate
 
@@ -760,6 +764,57 @@ Dry-run сообщает найденные каталоги/записи, impor
   отклоняется (`HISTORY_HOME_PERMISSION`, exit `50`) до создания plaintext-БД.
   Ошибка записи → exit `50` `HISTORY_WRITE_ERROR`; нечитаемая/более новая/
   иностранная БД → exit `30`.
+
+## `history resume ID` / `history sync ID` — DB-first продолжение (фрагмент S05)
+
+`history resume ID` и `history sync ID` восстанавливают **один уже
+закоммиченный нативный TTS-прогон** (обычный не-диалоговый `polza-tts` /
+`openrouter-tts`, который записал снимок в canonical SQLite) из его сохранённого
+снимка и запускают тот же нативный исполнитель, что и `generate --resume`. `ID`
+— внутренний `run_uuid`; метка не разрешается, потому что resume и sync меняют
+один конкретный прогон. Оригинальный файл `script.md` **не перечитывается**: текст
+берётся из committed `tts_script` источников, а сохранённый путь остаётся только
+полем `script` в совместимом экспорте.
+
+```bash
+voiceover history resume ID --json      # потенциально платно
+voiceover history sync ID --json        # без нового оплаченного submit
+```
+
+- **Потенциально платный `resume`.** Пропускает части с проверенным
+  converted chunk, локально пересобирает часть из валидного raw receipt,
+  доводит известный Polza Media task id только GET-запросами и делает новый
+  платный POST **только** для действительно unattempted части (в обычном порядке
+  оплаты, с pre-submit маркером и обычной проверкой identity). `--overwrite` не
+  принимается вообще (exit `2`), чтобы не удалить принятые платные доказательства.
+- **Бесплатный `sync`.** Никогда не начинает новый оплаченный submit. На
+  завершённом прогоне починка ограничивается четырьмя совместимыми JSON из
+  committed DB-вида (без API-ключа, провайдера и GET); при валидном raw
+  receipt/`raw_saved` — локальная пересборка; при известном Media ID —
+  GET-only добор с ленивым построением провайдера/ключа; синхронные маршруты без
+  Media ID восстанавливаются только локально. Неотправленная (unattempted) часть
+  или неподтверждённый submit блокируют (`NATIVE_SYNC_PAID_SUBMIT_REQUIRED` /
+  `PAID_SUBMIT_UNCONFIRMED`, exit `30`) до чтения ключа и построения провайдера,
+  без единого POST; остаток прогона молча не исполняется.
+- **Один писатель и CAS.** Оба глагола идут через тот же межпроцессный run lock и
+  CAS-резервацию, что и `generate`; занятый lock → exit `30` `NATIVE_RUN_LOCKED`.
+- **Никаких новых прогонов.** Вызов привязан к запрошенному UUID, поэтому не
+  создаёт новую строку прогона и не переключается на другой прогон того же
+  `run_root` (`NATIVE_HISTORY_RUN_MISMATCH`). Неизвестный/отсутствующий UUID,
+  отсутствующая БД и ненативный (импортированный/legacy/другой provider)
+  снимок падают **до** любой записи: exit `2` `HISTORY_RUN_NOT_FOUND` /
+  `HISTORY_INVALID_RUN_ID` или exit `30` `NATIVE_HISTORY_UNSUPPORTED`; дом, БД и
+  строка прогона не создаются. Завершённый прогон, чей финальный аудиофайл
+  пропал или изменён, падает fail-closed без пересборки (exit `50`
+  `NATIVE_FINAL_AUDIO_MISSING`).
+- **Приватность.** Успешный JSON — только метаданные (`run_uuid`, `revision`,
+  `mode`, пути артефактов, длительность, cost). Полный сценарий, prepared text,
+  transcript, raw snapshot, подписанные URL и секреты не печатаются.
+
+Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
+из S05; live/listening-приёмка при этом не проводилась. S05 целиком пока не
+принят: `history costs`, ASR/timing/verify, dialogue и остальные провайдеры
+остаются на legacy executor.
 
 ## Gemini Dialogue (machine-facing)
 
