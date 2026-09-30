@@ -1,4 +1,6 @@
 import base64
+import binascii
+import json
 import re
 import time
 from collections.abc import Callable
@@ -12,6 +14,8 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
+
+POLZA_TTS_PROVIDER_ID = "polza-tts"
 
 _MEDIA_POLL_INTERVAL = 5
 _MEDIA_POLL_MAX = 60
@@ -66,7 +70,7 @@ def _audio_format_from_response(
     else:
         audio_format = _POLZA_AUDIO_CONTENT_TYPES.get(base)
         if audio_format is None:
-            raise RuntimeError(f"Polza TTS returned an unsupported audio content type: {base}.")
+            raise RuntimeError("Polza TTS returned an unsupported audio content type.")
         if audio_format == "wav" and not _has_wav_header(audio_bytes):
             raise RuntimeError("Polza TTS reported WAV audio without a valid WAV header.")
     if _has_wav_header(audio_bytes):
@@ -81,12 +85,78 @@ def _safe_media_id(value: object) -> str | None:
     return None
 
 
+def build_audio_speech_result(
+    *,
+    body: bytes,
+    requested_format: str,
+    header_generation_id: str | None,
+    transcript: str,
+    model: str,
+    voice: str,
+) -> SynthesisResult:
+    """Parse one ``/audio/speech`` JSON body into a :class:`SynthesisResult`.
+
+    A pure function of the already-received body (plus the untrusted
+    ``X-Generation-Id`` header value), so the live submit and a local replay of a
+    stored private body share exactly one parser. ``parse_float=Decimal`` keeps an
+    unquoted usage cost exact. An empty body, a non-object payload, a missing
+    ``audio`` field, an unsupported content type, or a WAV declaration without a
+    RIFF header fails closed rather than guessing an audio container.
+    """
+    if not body:
+        raise RuntimeError("Polza TTS returned an empty body.")
+    try:
+        resp_json = json.loads(body, parse_float=Decimal)
+    except (UnicodeError, ValueError, RecursionError):
+        raise RuntimeError("Polza TTS response is not valid JSON.") from None
+    if not isinstance(resp_json, dict):
+        raise RuntimeError("Polza TTS response is not a JSON object.")
+    audio_b64 = resp_json.get("audio")
+    if not isinstance(audio_b64, str) or not audio_b64:
+        raise RuntimeError("Polza TTS response is missing a valid audio field.")
+    try:
+        audio_bytes = base64.b64decode(audio_b64, validate=True)
+    except (binascii.Error, ValueError):
+        raise RuntimeError("Polza TTS response has invalid base64 audio.") from None
+    if not audio_bytes:
+        raise RuntimeError("Polza TTS response has empty decoded audio.")
+    content_type = resp_json.get("contentType")
+    audio_format = _audio_format_from_response(content_type, audio_bytes, requested_format)
+    usage = resp_json.get("usage")
+
+    generation_id = (
+        _safe_media_id(header_generation_id)
+        or _safe_media_id(resp_json.get("id"))
+        or _safe_media_id(resp_json.get("generation_id"))
+    )
+
+    return SynthesisResult(
+        audio_bytes=audio_bytes,
+        audio_format=audio_format,
+        transcript=transcript,
+        generation_id=generation_id,
+        client_path="requests",
+        raw_metadata={
+            "voice": voice,
+            "provider": POLZA_TTS_PROVIDER_ID,
+            "model": model,
+            "content_type": content_type,
+            "usage_direct": usage,
+        },
+    )
+
+
 MediaTaskAcceptedCallback = Callable[[str], None]
 MediaCompletedCallback = Callable[[str, dict | None, str | None], None]
+# A synchronous response sink persists the exact HTTP body (with its observed
+# status and the untrusted ``X-Generation-Id`` header) *before* the status check
+# and the fallible parse, so an accepted paid response is never lost to a
+# malformed payload. A sink failure propagates and stops the parse.
+RawResponseCallback = Callable[[bytes, int, str | None], None]
 
 
 class PolzaTTSProvider(TTSProvider):
-    provider_id = "polza-tts"
+    provider_id = POLZA_TTS_PROVIDER_ID
 
     def __init__(
         self,
@@ -98,6 +168,7 @@ class PolzaTTSProvider(TTSProvider):
         timeout_seconds: int = 240,
         on_media_task_accepted: MediaTaskAcceptedCallback | None = None,
         on_media_completed: MediaCompletedCallback | None = None,
+        on_raw_response: RawResponseCallback | None = None,
     ) -> None:
         self.api_key = api_key
         self.model = model
@@ -107,6 +178,7 @@ class PolzaTTSProvider(TTSProvider):
         self.timeout_seconds = timeout_seconds
         self.on_media_task_accepted = on_media_task_accepted
         self.on_media_completed = on_media_completed
+        self.on_raw_response = on_raw_response
 
     @property
     def _is_elevenlabs(self) -> bool:
@@ -132,45 +204,28 @@ class PolzaTTSProvider(TTSProvider):
             },
             timeout=self.timeout_seconds,
         )
-        if response.status_code >= 400:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text}")
-
-        if not response.content:
-            raise RuntimeError("Polza TTS returned an empty body.")
-
-        # parse_float=Decimal keeps an unquoted usage cost exact instead of
-        # routing it through a binary float; _direct_cost_kwargs extracts it.
-        resp_json = response.json(parse_float=Decimal)
-        audio_b64 = resp_json.get("audio")
-        if not audio_b64:
-            raise RuntimeError(
-                f"Polza TTS response missing 'audio' field. Keys: {list(resp_json.keys())}"
+        if self.on_raw_response is not None:
+            # Hand the exact response body to the caller before the status check
+            # and the fallible JSON parse, so a paid response is persisted first.
+            # A sink failure propagates instead of parsing a response that could
+            # not be stored.
+            self.on_raw_response(
+                response.content,
+                response.status_code,
+                response.headers.get("X-Generation-Id"),
             )
+        if response.status_code >= 400:
+            # The provider error body is untrusted and may echo the request text
+            # or a signed URL, so only the bounded status is reported.
+            raise RuntimeError(f"HTTP {response.status_code}")
 
-        audio_bytes = base64.b64decode(audio_b64)
-        content_type = resp_json.get("contentType")
-        audio_format = _audio_format_from_response(content_type, audio_bytes, self.response_format)
-        usage = resp_json.get("usage")
-
-        generation_id = (
-            response.headers.get("X-Generation-Id")
-            or resp_json.get("id")
-            or resp_json.get("generation_id")
-        )
-
-        return SynthesisResult(
-            audio_bytes=audio_bytes,
-            audio_format=audio_format,
+        return build_audio_speech_result(
+            body=response.content,
+            requested_format=self.response_format,
+            header_generation_id=response.headers.get("X-Generation-Id"),
             transcript=text,
-            generation_id=generation_id,
-            client_path="requests",
-            raw_metadata={
-                "voice": self.voice,
-                "provider": self.provider_id,
-                "model": self.model,
-                "content_type": content_type,
-                "usage_direct": usage,
-            },
+            model=self.model,
+            voice=self.voice,
         )
 
     def _synthesize_media(self, text: str, chunk_id: str) -> SynthesisResult:

@@ -498,8 +498,10 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
   прогона не читают ключ и не создают провайдера.
 - **Порядок оплаты наследуется.** Резервация части → единственный POST →
   (для async `/media`: атомарная запись accepted `remote_task_id` → наблюдённая
-  точная стоимость) → атомарная запись оплаченных байтов и bounded receipt в
-  `raw/` → связывание с БД → локальная конвертация/trim → CAS-коммит converted
+  точная стоимость; для нативного sync `polza-tts` `/audio/speech`: приватный
+  bounded HTTP body и receipt **до** status/JSON/audio parse) → атомарная запись
+  оплаченных decoded raw-байтов и bounded receipt в `raw/` → связывание с БД →
+  локальная конвертация/trim → CAS-коммит converted
   chunk → сборка из **упорядоченных DB-частей** (не по glob) → CAS-коммит
   завершения прогона. Ни один прежний маркер не даёт второй POST: `submitting`
   без подтверждения блокирует (`PAID_SUBMIT_UNCONFIRMED`), известный Media ID
@@ -507,18 +509,34 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
 - **Синхронный маршрут без remote id.** Синхронный `polza-tts`
   (`/audio/speech`), `openrouter-tts` и `polza-chat-audio` (один streaming
   `POST /chat/completions` с инлайн-аудио) возвращают аудио инлайн и никогда не дают
-  восстановимого task id. Их принятые байты и bounded receipt связываются одним
-  CAS-переходом (`submitting` → `raw_saved`, `remote_task_id = null`). Точная
-  стоимость ответа `polza-tts` пишется в той же транзакции **до FFmpeg**;
-  `openrouter-tts` и `polza-chat-audio` не отдают синхронного usage, поэтому их
-  стоимость остаётся
-  неизвестной без нового сетевого GET и не выдумывается. Потерянный или
-  неопределённый синхронный ответ оставляет `submitting` и блокирует любой
-  resume/overwrite без повторного POST/GET. Крах между записью receipt и его
-  связыванием с БД пересобирается локально по тому же receipt без POST/GET; если
-  receipt отсутствует или повреждён — блок, никогда не возврат к POST. В этом
-  узком окне наблюдённая синхронная стоимость теряется (receipt её не несёт) и
-  остаётся неизвестной, а не ложной.
+  восстановимого task id. Их принятые decoded raw-байты и bounded receipt
+  связываются одним CAS-переходом (`submitting` → `raw_saved`,
+  `remote_task_id = null`). Точная наблюдённая стоимость `polza-tts` пишется в
+  той же транзакции **до FFmpeg**; `openrouter-tts` и `polza-chat-audio` не
+  сообщают синхронного usage, их стоимость остаётся неизвестной, не нулевой.
+  Потерянный/неопределённый ответ оставляет `submitting`, блокирует resume и
+  overwrite и никогда не разрешает второй POST/GET.
+
+  Только нативный `polza-tts` `/audio/speech` сохраняет **до status check и
+  parse** точное тело полученного HTTP-ответа в приватный
+  `raw/<attempt_uuid>.response` (максимум 16 MiB, файл 0600, каталог 0700) и
+  bounded `*.response.receipt.json`: UUID попытки/части, chunk number/id,
+  synthesis fingerprint, provider/model/voice/**requested response format**,
+  HTTP status, size/SHA-256 и очищенный opaque generation ID. Ключ, заголовок
+  Authorization, текст запроса, тело или JSON keys ошибки не публикуются.
+  HTTP-ошибка и malformed/неподдержанный audio сохраняются приватно, но не
+  считаются успешным raw и не порождают retry. На `--resume`/`history resume`
+  при `submitting` сначала проверяется **любая** часть response-evidence: только
+  полный совпавший 2xx receipt+body разбирается локально с Decimal cost,
+  сверяется с существующим decoded raw receipt при его наличии и сохраняет
+  наблюдённую стоимость до FFmpeg. Отсутствующая половина, чужая identity,
+  испорченный hash, неверный формат/тело или raw-конфликт дают
+  `PAID_SUBMIT_UNCONFIRMED` без ключа, POST/GET или усвоения чужих байтов.
+  Если response-evidence **вообще не существует**, прежний decoded raw receipt
+  может восстановить старую попытку локально с неизвестной стоимостью:
+  её нельзя придумать из аудиофайла. Для legacy/OpenRouter эта новая pre-parse
+  гарантия не заявляется; Gemini 3.8 через Polza остаётся
+  `BLOCKED_PROVIDER_CONTRACT`, live не подтверждён.
 - **Экспорт — проекция.** `run_state.json`, `chunks.json`, run/manifest JSON из
   одного verified DB-вида; каждый файл несёт `history_run_uuid` и
   `history_revision`, пишется атомарно и не даёт legacy JSON-разрешения на

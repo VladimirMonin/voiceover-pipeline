@@ -62,9 +62,13 @@ Contract:
   verified raw receipt is rebuilt locally with no provider work at all. A
   synchronous route has no task id: it links the inline bytes and the exact
   ``polza-tts`` cost it reported in one transaction (``openrouter-tts`` reports
-  none, so its cost stays unknown rather than being invented), and a lost or
-  uncertain synchronous response stays a durable ``submitting`` marker that
-  blocks every later resume with no repeat POST or GET.
+  none, so its cost stays unknown rather than being invented). The synchronous
+  ``/audio/speech`` route also persists its exact HTTP response body and a bounded
+  receipt *before* the status check and the parse, so a malformed payload or a
+  crash before the database link replays that same-attempt private body locally
+  (recovering the observed cost) with no POST or GET; an unparseable body, an
+  error status, or an identity mismatch stays a durable ``submitting`` marker that
+  blocks every later resume with no repeat request.
 * Recovery decisions read and hash on-disk evidence *outside* every database
   transaction. A completed part is skipped only after its committed digest, size,
   and file presence verify; a mismatch fails closed instead of regenerating and
@@ -87,9 +91,12 @@ the snapshot, the validated ``openrouter-tts`` Gemini dialogue route, the
 single-profile monologue), and the ordinary
 non-dialogue ``qwen-local`` local routes (clone and the instructed preset/design
 modes). The
-crash window between a synchronous raw receipt and its database link (covered by
-local reconciliation) is the only place a synchronous observed cost cannot be
-rebuilt, because the receipt carries no cost; the ``polza-chat-audio`` route
+crash window between a synchronous decoded raw receipt and its database link
+(covered by local reconciliation) and the pre-parse private response body
+(persisted by the ``/audio/speech`` route and replayed locally) leave no
+synchronous observed cost that cannot be rebuilt; the ``openrouter-tts`` route
+has no response-body sink, so a crash in its narrow decode window keeps the cost
+unknown, and the ``polza-chat-audio`` route
 reports no synchronous usage, so its cost stays unknown exactly like
 ``openrouter-tts`` and it never issues a history cost GET. Cloud ASR, cloud
 timing, the other
@@ -111,7 +118,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from ..artifacts import build_run_paths, build_srt, build_timing_manifest
-from ..config import DEFAULT_TIMING_MODEL
+from ..config import DEFAULT_POLZA_TTS_RESPONSE_FORMAT, DEFAULT_TIMING_MODEL
 from ..execution_identity import build_execution_identity
 from ..gemini_dialogue import is_dialogue_format
 from ..history.database import (
@@ -168,8 +175,13 @@ from ..history.paths import HistoryPathsError, history_database_path
 from ..history.raw_receipt import (
     PaidRawReceipt,
     PaidRawReceiptError,
+    PaidSyncResponseError,
     bounded_opaque_token,
+    read_sync_response_body,
+    sync_response_evidence_present,
+    verify_sync_response_receipt,
     write_paid_raw_receipt,
+    write_sync_response_receipt,
 )
 from ..history.repository import (
     ARTIFACT_ROLE_CHUNK_AUDIO,
@@ -1554,6 +1566,17 @@ class _Executor:
             self.prepared.model
         )
 
+    def _uses_sync_response_route(self) -> bool:
+        """Whether this run submits to Polza's synchronous ``/audio/speech`` route.
+
+        Only that provider can persist its exact HTTP response body *before* the
+        status check and parse, so the pre-parse response sink and the local body
+        replay are bound to it alone. ``openrouter-tts`` also returns audio inline
+        but has no response-body sink, so it keeps the decoded-receipt
+        reconciliation and the documented unconfirmed block.
+        """
+        return self.prepared.provider == "polza-tts" and not self._uses_media_route()
+
     # -- per-part processing --------------------------------------------------
 
     def _bind_media_callbacks(
@@ -1604,6 +1627,51 @@ class _Executor:
 
         provider.on_media_task_accepted = on_accepted
         provider.on_media_completed = on_completed
+
+    def _bind_sync_response_sink(
+        self, provider: Any, *, attempt: AttemptRecord, part: NativeTtsPart
+    ) -> None:
+        """Bind the pre-parse private response sink onto the synchronous provider.
+
+        The sink is registered before the paid POST, so the exact HTTP body and its
+        bounded receipt are persisted before the provider checks the status, parses
+        JSON, or decodes audio. The receipt binds the already-reserved attempt, part,
+        chunk, synthesis fingerprint, and request identity (provider/model/voice and
+        the requested response format), so a resume can replay exactly this body
+        locally. A persistence or size failure propagates out of the provider call
+        and keeps the attempt unconfirmed instead of repeating it.
+        """
+        run_root = self.run_root
+        attempt_uuid = attempt.attempt_uuid
+        part_uuid = part.record.part_uuid
+        fingerprint = part.fingerprint
+        chunk_id = part.chunk_id
+        number = part.number
+        provider_id = self.prepared.provider
+        model = self._model()
+        voice = self.prepared.voice
+        response_format = str(
+            getattr(provider, "response_format", DEFAULT_POLZA_TTS_RESPONSE_FORMAT)
+        )
+
+        def on_response(body: bytes, status_code: int, generation_id: str | None) -> None:
+            write_sync_response_receipt(
+                run_root=run_root,
+                attempt_uuid=attempt_uuid,
+                part_uuid=part_uuid,
+                synthesis_fingerprint=fingerprint,
+                chunk_id=chunk_id,
+                number=number,
+                provider=provider_id,
+                model=model,
+                voice=voice,
+                response_format=response_format,
+                http_status=status_code,
+                body=body,
+                generation_id=generation_id,
+            )
+
+        provider.on_raw_response = on_response
 
     def _convert_and_commit(
         self, evidence: _PartEvidence, result: SynthesisResult, attempt: AttemptRecord
@@ -2708,6 +2776,11 @@ class _Executor:
             self._bind_media_callbacks(
                 provider, attempt=attempt, part=part, accepted_id=accepted_id
             )
+        elif self._uses_sync_response_route():
+            # The synchronous ``/audio/speech`` route binds a response sink before
+            # the paid POST, so its exact body is persisted before any status check
+            # or parse even if the payload is malformed.
+            self._bind_sync_response_sink(provider, attempt=attempt, part=part)
         self.logger.event("info", "paid_submit_started", chunk=part.number, id=part.chunk_id)
         try:
             result = self._invoke_provider(provider, part)
@@ -2916,6 +2989,66 @@ class _Executor:
         self._revision = run.revision
         return artifact
 
+    def _replay_sync_response(self, evidence: _PartEvidence, attempt: AttemptRecord) -> bool:
+        """Replay a verified synchronous response body locally, with no POST or GET.
+
+        The stored private body is verified against exactly this attempt and its
+        request identity, read bounded, and parsed with the same pure parser the live
+        submit uses; a successful parse links the decoded raw receipt and the exact
+        observed cost, then converts the part. An absent, mismatched, tampered, or
+        oversized body, a non-success status, or a body that will not parse returns
+        ``False`` so the caller keeps the documented unconfirmed-submit block and
+        never repeats the paid request. A decoded-raw conflict (an orphan that does
+        not belong to this attempt) also returns ``False`` instead of adopting it.
+        """
+        part = evidence.part
+        try:
+            receipt = verify_sync_response_receipt(
+                run_root=self.run_root,
+                attempt_uuid=attempt.attempt_uuid,
+                part_uuid=part.record.part_uuid,
+                synthesis_fingerprint=part.fingerprint,
+                chunk_id=part.chunk_id,
+                number=part.number,
+                provider=self.prepared.provider,
+                model=self._model(),
+                voice=self.prepared.voice,
+                response_format=DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
+            )
+        except (PaidSyncResponseError, ValueError):
+            return False
+        try:
+            body = read_sync_response_body(receipt)
+        except (PaidSyncResponseError, ValueError):
+            return False
+        from ..providers.polza_tts import build_audio_speech_result
+
+        try:
+            result = build_audio_speech_result(
+                body=body,
+                requested_format=receipt.response_format,
+                header_generation_id=receipt.generation_id,
+                transcript=part.text,
+                model=self._model(),
+                voice=self.prepared.voice,
+            )
+        except (ValueError, RuntimeError):
+            # A malformed or unsupported stored response stays private and unknown;
+            # it can never be repaired by another paid submit.
+            self.logger.event("warning", "paid_sync_response_unparseable", chunk=part.number)
+            return False
+        result = replace(result, generation_id=bounded_opaque_token(result.generation_id))
+        try:
+            updated = self._link_sync_raw(part, attempt, result=result)
+        except (PaidRawReceiptError, HistoryRepositoryError):
+            # An orphan decoded-raw file that does not match this exact attempt is a
+            # conflict, so the part is blocked rather than adopting foreign bytes.
+            self.logger.event("warning", "paid_sync_raw_conflict", chunk=part.number)
+            return False
+        self.logger.event("info", "paid_sync_response_replay", chunk=part.number, id=part.chunk_id)
+        self._convert_and_commit(evidence, result, updated)
+        return True
+
     def _process_first_incomplete(self, evidence: _PartEvidence) -> None:
         """Recover or submit exactly the first part without a verified chunk file."""
         attempt = evidence.attempt
@@ -2929,14 +3062,27 @@ class _Executor:
         status = attempt.status
         if status == ATTEMPT_STATUS_SUBMITTING:
             if not self._uses_media_route():
-                # A synchronous POST with no remote task id can still have been
-                # accepted: if its response was received, the raw bytes and their
-                # receipt are already on disk. Reconcile exactly that same-attempt
-                # local evidence and rebuild the part with no POST and no GET.
-                linked = self._reconcile_sync_raw_receipt(evidence, attempt)
-                if linked is not None:
-                    self._convert_from_raw(replace(evidence, raw_artifact=linked), attempt)
-                    return
+                # A saved private response carries the observed cost even when
+                # decoded raw bytes were written before their DB link. Replay it
+                # first if either response half exists; invalid/incomplete evidence
+                # blocks rather than falling back to a raw-only link without cost.
+                response_evidence = False
+                if self._uses_sync_response_route():
+                    try:
+                        response_evidence = sync_response_evidence_present(
+                            run_root=self.run_root, attempt_uuid=attempt.attempt_uuid
+                        )
+                    except (OSError, ValueError):
+                        response_evidence = True  # fail closed on unreadable evidence
+                    if response_evidence and self._replay_sync_response(evidence, attempt):
+                        return
+                if not response_evidence:
+                    # Older synchronous runs have only a decoded raw receipt.
+                    # Keep their local recovery without inventing a cost.
+                    linked = self._reconcile_sync_raw_receipt(evidence, attempt)
+                    if linked is not None:
+                        self._convert_from_raw(replace(evidence, raw_artifact=linked), attempt)
+                        return
             # No recoverable evidence exists, so the paid outcome is unknown and
             # must never be repeated automatically.
             raise NativeGenerationError(

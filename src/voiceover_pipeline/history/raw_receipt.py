@@ -9,6 +9,13 @@ remote id, the digest, the format, the deterministic relative path, and the
 size. A later caller matches that evidence to an existing SQLite run/attempt
 identity; the receipt alone never authorizes a new paid POST.
 
+A synchronous paid TTS submit has no accepted remote id, so it also persists
+its exact HTTP response *body* here, before any status check, JSON parse, or
+audio decode. That private body plus its bounded receipt is bound to the same
+already-reserved attempt, part, chunk, synthesis fingerprint, and request
+identity, so a malformed or unsupported payload can be replayed locally with
+no second POST instead of being lost.
+
 This module is evidence storage, not a second state engine. Nothing here opens
 the database, holds a transaction, calls a provider, polls or downloads a media
 task, or runs FFmpeg. Every public function validates all inputs before touching
@@ -41,6 +48,45 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+# Run-local suffix and artifact identity for one synchronous provider response.
+# The body and its receipt live beside the decoded raw audio and are named by the
+# attempt UUID, so they never collide with the deterministic ``raw/<chunk-id>.*``
+# decoded files and a resume never has to guess which attempt a body belongs to.
+RESPONSE_RECEIPT_ARTIFACT_TYPE = "voiceover-paid-sync-response-receipt"
+RESPONSE_RECEIPT_VERSION = 1
+RESPONSE_FILE_SUFFIX = ".response"
+# A provider response body is attacker- or proxy-influenceable, so it is bounded
+# before it is stored, and it is bounded again before it is read for replay.
+MAX_RESPONSE_BODY_BYTES = 16 * 1024 * 1024
+# A body a resume may replay must be a successful response. An error status body
+# stays private evidence but never becomes a usable paid response, so a server
+# error can never be replayed as audio.
+_RESPONSE_SUCCESS_MIN = 200
+_RESPONSE_SUCCESS_MAX = 299
+_MIN_HTTP_STATUS = 100
+_MAX_HTTP_STATUS = 599
+# Upper bound for the non-secret request identity strings committed with a body.
+_MAX_IDENTITY_CHARS = 256
+
+_RESPONSE_RECEIPT_FIELDS = (
+    "artifact_type",
+    "receipt_version",
+    "attempt_uuid",
+    "part_uuid",
+    "synthesis_fingerprint",
+    "chunk_id",
+    "number",
+    "provider",
+    "model",
+    "voice",
+    "response_format",
+    "http_status",
+    "generation_id",
+    "path",
+    "size",
+    "sha256",
+)
 
 # Run-local directory that holds raw paid audio and its receipts.
 RAW_DIRECTORY_NAME = "raw"
@@ -96,6 +142,18 @@ class PaidRawReceiptConflictError(PaidRawReceiptError):
 
 class PaidRawReceiptVerificationError(PaidRawReceiptError):
     """Stored paid raw evidence is missing, malformed, or does not match."""
+
+
+class PaidSyncResponseError(PaidRawReceiptError):
+    """Base class for a synchronous provider response evidence contract violation."""
+
+
+class PaidSyncResponseConflictError(PaidSyncResponseError):
+    """A synchronous response body could not be stored or conflicts with another attempt."""
+
+
+class PaidSyncResponseVerificationError(PaidSyncResponseError):
+    """Stored synchronous response evidence is missing, malformed, or does not match."""
 
 
 @dataclass(frozen=True)
@@ -733,3 +791,485 @@ def verify_paid_raw_receipt(
         # the public message is fixed while the cause stays chained for diagnosis.
         raise error("cannot read paid raw evidence from the run directory") from exc
     return _receipt_from_payload(root, stored)
+
+
+# -- synchronous provider response evidence ------------------------------------
+
+
+def _bounded_identity(value: Any) -> str | None:
+    """Keep only a bounded, control-free, non-empty identity string."""
+    if not isinstance(value, str) or not value or len(value) > _MAX_IDENTITY_CHARS:
+        return None
+    if any(character in value for character in ("\x00", "\r", "\n")):
+        return None
+    return value
+
+
+def _require_identity(value: Any, field_name: str) -> str:
+    """Return a bounded identity string, or raise without echoing the value."""
+    bounded = _bounded_identity(value)
+    if bounded is None:
+        raise ValueError(f"{field_name} must be a bounded non-empty string")
+    return bounded
+
+
+def _bounded_http_status(value: Any) -> int | None:
+    """Keep only a real HTTP status code, else report unknown."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if _MIN_HTTP_STATUS <= value <= _MAX_HTTP_STATUS else None
+
+
+def _require_http_status(value: Any) -> int:
+    """Return a bounded HTTP status code, or raise without echoing it."""
+    bounded = _bounded_http_status(value)
+    if bounded is None:
+        raise ValueError("http_status must be a valid HTTP status code")
+    return bounded
+
+
+def _response_file_name(attempt_uuid: str) -> str:
+    """Return the deterministic response body file name for one attempt."""
+    return f"{attempt_uuid}{RESPONSE_FILE_SUFFIX}"
+
+
+def _response_receipt_name(attempt_uuid: str) -> str:
+    """Return the deterministic response receipt file name for one attempt."""
+    return f"{_response_file_name(attempt_uuid)}.receipt.json"
+
+
+def _response_relative_path(attempt_uuid: str) -> str:
+    """Return the deterministic run-relative response body path for one attempt."""
+    return f"{RAW_DIRECTORY_NAME}/{_response_file_name(attempt_uuid)}"
+
+
+@dataclass(frozen=True)
+class SyncResponseReceipt:
+    """The bounded evidence of one synchronous paid provider response body.
+
+    ``generation_id`` is the sanitized opaque ``X-Generation-Id`` header value (or
+    ``None`` when the provider reported none or a value that is not a bounded
+    token). ``http_status`` is the observed status code. ``relative_path`` and
+    ``body_path`` point at the private run-local body. No request text, API key,
+    signed URL, or provider error body is carried in the receipt itself.
+    """
+
+    attempt_uuid: str
+    part_uuid: str
+    synthesis_fingerprint: str
+    chunk_id: str
+    number: int
+    provider: str
+    model: str
+    voice: str
+    response_format: str
+    http_status: int
+    generation_id: str | None
+    relative_path: str
+    size: int
+    sha256: str
+    body_path: Path
+
+
+def _new_response_receipt_payload(
+    *,
+    attempt_uuid: str,
+    part_uuid: str,
+    synthesis_fingerprint: str,
+    chunk_id: str,
+    number: int,
+    provider: str,
+    model: str,
+    voice: str,
+    response_format: str,
+    http_status: int,
+    generation_id: str | None,
+    relative_path: str,
+    size: int,
+    sha256: str,
+) -> dict[str, Any]:
+    """Assemble the exact bounded response-receipt payload for validated inputs."""
+    return {
+        "artifact_type": RESPONSE_RECEIPT_ARTIFACT_TYPE,
+        "receipt_version": RESPONSE_RECEIPT_VERSION,
+        "attempt_uuid": attempt_uuid,
+        "part_uuid": part_uuid,
+        "synthesis_fingerprint": synthesis_fingerprint,
+        "chunk_id": chunk_id,
+        "number": number,
+        "provider": provider,
+        "model": model,
+        "voice": voice,
+        "response_format": response_format,
+        "http_status": http_status,
+        "generation_id": generation_id,
+        "path": relative_path,
+        "size": size,
+        "sha256": sha256,
+    }
+
+
+def _normalize_response_receipt(
+    payload: dict[str, Any], *, error: type[PaidRawReceiptError]
+) -> dict[str, Any]:
+    """Validate and normalize a parsed response receipt, or raise ``error``."""
+    if payload["artifact_type"] != RESPONSE_RECEIPT_ARTIFACT_TYPE:
+        raise error("paid sync response receipt has an unexpected artifact type")
+    version = payload["receipt_version"]
+    if isinstance(version, bool) or version != RESPONSE_RECEIPT_VERSION:
+        raise error("paid sync response receipt has an unsupported version")
+    attempt = _bounded_uuid(payload["attempt_uuid"])
+    part = _bounded_uuid(payload["part_uuid"])
+    fingerprint = _bounded_sha256(payload["synthesis_fingerprint"])
+    number = _bounded_chunk_number(payload["number"])
+    chunk_id = _bounded_chunk_id(payload["chunk_id"], number)
+    provider = _bounded_identity(payload["provider"])
+    model = _bounded_identity(payload["model"])
+    voice = _bounded_identity(payload["voice"])
+    response_format = _bounded_identity(payload["response_format"])
+    http_status = _bounded_http_status(payload["http_status"])
+    stored_generation = payload["generation_id"]
+    generation = None if stored_generation is None else _bounded_opaque(stored_generation)
+    size = _bounded_size(payload["size"])
+    sha256 = _bounded_sha256(payload["sha256"])
+    if (
+        attempt is None
+        or part is None
+        or fingerprint is None
+        or number is None
+        or chunk_id is None
+        or provider is None
+        or model is None
+        or voice is None
+        or response_format is None
+        or http_status is None
+        or size is None
+        or size == 0
+        or size > MAX_RESPONSE_BODY_BYTES
+        or sha256 is None
+        or (stored_generation is not None and generation is None)
+    ):
+        raise error("paid sync response receipt does not carry valid bounded evidence")
+    expected_path = _response_relative_path(attempt)
+    if payload["path"] != expected_path:
+        raise error("paid sync response receipt path is not the deterministic response path")
+    return {
+        "artifact_type": RESPONSE_RECEIPT_ARTIFACT_TYPE,
+        "receipt_version": RESPONSE_RECEIPT_VERSION,
+        "attempt_uuid": attempt,
+        "part_uuid": part,
+        "synthesis_fingerprint": fingerprint,
+        "chunk_id": chunk_id,
+        "number": number,
+        "provider": provider,
+        "model": model,
+        "voice": voice,
+        "response_format": response_format,
+        "http_status": http_status,
+        "generation_id": generation,
+        "path": expected_path,
+        "size": size,
+        "sha256": sha256,
+    }
+
+
+def _read_response_receipt_payload(
+    receipt_path: Path, *, error: type[PaidRawReceiptError]
+) -> dict[str, Any]:
+    """Read a bounded response receipt as normalized evidence, or raise ``error``."""
+    _require_regular_file(receipt_path, error=error, label="paid sync response receipt")
+    try:
+        with receipt_path.open("rb") as handle:
+            raw = handle.read(_MAX_RECEIPT_BYTES + 1)
+    except OSError as exc:
+        raise error("cannot read paid sync response receipt") from exc
+    if len(raw) > _MAX_RECEIPT_BYTES:
+        raise error("paid sync response receipt is larger than the bounded maximum")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise error("paid sync response receipt is not valid JSON") from exc
+    if not isinstance(payload, dict):
+        raise error("paid sync response receipt is not a JSON object")
+    if set(payload) != set(_RESPONSE_RECEIPT_FIELDS):
+        raise error("paid sync response receipt does not carry exactly the bounded fields")
+    return _normalize_response_receipt(payload, error=error)
+
+
+def _response_receipt_from_payload(run_root: Path, payload: dict[str, Any]) -> SyncResponseReceipt:
+    """Build the frozen response receipt value object from validated evidence."""
+    return SyncResponseReceipt(
+        attempt_uuid=payload["attempt_uuid"],
+        part_uuid=payload["part_uuid"],
+        synthesis_fingerprint=payload["synthesis_fingerprint"],
+        chunk_id=payload["chunk_id"],
+        number=payload["number"],
+        provider=payload["provider"],
+        model=payload["model"],
+        voice=payload["voice"],
+        response_format=payload["response_format"],
+        http_status=payload["http_status"],
+        generation_id=payload["generation_id"],
+        relative_path=payload["path"],
+        size=payload["size"],
+        sha256=payload["sha256"],
+        body_path=run_root / payload["path"],
+    )
+
+
+def write_sync_response_receipt(
+    *,
+    run_root: Path | str,
+    attempt_uuid: str,
+    part_uuid: str,
+    synthesis_fingerprint: str,
+    chunk_id: str,
+    number: int,
+    provider: str,
+    model: str,
+    voice: str,
+    response_format: str,
+    http_status: int,
+    body: bytes,
+    generation_id: str | None = None,
+) -> SyncResponseReceipt:
+    """Persist a synchronous provider response body and its bounded receipt.
+
+    The exact HTTP body is written to the deterministic ``raw/<attempt>.response``
+    path together with a bounded receipt, both private and atomic, *before* any
+    status check, JSON parse, or audio decode, so an accepted paid response is
+    never lost to a malformed or unsupported payload. ``generation_id`` is the
+    untrusted ``X-Generation-Id`` header value and is sanitized to a bounded opaque
+    token (or ``None``) before it is stored, so an invalid header never fails a
+    valid body. An oversized, empty, or unstorable body fails closed. A repeated
+    call with identical bytes and identity is an idempotent no-op; any existing
+    evidence that does not match this exact attempt is a conflict, so another paid
+    attempt is never overwritten or adopted. No database row is written here, and
+    a present body never authorizes a new paid POST on its own.
+    """
+    try:
+        root = _require_absolute_run_root(run_root)
+        attempt = _require_uuid(attempt_uuid, "attempt_uuid")
+        part = _require_uuid(part_uuid, "part_uuid")
+        fingerprint = _require_sha256(synthesis_fingerprint, "synthesis_fingerprint")
+        bounded_number = _require_chunk_number(number)
+        bounded_id = _require_chunk_id(chunk_id, bounded_number)
+        bounded_provider = _require_identity(provider, "provider")
+        bounded_model = _require_identity(model, "model")
+        bounded_voice = _require_identity(voice, "voice")
+        bounded_format = _require_identity(response_format, "response_format")
+        bounded_status = _require_http_status(http_status)
+        if not isinstance(body, (bytes, bytearray)):
+            raise ValueError("body must be bytes")
+        data = bytes(body)
+        if not data:
+            raise ValueError("body must not be empty")
+        if len(data) > MAX_RESPONSE_BODY_BYTES:
+            raise PaidSyncResponseConflictError(
+                "the paid sync response body exceeds the bounded maximum"
+            )
+        bounded_generation = _bounded_opaque(generation_id)
+
+        relative_path = _response_relative_path(attempt)
+        payload = _new_response_receipt_payload(
+            attempt_uuid=attempt,
+            part_uuid=part,
+            synthesis_fingerprint=fingerprint,
+            chunk_id=bounded_id,
+            number=bounded_number,
+            provider=bounded_provider,
+            model=bounded_model,
+            voice=bounded_voice,
+            response_format=bounded_format,
+            http_status=bounded_status,
+            generation_id=bounded_generation,
+            relative_path=relative_path,
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
+
+        raw_dir = _prepare_raw_directory(root)
+        body_path = raw_dir / _response_file_name(attempt)
+        receipt_path = raw_dir / _response_receipt_name(attempt)
+
+        if _path_present(body_path) or _path_present(receipt_path):
+            return _existing_response_evidence(
+                run_root=root,
+                body_path=body_path,
+                receipt_path=receipt_path,
+                payload=payload,
+                data=data,
+            )
+
+        _atomic_write_private(body_path, data)
+        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        _atomic_write_private(receipt_path, serialized.encode("utf-8") + b"\n")
+    except OSError as exc:
+        # The underlying OSError text normally carries the absolute run path, so
+        # the public message is fixed while the cause stays chained for diagnosis.
+        raise PaidSyncResponseConflictError(
+            "cannot store paid sync response evidence in the run directory"
+        ) from exc
+    return _response_receipt_from_payload(root, payload)
+
+
+def _existing_response_evidence(
+    *,
+    run_root: Path,
+    body_path: Path,
+    receipt_path: Path,
+    payload: dict[str, Any],
+    data: bytes,
+) -> SyncResponseReceipt:
+    """Return the matching receipt of an identical repeat, else raise a conflict.
+
+    Both halves must be present, non-symlinked regular files, and must describe
+    exactly this attempt with exactly these bytes. Anything else is a conflict,
+    because it could be another paid attempt whose evidence must not be
+    overwritten or adopted.
+    """
+    if not (_path_present(body_path) and _path_present(receipt_path)):
+        raise PaidSyncResponseConflictError(
+            "incomplete paid sync response evidence: body and receipt must both be present"
+        )
+    _require_regular_file(
+        body_path, error=PaidSyncResponseConflictError, label="paid sync response body"
+    )
+    stored = _read_response_receipt_payload(receipt_path, error=PaidSyncResponseConflictError)
+    if stored != payload:
+        raise PaidSyncResponseConflictError(
+            "existing paid sync response receipt belongs to a different paid attempt"
+        )
+    if _file_size(
+        body_path, error=PaidSyncResponseConflictError, label="paid sync response body"
+    ) != len(data):
+        raise PaidSyncResponseConflictError("existing paid sync response body has a different size")
+    if (
+        _sha256_file(
+            body_path, error=PaidSyncResponseConflictError, label="paid sync response body"
+        )
+        != payload["sha256"]
+    ):
+        raise PaidSyncResponseConflictError(
+            "existing paid sync response body has a different digest"
+        )
+    return _response_receipt_from_payload(run_root, stored)
+
+
+def sync_response_evidence_present(*, run_root: Path | str, attempt_uuid: str) -> bool:
+    """Whether either private response half exists, including a dangling symlink.
+
+    A pre-feature synchronous attempt may only have a decoded raw receipt. When
+    either new response half exists, however, replay must verify it instead of
+    taking the older raw-only path and discarding an observed paid cost.
+    """
+    root = _require_absolute_run_root(run_root)
+    attempt = _require_uuid(attempt_uuid, "attempt_uuid")
+    raw_dir = root / RAW_DIRECTORY_NAME
+    return _path_present(raw_dir / _response_file_name(attempt)) or _path_present(
+        raw_dir / _response_receipt_name(attempt)
+    )
+
+
+def verify_sync_response_receipt(
+    *,
+    run_root: Path | str,
+    attempt_uuid: str,
+    part_uuid: str,
+    synthesis_fingerprint: str,
+    chunk_id: str,
+    number: int,
+    provider: str,
+    model: str,
+    voice: str,
+    response_format: str,
+) -> SyncResponseReceipt:
+    """Verify stored synchronous response evidence for local replay, or raise.
+
+    The receipt and body must both exist as regular non-symlink files inside a
+    private ``raw`` directory, the receipt must carry exactly the bounded fields,
+    and its attempt, part, fingerprint, chunk, number, and request identity must
+    match the requested run. The observed status must be a successful response and
+    the body's size and digest must match the receipt, so a replayed body is never
+    guessed from a file name. Any tampered, mismatched, missing, oversized, or
+    traversal-shaped evidence raises :class:`PaidSyncResponseVerificationError`.
+    """
+    error = PaidSyncResponseVerificationError
+    try:
+        root = _require_absolute_run_root(run_root)
+        attempt = _require_uuid(attempt_uuid, "attempt_uuid")
+        part = _require_uuid(part_uuid, "part_uuid")
+        fingerprint = _require_sha256(synthesis_fingerprint, "synthesis_fingerprint")
+        bounded_number = _require_chunk_number(number)
+        bounded_id = _require_chunk_id(chunk_id, bounded_number)
+        expected_provider = _require_identity(provider, "provider")
+        expected_model = _require_identity(model, "model")
+        expected_voice = _require_identity(voice, "voice")
+        expected_format = _require_identity(response_format, "response_format")
+
+        raw_dir = root / RAW_DIRECTORY_NAME
+        if raw_dir.is_symlink() or not raw_dir.is_dir():
+            raise error("paid raw directory is missing or not a directory")
+        _require_private_raw_directory(raw_dir, error=error)
+        body_path = raw_dir / _response_file_name(attempt)
+        receipt_path = raw_dir / _response_receipt_name(attempt)
+        if not _path_present(receipt_path):
+            raise error("paid sync response receipt is missing")
+        if not _path_present(body_path):
+            raise error("paid sync response body is missing")
+
+        stored = _read_response_receipt_payload(receipt_path, error=error)
+        expected_identity = {
+            "attempt_uuid": attempt,
+            "part_uuid": part,
+            "synthesis_fingerprint": fingerprint,
+            "chunk_id": bounded_id,
+            "number": bounded_number,
+            "provider": expected_provider,
+            "model": expected_model,
+            "voice": expected_voice,
+            "response_format": expected_format,
+        }
+        for key, value in expected_identity.items():
+            if stored[key] != value:
+                raise error("paid sync response receipt does not match the requested identity")
+        if not _RESPONSE_SUCCESS_MIN <= stored["http_status"] <= _RESPONSE_SUCCESS_MAX:
+            raise error("the stored paid sync response is not a successful response")
+        _require_regular_file(body_path, error=error, label="paid sync response body")
+        if _file_size(body_path, error=error, label="paid sync response body") != stored["size"]:
+            raise error("paid sync response body size does not match the receipt")
+        if (
+            _sha256_file(body_path, error=error, label="paid sync response body")
+            != stored["sha256"]
+        ):
+            raise error("paid sync response body digest does not match the receipt")
+    except OSError as exc:
+        # The underlying OSError text normally carries the absolute run path, so
+        # the public message is fixed while the cause stays chained for diagnosis.
+        raise error("cannot read paid sync response evidence from the run directory") from exc
+    return _response_receipt_from_payload(root, stored)
+
+
+def read_sync_response_body(receipt: SyncResponseReceipt) -> bytes:
+    """Return the validated private response body of one verified receipt.
+
+    The body is read bounded and re-checked against the receipt's size and digest,
+    so a body replaced between verification and read fails closed instead of being
+    parsed. At most the bound plus one byte is read, so an oversized body is
+    refused before its full contents are allocated.
+    """
+    error = PaidSyncResponseVerificationError
+    path = receipt.body_path
+    _require_regular_file(path, error=error, label="paid sync response body")
+    if _file_size(path, error=error, label="paid sync response body") != receipt.size:
+        raise error("paid sync response body size does not match the receipt")
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(MAX_RESPONSE_BODY_BYTES + 1)
+    except OSError as exc:
+        raise error("cannot read the paid sync response body") from exc
+    if len(data) > MAX_RESPONSE_BODY_BYTES:
+        raise error("the paid sync response body exceeds the bounded maximum")
+    if hashlib.sha256(data).hexdigest() != receipt.sha256:
+        raise error("paid sync response body digest does not match the receipt")
+    return data
