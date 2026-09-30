@@ -7,8 +7,10 @@ atomic multi-entity inserts through one transaction, database-enforced run
 ownership, exact ``Decimal`` and preserved legacy-number money, fail-closed
 snapshot redaction and path classification, UTF-8 text completeness, and
 bounded metadata queries. The paid Polza seams cover the pre-submit reservation,
-the accepted media task id, and the provider-observed media cost that must be
-durable before a signed-URL download.
+the accepted media task id, the provider-observed media cost that must be
+durable before a signed-URL download, and the verified raw-artifact link that
+joins already-saved paid bytes to their attempt without holding a database
+transaction across file hashing.
 """
 
 import json
@@ -18,8 +20,10 @@ from pathlib import Path
 
 import pytest
 
+import voiceover_pipeline.history.raw_receipt as raw_receipt_module
 import voiceover_pipeline.history.repository as history_repository_module
 from voiceover_pipeline.history.database import HistoryDatabase
+from voiceover_pipeline.history.raw_receipt import write_paid_raw_receipt
 from voiceover_pipeline.history.repository import (
     AVAILABILITY_MISSING,
     AVAILABILITY_PRESENT,
@@ -38,6 +42,7 @@ from voiceover_pipeline.history.repository import (
     HistoryPaidAttemptInTransactionError,
     HistoryPaidMediaCostConflictError,
     HistoryPaidMediaTaskConflictError,
+    HistoryPaidRawConflictError,
     HistoryPartNotFoundError,
     HistoryRepository,
     HistoryRevisionConflictError,
@@ -2376,3 +2381,599 @@ def test_record_polza_media_observed_cost_fails_closed_when_guarded_update_is_ig
     assert unchanged is not None
     assert unchanged.cost.amount is None
     assert unchanged.cost.source == COST_SOURCE_UNKNOWN
+
+
+# -- paid Polza Media verified raw artifact link ----------------------------
+
+_RAW_FINGERPRINT = "a" * 64
+_RAW_AUDIO = b"PAID-RAW-MARKER" + bytes(range(16))
+_RAW_REMOTE_TASK_ID = "media_task_01"
+_RAW_GENERATION_ID = "gen-media-123"
+
+
+def _write_media_receipt(tmp_path, attempt_uuid, part_uuid, overrides=None):
+    """Write the bounded paid raw receipt for a synthetic media attempt."""
+    kwargs = {
+        "run_root": str(tmp_path),
+        "attempt_uuid": attempt_uuid,
+        "part_uuid": part_uuid,
+        "synthesis_fingerprint": _RAW_FINGERPRINT,
+        "chunk_id": "chunk_01",
+        "number": 1,
+        "audio_format": "mp3",
+        "audio_bytes": _RAW_AUDIO,
+        "remote_task_id": _RAW_REMOTE_TASK_ID,
+        "generation_id": _RAW_GENERATION_ID,
+    }
+    if overrides:
+        kwargs.update(overrides)
+    return write_paid_raw_receipt(**kwargs)
+
+
+def _accepted_media_attempt_with_raw(repository, tmp_path, **overrides):
+    """Reserve, accept, and save raw evidence for one paid media attempt."""
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_RAW_FINGERPRINT)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+    _, accepted = repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=reserved.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        remote_task_id=_RAW_REMOTE_TASK_ID,
+    )
+    receipt = _write_media_receipt(
+        tmp_path, accepted.attempt_uuid, part.part_uuid, overrides=overrides
+    )
+    return run, part, accepted, receipt
+
+
+def _record_raw_saved(repository, run, part, attempt, receipt, *, expected_revision=3):
+    """Call the raw-saved seam for the synthetic media fixture."""
+    return repository.record_polza_media_raw_saved(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=expected_revision,
+        receipt=receipt,
+    )
+
+
+def _assert_no_raw_link(repository, run, attempt, *, revision=3, status=None):
+    """Assert the raw-saved seam left run, attempt, parts, and artifacts unchanged."""
+    reloaded = repository.get_run(run.run_uuid)
+    assert reloaded is not None and reloaded.revision == revision
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None
+    if status is not None:
+        assert unchanged.status == status
+    assert repository.get_artifacts(run.run_uuid) == []
+    assert all(stored_part.stage is None for stored_part in repository.get_parts(run.run_uuid))
+
+
+def test_record_polza_media_raw_saved_links_verified_evidence(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+
+    advanced, updated, artifact = _record_raw_saved(repository, run, part, attempt, receipt)
+
+    assert advanced.run_uuid == run.run_uuid
+    assert advanced.revision == 4
+    assert updated.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    # The immutable accepted remote id, provider identity, and still-unknown cost
+    # survive the transition untouched.
+    assert updated.remote_id == _RAW_REMOTE_TASK_ID
+    assert updated.provider == "polza-tts"
+    assert updated.model == "elevenlabs/eleven_multilingual_v2"
+    assert updated.cost.amount is None
+    assert updated.cost.source == COST_SOURCE_UNKNOWN
+
+    artifacts = repository.get_artifacts(run.run_uuid)
+    assert [stored.artifact_uuid for stored in artifacts] == [artifact.artifact_uuid]
+    assert artifact.role == history_repository_module.ARTIFACT_ROLE_PAID_RAW_AUDIO
+    assert artifact.path_kind == PATH_KIND_MANAGED_RELATIVE
+    assert artifact.path == "raw/chunk_01.mp3"
+    assert artifact.part_uuid == part.part_uuid
+    assert artifact.attempt_uuid == attempt.attempt_uuid
+    assert artifact.sha256 == receipt.sha256
+    assert artifact.size_bytes == len(_RAW_AUDIO)
+    assert artifact.mime == "audio/mpeg"
+    assert artifact.media_metadata == {
+        "format": "mp3",
+        "chunk_id": "chunk_01",
+        "number": 1,
+        "generation_id": _RAW_GENERATION_ID,
+    }
+    # The part stage records the paid progression only while it was unset.
+    stored_part = repository.get_parts(run.run_uuid)[0]
+    assert stored_part.stage == history_repository_module.PART_STAGE_RAW_SAVED
+
+
+def test_record_polza_media_raw_saved_preserves_observed_cost(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    repository.record_polza_media_observed_cost(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        amount="0.1250",
+    )
+
+    advanced, updated, _artifact = _record_raw_saved(
+        repository, run, part, attempt, receipt, expected_revision=4
+    )
+
+    assert advanced.revision == 5
+    assert updated.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert updated.cost.amount == "0.1250"
+    assert updated.cost.source == COST_SOURCE_EXACT
+    assert updated.cost.exact_available is True
+    assert updated.remote_id == _RAW_REMOTE_TASK_ID
+
+
+def test_record_polza_media_raw_saved_hashes_outside_any_transaction(
+    repository, tmp_path, monkeypatch
+):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    observed: list[bool] = []
+    real_sha256_file = raw_receipt_module._sha256_file
+
+    def recording_sha256_file(path, *, error, label):
+        observed.append(repository._connection.in_transaction)
+        return real_sha256_file(path, error=error, label=label)
+
+    monkeypatch.setattr(raw_receipt_module, "_sha256_file", recording_sha256_file)
+
+    _record_raw_saved(repository, run, part, attempt, receipt)
+
+    assert observed, "the raw hashing was not instrumented"
+    assert all(in_transaction is False for in_transaction in observed)
+
+
+def test_record_polza_media_raw_saved_repeat_is_idempotent_without_bump(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    first_run, _first_attempt, first_artifact = _record_raw_saved(
+        repository, run, part, attempt, receipt
+    )
+    assert first_run.revision == 4
+
+    # The repository owns no JSON compatibility export, so a lost or failed
+    # export after the commit cannot roll back this durable row. A repeated
+    # verified call at the current revision is a safe no-op: same revision, one
+    # artifact, and untouched bytes on disk.
+    second_run, second_attempt, second_artifact = _record_raw_saved(
+        repository, run, part, attempt, receipt, expected_revision=4
+    )
+
+    assert second_run.revision == 4
+    assert second_attempt.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert second_artifact.artifact_uuid == first_artifact.artifact_uuid
+    assert len(repository.get_artifacts(run.run_uuid)) == 1
+    assert receipt.raw_path.read_bytes() == _RAW_AUDIO
+
+
+def test_record_polza_media_raw_saved_rejects_receipt_number_off_part_position(
+    repository, tmp_path
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_RAW_FINGERPRINT)
+    # A second part with the identical fingerprint is indistinguishable by
+    # fingerprint alone, so only the receipt number and the part position bind
+    # the paid bytes to the right chunk.
+    repository.add_part(run.run_uuid, position=2, fingerprint=_RAW_FINGERPRINT)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+    _, accepted = repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=reserved.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        remote_task_id=_RAW_REMOTE_TASK_ID,
+    )
+    # This is a valid bounded receipt for chunk 2 that names part position 1 and
+    # that part's fingerprint, so only a positional cross-check can refuse it.
+    receipt = _write_media_receipt(
+        tmp_path,
+        accepted.attempt_uuid,
+        part.part_uuid,
+        overrides={"number": 2, "chunk_id": "chunk_02"},
+    )
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, accepted, receipt)
+
+    _assert_no_raw_link(repository, run, accepted)
+
+
+@pytest.mark.parametrize("case", ["part_uuid", "availability", "mime", "media_metadata"])
+def test_record_polza_media_raw_saved_rejects_inconsistent_existing_artifact(
+    repository, tmp_path, case
+):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    _record_raw_saved(repository, run, part, attempt, receipt)
+    assert repository.get_run(run.run_uuid).revision == 4
+
+    if case == "part_uuid":
+        other = repository.add_part(run.run_uuid, position=2, fingerprint=_RAW_FINGERPRINT)
+        statement = "UPDATE artifacts SET part_uuid = ? WHERE attempt_uuid = ?"
+        parameters = (other.part_uuid, attempt.attempt_uuid)
+    elif case == "availability":
+        statement = "UPDATE artifacts SET availability = ? WHERE attempt_uuid = ?"
+        parameters = (AVAILABILITY_MISSING, attempt.attempt_uuid)
+    elif case == "mime":
+        statement = "UPDATE artifacts SET mime = ? WHERE attempt_uuid = ?"
+        parameters = ("audio/ogg", attempt.attempt_uuid)
+    else:
+        statement = "UPDATE artifacts SET media_metadata_json = ? WHERE attempt_uuid = ?"
+        parameters = (
+            json.dumps(
+                {
+                    "format": "mp3",
+                    "chunk_id": "chunk_02",
+                    "number": 2,
+                    "generation_id": _RAW_GENERATION_ID,
+                }
+            ),
+            attempt.attempt_uuid,
+        )
+    repository._connection.execute(statement, parameters)
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt, expected_revision=4)
+
+    reloaded = repository.get_run(run.run_uuid)
+    assert reloaded is not None and reloaded.revision == 4
+    assert len(repository.get_artifacts(run.run_uuid)) == 1
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+
+
+def test_record_polza_media_raw_saved_recovers_after_pre_commit_crash(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    # A failing artifact INSERT models a crash between the file+receipt write and
+    # the database commit: the raw evidence stays on disk while the transaction
+    # rolls back the artifact, the attempt status, the part stage, and the bump.
+    repository._connection.execute(
+        "CREATE TRIGGER artifacts_crash_insert BEFORE INSERT ON artifacts "
+        "BEGIN SELECT RAISE(ABORT, 'synthetic pre-commit crash'); END"
+    )
+
+    with pytest.raises(sqlite3.Error):
+        _record_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_raw_link(repository, run, attempt)
+    assert receipt.raw_path.read_bytes() == _RAW_AUDIO
+    assert (receipt.raw_path.parent / f"{receipt.raw_path.name}.receipt.json").exists()
+
+    # After the fault is removed the same evidence links with no provider call:
+    # the repository has no provider, network, or FFmpeg path.
+    repository._connection.execute("DROP TRIGGER artifacts_crash_insert")
+    advanced, updated, artifact = _record_raw_saved(repository, run, part, attempt, receipt)
+
+    assert advanced.revision == 4
+    assert updated.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+    assert artifact.path == "raw/chunk_01.mp3"
+    assert len(repository.get_artifacts(run.run_uuid)) == 1
+
+
+def test_record_polza_media_raw_saved_fails_closed_when_guarded_update_is_ignored(
+    repository, tmp_path
+):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    # A ``BEFORE UPDATE`` trigger that silently skips the row models any database
+    # condition under which the guarded status UPDATE affects no row. The seam
+    # must not then return a linked artifact with an advanced revision: it raises
+    # and rolls the artifact, part stage, and revision bump back together.
+    repository._connection.execute(
+        "CREATE TRIGGER attempts_ignore_raw_saved BEFORE UPDATE ON attempts "
+        "WHEN NEW.status = 'raw_saved' BEGIN SELECT RAISE(IGNORE); END"
+    )
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"synthesis_fingerprint": "b" * 64},
+        {"remote_task_id": "a-different-task"},
+        {"part_uuid": "33333333-3333-4333-8333-333333333333"},
+    ],
+)
+def test_record_polza_media_raw_saved_rejects_mismatched_receipt_identity(
+    repository, tmp_path, overrides
+):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(
+        repository, tmp_path, **overrides
+    )
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_rejects_tampered_digest(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    receipt.raw_path.write_bytes(b"PAID-RAW-MARKER-tampered")
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+@pytest.mark.parametrize("half", ["raw", "receipt"])
+def test_record_polza_media_raw_saved_rejects_missing_evidence(repository, tmp_path, half):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    if half == "raw":
+        receipt.raw_path.unlink()
+    else:
+        (receipt.raw_path.parent / f"{receipt.raw_path.name}.receipt.json").unlink()
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_rejects_stale_revision_without_mutation(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+
+    with pytest.raises(HistoryRevisionConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt, expected_revision=2)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_rejects_attempt_not_remote_accepted(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_RAW_FINGERPRINT)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+    receipt = _write_media_receipt(tmp_path, reserved.attempt_uuid, part.part_uuid)
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, reserved, receipt, expected_revision=2)
+
+    _assert_no_raw_link(
+        repository,
+        run,
+        reserved,
+        revision=2,
+        status=history_repository_module.ATTEMPT_STATUS_SUBMITTING,
+    )
+
+
+def test_record_polza_media_raw_saved_rejects_foreign_part(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+    foreign = repository.add_part(run.run_uuid, position=2, fingerprint=_RAW_FINGERPRINT)
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        repository.record_polza_media_raw_saved(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=foreign.part_uuid,
+            expected_revision=3,
+            receipt=receipt,
+        )
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_rejects_missing_part(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.record_polza_media_raw_saved(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid="11111111-2222-3333-4444-555555555555",
+            expected_revision=3,
+            receipt=receipt,
+        )
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_rejects_synchronous_polza_model(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_RAW_FINGERPRINT)
+    # ``openai/gpt-4o-mini-tts`` submits through the synchronous
+    # ``/audio/speech`` route, so it can never hold a recoverable async media
+    # task id even though the provider matches.
+    attempt = repository.add_attempt(
+        run.run_uuid,
+        call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+        part_uuid=part.part_uuid,
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        status=history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED,
+        remote_id="sync-task",
+    )
+    receipt = _write_media_receipt(
+        tmp_path, attempt.attempt_uuid, part.part_uuid, overrides={"remote_task_id": "sync-task"}
+    )
+
+    with pytest.raises(HistoryPaidRawConflictError):
+        _record_raw_saved(repository, run, part, attempt, receipt, expected_revision=1)
+
+    _assert_no_raw_link(repository, run, attempt, revision=1)
+
+
+def test_record_polza_media_raw_saved_refuses_open_outer_transaction(repository, tmp_path):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+
+    with pytest.raises(HistoryPaidAttemptInTransactionError):
+        with repository.transaction():
+            _record_raw_saved(repository, run, part, attempt, receipt)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+@pytest.mark.parametrize("bad_revision", [0, -1, True, False, 1.0, "3"])
+def test_record_polza_media_raw_saved_rejects_invalid_expected_revision(
+    repository, tmp_path, bad_revision
+):
+    run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+
+    with pytest.raises(ValueError):
+        _record_raw_saved(repository, run, part, attempt, receipt, expected_revision=bad_revision)
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_rejects_non_receipt(repository, tmp_path):
+    run, part, attempt, _receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+
+    with pytest.raises(ValueError):
+        repository.record_polza_media_raw_saved(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=3,
+            receipt="not-a-receipt",
+        )
+
+    _assert_no_raw_link(repository, run, attempt)
+
+
+def test_record_polza_media_raw_saved_refuses_legacy_imported_run(repository, tmp_path):
+    legacy_root = str(tmp_path / "legacy-run")
+    with repository.transaction():
+        run, _ = repository.create_legacy_run(
+            operation="tts",
+            run_root=legacy_root,
+            legacy_source_root=legacy_root,
+            status="interrupted",
+        )
+        part = repository.add_part(run.run_uuid, position=1, fingerprint=_RAW_FINGERPRINT)
+        attempt = repository.add_attempt(
+            run.run_uuid,
+            call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+            part_uuid=part.part_uuid,
+            provider="polza-tts",
+            model="elevenlabs/eleven_multilingual_v2",
+            status=history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED,
+            remote_id="legacy-task",
+        )
+    # An imported run's paid work belongs to a run-level total, so the guard must
+    # refuse before any receipt verification or database mutation.
+    receipt = _write_media_receipt(
+        tmp_path, attempt.attempt_uuid, part.part_uuid, overrides={"remote_task_id": "legacy-task"}
+    )
+
+    with pytest.raises(HistoryRunNotReservableError):
+        _record_raw_saved(repository, run, part, attempt, receipt, expected_revision=1)
+
+    _assert_no_raw_link(repository, run, attempt, revision=1)
+
+
+def test_record_polza_media_raw_saved_refuses_completed_run(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="completed")
+    part = repository.add_part(run.run_uuid, position=1, fingerprint=_RAW_FINGERPRINT)
+    attempt = repository.add_attempt(
+        run.run_uuid,
+        call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+        part_uuid=part.part_uuid,
+        provider="polza-tts",
+        model="elevenlabs/eleven_multilingual_v2",
+        status=history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED,
+        remote_id="completed-task",
+    )
+    receipt = _write_media_receipt(
+        tmp_path,
+        attempt.attempt_uuid,
+        part.part_uuid,
+        overrides={"remote_task_id": "completed-task"},
+    )
+
+    with pytest.raises(HistoryRunNotReservableError):
+        _record_raw_saved(repository, run, part, attempt, receipt, expected_revision=1)
+
+    _assert_no_raw_link(repository, run, attempt, revision=1)
+
+
+def test_record_polza_media_raw_saved_two_connections_stale_cannot_duplicate(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as first_database:
+        first_database.migrate()
+        with HistoryDatabase(database_path) as second_database:
+            second_database.connect()
+            first = HistoryRepository(first_database)
+            second = HistoryRepository(second_database)
+            run, part, attempt, receipt = _accepted_media_attempt_with_raw(first, tmp_path)
+            first.record_polza_media_raw_saved(
+                run.run_uuid,
+                attempt_uuid=attempt.attempt_uuid,
+                part_uuid=part.part_uuid,
+                expected_revision=3,
+                receipt=receipt,
+            )
+
+            # The second connection's stale view cannot link a second artifact or
+            # advance the already-committed revision.
+            with pytest.raises(HistoryRevisionConflictError):
+                second.record_polza_media_raw_saved(
+                    run.run_uuid,
+                    attempt_uuid=attempt.attempt_uuid,
+                    part_uuid=part.part_uuid,
+                    expected_revision=3,
+                    receipt=receipt,
+                )
+
+            reloaded_run = second.get_run(run.run_uuid)
+            assert reloaded_run is not None and reloaded_run.revision == 4
+            assert len(second.get_artifacts(run.run_uuid)) == 1
+            saved = second.get_attempt(attempt.attempt_uuid)
+            assert saved is not None
+            assert saved.status == history_repository_module.ATTEMPT_STATUS_RAW_SAVED
+
+
+def test_record_polza_media_raw_saved_rejects_run_root_change_after_verify(
+    repository, tmp_path, monkeypatch
+):
+    # The verified evidence is read from the run_root fetched before the
+    # transaction. A concurrent writer can move runs.run_root between that file
+    # verification and BEGIN IMMEDIATE without bumping the run revision, which
+    # would leave the linked relative artifact path pointing into a root whose
+    # bytes were never verified. Deterministically reproduce that interleaving by
+    # letting the verification seam run for real, then moving the root through a
+    # separate connection before the transaction starts.
+    moved_root = tmp_path / "moved-root"
+    moved_root.mkdir()
+    with HistoryDatabase(tmp_path / "history.sqlite3") as second_database:
+        second_database.connect()
+        second = HistoryRepository(second_database)
+        run, part, attempt, receipt = _accepted_media_attempt_with_raw(repository, tmp_path)
+        original_bytes = receipt.raw_path.read_bytes()
+        real_verify = repository._verify_media_raw_receipt
+
+        def verify_then_move_run_root(run_record, part_record, attempt_record, raw_receipt):
+            verified = real_verify(run_record, part_record, attempt_record, raw_receipt)
+            # Model the race: the on-disk evidence verified against the old
+            # run_root, and now the root moves without a revision bump.
+            second._connection.execute(
+                "UPDATE runs SET run_root = ? WHERE run_uuid = ?",
+                (str(moved_root), run_record.run_uuid),
+            )
+            moved = second.get_run(run_record.run_uuid)
+            assert moved is not None and moved.run_root == str(moved_root)
+            assert moved.revision == run_record.revision
+            return verified
+
+        monkeypatch.setattr(repository, "_verify_media_raw_receipt", verify_then_move_run_root)
+
+        with pytest.raises(HistoryPaidRawConflictError):
+            _record_raw_saved(repository, run, part, attempt, receipt)
+
+        # No link, bump, or stage change reached the database, and the bytes
+        # stay in the original, verified root untouched.
+        _assert_no_raw_link(second, run, attempt)
+        saved = second.get_attempt(attempt.attempt_uuid)
+        assert saved is not None
+        assert saved.status == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+        assert receipt.raw_path.read_bytes() == original_bytes
+        assert (receipt.raw_path.parent / f"{receipt.raw_path.name}.receipt.json").exists()
+        assert not (moved_root / "raw").exists()
