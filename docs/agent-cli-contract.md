@@ -20,9 +20,9 @@
 | `history list` | Метаданные прогонов из локальной SQLite-истории | да |
 | `history show ID` | Один прогон по внутреннему UUID или точной метке | да |
 | `history resume ID` | Возобновить нативный TTS-прогон из сохранённого снимка (потенциально платно) | да |
-| `history sync ID` | Получить сохранённое состояние/результат известного нативного прогона без нового оплаченного submit | да |
+| `history sync ID` | Получить сохранённое состояние/результат известного нативного прогона без нового оплаченного submit (для известного remote id возможен GET, не POST) | да |
 | `history import DIR [--dry-run]` | Безопасный offline-импорт старых `out/<run-id>` каталогов | да |
-| `search QUERY --mode lexical` | Offline FTS5-поиск по сохранённым сценариям, транскрипциям и меткам | да |
+| `search QUERY` | Offline FTS5-поиск по сохранённым сценариям, транскрипциям и меткам; режим — явный `--mode` или `[search] default_mode` | да |
 | `index status\|build\|rebuild` | Состояние, добор и полная пересборка производного поискового индекса | да |
 
 Все команды можно вызвать с `--json` для машинно-читаемого вывода.
@@ -35,7 +35,7 @@
 | `2` | invalid args | Неверные аргументы, файл не найден, 0 чанков, неизвестный provider или неподдерживаемая capability |
 | `10` | missing dependency | Не установлен выбранный локальный ASR runtime или faster-whisper |
 | `11` | no ffmpeg/ffprobe | FFmpeg не найден в PATH |
-| `20` | no key | Нет POLZA_API_KEY или OPENROUTER_API_KEY |
+| `20` | no key | Нет POLZA_API_KEY/OPENROUTER_API_KEY/GROQ_API_KEY/X_AI_API_KEY, либо непригодный явный `--env-file` |
 | `30` | provider/run error | API error, папка существует без --overwrite |
 | `40` | whisper error | Whisper timing не удался |
 | `50` | output error | Ошибка записи/удаления файлов или сбой сохранения уже полученного результата в локальную историю (`details.error_code` = `HISTORY_PERSISTENCE_FAILED`) |
@@ -58,6 +58,72 @@
 flags) превращаются в единственный JSON error
 `{"status": "error", "error": "Invalid command-line arguments", "code": 2}`
 с exit code `2`.
+
+## Глобальный `--env-file` и разрешение секретов
+
+`--env-file PATH` — глобальная опция **перед** подкомандой:
+`voiceover --env-file PATH <command> ...`. Runtime-значение секрета разрешается
+в одном детерминированном порядке:
+
+1. непустая переменная окружения текущего процесса — приоритет; содержимое
+   env-файла при этом не читается;
+2. явный `--env-file PATH` (проверяется только по метаданным как regular file);
+3. `<call-time CWD>/.env` — для совместимости.
+
+Поиска `.env` по родительским каталогам нет, и путь не захватывается на момент
+импорта: шаг 3 разрешается в момент вызова. Явный `--env-file` **заменяет**
+рабочий `.env`, а не дополняет его: если в явном файле ключа нет, фоллбэка на
+`<CWD>/.env` не происходит.
+
+При обращении к ключу отсутствующий, не-regular (каталог) или недоступный для
+проверки метаданных явный путь fail-closed с exit `20` **даже если** в процессе
+есть пригодный ключ. Если процессного ключа нет, дополнительно проверяется
+чтение/декодирование файла; ошибка тоже даёт exit `20`. Сообщения фиксированы и
+не содержат путь или значение (`Explicit --env-file is missing or not a regular
+file.` / `Explicit --env-file could not be read.`). Когда процессное значение
+побеждает, содержимое файла не читается, поэтому его читаемость не проверяется.
+В `--json` это тот же error envelope без пути и секретов. Read-only `help` не
+проверяет файл; `doctor` отдельно сообщает о проблеме в checks без exit `20`.
+
+`help` не читает ключ и env-файл даже при заданном `--env-file`. `doctor`
+проверяет наличие ключей и отдаёт `checks.env_file.path` (разрешённый явный путь
+или `<CWD>/.env`) и `checks.env_file.ok` по `is_file()`, но никогда не значение;
+при непригодном явном файле `doctor` завершается с exit `0` и JSON
+`status: "success"`, но сообщает `checks.env_file.ok: false` при
+`required: true`, поэтому `required_ok: false` и `workflow_ok: false`;
+stat-ошибка не эхоится. Подробный порядок и примеры — `voiceover help
+start.quick`, `voiceover help providers.polza`.
+
+## `help` — упакованная атомарная справка (S10)
+
+```bash
+voiceover help [TOPIC] [--raw | --json]
+```
+
+Темы — обычные Markdown-файлы в `voiceover_pipeline/resources/help/*.md`
+установленного пакета; они читаются через `importlib.resources`. Рабочий каталог,
+репозиторий, `.env`, ключи, FFmpeg, GPU, история и сеть для `help` не нужны — то
+же самое при установленном колесе вне checkout.
+
+- Без `TOPIC` печатается тема `index`, которая перечисляет все упакованные темы;
+  отдельного флага `--list` нет.
+- `--raw` печатает ровно упакованный Markdown без frontmatter и без ANSI;
+  `--json` — один объект `{status, topic, title, summary, related, markdown}`;
+  по умолчанию тот же Markdown с заголовком темы. `--raw` и `--json`
+  взаимоисключающие (exit `2`).
+- Имя темы — строгий lowercase dotted identifier (`speech.parts`). `../`, путь с
+  `/`, абсолютный путь, `.env`, uppercase — usage error exit `2`
+  `HELP_INVALID_TOPIC`; корректное, но отсутствующее имя — exit `2`
+  `HELP_UNKNOWN_TOPIC`. Непригодный или несогласованный упакованный каталог
+  (пропавшая/дублирующая тема, незнакомый frontmatter-ключ, битая `related`-
+  ссылка, посторонний файл, отсутствие default-темы) — exit `30`
+  `HELP_RESOURCE_ERROR`. Все эти сообщения не включают путь, содержимое файла или
+  секрет.
+- Frontmatter ограничен полями `topic`, `title`, `summary`, `related`; тема
+  `index` обязана ссылаться на каждую другую тему.
+- Справка и контракт не дублируют исчерпывающие списки провайдеров, моделей и
+  флагов: актуальные значения берутся из parser metadata и `voiceover list ...`.
+  `voiceover --help` остаётся кратким списком команд.
 
 ## JSON Output Contract
 
@@ -168,10 +234,16 @@ voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спо
   консервативная политика, не доказанный предел Gemini). Поздняя over-limit
   часть не отправляет ни одного запроса (JSON `SPEECH_PART_TOO_LONG`, exit `2`).
 - Маршрут `speech-parts` идёт только через DB-first нативную генерацию; legacy
-  fallback отсутствует. Пока контракт Polza Gemini не подтверждён live-пробой,
-  candidate-модель `google/gemini-3.8-flash-tts` (и любая непустая vibe) не
-  регистрируется как stable и fail-closed: JSON `error_code
-  BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до** чтения ключа и любого POST.
+  fallback отсутствует. Один разрешённый GET `/models` наблюдал оба ID
+  `google/gemini-3.8-flash-tts` и `google/gemini-3.8-flash-lite-tts`, но не
+  подтвердил endpoint, поле per-part инструкции, голоса, контейнер, применимую
+  цену и верхнюю границу стоимости; POST было ноль, а дополнительные GET/POST
+  требуют отдельного разрешения владельца и документированного потолка
+  (см. `docs/reports/2026-10-01-s06-paid-sync-response.md`). Поэтому
+  candidate-маршрут Flash (и любая непустая vibe) не регистрируется как stable и
+  fail-closed: JSON `error_code` `BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до**
+  чтения ключа и любого POST. Наблюдённый ID каталога не является подтверждённым
+  speech-parts-контрактом.
 - `--audio-format {mp3,wav}` задаёт контейнер итогового merged-файла (default
   `mp3`); промежуточные части в `chunks/` остаются MP3. `wav` пишет реальный
   RIFF/WAVE через ffmpeg и допускается только на нативном маршруте; смена
@@ -961,6 +1033,16 @@ Standalone `voiceover timings --timing-provider groq-whisper|xai-stt` тепер
 - **Требуется history.** Если `settings.toml` отключает историю, команда
   fail-closed завершается с `PAID_TIMING_HISTORY_REQUIRED` **до** запроса,
   удаления и чтения ключа.
+- **Ключ до удаления и резервации.** Под уже взятым output-root lock сначала
+  обрабатываются credential-free случаи: существующий каталог без `--overwrite`
+  (exit `30`) и `--skip-existing` (exit `0`, `status: skipped`) — ключ для них
+  не читается. Затем резолвится ключ выбранного провайдера (`GROQ_API_KEY` для
+  `groq-whisper`, `X_AI_API_KEY` для `xai-stt`), и только после этого
+  `--overwrite` удаляет каталог и резервируется платная попытка. Непригодный
+  явный `--env-file` или отсутствующий ключ дают exit `20` с тем же redacted
+  сообщением: каталог не удаляется, ложный `submitting`-маркер не пишется,
+  провайдер не вызывается. Если явный env-файл сломался уже после preflight, та
+  же фиксированная credential-ошибка не маскируется под ASR failure.
 
 ```bash
 voiceover timings --audio recording.wav --timing-provider groq-whisper --output-dir out --run-id rec --json
@@ -1971,8 +2053,22 @@ voiceover index rebuild --json
   отмечаются отдельно в `warnings`; `index build` добирает индексируемые тексты,
   а `index rebuild` исправляет версию. Источник без сохранённого текста
   невозможно восстановить одной пересборкой.
-- `--mode semantic|hybrid` явно отклоняется (`SEARCH_MODE_DEFERRED`, exit `2`):
-  embedding-бэкенды и гибридное ранжирование — этап S09, здесь их нет.
+- Режим берётся из явного `--mode`, а при его отсутствии — из несекретного
+  `<CWD>/settings.toml`, секция `[search] default_mode` (`lexical`, `semantic`
+  или `hybrid`; отсутствие файла/секции/ключа → `lexical`). Режим никогда не
+  читается из `.env`: `search` не читает ключ или env-файл.
+- Явный `--mode` побеждает всегда, даже когда консультируемый `settings.toml`
+  испорчен или содержит недопустимое значение. Если `--mode` не задан и файл
+  нечитаем, не является таблицей или `default_mode` не входит в три допустимых
+  значения, команда fail-closed **до** открытия/создания базы и любого
+  provider/model пути: exit `2`, `details.error_code = SEARCH_SETTINGS_INVALID`,
+  одно фиксированное сообщение без пути и содержимого файла.
+- Настроенный `semantic`/`hybrid` (`--mode` или `[search] default_mode`)
+  принимается reader'ом настроек и отклоняется самим `search` с честным
+  `SEARCH_MODE_DEFERRED` (exit `2`) **до** открытия/создания базы, без
+  embeddings и provider: semantic/hybrid и оба embedding-backend относятся
+  только к [плану следующего релиза](plans/2026-10-01-semantic-search-next-release-plan.md)
+  (`S09 DEFERRED`), а доступный сейчас слой — только лексический FTS5.
 
 ### Поведение `index`
 
@@ -2071,7 +2167,8 @@ voiceover index rebuild --json
 ### Коды ошибок S08
 
 Все новые причины передаются стабильной строкой `details.error_code` при обычных
-числовых кодах `2`/`30`/`50`: `SEARCH_EMPTY_QUERY`, `SEARCH_MODE_DEFERRED`,
+числовых кодах `2`/`30`/`50`: `SEARCH_EMPTY_QUERY`,
+`SEARCH_MODE_DEFERRED`, `SEARCH_SETTINGS_INVALID`,
 `SEARCH_INVALID_LIMIT`, `SEARCH_INVALID_SCOPE`, `SEARCH_INVALID_ROLE`,
 `SEARCH_INVALID_KIND`, `SEARCH_INVALID_RUN`, `SEARCH_INVALID_DATE` (все exit `2`),
 плюс унаследованные `HISTORY_DATABASE_*`/`HISTORY_HOME_*` при чтении/записи БД.

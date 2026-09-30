@@ -16,7 +16,7 @@ voiceover search "текст" --mode semantic --json
  "code": 2, "details": {"error_code": "SEARCH_MODE_DEFERRED"}}
 ```
 
-`--mode semantic` и `--mode hybrid` возвращают `SEARCH_MODE_DEFERRED` с exit `2`. Это не поломка и не «пока пустой результат»: режимы осознанно не входят в текущую версию.
+`--mode semantic` и `--mode hybrid` возвращают `SEARCH_MODE_DEFERRED` с exit `2`. Это не поломка и не «пока пустой результат»: режимы осознанно не входят в текущую версию. Тот же отказ приходит без явного `--mode`, когда `<CWD>/settings.toml` задаёт `[search] default_mode = "semantic"` или `"hybrid"`: режим читается из несекретных настроек и отклоняется до открытия базы и любых моделей. Невалидный `settings.toml` без явного `--mode` даёт вместо этого `SEARCH_SETTINGS_INVALID` (exit `2`), а явный `--mode lexical` побеждает и работает (см. `voiceover help search.lexical`).
 
 ## Чего в этой версии нет
 

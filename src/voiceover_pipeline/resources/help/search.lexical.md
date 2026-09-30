@@ -14,6 +14,10 @@ voiceover search "сценарный текст" --mode lexical --scope directio
 
 `--mode lexical` — офлайн FTS5 по сохранённой истории: сценарии, распознанные транскрипты и пользовательские метки. Ключ, FFmpeg, Torch, `sqlite-vec` и сеть не нужны. Запрос трактуется как литеральные слова; пустой запрос отклоняется (`SEARCH_EMPTY_QUERY`, exit `2`).
 
+## Режим по умолчанию
+
+`--mode` можно не указывать: тогда режим берётся из несекретного `<CWD>/settings.toml`, секция `[search] default_mode` (default `lexical`). Явный `--mode` побеждает всегда — даже если `settings.toml` испорчен. Если `--mode` не задан и консультируемый файл невалиден или `default_mode` не `lexical|semantic|hybrid`, команда fail-closed **до** открытия базы: exit `2`, `SEARCH_SETTINGS_INVALID`, сообщение без пути и содержимого файла. Настроенный `semantic`/`hybrid` доходит до честного `SEARCH_MODE_DEFERRED` (exit `2`) без входа в базу и без моделей. Режим читается только из `settings.toml`, никогда из `.env`.
+
 ## Фильтры
 
 | Флаг | Смысл |

@@ -13,7 +13,7 @@ voiceover transcribe --audio speech.mp3 --provider nemotron-local --word-timesta
 voiceover list asr-providers --json
 ```
 
-Обязательны `--audio` и `--provider`. Зарегистрированы локальные провайдеры `qwen-local` (`Qwen/Qwen3-ASR-0.6B` по умолчанию, `Qwen/Qwen3-ASR-1.7B` отдельно) и `nemotron-local`. Облачный ASR-провайдер в реестре отсутствует: неподтверждённый маршрут не регистрируется как доступный.
+Обязательны `--audio` и `--provider`. Зарегистрированы локальные провайдеры `qwen-local` (`Qwen/Qwen3-ASR-0.6B` по умолчанию, `Qwen/Qwen3-ASR-1.7B` отдельно) и `nemotron-local`. Облачный ASR-провайдер в реестре отсутствует: неподтверждённый маршрут не регистрируется как доступный. Актуальный список провайдеров, моделей и флагов читайте из `voiceover list asr-providers --json` и `voiceover transcribe --help`: справка не является исчерпывающим каталогом.
 
 Флаги: `--model`, `--language`, `--device {auto,cpu,cuda}`, `--compute`, `--word-timestamps`, `--context` **или** `--context-file` (взаимоисключающие), `--runtime {auto,python,audio-cpp}`, `--json`.
 
