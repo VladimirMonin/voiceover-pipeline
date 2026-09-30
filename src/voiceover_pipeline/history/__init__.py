@@ -5,8 +5,10 @@ Plan section 6 makes this package the single source of truth for run history.
 versioned checksummed migration ledger; :mod:`voiceover_pipeline.history.repository`
 owns the typed entity API (records, cost provenance, bounded metadata queries);
 :mod:`voiceover_pipeline.history.paths` resolves the private ``VOICEOVER_HOME``
-layout; and :mod:`voiceover_pipeline.history.legacy_import` safely imports old
-``out/<run-id>`` trees without touching them.
+layout; :mod:`voiceover_pipeline.history.legacy_import` safely imports old
+``out/<run-id>`` trees without touching them; and
+:mod:`voiceover_pipeline.history.native_snapshot` atomically persists a native
+prepared TTS run before any provider request exists.
 """
 
 from .database import (
@@ -40,6 +42,17 @@ from .locking import (
     HistoryRunLockError,
     acquire_run_lock,
     run_lock_path,
+)
+from .native_snapshot import (
+    NATIVE_SNAPSHOT_FINGERPRINT_VERSION,
+    NATIVE_SNAPSHOT_OPERATION,
+    NATIVE_SNAPSHOT_ORIGIN,
+    NativeSnapshotError,
+    NativeSnapshotInTransactionError,
+    NativeSnapshotRunRootConflictError,
+    NativeSnapshotValidationError,
+    PreparedTtsSnapshot,
+    persist_prepared_tts_snapshot,
 )
 from .paths import (
     APP_DIR_NAME,
@@ -106,6 +119,9 @@ __all__ = [
     "LOCKS_DIR_NAME",
     "MAX_QUERY_LIMIT",
     "MIGRATIONS",
+    "NATIVE_SNAPSHOT_FINGERPRINT_VERSION",
+    "NATIVE_SNAPSHOT_OPERATION",
+    "NATIVE_SNAPSHOT_ORIGIN",
     "PATH_KIND_EXTERNAL_ABSOLUTE",
     "PATH_KIND_MANAGED_RELATIVE",
     "PRIVATE_DIR_MODE",
@@ -143,7 +159,12 @@ __all__ = [
     "LegacyRunPreview",
     "Migration",
     "MigrationChecksumError",
+    "NativeSnapshotError",
+    "NativeSnapshotInTransactionError",
+    "NativeSnapshotRunRootConflictError",
+    "NativeSnapshotValidationError",
     "PartRecord",
+    "PreparedTtsSnapshot",
     "RunRecord",
     "SchemaVersionTooNewError",
     "TextSourceRecord",
@@ -159,6 +180,7 @@ __all__ = [
     "history_logs_dir",
     "history_runs_dir",
     "import_legacy_runs",
+    "persist_prepared_tts_snapshot",
     "preview_legacy_import",
     "resolve_history_home",
     "run_lock_path",
