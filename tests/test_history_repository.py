@@ -43,6 +43,7 @@ from voiceover_pipeline.history.repository import (
     HistoryPaidMediaCostConflictError,
     HistoryPaidMediaTaskConflictError,
     HistoryPaidRawConflictError,
+    HistoryPartCompletionConflictError,
     HistoryPartNotFoundError,
     HistoryRepository,
     HistoryRevisionConflictError,
@@ -3239,3 +3240,141 @@ def test_record_polza_sync_raw_saved_rejects_invalid_revision_and_amount(reposit
         _record_sync_raw_saved(repository, run, part, attempt, receipt, amount="not-a-decimal")
 
     _assert_no_sync_raw_link(repository, run, attempt)
+
+
+# -- local (no-network, no-cost) TTS attempt seams ----------------------------
+
+
+def _reserve_one_local_attempt(repository, run, part, *, expected_revision):
+    return repository.reserve_local_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=expected_revision,
+        provider="omnivoice-local",
+        model="audio-cpp/omnivoice-q8_0",
+    )
+
+
+def test_reserve_local_tts_attempt_commits_pending_costless_marker(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+
+    advanced, attempt = _reserve_one_local_attempt(repository, run, part, expected_revision=1)
+
+    assert advanced.revision == 2
+    assert attempt.call_type == history_repository_module.ATTEMPT_CALL_TYPE_LOCAL_TTS
+    assert attempt.provider == "omnivoice-local"
+    assert attempt.model == "audio-cpp/omnivoice-q8_0"
+    assert attempt.account_alias is None
+    assert attempt.remote_id is None
+    assert attempt.status is None
+    assert attempt.cost.amount is None
+    assert attempt.cost.source == COST_SOURCE_UNKNOWN
+    assert attempt.cost.exact_available is False
+
+    # A local invocation is safe to repeat, so a second invocation on the same part
+    # records a second distinct durable attempt rather than being refused.
+    advanced_two, attempt_two = _reserve_one_local_attempt(
+        repository, run, part, expected_revision=2
+    )
+    assert advanced_two.revision == 3
+    assert attempt_two.attempt_uuid != attempt.attempt_uuid
+    assert repository.get_attempt(attempt.attempt_uuid) is not None
+    assert len(repository.get_attempts(run.run_uuid)) == 2
+
+
+def test_reserve_local_tts_attempt_refuses_a_paid_part(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="elevenlabs/eleven_multilingual_v2",
+        account_alias="main",
+    )
+
+    with pytest.raises(HistoryPartCompletionConflictError):
+        _reserve_one_local_attempt(repository, run, part, expected_revision=2)
+
+    assert len(repository.get_attempts(run.run_uuid)) == 1
+
+
+def test_record_local_tts_attempt_failed_labels_only_a_pending_attempt(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    _, attempt = _reserve_one_local_attempt(repository, run, part, expected_revision=1)
+
+    advanced, failed = repository.record_local_tts_attempt_failed(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        error="NATIVE_LOCAL_SYNTHESIS_FAILED",
+    )
+
+    assert advanced.revision == 3
+    assert failed.status == history_repository_module.ATTEMPT_STATUS_LOCAL_FAILED
+    assert failed.error == "NATIVE_LOCAL_SYNTHESIS_FAILED"
+    assert failed.cost.amount is None
+
+    # A repeated identical observation is idempotent and adds no new revision.
+    again_run, again = repository.record_local_tts_attempt_failed(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        error="NATIVE_LOCAL_SYNTHESIS_FAILED",
+    )
+    assert again_run.revision == 3
+    assert again.status == history_repository_module.ATTEMPT_STATUS_LOCAL_FAILED
+
+
+def test_record_local_tts_raw_saved_and_completion_link_the_local_attempt(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    _, attempt = _reserve_one_local_attempt(repository, run, part, expected_revision=1)
+
+    advanced, raw_artifact = repository.record_local_tts_raw_saved(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        path="raw/chunk_01.wav",
+        mime="audio/wav",
+        size_bytes=4,
+        sha256="a" * 64,
+        media_metadata={"format": "wav", "chunk_id": "chunk_01", "number": 1},
+    )
+
+    assert advanced.revision == 3
+    assert raw_artifact.role == history_repository_module.ARTIFACT_ROLE_LOCAL_RAW_AUDIO
+    assert raw_artifact.attempt_uuid == attempt.attempt_uuid
+    assert raw_artifact.part_uuid == part.part_uuid
+    linked = repository.get_attempt(attempt.attempt_uuid)
+    assert linked is not None
+    assert linked.status == history_repository_module.ATTEMPT_STATUS_LOCAL_RAW_SAVED
+
+    advanced_two, chunk_artifact = repository.record_local_tts_part_completed(
+        run.run_uuid,
+        attempt_uuid=attempt.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=3,
+        path="chunks/chunk_01.mp3",
+        mime="audio/mpeg",
+        size_bytes=4,
+        sha256="b" * 64,
+        media_metadata={"duration_ms": 1000, "generation_id": None, "processing_version": 1},
+    )
+
+    assert advanced_two.revision == 4
+    assert chunk_artifact.role == history_repository_module.ARTIFACT_ROLE_CHUNK_AUDIO
+    assert chunk_artifact.attempt_uuid == attempt.attempt_uuid
+    completed = repository.get_attempt(attempt.attempt_uuid)
+    assert completed is not None
+    assert completed.status == history_repository_module.ATTEMPT_STATUS_LOCAL_COMPLETED
+    # A local attempt never gains a cost and never a fabricated zero.
+    assert completed.cost.amount is None
+    stored_part = repository.get_parts(run.run_uuid)[0]
+    assert stored_part.stage == history_repository_module.PART_STAGE_COMPLETED

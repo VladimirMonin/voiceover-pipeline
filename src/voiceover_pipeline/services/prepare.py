@@ -1,7 +1,7 @@
 """Bounded script preparation and prepared speech parts for one CLI generation run."""
 
 import argparse
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -72,11 +72,98 @@ class PreparedPart:
 
 
 @dataclass(frozen=True)
+class OmniVoiceBankProfileIdentity:
+    """One referenced voice-bank profile's immutable, nonsecret settings.
+
+    This is the profile's ``reference_text`` and reference locator/digest taken
+    from the admitted catalog at preparation time, so a later resume can prove
+    the exact clone reference it would submit instead of re-deriving it from a
+    catalog that may have changed.
+    """
+
+    profile_id: str
+    reference_audio: str
+    reference_sha256: str
+    reference_text: str
+    language: str
+
+    def to_payload(self) -> dict[str, str]:
+        return {
+            "profile_id": self.profile_id,
+            "reference_audio": self.reference_audio,
+            "reference_sha256": self.reference_sha256,
+            "reference_text": self.reference_text,
+            "language": self.language,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "OmniVoiceBankProfileIdentity":
+        if not isinstance(payload, Mapping):
+            raise ValueError("voice-bank profile identity must be a mapping")
+        fields = {
+            key: payload.get(key)
+            for key in (
+                "profile_id",
+                "reference_audio",
+                "reference_sha256",
+                "reference_text",
+                "language",
+            )
+        }
+        if any(not isinstance(value, str) or not value for value in fields.values()):
+            raise ValueError("voice-bank profile identity fields must be non-empty strings")
+        return cls(**fields)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class OmniVoiceVoiceBankIdentity:
+    """The admitted preset voice bank one OmniVoice dialogue run commits to.
+
+    ``catalog_path`` locates the user's catalog for a later resume; ``profiles``
+    holds only the cast profiles the run actually references, in stable profile
+    id order, so an unrelated catalog edit does not change this identity.
+    """
+
+    catalog_path: str
+    mode: str
+    profiles: tuple[OmniVoiceBankProfileIdentity, ...]
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "catalog_path": self.catalog_path,
+            "mode": self.mode,
+            "profiles": [profile.to_payload() for profile in self.profiles],
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "OmniVoiceVoiceBankIdentity":
+        if not isinstance(payload, Mapping):
+            raise ValueError("voice-bank identity must be a mapping")
+        catalog_path = payload.get("catalog_path")
+        mode = payload.get("mode")
+        raw_profiles = payload.get("profiles")
+        if not isinstance(catalog_path, str) or not catalog_path:
+            raise ValueError("voice-bank identity catalog_path must be a non-empty string")
+        if not isinstance(mode, str) or not mode:
+            raise ValueError("voice-bank identity mode must be a non-empty string")
+        if not isinstance(raw_profiles, list) or not raw_profiles:
+            raise ValueError("voice-bank identity profiles must be a non-empty list")
+        profiles = tuple(OmniVoiceBankProfileIdentity.from_payload(item) for item in raw_profiles)
+        seen: set[str] = set()
+        for profile in profiles:
+            if profile.profile_id in seen:
+                raise ValueError("voice-bank identity profiles must be unique")
+            seen.add(profile.profile_id)
+        return cls(catalog_path=catalog_path, mode=mode, profiles=profiles)
+
+
+@dataclass(frozen=True)
 class PreparedRun:
     """Run-scoped provider identity plus the ordered parts to synthesize.
 
     ``voice`` is the run-level voice the CLI already resolved; a part without
-    its own cast voice falls back to it.
+    its own cast voice falls back to it. ``voice_bank_identity`` is present only
+    for the admitted ``omnivoice-local`` preset dialogue route.
     """
 
     provider: str
@@ -85,6 +172,7 @@ class PreparedRun:
     style_prompt: str | None
     prompt_mode: str
     parts: tuple[PreparedPart, ...]
+    voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
 
 
 def default_voice(args: argparse.Namespace) -> str | None:
@@ -147,6 +235,38 @@ def bind_omnivoice_dialogue_fingerprints(
             raise PreparationError(f"voice '{chunk.voice}' not found in the voice bank")
         bound.append(replace(chunk, voice_fingerprint=profile.reference_sha256))
     return bound
+
+
+def build_omnivoice_voice_bank_identity(
+    catalog: VoiceBankCatalog, catalog_path: Path, profile_ids: Iterable[str]
+) -> OmniVoiceVoiceBankIdentity:
+    """Bind the cast profile ids of one dialogue run to their bank settings.
+
+    The referenced profiles are resolved from the admitted catalog and stored in
+    stable id order, so the run identity never depends on a catalog's own order
+    or on profiles the run does not use. An unknown cast voice raises
+    ``PreparationError`` before any provider work.
+    """
+    by_id = {profile.id: profile for profile in catalog.profiles}
+    selected: list[OmniVoiceBankProfileIdentity] = []
+    for voice_id in sorted(set(profile_ids)):
+        profile = by_id.get(voice_id)
+        if profile is None:
+            raise PreparationError(f"voice '{voice_id}' not found in the voice bank")
+        selected.append(
+            OmniVoiceBankProfileIdentity(
+                profile_id=profile.id,
+                reference_audio=profile.reference_audio,
+                reference_sha256=profile.reference_sha256,
+                reference_text=profile.reference_text,
+                language=profile.language,
+            )
+        )
+    if not selected:
+        raise PreparationError("OmniVoice dialogue has no cast voice-bank profile")
+    return OmniVoiceVoiceBankIdentity(
+        catalog_path=str(catalog_path), mode="preset", profiles=tuple(selected)
+    )
 
 
 @dataclass(frozen=True)
@@ -212,6 +332,21 @@ def prepare_run(
     prompt_mode: str,
 ) -> PreparedRun:
     """Wrap the already-resolved run identity and chunks without changing them."""
+    voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
+    if args.provider == "omnivoice-local" and is_dialogue_format(
+        getattr(args, "format", "markdown")
+    ):
+        catalog = getattr(args, "voice_bank_catalog", None)
+        bank_arg = getattr(args, "voice_bank", None)
+        if not isinstance(catalog, VoiceBankCatalog) or bank_arg is None:
+            raise PreparationError(
+                "omnivoice-local dialogue requires an admitted --voice-bank catalog"
+            )
+        voice_bank_identity = build_omnivoice_voice_bank_identity(
+            catalog,
+            Path(bank_arg).expanduser().resolve(),
+            [chunk.voice for chunk in chunks if chunk.voice],
+        )
     return PreparedRun(
         provider=args.provider,
         model=args.model,
@@ -219,6 +354,7 @@ def prepare_run(
         style_prompt=style_prompt,
         prompt_mode=prompt_mode,
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
+        voice_bank_identity=voice_bank_identity,
     )
 
 

@@ -52,6 +52,7 @@ from .repository import (
     ARTIFACT_ROLE_CHUNK_AUDIO,
     ARTIFACT_ROLE_FINAL_AUDIO,
     ARTIFACT_ROLE_TTS_TURN_QUALITY,
+    ATTEMPT_CALL_TYPE_TTS_CHUNK,
     AttemptRecord,
     Cost,
 )
@@ -109,7 +110,14 @@ def _chunk_artifact_for_part(view: NativeTtsView, part_uuid: str):
 
 
 def _attempt_for_part(view: NativeTtsView, part_uuid: str) -> AttemptRecord | None:
-    matches = [attempt for attempt in view.attempts if attempt.part_uuid == part_uuid]
+    # Only a paid ``tts_chunk`` attempt is projected. A local ``omnivoice-local``
+    # part may carry several ``local_tts_chunk`` attempts after local retries, and
+    # those cost-free rows are not the paid attempt the export describes.
+    matches = [
+        attempt
+        for attempt in view.attempts
+        if attempt.part_uuid == part_uuid and attempt.call_type == ATTEMPT_CALL_TYPE_TTS_CHUNK
+    ]
     if len(matches) > 1:
         raise NativeExportError("a committed native part must not carry more than one attempt")
     return matches[0] if matches else None

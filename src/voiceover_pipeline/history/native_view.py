@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..models import ScriptChunk
+from ..services.prepare import OmniVoiceVoiceBankIdentity
 from .native_snapshot import (
     _NATIVE_SNAPSHOT_SUPPORTED_TTS_PROVIDERS,
     NATIVE_SNAPSHOT_FINGERPRINT_VERSION,
@@ -174,6 +175,7 @@ class NativeTtsView:
     script_text: str
     style_prompt: str | None
     output_options: dict[str, Any] | None
+    voice_bank_identity: dict[str, Any] | None
     parts: tuple[NativeTtsPart, ...]
     attempts: tuple[AttemptRecord, ...]
     artifacts: tuple[ArtifactRecord, ...]
@@ -253,6 +255,27 @@ def _config_optional_output(config: dict[str, Any]) -> dict[str, Any] | None:
             raise NativeViewIntegrityError(
                 "native snapshot output option value is not a plain string, integer, or boolean"
             )
+    return value
+
+
+def _config_optional_voice_bank(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the committed voice-bank identity, or ``None`` when absent.
+
+    The writer stores this block only for the admitted ``omnivoice-local`` preset
+    dialogue route. When present it must parse as the same identity the writer
+    hash-covered, or the view fails closed with a fixed message; the block is
+    returned verbatim so the recomputed run identity matches the committed one
+    byte-for-byte.
+    """
+    value = config.get("voice_bank")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise NativeViewIntegrityError("native snapshot voice-bank identity is not a mapping")
+    try:
+        OmniVoiceVoiceBankIdentity.from_payload(value)
+    except ValueError as exc:
+        raise NativeViewIntegrityError("native snapshot voice-bank identity is malformed") from exc
     return value
 
 
@@ -583,6 +606,11 @@ def _read_committed_view(
     prompt_mode = _config_required_str(config, "prompt_mode")
     voice_identity = _config_optional_str(config, "voice_identity")
     synthesis_identity = _config_optional_str(config, "synthesis_identity")
+    voice_bank = _config_optional_voice_bank(config)
+    if provider == "omnivoice-local" and voice_bank is None:
+        raise NativeViewIntegrityError(
+            "native snapshot local OmniVoice run is missing its voice-bank identity"
+        )
 
     style_prompt = _resolve_style_prompt(text_sources)
     identity = _run_identity_payload(
@@ -593,6 +621,7 @@ def _read_committed_view(
         prompt_mode=prompt_mode,
         voice_identity=voice_identity,
         synthesis_identity=synthesis_identity,
+        voice_bank=voice_bank,
     )
     native_parts, part_fingerprints = _build_parts(run, config, parts, text_sources, identity)
 
@@ -635,6 +664,7 @@ def _read_committed_view(
         script_text=script_text,
         style_prompt=style_prompt,
         output_options=_config_optional_output(config),
+        voice_bank_identity=voice_bank,
         parts=tuple(native_parts),
         attempts=tuple(attempts),
         artifacts=tuple(artifacts),

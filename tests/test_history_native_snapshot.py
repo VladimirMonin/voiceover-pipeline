@@ -10,10 +10,11 @@ when a part or text insert aborts, zero filesystem side effects, fail-closed
 rejection of a secret-looking identity, rejection of a sparse, reordered, or
 malformed chunk identity, rejection of a supplied empty style prompt before any
 insert, refusal to join a caller's open transaction, acceptance
-of the two allowlisted routes, and fail-closed rejection of every non-allowlisted
-route (OmniVoice dialogue and preset/clone/design, Qwen preset/clone/design, Polza
-chat-audio, and an unknown provider) before any write even when the provider, ids,
-and fingerprints all look valid.
+of the allowlisted routes (including the local OmniVoice preset dialogue with its
+committed voice-bank identity), and fail-closed rejection of every other route
+(OmniVoice preset/clone/design, Qwen preset/clone/design, Polza chat-audio, and an
+unknown provider) before any write even when the provider, ids, and fingerprints
+all look valid.
 """
 
 import hashlib
@@ -39,7 +40,12 @@ from voiceover_pipeline.history.repository import (
     HistoryRepository,
 )
 from voiceover_pipeline.models import ScriptChunk
-from voiceover_pipeline.services.prepare import PreparedPart, PreparedRun
+from voiceover_pipeline.services.prepare import (
+    OmniVoiceBankProfileIdentity,
+    OmniVoiceVoiceBankIdentity,
+    PreparedPart,
+    PreparedRun,
+)
 
 _DEFAULT_SCRIPT_TEXT = "Первый.\n\nВторой."
 
@@ -145,6 +151,26 @@ def _omnivoice_dialogue_prepared():
         style_prompt=None,
         prompt_mode="plain",
         parts=parts,
+        voice_bank_identity=_omnivoice_voice_bank_identity(parts),
+    )
+
+
+def _omnivoice_voice_bank_identity(parts):
+    """A committed voice-bank identity whose profiles each match their turn."""
+    by_id = {}
+    for part in parts:
+        chunk = part.chunk
+        by_id[chunk.voice] = OmniVoiceBankProfileIdentity(
+            profile_id=chunk.voice,
+            reference_audio=f"voices/{chunk.voice}.wav",
+            reference_sha256=chunk.voice_fingerprint,
+            reference_text=f"reference for {chunk.voice}",
+            language="ru",
+        )
+    return OmniVoiceVoiceBankIdentity(
+        catalog_path="/tmp/bank/catalog.json",
+        mode="preset",
+        profiles=tuple(by_id[key] for key in sorted(by_id)),
     )
 
 
@@ -191,10 +217,6 @@ def _single_chunk_prepared(*, provider, model, voice="voice_a"):
 
 
 _UNSUPPORTED_ROUTES = {
-    "omnivoice-dialogue": lambda: (
-        _omnivoice_dialogue_prepared(),
-        {"synthesis_identity": "a" * 64},
-    ),
     "omnivoice-preset": lambda: (
         _omnivoice_single_mode_prepared(),
         {"voice_identity": f"preset:voice_a:{_OMNIVOICE_REFERENCE_SHA}"},
@@ -659,6 +681,49 @@ def test_unsupported_route_is_rejected_before_any_write(repository, tmp_path, ro
     assert list(tmp_path.rglob("*.json")) == []
 
 
+def test_omnivoice_dialogue_identity_mismatch_is_rejected_before_write(repository, tmp_path):
+    # A committed voice-bank identity must agree with every turn's cast profile id
+    # and bound reference digest, or a resume could synthesize a different voice.
+    prepared = replace(
+        _omnivoice_dialogue_prepared(),
+        parts=(
+            PreparedPart(
+                chunk=ScriptChunk(
+                    number=1,
+                    id="turn_0001",
+                    text="Первая реплика.",
+                    speaker="host",
+                    voice="voice_a",
+                    voice_fingerprint="c" * 64,
+                ),
+                voice="voice_a",
+            ),
+        ),
+    )
+
+    with pytest.raises(NativeSnapshotValidationError):
+        _persist(repository, prepared, tmp_path / "runs" / "omnivoice-mismatch")
+
+    assert _row_count(repository, "runs") == 0
+
+
+def test_omnivoice_dialogue_route_is_accepted_and_reconstructable(repository, tmp_path):
+    prepared = _omnivoice_dialogue_prepared()
+
+    result = _persist(repository, prepared, tmp_path / "runs" / "omnivoice")
+
+    snapshot = result.run.config_snapshot
+    assert snapshot["provider"] == "omnivoice-local"
+    assert snapshot["model"] == _OMNIVOICE_MODEL
+    assert snapshot["voice_bank"]["catalog_path"] == "/tmp/bank/catalog.json"
+    assert [item["profile_id"] for item in snapshot["voice_bank"]["profiles"]] == [
+        "voice_a",
+        "voice_b",
+    ]
+    assert snapshot["parts"][0]["cast_voice"] == "voice_a"
+    assert snapshot["parts"][0]["voice_fingerprint"] == _OMNIVOICE_REFERENCE_SHA
+
+
 def test_unknown_provider_is_rejected_without_echoing_the_identifier(repository, tmp_path):
     secret = "sk-syntheticUnknownProviderValue"
 
@@ -701,6 +766,7 @@ def test_omnivoice_rejection_precedes_part_validation(repository, tmp_path):
     # check first, proving the rejection is fail-first and pre-write.
     prepared = replace(
         _omnivoice_dialogue_prepared(),
+        voice_bank_identity=None,
         parts=(
             PreparedPart(
                 chunk=ScriptChunk(number=1, id="not_generated", text="x", voice="voice_a"),

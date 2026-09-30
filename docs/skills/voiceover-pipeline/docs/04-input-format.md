@@ -193,8 +193,17 @@ voiceover generate `
 
 Для локального варианта укажи `--provider omnivoice-local --mode preset
 --voice-bank <catalog.json>` и явно выбранные два profile ID в frontmatter.
+Локальный вариант сохраняется в каноническую историю без платной попытки и
+без стоимости: каждый turn пишется своим voice-bank profile с его reference
+SHA, каждая реальная локальная реплика сохраняет свою отдельную durable-попытку
+`local_tts_chunk` (в `history costs` — `local_attempts_without_api_charge`), а
+raw-байты реплики линкуются к этой попытке до конвертации, поэтому неопределённый
+или упавший локальный запуск можно безопасно повторить при `--resume`. Если
+reference-файл профиля пропал или изменился, запуск завершается ошибкой до вызова
+локальной модели, а `history sync` локальную модель не запускает.
 Проверенный offline contract не заменяет отдельное human listening acceptance:
-не заявляй два слышимо разных голоса до PASS для нужного provider.
+не заявляй два слышимо разных голоса до PASS для нужного provider. Реальный
+локальный запуск модели (audio.cpp/OmniVoice) в тестах `NOT_RUN`.
 
 ## Voiceover metadata format
 

@@ -245,6 +245,24 @@ PART_STAGE_COMPLETED = "completed"
 # the compatibility JSON without touching the filesystem again.
 ARTIFACT_ROLE_CHUNK_AUDIO = "chunk_audio"
 ARTIFACT_ROLE_FINAL_AUDIO = "final_audio"
+# The one managed artifact that links a locally synthesized raw response to its
+# part before the converted chunk is committed. It is linked to that local
+# invocation's attempt row (never to a paid attempt) and is the durable evidence a
+# resume converts from without running the local model again.
+ARTIFACT_ROLE_LOCAL_RAW_AUDIO = "local_raw_audio"
+# Call type and statuses of a local (no-network, no-cost) TTS attempt. The local
+# route writes one durable attempt row per actual local synthesis invocation
+# before it calls the local model, so ``history costs`` counts every real local
+# attempt as ``local_attempts_without_api_charge`` instead of reporting no
+# execution at all. These statuses are distinct from the paid lifecycle above,
+# and no local value may ever be read as a paid outcome: ``None`` is the pending
+# status of a just-reserved, not-yet-finished invocation, ``local_failed`` is a
+# caught local failure, ``local_raw_saved`` means the local raw bytes are linked,
+# and ``local_completed`` means the converted chunk is committed.
+ATTEMPT_CALL_TYPE_LOCAL_TTS = "local_tts_chunk"
+ATTEMPT_STATUS_LOCAL_FAILED = "local_failed"
+ATTEMPT_STATUS_LOCAL_RAW_SAVED = "local_raw_saved"
+ATTEMPT_STATUS_LOCAL_COMPLETED = "local_completed"
 # One per-turn dialogue quality receipt the native dialogue route records on its
 # own TTS run, linked to the exact turn part it verified. It carries the
 # content-free verdict, the observed-turn audio digest, and the ASR identity;
@@ -2158,6 +2176,485 @@ class HistoryRepository:
                 )
             return advanced, artifact
 
+    def reserve_local_tts_attempt(
+        self,
+        run_uuid: str,
+        *,
+        part_uuid: str,
+        expected_revision: int,
+        provider: str,
+        model: str,
+    ) -> tuple[RunRecord, AttemptRecord]:
+        """Reserve one durable local TTS attempt for a run part before its local call.
+
+        This is the pre-invocation seam for the admitted ``omnivoice-local`` preset
+        dialogue route. A local synthesis makes no network request and has no cost,
+        so this seam deliberately differs from :meth:`reserve_paid_tts_attempt`: a
+        local invocation is safe to repeat, so several attempts may accumulate for
+        one part and every real invocation gets its own row. Inside one
+        :meth:`transaction` it validates that the run exists and that ``part_uuid``
+        belongs to it, refuses a part that already carries a paid ``tts_chunk``
+        attempt (a mixed paid/local part), a part already converted, or a part
+        whose local raw bytes are already linked (no new invocation is needed),
+        compare-and-swaps the run revision through :meth:`advance_run_revision`,
+        and inserts one pending local attempt marker with ``status=None``,
+        ``remote_id=None``, and :meth:`Cost.unknown`. It returns
+        ``(advanced_run, attempt)``, where ``advanced_run.revision`` is the new
+        revision. The caller may only call the local model after this returns, so
+        an interrupted invocation leaves a durable, cost-free attempt row that
+        ``history costs`` counts as ``local_attempts_without_api_charge``.
+
+        The call owns its transaction and refuses to run inside an already open
+        one. It also refuses a run that already carries a ``legacy_source_root`` and
+        any run already in :data:`RUN_STATUS_COMPLETED`. Raises :class:`ValueError`
+        for an invalid ``expected_revision`` or an empty identity field before any
+        write; :class:`HistoryPaidAttemptInTransactionError` inside an open
+        transaction; :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign or absent part;
+        :class:`HistoryPartCompletionConflictError` for a mixed paid part, an
+        already-converted part, or a part with linked local raw evidence; and
+        :class:`HistoryRevisionConflictError` for a stale revision.
+        """
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_identity_field(provider, "provider")
+        _require_identity_field(model, "model")
+        _require_expected_revision(expected_revision)
+        self._require_no_open_transaction("reserve_local_tts_attempt")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            part = self._get_part(part_identifier)
+            if part is None or part.run_uuid != run_uuid:
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            self._require_no_paid_attempt(run_uuid, part_identifier)
+            if part.stage == PART_STAGE_COMPLETED:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} is already {PART_STAGE_COMPLETED!r}; refusing a "
+                    "new local invocation over finished work"
+                )
+            if self._part_local_raw_artifact(part_identifier) is not None:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} already links its local raw audio; refusing a new "
+                    "local invocation that would need no model run"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            attempt = self.add_attempt(
+                run_uuid,
+                call_type=ATTEMPT_CALL_TYPE_LOCAL_TTS,
+                part_uuid=part_identifier,
+                provider=provider,
+                model=model,
+                status=None,
+                cost=Cost.unknown(),
+            )
+            return advanced, attempt
+
+    def record_local_tts_attempt_failed(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        part_uuid: str,
+        expected_revision: int,
+        error: str,
+    ) -> tuple[RunRecord, AttemptRecord]:
+        """Record the outcome of one failed local TTS invocation.
+
+        A caught local model failure is not a paid outcome and never blocks a
+        retry, so this seam only records that this exact invocation failed: inside
+        one :meth:`transaction` it validates that ``attempt_uuid`` is this run and
+        part's pending :data:`ATTEMPT_CALL_TYPE_LOCAL_TTS` attempt, compare-and-swaps
+        the run revision, and writes :data:`ATTEMPT_STATUS_LOCAL_FAILED` together
+        with the fixed ``error`` code. A repeated identical observation is an
+        idempotent no-op. An attempt that already finished (linked raw or
+        completed) is refused rather than rewritten, so a finished invocation is
+        never relabelled. The local attempt is never deleted, so its outcome stays
+        durable and a later resume records a fresh invocation as a new attempt.
+
+        The call owns its transaction and refuses to run inside an already open
+        one, a legacy or completed run, and a foreign attempt or part. Raises
+        :class:`ValueError` for a malformed argument before any write;
+        :class:`HistoryPaidAttemptInTransactionError` inside an open transaction;
+        :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign part;
+        :class:`HistoryPartCompletionConflictError` for a foreign or already
+        finished attempt; and :class:`HistoryRevisionConflictError` for a stale
+        revision.
+        """
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_identity_field(error, "error")
+        _require_expected_revision(expected_revision)
+        self._require_no_open_transaction("record_local_tts_attempt_failed")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            if not self._part_belongs_to_run(part_identifier, run_uuid):
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            attempt = self.get_attempt(attempt_identifier)
+            if (
+                attempt is None
+                or attempt.run_uuid != run_uuid
+                or attempt.part_uuid != part_identifier
+                or attempt.call_type != ATTEMPT_CALL_TYPE_LOCAL_TTS
+            ):
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is not a local TTS attempt of run "
+                    f"{run_uuid!r} part {part_identifier!r}"
+                )
+            if attempt.status == ATTEMPT_STATUS_LOCAL_FAILED:
+                if attempt.error != error:
+                    raise HistoryPartCompletionConflictError(
+                        f"attempt {attempt_identifier!r} already records a different local failure"
+                    )
+                if run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return run, attempt
+            if attempt.status is not None:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is {attempt.status!r}, not pending; refusing "
+                    "to relabel a finished local invocation as failed"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            cursor = self._connection.execute(
+                "UPDATE attempts SET status = ?, error = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND run_uuid = ? AND status IS NULL",
+                (
+                    ATTEMPT_STATUS_LOCAL_FAILED,
+                    error,
+                    utc_now(),
+                    attempt_identifier,
+                    run_uuid,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} was not pending during the local failure "
+                    "transition"
+                )
+            updated = self.get_attempt(attempt_identifier)
+            assert updated is not None  # the guarded update just affected one row
+            return advanced, updated
+
+    def record_local_tts_raw_saved(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        part_uuid: str,
+        expected_revision: int,
+        path: str,
+        mime: str,
+        size_bytes: int,
+        sha256: str,
+        media_metadata: dict[str, Any],
+    ) -> tuple[RunRecord, ArtifactRecord]:
+        """Link locally synthesized raw audio to one local attempt.
+
+        This is the local counterpart of :meth:`record_polza_sync_raw_saved` for
+        the admitted ``omnivoice-local`` preset dialogue route. The caller has
+        already synthesized the part locally (no network and no cost) and written
+        the raw bytes to their managed path and digest; this seam turns that
+        evidence into one ``managed_relative`` :data:`ARTIFACT_ROLE_LOCAL_RAW_AUDIO`
+        artifact linked to this invocation's ``attempt_uuid``, advances that attempt
+        to :data:`ATTEMPT_STATUS_LOCAL_RAW_SAVED`, and sets the part stage to
+        :data:`PART_STAGE_RAW_SAVED` in one short transaction, so an FFmpeg crash
+        after the response can be rebuilt locally with no second model run.
+
+        A local route has no paid reservation, so a paid attempt status is never
+        involved: the only paid-shaped state this seam refuses is a part that
+        already carries a paid ``tts_chunk`` attempt, which would mean a paid and a
+        local path had been mixed on one part. The named attempt must be this run
+        and part's pending :data:`ATTEMPT_CALL_TYPE_LOCAL_TTS` attempt. A repeated
+        identical call whose ``expected_revision`` is still current is an idempotent
+        no-op. A stale revision, a foreign part or attempt, an already-finished
+        attempt, an unexpected part stage, an already-converted part, or a
+        conflicting existing artifact fails closed.
+
+        The call owns its transaction and refuses to run inside an already open
+        one. Raises :class:`ValueError` for a malformed argument before any write;
+        :class:`HistoryPaidAttemptInTransactionError` inside an open transaction;
+        :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign part;
+        :class:`HistoryPartCompletionConflictError` for a mixed, foreign, finished,
+        already-converted, or conflicting part; and
+        :class:`HistoryRevisionConflictError` for a stale revision.
+        """
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_expected_revision(expected_revision)
+        _require_managed_relative_path(path)
+        _require_identity_field(mime, "mime")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise ValueError("size_bytes must be a non-negative integer")
+        _require_identity_field(sha256, "sha256")
+        if not isinstance(media_metadata, dict):
+            raise ValueError("media_metadata must be a mapping")
+        self._require_no_open_transaction("record_local_tts_raw_saved")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            part = self._get_part(part_identifier)
+            if part is None or part.run_uuid != run_uuid:
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            self._require_no_paid_attempt(run_uuid, part_identifier)
+            if part.stage == PART_STAGE_COMPLETED:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} is already {PART_STAGE_COMPLETED!r}; refusing a "
+                    "local raw link over finished work"
+                )
+            attempt = self.get_attempt(attempt_identifier)
+            if (
+                attempt is None
+                or attempt.run_uuid != run_uuid
+                or attempt.part_uuid != part_identifier
+                or attempt.call_type != ATTEMPT_CALL_TYPE_LOCAL_TTS
+            ):
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is not a local TTS attempt of run "
+                    f"{run_uuid!r} part {part_identifier!r}"
+                )
+            existing = self._part_role_artifact(
+                part_identifier, attempt_identifier, ARTIFACT_ROLE_LOCAL_RAW_AUDIO
+            )
+            if existing is not None:
+                if not _artifact_matches(
+                    existing,
+                    role=ARTIFACT_ROLE_LOCAL_RAW_AUDIO,
+                    path=path,
+                    mime=mime,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                    media_metadata=media_metadata,
+                    part_uuid=part_identifier,
+                    attempt_uuid=attempt_identifier,
+                ):
+                    raise HistoryPartCompletionConflictError(
+                        f"attempt {attempt_identifier!r} already carries a different local "
+                        "raw artifact"
+                    )
+                if run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return run, existing
+            if attempt.status is not None:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is {attempt.status!r}, not pending; refusing "
+                    "a local raw link for a finished invocation"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            artifact = self.add_artifact(
+                run_uuid,
+                role=ARTIFACT_ROLE_LOCAL_RAW_AUDIO,
+                path_kind=PATH_KIND_MANAGED_RELATIVE,
+                path=path,
+                part_uuid=part_identifier,
+                attempt_uuid=attempt_identifier,
+                mime=mime,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_metadata=media_metadata,
+            )
+            attempt_cursor = self._connection.execute(
+                "UPDATE attempts SET status = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND run_uuid = ? AND status IS NULL",
+                (ATTEMPT_STATUS_LOCAL_RAW_SAVED, utc_now(), attempt_identifier, run_uuid),
+            )
+            if attempt_cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} vanished during the local raw-saved transition"
+                )
+            cursor = self._connection.execute(
+                "UPDATE parts SET stage = ?, updated_at = ? "
+                "WHERE part_uuid = ? AND run_uuid = ? AND stage IS NOT ?",
+                (PART_STAGE_RAW_SAVED, utc_now(), part_identifier, run_uuid, PART_STAGE_COMPLETED),
+            )
+            if cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} vanished during the local raw-saved transition"
+                )
+            return advanced, artifact
+
+    def record_local_tts_part_completed(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        part_uuid: str,
+        expected_revision: int,
+        path: str,
+        mime: str,
+        size_bytes: int,
+        sha256: str,
+        media_metadata: dict[str, Any],
+    ) -> tuple[RunRecord, ArtifactRecord]:
+        """Commit one converted local part artifact linked to its local attempt.
+
+        The local counterpart of :meth:`record_tts_part_completed` for the
+        ``omnivoice-local`` preset dialogue route. The caller has already written
+        and hashed the converted ``chunks/<id>.mp3`` file; inside one
+        :meth:`transaction` this seam rechecks the run and part, requires the named
+        :data:`ATTEMPT_CALL_TYPE_LOCAL_TTS` attempt to carry its linked
+        :data:`ARTIFACT_ROLE_LOCAL_RAW_AUDIO` evidence and the part to be at
+        :data:`PART_STAGE_RAW_SAVED`, compare-and-swaps the run revision, inserts
+        exactly one :data:`ARTIFACT_ROLE_CHUNK_AUDIO` artifact linked to
+        ``attempt_uuid``, advances that attempt to
+        :data:`ATTEMPT_STATUS_LOCAL_COMPLETED`, and moves the part to
+        :data:`PART_STAGE_COMPLETED`. No paid attempt is ever created or touched.
+
+        A repeated identical call whose ``expected_revision`` is still current is
+        an idempotent no-op. A stale revision, a foreign part or attempt, a mixed
+        paid attempt, a finished-but-unlinked attempt, a missing raw link, or a
+        conflicting existing artifact fails closed with no database mutation. The
+        call owns its transaction and refuses to run inside an already open one.
+        Raises :class:`ValueError` for a malformed argument before any write;
+        :class:`HistoryPaidAttemptInTransactionError` inside an open transaction;
+        :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign part;
+        :class:`HistoryPartCompletionConflictError` for a missing raw link or a
+        conflicting artifact; and :class:`HistoryRevisionConflictError` for a stale
+        revision.
+        """
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_expected_revision(expected_revision)
+        _require_managed_relative_path(path)
+        _require_identity_field(mime, "mime")
+        if isinstance(size_bytes, bool) or not isinstance(size_bytes, int) or size_bytes < 0:
+            raise ValueError("size_bytes must be a non-negative integer")
+        _require_identity_field(sha256, "sha256")
+        if not isinstance(media_metadata, dict):
+            raise ValueError("media_metadata must be a mapping")
+        self._require_no_open_transaction("record_local_tts_part_completed")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            part = self._get_part(part_identifier)
+            if part is None or part.run_uuid != run_uuid:
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            self._require_no_paid_attempt(run_uuid, part_identifier)
+            attempt = self.get_attempt(attempt_identifier)
+            if (
+                attempt is None
+                or attempt.run_uuid != run_uuid
+                or attempt.part_uuid != part_identifier
+                or attempt.call_type != ATTEMPT_CALL_TYPE_LOCAL_TTS
+            ):
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is not a local TTS attempt of run "
+                    f"{run_uuid!r} part {part_identifier!r}"
+                )
+            existing = self._part_role_artifact(
+                part_identifier, attempt_identifier, ARTIFACT_ROLE_CHUNK_AUDIO
+            )
+            if existing is not None:
+                if not _artifact_matches(
+                    existing,
+                    role=ARTIFACT_ROLE_CHUNK_AUDIO,
+                    path=path,
+                    mime=mime,
+                    size_bytes=size_bytes,
+                    sha256=sha256,
+                    media_metadata=media_metadata,
+                    part_uuid=part_identifier,
+                    attempt_uuid=attempt_identifier,
+                ):
+                    raise HistoryPartCompletionConflictError(
+                        f"attempt {attempt_identifier!r} already carries a different converted "
+                        "chunk artifact"
+                    )
+                if part.stage != PART_STAGE_COMPLETED:
+                    raise HistoryPartCompletionConflictError(
+                        f"part {part_identifier!r} has a converted chunk artifact but is not "
+                        f"{PART_STAGE_COMPLETED!r}"
+                    )
+                if run.revision != expected_revision:
+                    raise HistoryRevisionConflictError(
+                        f"run {run_uuid!r} is not at revision {expected_revision}"
+                    )
+                return run, existing
+            if attempt.status != ATTEMPT_STATUS_LOCAL_RAW_SAVED:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} is {attempt.status!r}, not "
+                    f"{ATTEMPT_STATUS_LOCAL_RAW_SAVED!r}; refusing a local conversion without its "
+                    "raw link"
+                )
+            raw_existing = self._part_role_artifact(
+                part_identifier, attempt_identifier, ARTIFACT_ROLE_LOCAL_RAW_AUDIO
+            )
+            if raw_existing is None:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} has no linked local raw audio to convert"
+                )
+            if part.stage != PART_STAGE_RAW_SAVED:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} is {part.stage!r}, not "
+                    f"{PART_STAGE_RAW_SAVED!r}; refusing a local conversion without its raw link"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            artifact = self.add_artifact(
+                run_uuid,
+                role=ARTIFACT_ROLE_CHUNK_AUDIO,
+                path_kind=PATH_KIND_MANAGED_RELATIVE,
+                path=path,
+                part_uuid=part_identifier,
+                attempt_uuid=attempt_identifier,
+                mime=mime,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_metadata=media_metadata,
+            )
+            attempt_cursor = self._connection.execute(
+                "UPDATE attempts SET status = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND run_uuid = ? AND status = ?",
+                (
+                    ATTEMPT_STATUS_LOCAL_COMPLETED,
+                    utc_now(),
+                    attempt_identifier,
+                    run_uuid,
+                    ATTEMPT_STATUS_LOCAL_RAW_SAVED,
+                ),
+            )
+            if attempt_cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"attempt {attempt_identifier!r} did not carry linked local raw audio during "
+                    "the conversion transition; refusing a partial completion"
+                )
+            cursor = self._connection.execute(
+                "UPDATE parts SET stage = ?, updated_at = ? "
+                "WHERE part_uuid = ? AND run_uuid = ? AND stage = ?",
+                (PART_STAGE_COMPLETED, utc_now(), part_identifier, run_uuid, PART_STAGE_RAW_SAVED),
+            )
+            if cursor.rowcount != 1:
+                raise HistoryPartCompletionConflictError(
+                    f"part {part_identifier!r} did not carry linked local raw audio during the "
+                    "conversion transition; refusing a partial completion"
+                )
+            return advanced, artifact
+
     def record_tts_run_completed(
         self,
         run_uuid: str,
@@ -2727,6 +3224,43 @@ class HistoryRepository:
                 "refusing to link a second"
             )
         return artifact
+
+    def _part_local_raw_artifact(self, part_uuid: str) -> ArtifactRecord | None:
+        """Return the one linked local raw artifact for a part, or ``None``.
+
+        A local invocation is refused when its part already links local raw audio,
+        because a rebuild needs no model run. More than one matching row is a
+        conflict: the canonical history links exactly one local raw artifact per
+        part, so a duplicate is never adopted.
+        """
+        rows = self._connection.execute(
+            "SELECT * FROM artifacts WHERE part_uuid = ? AND role = ?",
+            (part_uuid, ARTIFACT_ROLE_LOCAL_RAW_AUDIO),
+        ).fetchall()
+        if not rows:
+            return None
+        if len(rows) != 1:
+            raise HistoryPartCompletionConflictError(
+                f"part {part_uuid!r} carries {len(rows)} {ARTIFACT_ROLE_LOCAL_RAW_AUDIO!r} "
+                "artifacts; refusing to add another"
+            )
+        return _row_to_artifact(rows[0])
+
+    def _require_no_paid_attempt(self, run_uuid: str, part_uuid: str) -> None:
+        """Refuse a local transition on a part that already carries a paid attempt.
+
+        A paid and a local synthesis path must never share one part; mixing them
+        would let a local conversion overwrite or accompany paid evidence the paid
+        reservation/GET seams still own. The check names no stored value.
+        """
+        if (
+            self._find_attempt_uuid_for_part(run_uuid, part_uuid, ATTEMPT_CALL_TYPE_TTS_CHUNK)
+            is not None
+        ):
+            raise HistoryPartCompletionConflictError(
+                f"part {part_uuid!r} already carries a paid {ATTEMPT_CALL_TYPE_TTS_CHUNK!r} "
+                "attempt; refusing a local transition on it"
+            )
 
     def _part_role_artifact(
         self, part_uuid: str, attempt_uuid: str, role: str

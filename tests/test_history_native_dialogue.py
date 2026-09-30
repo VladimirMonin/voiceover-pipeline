@@ -783,9 +783,14 @@ def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route()
     args.with_timings = True
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.with_timings = False
-    # OmniVoice and every Polza dialogue stay legacy.
+    # OmniVoice is admitted only with its own voice bank and no quality provider;
+    # every Polza dialogue stays legacy.
     args.provider = "omnivoice-local"
     args.model = "audio-cpp/omnivoice-q8_0"
+    args.mode = "preset"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    args.voice_bank_catalog = object()
+    args.tts_quality_provider = None
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.provider = "polza-tts"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False

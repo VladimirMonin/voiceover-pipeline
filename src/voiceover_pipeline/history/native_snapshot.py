@@ -86,7 +86,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ScriptChunk
-from ..services.prepare import PreparedPart, PreparedRun
+from ..services.prepare import OmniVoiceVoiceBankIdentity, PreparedPart, PreparedRun
 from .repository import (
     TEXT_COMPLETENESS_COMPLETE,
     TEXT_KIND_TTS_DIRECTION,
@@ -116,12 +116,18 @@ _REDACTED_IDENTITY_REJECTED = (
 # resume needs, so only they may be snapshotted at this foundation stage:
 #   * ``polza-tts`` -- model and voice.
 #   * ``openrouter-tts`` -- model, voice, style prompt, and prompt mode.
+#   * ``omnivoice-local`` -- the admitted preset dialogue route, whose
+#     ``PreparedRun.voice_bank_identity`` carries the catalog locator and each
+#     referenced profile's reference locator, digest, text, and language.
 # Every other provider fails closed before any insert, whether it is a known route
 # whose resume inputs ``PreparedRun`` does not yet carry (``qwen-local``,
-# ``omnivoice-local``, or ``polza-chat-audio``) or an unknown identifier. The
-# rejection is one fixed message because an unknown identifier is not admitted
-# input and could be a secret, so the message echoes no provider value.
-_NATIVE_SNAPSHOT_SUPPORTED_TTS_PROVIDERS = frozenset({"polza-tts", "openrouter-tts"})
+# ``omnivoice-local`` non-dialogue modes, or ``polza-chat-audio``) or an unknown
+# identifier. The rejection is one fixed message because an unknown identifier is
+# not admitted input and could be a secret, so the message echoes no provider
+# value.
+_NATIVE_SNAPSHOT_SUPPORTED_TTS_PROVIDERS = frozenset(
+    {"polza-tts", "openrouter-tts", "omnivoice-local"}
+)
 _UNSUPPORTED_TTS_ROUTE_REJECTED = (
     "prepared run provider is not yet supported by the native snapshot writer: its "
     "resume identity inputs are not persisted, so the snapshot would be "
@@ -260,8 +266,9 @@ def _run_identity_payload(
     prompt_mode: str,
     voice_identity: str | None,
     synthesis_identity: str | None,
+    voice_bank: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "version": NATIVE_SNAPSHOT_FINGERPRINT_VERSION,
         "provider": provider,
         "model": model,
@@ -271,6 +278,13 @@ def _run_identity_payload(
         "voice_identity": voice_identity,
         "synthesis_identity": synthesis_identity,
     }
+    if voice_bank is not None:
+        # Only the ``omnivoice-local`` preset dialogue route records a voice-bank
+        # identity. The key is added only when present, so a polza/openrouter run
+        # keeps the exact version-1 payload it committed before this route existed
+        # and needs no fingerprint-version bump.
+        payload["voice_bank"] = voice_bank
+    return payload
 
 
 def _chunk_payload(chunk: ScriptChunk) -> dict[str, Any]:
@@ -323,6 +337,7 @@ def _build_snapshot_config(
     part_count: int,
     part_entries: list[dict[str, Any]],
     output_options: dict[str, Any] | None,
+    voice_bank: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the whitelisted structural snapshot stored in ``config_snapshot``.
 
@@ -346,6 +361,8 @@ def _build_snapshot_config(
         "part_count": part_count,
         "parts": part_entries,
     }
+    if voice_bank is not None:
+        snapshot["voice_bank"] = voice_bank
     if output_options is not None:
         snapshot["output"] = output_options
     return snapshot
@@ -374,6 +391,56 @@ def _require_output_options(value: object) -> dict[str, Any] | None:
             )
         validated[key] = item
     return validated
+
+
+def _require_voice_bank_identity(prepared: PreparedRun, provider: str) -> dict[str, Any] | None:
+    """Return the committed voice-bank identity payload, or ``None`` when absent.
+
+    Only the admitted ``omnivoice-local`` preset dialogue route carries one, and
+    it must always carry one: a non-dialogue ``omnivoice-local`` run (or any other
+    provider) that somehow reached this writer would otherwise commit an identity
+    whose voice-bank inputs were never captured. The rejection echoes no value.
+    """
+    identity = prepared.voice_bank_identity
+    if provider == "omnivoice-local":
+        if not isinstance(identity, OmniVoiceVoiceBankIdentity):
+            # A local run without a committed voice-bank identity (a non-dialogue
+            # preset/clone/design mode) did not capture its resume inputs, so the
+            # same fixed route-rejection message applies and names no value.
+            raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
+        return identity.to_payload()
+    if identity is not None:
+        raise NativeSnapshotValidationError(
+            "a voice-bank identity is only valid for the local OmniVoice dialogue route"
+        )
+    return None
+
+
+def _require_dialogue_bank_consistency(
+    prepared: PreparedRun, identity_payload: dict[str, Any] | None
+) -> None:
+    """Require every local dialogue turn to match its committed voice-bank profile.
+
+    Each turn's cast profile id must be one of the identity's referenced profiles
+    and its bound reference digest must equal that profile's stored
+    ``reference_sha256``, so a committed snapshot can never bind a turn to a
+    reference the run did not actually clone. The rejection echoes no value.
+    """
+    if identity_payload is None:
+        return
+    by_id = {
+        item["profile_id"]: item["reference_sha256"]
+        for item in identity_payload["profiles"]
+        if isinstance(item, dict)
+        and isinstance(item.get("profile_id"), str)
+        and isinstance(item.get("reference_sha256"), str)
+    }
+    for part in prepared.parts:
+        chunk = part.chunk
+        if chunk.voice is None or by_id.get(chunk.voice) != chunk.voice_fingerprint:
+            raise NativeSnapshotValidationError(
+                "a local OmniVoice dialogue turn does not match its voice-bank identity"
+            )
 
 
 def persist_prepared_tts_snapshot(
@@ -461,6 +528,11 @@ def persist_prepared_tts_snapshot(
     if style_prompt is not None and (not isinstance(style_prompt, str) or not style_prompt):
         raise NativeSnapshotValidationError("style_prompt must be None or a non-empty string")
     validated_output_options = _require_output_options(output_options)
+    # The ``omnivoice-local`` preset dialogue route is the only one that carries a
+    # voice-bank identity; every other route must not, so a mismatched pairing
+    # fails closed instead of committing an identity the reader cannot rebuild.
+    voice_bank_payload = _require_voice_bank_identity(prepared, provider)
+    _require_dialogue_bank_consistency(prepared, voice_bank_payload)
 
     identity = _run_identity_payload(
         provider=provider,
@@ -470,6 +542,7 @@ def persist_prepared_tts_snapshot(
         prompt_mode=prompt_mode,
         voice_identity=voice_identity,
         synthesis_identity=synthesis_identity,
+        voice_bank=voice_bank_payload,
     )
 
     planned: list[_PlannedPart] = []
@@ -540,6 +613,7 @@ def persist_prepared_tts_snapshot(
         part_count=len(planned),
         part_entries=[item.config_entry for item in planned],
         output_options=validated_output_options,
+        voice_bank=voice_bank_payload,
     )
     # The history boundary redacts secret-looking values in its own copy; if that
     # would change any whitelisted structural identity, persisting it would store

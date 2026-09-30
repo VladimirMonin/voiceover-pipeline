@@ -547,14 +547,13 @@ provider/model/voice/script, с которыми позднее будет за�
 
 ### Нативный OpenRouter Gemini dialogue (фрагмент S05)
 
-Единственный диалоговый маршрут, переведённый на canonical SQLite —
+Первый диалоговый маршрут, переведённый на canonical SQLite —
 `--provider openrouter-tts --model google/gemini-3.1-flash-tts-preview
 --format dialogue` (валидированный YAML, ровно два speaker'а с различными
 голосами из `GEMINI_TTS_VOICES`) с обязательным установленным локальным
 `--tts-quality-provider` (`qwen-local`/`nemotron-local`) и обрезкой по
-умолчанию. `--no-trim`, `--with-timings`, `omnivoice-local` и любой
-`polza-tts` dialogue остаются на legacy executor; новый обобщённый движок не
-добавляется.
+умолчанию. `--no-trim`, `--with-timings` и любой `polza-tts` dialogue остаются
+на legacy executor; новый обобщённый движок не добавляется.
 
 - Каждая реплика — один paid-запрос со своим cast-voice (`voice`, как в legacy);
   снимок хранит порядок реплик, speaker, cast/effective voice, паузу и текст.
@@ -575,6 +574,35 @@ provider/model/voice/script, с которыми позднее будет за�
   и несут `history_run_uuid`/`history_revision`, а также per-turn
   `turn_index`/`speaker`/`voice`/`pause_after_ms`/`audio_sha256` и
   контентно-пустой `tts_quality` receipt (без приватного транскрипта).
+
+### Нативный локальный OmniVoice dialogue (фрагмент S05)
+
+Второй диалоговый маршрут — `--provider omnivoice-local --model
+audio-cpp/omnivoice-q8_0 --mode preset --voice-bank <catalog.json> --format
+dialogue` (валидированный YAML, ровно два speaker'а с различными profile ID из
+admitted bank и различными `reference_sha256`) с обрезкой по умолчанию.
+`--no-trim`, `--with-timings`, `--tts-quality-provider`, другие режимы
+OmniVoice и любой `polza-tts` dialogue остаются на legacy executor.
+
+- Каждая реплика — один локальный запрос со своим cast voice-bank profile;
+  снимок хранит порядок, speaker, cast/effective voice, reference digest,
+  паузу и текст, а также локатор каталога и настройки выбранных профилей.
+- Платной попытки и стоимости нет: каждая реальная локальная реплика пишет свою
+  отдельную durable-попытку `local_tts_chunk` (`status`/`cost` NULL, никогда не
+  платный маркер), а `history costs` считает такие строки в
+  `local_attempts_without_api_charge`, не как облачную неизвестную стоимость и не
+  как выдуманный ноль. Raw-байты реплики и её converted chunk линкуются к этой
+  попытке до конвертации, поэтому сбой FFmpeg восстанавливается из raw без
+  повторного запуска модели; упавший или прерванный локальный запуск сохраняет
+  свой truthful outcome (`local_failed` или pending-строка) и безопасно
+  повторяется новой попыткой при явном `--resume`/`history resume`.
+- Если reference-файл профиля пропал или его digest изменился, запуск
+  завершается ошибкой (`NATIVE_LOCAL_REFERENCE_UNAVAILABLE` или
+  `NATIVE_RESUME_IDENTITY_CHANGED`) до вызова локальной модели.
+- `history sync ID` не запускает локальную модель: незавершённая локальная часть
+  сообщает `NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED`, завершённый прогон только
+  переписывает совместимые JSON-экспорты из БД. Реальный локальный запуск модели
+  в тестах — `NOT_RUN`.
 
 ## Локальные ASR / timings / verify в канонической истории (фрагмент S05)
 
@@ -1045,7 +1073,9 @@ voiceover history sync ID --json        # без нового оплаченно
   Media ID восстанавливаются только локально. Неотправленная (unattempted) часть
   или неподтверждённый submit блокируют (`NATIVE_SYNC_PAID_SUBMIT_REQUIRED` /
   `PAID_SUBMIT_UNCONFIRMED`, exit `30`) до чтения ключа и построения провайдера,
-  без единого POST; остаток прогона молча не исполняется.
+  без единого POST; незавершённая локальная часть `omnivoice-local` блокируется
+  отдельным `NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED` (exit `30`) без запуска
+  локальной модели; остаток прогона молча не исполняется.
 - **Один писатель и CAS.** Оба глагола идут через тот же межпроцессный run lock и
   CAS-резервацию, что и `generate`; занятый lock → exit `30` `NATIVE_RUN_LOCKED`.
 - **Никаких новых прогонов.** Вызов привязан к запрошенному UUID, поэтому не

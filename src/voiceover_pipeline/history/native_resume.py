@@ -63,7 +63,7 @@ from pathlib import Path
 from typing import Any
 
 from ..models import ScriptChunk
-from ..services.prepare import PreparedPart, PreparedRun
+from ..services.prepare import OmniVoiceVoiceBankIdentity, PreparedPart, PreparedRun
 from .native_snapshot import (
     _is_generated_chunk_id,
     _normalize_run_root,
@@ -103,6 +103,10 @@ _SCRIPT_FORMAT_CONFLICT = "native resume identity conflict: script format change
 _RUN_IDENTITY_CONFLICT = (
     "native resume identity conflict: run provider, model, voice, style prompt, prompt mode, "
     "or opaque identity changed"
+)
+_VOICE_BANK_CONFLICT = (
+    "native resume identity conflict: the omnivoice-local voice-bank catalog or referenced "
+    "profile settings changed"
 )
 _PART_COUNT_CONFLICT = "native resume identity conflict: part count changed"
 _PART_ORDER_CONFLICT = (
@@ -167,6 +171,11 @@ def _require_prepared(prepared: object) -> PreparedRun:
             or isinstance(chunk.pause_after_ms, bool)
         ):
             raise NativeResumeValidationError("prepared chunk fields have invalid types")
+    voice_bank = prepared.voice_bank_identity
+    if voice_bank is not None and not isinstance(voice_bank, OmniVoiceVoiceBankIdentity):
+        raise NativeResumeValidationError(
+            "prepared voice-bank identity must be None or an OmniVoiceVoiceBankIdentity"
+        )
     return prepared
 
 
@@ -274,6 +283,14 @@ def preflight_native_tts_resume(
         or _config_optional_str(config, "synthesis_identity") != candidate_synthesis_identity
     ):
         raise NativeResumeIdentityConflictError(_RUN_IDENTITY_CONFLICT)
+    committed_voice_bank = config.get("voice_bank")
+    candidate_voice_bank = (
+        None
+        if candidate.voice_bank_identity is None
+        else candidate.voice_bank_identity.to_payload()
+    )
+    if committed_voice_bank != candidate_voice_bank:
+        raise NativeResumeIdentityConflictError(_VOICE_BANK_CONFLICT)
 
     if len(candidate.parts) != len(view.parts):
         raise NativeResumeIdentityConflictError(_PART_COUNT_CONFLICT)
@@ -289,6 +306,7 @@ def preflight_native_tts_resume(
         prompt_mode=candidate.prompt_mode,
         voice_identity=candidate_voice_identity,
         synthesis_identity=candidate_synthesis_identity,
+        voice_bank=candidate_voice_bank,
     )
     for position, part in enumerate(candidate.parts, start=1):
         chunk = part.chunk

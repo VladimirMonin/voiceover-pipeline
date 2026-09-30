@@ -7,21 +7,28 @@ compatibility exports. This module owns the bounded executor for the admitted
 routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing
 processing, either its synchronous ``/audio/speech`` model or its async
 ``elevenlabs/`` ``/media`` model, the synchronous ``openrouter-tts`` route, and
-the validated ``openrouter-tts`` Gemini two-speaker dialogue route -- and their
+the validated ``openrouter-tts`` Gemini two-speaker dialogue route, and the
+``omnivoice-local`` preset two-profile bank dialogue route -- and their
 recovery decisions. Two orthogonal integrated steps are admitted for that same
 ordinary route: the recorded silence-trimming semantics (``--no-trim`` vs the
 default trim) and one local post-audio step -- either local ``faster-whisper``
 timings or, separately, a local ASR quality verification.
 
-The admitted dialogue route is deliberately narrower. It is one turn per request,
-keeps each turn's cast voice, and requires an installed local
+The admitted ``openrouter-tts`` dialogue route is deliberately narrower. It is one
+turn per request, keeps each turn's cast voice, and requires an installed local
 ``--tts-quality-provider``: every converted turn is transcribed and checked before
 the next paid turn and before the final concat, and the observed PASS/FAIL verdict
 together with the private transcript is persisted on the TTS run, linked to that
 exact turn part. It records no integrated timing and no ``--no-trim`` mixture; the
-final audio is assembled with the recorded 250/600/0 ms pause plan. Every other
-dialogue route -- ``omnivoice-local`` and every ``polza-tts`` dialogue -- stays on
-the legacy executor.
+final audio is assembled with the recorded 250/600/0 ms pause plan. The admitted
+``omnivoice-local`` preset dialogue route is local: one turn per request with its
+cast voice-bank profile, no paid POST or paid attempt marker, no quality gate, and no
+``--no-trim``/``--with-timings`` mixture. Each real local invocation reserves its own
+cost-free ``local_tts_chunk`` attempt before the local model runs and links that
+turn's raw bytes to it before conversion, so a crash converts from them with no
+second model run and an interrupted or failed invocation stays truthful and
+repeatable on an explicit resume. Every other dialogue route -- every
+``polza-tts`` dialogue -- stays on the legacy executor.
 
 Contract:
 
@@ -65,12 +72,13 @@ Contract:
 
 Known limits: this slice admits the non-dialogue ``polza-tts`` and
 ``openrouter-tts`` routes with the recorded trimming/timing/quality semantics in
-the snapshot, plus the one validated ``openrouter-tts`` Gemini dialogue route. The
+the snapshot, the validated ``openrouter-tts`` Gemini dialogue route, and the
+``omnivoice-local`` preset two-profile bank dialogue route. The
 crash window between a synchronous raw receipt and its database link (covered by
 local reconciliation) is the only place a synchronous observed cost cannot be
 rebuilt, because the receipt carries no cost. Cloud ASR, cloud timing, the other
-speech providers, and every other dialogue route stay on the legacy executor until
-their own identity and processing paths are supported.
+speech providers, and every ``polza-tts`` dialogue route stay on the legacy
+executor until their own identity and processing paths are supported.
 """
 
 from __future__ import annotations
@@ -133,8 +141,10 @@ from ..history.raw_receipt import (
 from ..history.repository import (
     ARTIFACT_ROLE_CHUNK_AUDIO,
     ARTIFACT_ROLE_FINAL_AUDIO,
+    ARTIFACT_ROLE_LOCAL_RAW_AUDIO,
     ARTIFACT_ROLE_PAID_RAW_AUDIO,
     ARTIFACT_ROLE_TTS_TURN_QUALITY,
+    ATTEMPT_CALL_TYPE_TTS_CHUNK,
     ATTEMPT_STATUS_COMPLETED,
     ATTEMPT_STATUS_RAW_SAVED,
     ATTEMPT_STATUS_REMOTE_ACCEPTED,
@@ -156,7 +166,7 @@ from ..models import ASRResult, RunPaths, ScriptChunk, SynthesisResult
 from ..run_state import LOG_FILE, GenerationLogger
 from ..tts_quality import TTSQualityResult, evaluate_tts_transcript
 from . import costs
-from .prepare import PreparedPart, PreparedRun
+from .prepare import OmniVoiceVoiceBankIdentity, PreparedPart, PreparedRun
 from .recovery import polza_media_route_model
 from .synthesis import synthesize_part
 
@@ -189,6 +199,13 @@ _ERROR_EVIDENCE_INCONSISTENT = "NATIVE_EVIDENCE_INCONSISTENT"
 _ERROR_RAWS_EVIDENCE_INVALID = "NATIVE_RAW_EVIDENCE_INVALID"
 _ERROR_SUBMIT_UNCONFIRMED = "PAID_SUBMIT_UNCONFIRMED"
 _ERROR_SYNTHESIS_FAILED = "NATIVE_SYNTHESIS_FAILED"
+# Local synthesis (the admitted ``omnivoice-local`` preset dialogue route) has no
+# paid POST, so it has its own bounded codes: a local model failure, verified
+# local raw evidence that no longer matches, and a local reference profile that
+# changed or disappeared before any local model call.
+_ERROR_LOCAL_SYNTHESIS_FAILED = "NATIVE_LOCAL_SYNTHESIS_FAILED"
+_ERROR_LOCAL_RAW_EVIDENCE_INVALID = "NATIVE_LOCAL_RAW_EVIDENCE_INVALID"
+_ERROR_LOCAL_REFERENCE_UNAVAILABLE = "NATIVE_LOCAL_REFERENCE_UNAVAILABLE"
 _ERROR_CONVERSION_FAILED = "NATIVE_CONVERSION_FAILED"
 _ERROR_ASSEMBLY_FAILED = "NATIVE_ASSEMBLY_FAILED"
 _ERROR_EXPORT_FAILED = "NATIVE_EXPORT_FAILED"
@@ -199,11 +216,14 @@ _ERROR_HISTORY_CONFLICT = "NATIVE_HISTORY_CONFLICT"
 # snapshot alone, so a stored identity they cannot rebuild, a run root that no
 # longer resolves to the requested committed run, a completed run whose final
 # audio is gone, and an unattempted part that ``history sync`` must not submit all
-# fail closed with their own stable code.
+# fail closed with their own stable code. A local ``omnivoice-local`` part that
+# ``history sync`` cannot finish without running the local model reports its own
+# fixed code, so a sync error never claims a paid submit was refused.
 _ERROR_HISTORY_INCOMPLETE = "NATIVE_HISTORY_RECONSTRUCTION_FAILED"
 _ERROR_HISTORY_RUN_MISMATCH = "NATIVE_HISTORY_RUN_MISMATCH"
 _ERROR_FINAL_AUDIO_MISSING = "NATIVE_FINAL_AUDIO_MISSING"
 _ERROR_SYNC_SUBMIT_REQUIRED = "NATIVE_SYNC_PAID_SUBMIT_REQUIRED"
+_ERROR_SYNC_LOCAL_SYNTHESIS_REQUIRED = "NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED"
 # Local timing (after the committed final audio) has its own bounded codes: a
 # timing extraction failure, a timing-history persistence failure, a malformed
 # recorded timing block, an unsupported timing provider, an unavailable local
@@ -871,6 +891,7 @@ class _PartEvidence:
     part: NativeTtsPart
     attempt: AttemptRecord | None
     raw_artifact: ArtifactRecord | None
+    local_raw_artifact: ArtifactRecord | None
     chunk_artifact: ArtifactRecord | None
 
 
@@ -878,18 +899,31 @@ def _collect_evidence(view: NativeTtsView) -> list[_PartEvidence]:
     evidence: list[_PartEvidence] = []
     for part in view.parts:
         part_uuid = part.record.part_uuid
-        attempts = [attempt for attempt in view.attempts if attempt.part_uuid == part_uuid]
+        # Only a paid ``tts_chunk`` attempt is paid evidence. A local route records
+        # its own ``local_tts_chunk`` attempt per real local invocation, and a part
+        # may legitimately carry several after local retries, so those rows never
+        # count here and are never mistaken for a paid reservation.
+        attempts = [
+            attempt
+            for attempt in view.attempts
+            if attempt.part_uuid == part_uuid and attempt.call_type == ATTEMPT_CALL_TYPE_TTS_CHUNK
+        ]
         raws = [
             artifact
             for artifact in view.artifacts
             if artifact.part_uuid == part_uuid and artifact.role == ARTIFACT_ROLE_PAID_RAW_AUDIO
+        ]
+        local_raws = [
+            artifact
+            for artifact in view.artifacts
+            if artifact.part_uuid == part_uuid and artifact.role == ARTIFACT_ROLE_LOCAL_RAW_AUDIO
         ]
         chunks = [
             artifact
             for artifact in view.artifacts
             if artifact.part_uuid == part_uuid and artifact.role == ARTIFACT_ROLE_CHUNK_AUDIO
         ]
-        if len(attempts) > 1 or len(raws) > 1 or len(chunks) > 1:
+        if len(attempts) > 1 or len(raws) > 1 or len(local_raws) > 1 or len(chunks) > 1:
             # A part with more than one attempt or artifact cannot be told apart, so
             # the executor must not silently pick one and continue to a paid call.
             raise NativeGenerationError(
@@ -903,6 +937,7 @@ def _collect_evidence(view: NativeTtsView) -> list[_PartEvidence]:
                 part=part,
                 attempt=attempts[0] if attempts else None,
                 raw_artifact=raws[0] if raws else None,
+                local_raw_artifact=local_raws[0] if local_raws else None,
                 chunk_artifact=chunks[0] if chunks else None,
             )
         )
@@ -915,6 +950,15 @@ def _has_paid_evidence(evidence: _PartEvidence) -> bool:
         or evidence.raw_artifact is not None
         or evidence.chunk_artifact is not None
     )
+
+
+def _has_any_evidence(evidence: _PartEvidence) -> bool:
+    """Whether a part carries any committed paid or local evidence.
+
+    Used only for the contiguous-prefix invariant, so a local raw or converted
+    chunk is treated as committed work exactly like a paid one.
+    """
+    return _has_paid_evidence(evidence) or evidence.local_raw_artifact is not None
 
 
 def _verified_chunk_file(
@@ -1174,6 +1218,11 @@ class _Executor:
         self.chunks = chunks
         self.script_format = script_format
         self.dialogue = is_dialogue_format(script_format)
+        # The admitted local route is the ``omnivoice-local`` preset dialogue: it
+        # has no paid POST and its per-turn quality gate is the OpenRouter-only
+        # rule, so the two are tracked separately from a generic dialogue run.
+        self.local = prepared.provider == "omnivoice-local"
+        self.dialogue_quality_gate = self.dialogue and prepared.provider == "openrouter-tts"
         self.script_path = script_path
         self.output_options = output_options
         self.timing_options = timing_options_from_output_options(output_options)
@@ -1340,10 +1389,294 @@ class _Executor:
             ) from exc
         self._revision = run.revision
         self.logger.event("info", "chunk_state_saved", chunk=part.number, id=part.chunk_id)
-        if self.dialogue:
+        if self.dialogue_quality_gate:
             # The required per-turn local quality gate runs on this just-committed
             # turn audio, before any later turn's paid submit and before concat.
             self._run_turn_quality(evidence)
+
+    # -- local synthesis (admitted omnivoice-local preset dialogue) -------------
+
+    def _local_raw_path(self, part: NativeTtsPart, audio_format: str) -> str:
+        """Return the managed-relative raw path for one local turn's bytes."""
+        extension = "wav" if audio_format == "wav" else audio_format
+        return f"raw/{part.chunk_id}.{extension}"
+
+    def _link_local_raw(
+        self, part: NativeTtsPart, result: SynthesisResult, attempt_uuid: str
+    ) -> ArtifactRecord:
+        """Persist and link locally synthesized raw bytes before any conversion.
+
+        The bytes are written to their managed ``raw/<id>.<ext>`` path and linked as
+        the one :data:`ARTIFACT_ROLE_LOCAL_RAW_AUDIO` artifact of this invocation's
+        ``attempt_uuid``, so a later FFmpeg crash can be rebuilt from these bytes
+        with no second local model run. A conflicting existing file (a different
+        synthesis for the same turn) fails closed instead of being silently
+        replaced.
+        """
+        relative = self._local_raw_path(part, result.audio_format)
+        target = self.run_root / relative
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise NativeGenerationError(
+                "the native run raw directory could not be created.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_OUTPUT_UNAVAILABLE,
+            ) from exc
+        staged = _new_staging_path(target)
+        try:
+            staged.write_bytes(result.audio_bytes)
+            size_bytes = staged.stat().st_size
+            sha256 = self.hooks.sha256_file(staged)
+            _publish_staged(
+                staged,
+                target,
+                error_code=_ERROR_LOCAL_RAW_EVIDENCE_INVALID,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                sha256_file=self.hooks.sha256_file,
+            )
+        except NativeGenerationError:
+            staged.unlink(missing_ok=True)
+            raise
+        except OSError as exc:
+            staged.unlink(missing_ok=True)
+            raise NativeGenerationError(
+                "the locally synthesized raw audio could not be stored.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_LOCAL_RAW_EVIDENCE_INVALID,
+            ) from exc
+        mime = "audio/wav" if result.audio_format == "wav" else f"audio/{result.audio_format}"
+        try:
+            run, artifact = self.repository.record_local_tts_raw_saved(
+                self._run_uuid(),
+                attempt_uuid=attempt_uuid,
+                part_uuid=part.record.part_uuid,
+                expected_revision=self._revision,
+                path=relative,
+                mime=mime,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_metadata={
+                    "format": result.audio_format,
+                    "chunk_id": part.chunk_id,
+                    "number": part.number,
+                },
+            )
+        except HistoryRepositoryError as exc:
+            raise NativeGenerationError(
+                "the committed history for this part conflicts with its local raw audio; "
+                "refusing to overwrite committed state.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_HISTORY_CONFLICT,
+            ) from exc
+        self._revision = run.revision
+        return artifact
+
+    def _submit_local_part(self, evidence: _PartEvidence) -> None:
+        """Synthesize one part locally, link its raw bytes, then convert it.
+
+        A local route has no paid reservation and no network, so this reserves one
+        durable ``local_tts_chunk`` attempt before calling the local model, stores
+        the accepted bytes linked to that attempt, and converts. An unconfirmed
+        local attempt is safe to repeat on an explicit resume, so a failed or
+        interrupted invocation never blocks a new one, but its outcome is recorded
+        (``local_failed``, or a pending row when the process was interrupted) so
+        ``history costs`` counts every real local invocation.
+        """
+        part = evidence.part
+        provider = self._provider_instance()
+        run, attempt = self.repository.reserve_local_tts_attempt(
+            self._run_uuid(),
+            part_uuid=part.record.part_uuid,
+            expected_revision=self._revision,
+            provider=self.prepared.provider,
+            model=self._model(),
+        )
+        self._revision = run.revision
+        self.logger.event("info", "local_synthesis_started", chunk=part.number, id=part.chunk_id)
+        try:
+            result = self._invoke_provider(provider, part)
+        except Exception:
+            self.logger.event("error", "local_synthesis_failed", chunk=part.number)
+            self._record_local_attempt_failure(part, attempt)
+            raise NativeGenerationError(
+                f"Failed to synthesize {part.chunk_id} locally.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_LOCAL_SYNTHESIS_FAILED,
+            ) from None
+        self._link_local_raw(part, result, attempt.attempt_uuid)
+        self._convert_local(evidence, result, attempt.attempt_uuid)
+
+    def _record_local_attempt_failure(self, part: NativeTtsPart, attempt: AttemptRecord) -> None:
+        """Record a failed local invocation's outcome without masking the failure.
+
+        The synthesis error is the caller's primary outcome; a persistence failure
+        while labelling the attempt is logged and swallowed so the same fixed
+        synthesis error still reaches the user. A pending attempt a crash left
+        behind needs no write here.
+        """
+        try:
+            run, _updated = self.repository.record_local_tts_attempt_failed(
+                self._run_uuid(),
+                attempt_uuid=attempt.attempt_uuid,
+                part_uuid=part.record.part_uuid,
+                expected_revision=self._revision,
+                error=_ERROR_LOCAL_SYNTHESIS_FAILED,
+            )
+        except HistoryRepositoryError:
+            self.logger.event("warning", "local_attempt_outcome_unsaved", chunk=part.number)
+            return
+        self._revision = run.revision
+
+    def _verified_local_raw_bytes(self, raw: ArtifactRecord) -> bytes:
+        """Return linked local raw bytes only while they still match their row."""
+        return _verified_raw_bytes(raw, self.run_root, self.hooks.sha256_file)
+
+    def _convert_local_from_raw(self, evidence: _PartEvidence) -> None:
+        """Rebuild one local part from its linked raw bytes with no model run."""
+        raw = evidence.local_raw_artifact
+        assert raw is not None  # narrowed by the caller
+        attempt_uuid = raw.attempt_uuid
+        if attempt_uuid is None:
+            raise NativeGenerationError(
+                "the linked local raw artifact carries no local attempt.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_LOCAL_RAW_EVIDENCE_INVALID,
+            )
+        metadata = raw.media_metadata if isinstance(raw.media_metadata, dict) else {}
+        audio_format = metadata.get("format")
+        if not isinstance(audio_format, str) or not audio_format:
+            raise NativeGenerationError(
+                "the linked local raw artifact is missing its audio format.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_LOCAL_RAW_EVIDENCE_INVALID,
+            )
+        audio_bytes = self._verified_local_raw_bytes(raw)
+        result = SynthesisResult(
+            audio_bytes=audio_bytes,
+            audio_format=audio_format,
+            transcript=evidence.part.text,
+            client_path="local",
+        )
+        self.logger.event(
+            "info", "local_raw_recovery", chunk=evidence.part.number, id=evidence.part.chunk_id
+        )
+        self._convert_local(evidence, result, attempt_uuid)
+
+    def _convert_local(
+        self, evidence: _PartEvidence, result: SynthesisResult, attempt_uuid: str
+    ) -> None:
+        """Convert one locally synthesized turn into its canonical chunk artifact."""
+        part = evidence.part
+        output_path = self.paths.chunks_dir / f"{part.chunk_id}.mp3"
+        staged = _new_staging_path(output_path)
+        try:
+            self.hooks.write_audio_as_mp3(
+                self.ffmpeg_path, result.audio_bytes, result.audio_format, staged
+            )
+            if self.trim_final_silence:
+                self.hooks.trim_final_silence(self.ffmpeg_path, self.ffprobe_path, staged)
+            duration_ms = self.hooks.mp3_duration_ms(self.ffprobe_path, staged)
+            sha256 = self.hooks.sha256_file(staged)
+            size_bytes = staged.stat().st_size
+            _publish_staged(
+                staged,
+                output_path,
+                error_code=_ERROR_CONVERSION_FAILED,
+                size_bytes=size_bytes,
+                sha256=sha256,
+                sha256_file=self.hooks.sha256_file,
+            )
+        except NativeGenerationError:
+            staged.unlink(missing_ok=True)
+            raise
+        except Exception as exc:
+            staged.unlink(missing_ok=True)
+            self.logger.event("error", "chunk_conversion_failed", chunk=part.number)
+            raise NativeGenerationError(
+                f"Failed to write chunk audio {output_path.name}: {exc}",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_CONVERSION_FAILED,
+            ) from exc
+        metadata = {
+            "duration_ms": duration_ms,
+            "generation_id": result.generation_id,
+            "processing_version": OUTPUT_PROCESSING_VERSION,
+        }
+        try:
+            run, _artifact = self.repository.record_local_tts_part_completed(
+                self._run_uuid(),
+                attempt_uuid=attempt_uuid,
+                part_uuid=part.record.part_uuid,
+                expected_revision=self._revision,
+                path=f"chunks/{part.chunk_id}.mp3",
+                mime="audio/mpeg",
+                size_bytes=size_bytes,
+                sha256=sha256,
+                media_metadata=metadata,
+            )
+        except HistoryRepositoryError as exc:
+            raise NativeGenerationError(
+                "the committed history for this part conflicts with the converted chunk; "
+                "refusing to overwrite committed state.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_HISTORY_CONFLICT,
+            ) from exc
+        self._revision = run.revision
+        self.logger.event("info", "chunk_state_saved", chunk=part.number, id=part.chunk_id)
+
+    def _run_local_parts(self, evidence: list[_PartEvidence]) -> None:
+        """Execute or recover every local part, stopping before any inconsistent gap.
+
+        A part with no verified converted chunk is processed exactly once: a part
+        with linked local raw audio is converted from those bytes with no model run,
+        and a part without any evidence is synthesized locally. A local attempt is
+        safe to repeat, so no paid-marker guard applies; ``history sync`` may not run
+        a local model and fails closed on an uncommitted part instead. Paid evidence
+        on a local run is a mixed-route conflict and always fails closed.
+        """
+        first_incomplete_done = False
+        for index, item in enumerate(evidence):
+            if _verified_chunk_file(item, self.run_root, self.hooks.sha256_file) is not None:
+                self.hooks.progress(
+                    f"Skipping {item.part.chunk_id}/{len(evidence):02d}: already committed"
+                )
+                continue
+            if any(_has_any_evidence(later) for later in evidence[index + 1 :]):
+                raise NativeGenerationError(
+                    "refusing to resume: a later part carries committed evidence before this "
+                    "part completed.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_EVIDENCE_INCONSISTENT,
+                )
+            if first_incomplete_done and _has_any_evidence(item):
+                raise NativeGenerationError(
+                    "refusing to resume: committed evidence does not form a contiguous prefix.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_EVIDENCE_INCONSISTENT,
+                )
+            if item.attempt is not None or item.raw_artifact is not None:
+                raise NativeGenerationError(
+                    "refusing to continue: a local run carries paid evidence on one of its parts.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_EVIDENCE_INCONSISTENT,
+                )
+            self.hooks.progress(
+                f"Generating {item.part.chunk_id}/{len(evidence):02d}: {item.part.chunk_id}.mp3"
+            )
+            if item.local_raw_artifact is not None:
+                self._convert_local_from_raw(item)
+            elif self.paid_submit_allowed:
+                self._submit_local_part(item)
+            else:
+                raise NativeGenerationError(
+                    "refusing to sync: an unattempted local part remains and history sync "
+                    "never runs a local model. Use history resume to synthesize it.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_SYNC_LOCAL_SYNTHESIS_REQUIRED,
+                )
+            first_incomplete_done = True
 
     # -- per-turn dialogue quality gate ---------------------------------------
 
@@ -1494,6 +1827,8 @@ class _Executor:
         and ``history sync`` all re-report it without running the model or sending
         another POST. The paid raw bytes, converted audio, and cost stay on disk.
         """
+        if not self.dialogue_quality_gate:
+            return
         evidence = _turn_quality_evidence(self.view)
         if any(not item.passed for item in evidence.values()):
             raise NativeGenerationError(
@@ -1878,7 +2213,12 @@ class _Executor:
         fresh or recovered turn is checked right after its conversion.
         """
         evidence = _collect_evidence(self.view)
-        if self.dialogue:
+        if self.local:
+            # The admitted local route has no paid attempt and no paid-marker guard;
+            # its own loop handles a retryable local attempt and raw recovery.
+            self._run_local_parts(evidence)
+            return
+        if self.dialogue_quality_gate:
             # A recorded per-turn FAIL is durable and can never be repaired by a
             # paid submit, so every verb re-reports it before any work.
             self._reject_recorded_dialogue_failure()
@@ -1886,7 +2226,7 @@ class _Executor:
         for index, item in enumerate(evidence):
             if _verified_chunk_file(item, self.run_root, self.hooks.sha256_file) is not None:
                 if (
-                    self.dialogue
+                    self.dialogue_quality_gate
                     and self.local_quality_allowed
                     and item.part.record.part_uuid not in _turn_quality_evidence(self.view)
                 ):
@@ -2096,7 +2436,7 @@ class _Executor:
         self._reload_view()
         if self.view.run.status == "completed" and self._final_artifact_verified():
             return
-        if self.dialogue:
+        if self.dialogue_quality_gate:
             # The required per-turn gate runs before the final concat, so a
             # recorded or still-pending turn verdict stops here instead of
             # assembling audio the project cannot claim is verified.
@@ -2646,7 +2986,7 @@ class _Executor:
         # The private verification transcript is never projected into a result, the
         # JSON exports, or the compatibility manifests: only the content-free
         # verdict and whether a linked verification exists at all.
-        if self.dialogue:
+        if self.dialogue_quality_gate:
             quality_complete, quality_passed = self._dialogue_quality_summary()
         else:
             quality = self._linked_quality()
@@ -2778,10 +3118,13 @@ def execute_native_tts(
     """
     if (
         is_dialogue_format(script_format)
+        and prepared.provider == "openrouter-tts"
         and quality_options_from_output_options(output_options) is None
     ):
-        # The dialogue route always records the local quality settings it verifies
-        # each turn with; a run without them cannot satisfy the required gate.
+        # The admitted OpenRouter dialogue route always records the local quality
+        # settings it verifies each turn with; a run without them cannot satisfy
+        # the required gate. The omnivoice-local preset dialogue route records no
+        # quality gate (its legacy route never had one), so it is exempt.
         raise NativeGenerationError(
             "the dialogue native route requires an installed local --tts-quality-provider.",
             code=_EXIT_PROVIDER,
@@ -3002,6 +3345,27 @@ class NativeRunReconstruction:
     script_path: Path
 
 
+def _stored_voice_bank_identity(config: dict[str, Any]) -> OmniVoiceVoiceBankIdentity | None:
+    """Return the committed voice-bank identity, or ``None`` when the run has none.
+
+    The verified view already guarantees the committed block parses, so this only
+    narrows the type; a run without one (every non-omnivoice route) reports
+    ``None`` and its reconstruction stays exactly as before.
+    """
+    value = config.get("voice_bank")
+    if value is None:
+        return None
+    try:
+        return OmniVoiceVoiceBankIdentity.from_payload(value)
+    except ValueError as exc:
+        raise NativeGenerationError(
+            "the committed snapshot voice-bank identity is malformed; refusing to "
+            "reconstruct the run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        ) from exc
+
+
 def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
     """Rebuild one committed native run's synthesis inputs from its verified view.
 
@@ -3034,6 +3398,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         for part in view.parts
     ]
     model = _stored_identity_str(config, "model")
+    voice_bank_identity = _stored_voice_bank_identity(config)
     prepared = PreparedRun(
         provider=_stored_identity_str(config, "provider"),
         model=model,
@@ -3041,6 +3406,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         style_prompt=view.style_prompt,
         prompt_mode=_stored_identity_str(config, "prompt_mode"),
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
+        voice_bank_identity=voice_bank_identity,
     )
     run_root = Path(view.run.run_root)
     paths = build_run_paths(run_root.parent, model, run_root.name)
