@@ -24,6 +24,7 @@ from voiceover_pipeline.history.database import (
     SchemaVersionTooNewError,
     apply_migrations,
     connect_readonly,
+    connect_readonly_consistent,
 )
 
 # Frozen sha256 of the v1 core migration; the v2 revision migration must never
@@ -671,6 +672,87 @@ def test_connect_readonly_accepts_empty_database(tmp_path):
         connection.close()
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["history.sqlite3"]
+
+
+def test_connect_readonly_consistent_reads_quiescent_database_without_sidecar(tmp_path):
+    """A database with no ``-wal`` is read without creating one.
+
+    Regression: the consistent reader used to open ``mode=ro`` unconditionally,
+    which created an empty ``-wal``/``-shm`` pair that a read-only connection
+    cannot remove again and that every later immutable read then refused.
+    """
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as database:
+        database.migrate()
+        _insert_run(database, "run-1", "/tmp/run-1")
+    before = {path.name: path.read_bytes() for path in tmp_path.iterdir()}
+    assert sorted(before) == ["history.sqlite3"]
+
+    connection = connect_readonly_consistent(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 1
+    finally:
+        connection.close()
+
+    assert {path.name: path.read_bytes() for path in tmp_path.iterdir()} == before
+
+
+def test_connect_readonly_consistent_reads_live_wal_without_touching_sidecars(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    writer = HistoryDatabase(database_path)
+    writer.migrate()
+    _insert_run(writer, "run-1", "/tmp/run-1")
+    wal_path = database_path.with_name(database_path.name + "-wal")
+    committed_frames = wal_path.read_bytes()
+    assert committed_frames
+
+    connection = connect_readonly_consistent(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 1
+    finally:
+        connection.close()
+
+    # The live writer's committed frames and WAL index are reused as they are.
+    assert wal_path.read_bytes() == committed_frames
+    assert database_path.with_name(database_path.name + "-shm").exists()
+    assert writer.connection.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 1
+    writer.close()
+
+
+def test_connect_readonly_consistent_reads_past_a_stale_empty_wal(tmp_path):
+    """A stale zero-frame ``-wal`` is read through, never deleted or repaired.
+
+    An empty ``-wal`` carries no committed state, so the consistent reader still
+    reads the database, while the immutable reader keeps its documented
+    fail-closed refusal instead of deleting a sidecar that a live writer could
+    own.
+    """
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as database:
+        database.migrate()
+        _insert_run(database, "run-1", "/tmp/run-1")
+    wal_path = database_path.with_name(database_path.name + "-wal")
+    shm_path = database_path.with_name(database_path.name + "-shm")
+    wal_path.write_bytes(b"")
+    shm_path.write_bytes(b"\0" * 32768)
+    shm_size = shm_path.stat().st_size
+
+    connection = connect_readonly_consistent(database_path)
+    try:
+        assert connection.execute("SELECT COUNT(*) AS c FROM runs").fetchone()["c"] == 1
+    finally:
+        connection.close()
+
+    with pytest.raises(HistoryDatabaseReadOnlyError):
+        connect_readonly(database_path)
+
+    assert wal_path.read_bytes() == b""
+    assert shm_path.stat().st_size == shm_size
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "history.sqlite3",
+        "history.sqlite3-shm",
+        "history.sqlite3-wal",
+    ]
 
 
 def test_connect_readonly_rejects_corrupt_database(tmp_path):

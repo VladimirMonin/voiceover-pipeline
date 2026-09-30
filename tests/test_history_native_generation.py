@@ -1815,6 +1815,62 @@ def test_history_sync_completed_run_repairs_exports_without_provider_or_script(
     assert _evidence_counts(native_env, run_uuid) == evidence_before
 
 
+def test_history_costs_before_completed_resume_and_sync_leaves_no_sidecar(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A quiescent ``costs`` read must not break later ``list``/``show``/``resume``/``sync``.
+
+    Regression from the manual offline smoke: ``costs`` opened ``mode=ro`` on a
+    database that had no ``-wal``, which created an empty ``-wal``/``-shm`` pair
+    that a read-only connection cannot remove, and every later immutable read of
+    the same home then failed closed with exit ``30``.
+    """
+    provider = FakeMediaProvider()
+    _install_provider(monkeypatch, provider)
+    script = _script(tmp_path, ["Первый фрагмент.", "Второй фрагмент."])
+    code, _payload = _json_run(
+        monkeypatch, capsys, _generate_argv(tmp_path, script, "hist-costs-then-sync")
+    )
+    assert code == 0
+    assert provider.submits == ["chunk_01", "chunk_02"]
+
+    run_uuid = _run_uuid("hist-costs-then-sync")
+    sidecars = ("history.sqlite3-wal", "history.sqlite3-shm")
+    assert not any((native_env / name).exists() for name in sidecars)
+    row_before = _run_row(native_env, run_uuid)
+    assert row_before[0] == "completed"
+
+    code, costs = _json_run(
+        monkeypatch, capsys, ["voiceover-pipeline", "history", "costs", "--json"]
+    )
+    assert code == 0
+    assert costs["attempts"] == 2
+    assert [row["known_amount"] for row in costs["totals"]] == ["0.6"]
+    assert not any((native_env / name).exists() for name in sidecars)
+    assert _run_row(native_env, run_uuid) == row_before
+
+    code, listed = _json_run(
+        monkeypatch, capsys, ["voiceover-pipeline", "history", "list", "--json"]
+    )
+    assert code == 0
+    assert listed["count"] == 1
+
+    code, shown = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "show"))
+    assert code == 0
+    assert shown["run"]["run_uuid"] == run_uuid
+
+    code, resumed = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "resume"))
+    assert code == 0
+    assert resumed["mode"] == "resume"
+
+    code, synced = _json_run(monkeypatch, capsys, _history_argv(run_uuid, "sync"))
+    assert code == 0
+    assert synced["mode"] == "sync"
+    assert synced["revision"] == row_before[1]
+    assert _run_row(native_env, run_uuid) == row_before
+    assert not any((native_env / name).exists() for name in sidecars)
+
+
 def test_history_resume_submits_only_the_unattempted_part_without_original_script(
     tmp_path, monkeypatch, capsys, native_env
 ):

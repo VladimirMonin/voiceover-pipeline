@@ -432,6 +432,11 @@ def apply_migrations(
     return pending
 
 
+def _sidecar_path(target: Path, suffix: str) -> Path:
+    """Return the adjacent SQLite sidecar path for a suffix such as ``"-wal"``."""
+    return target.with_name(target.name + suffix)
+
+
 def _reject_symlinked_database(path: Path) -> None:
     """Refuse a database reached through a symlinked file or home directory.
 
@@ -475,7 +480,7 @@ def connect_readonly(
     if not target.exists():
         raise FileNotFoundError(str(target))
     for suffix in ("-wal", "-journal"):
-        sidecar = target.with_name(target.name + suffix)
+        sidecar = _sidecar_path(target, suffix)
         if sidecar.exists():
             raise HistoryDatabaseReadOnlyError(
                 f"history database {target} has a {suffix.lstrip('-')} sidecar; refusing to "
@@ -497,35 +502,56 @@ def connect_readonly_consistent(
     *,
     migrations: Sequence[Migration] | None = None,
 ) -> sqlite3.Connection:
-    """Open an existing history database read-only with a WAL-consistent view.
+    """Open an existing history database read-only with the most trustworthy view.
 
-    Unlike :func:`connect_readonly`, which pins ``immutable=1`` and therefore
-    refuses any adjacent ``-wal`` sidecar, this reader accepts a live
-    ``-wal``/``-shm`` pair and reads the committed frames written through it, so a
-    run another process just committed is never missed as a stale main-file
-    snapshot. It still writes nothing of its own: no migration, no DDL, no
-    journal-mode switch, and no database creation. A hot ``-journal`` (an unclean
-    non-WAL rollback) is refused because the main file may be mid-rollback, and a
-    symlinked database, home directory, or sidecar is rejected before any connect.
-    The migration ledger is validated with the same read-only gate as
-    :meth:`HistoryDatabase.migrate`, so a foreign, corrupt, or newer database
-    raises the corresponding :class:`HistoryDatabaseError`; a missing file raises
-    :class:`FileNotFoundError`.
+    This reader writes nothing of its own: no migration, no DDL, no journal-mode
+    switch, no database creation, and no sidecar of its own. Which view it opens
+    is decided by the ``-wal`` sidecar at connect time:
+
+    * Without a ``-wal`` every committed byte is already in the main file, so the
+      read falls through to :func:`connect_readonly`, the ``immutable=1``
+      no-sidecar reader. That is what keeps a quiescent database quiescent: a
+      read-only WAL connection would create an empty ``-wal``/``-shm`` pair that a
+      read-only connection cannot remove again, and every later immutable read of
+      that home would then fail closed.
+    * With a ``-wal`` the main file alone may be a stale snapshot, so the database
+      is opened ``mode=ro`` over the WAL and the committed frames are read, and a
+      run another process just committed is never missed. A live ``-wal``/``-shm``
+      pair is reused as it is: this reader never deletes and never overwrites a
+      sidecar.
+
+    A hot ``-journal`` (an unclean non-WAL rollback) is refused because the main
+    file may be mid-rollback, and a symlinked database, home directory, or sidecar
+    is rejected before any connect. The migration ledger is validated with the same
+    read-only gate as :meth:`HistoryDatabase.migrate`, so a foreign, corrupt, or
+    newer database raises the corresponding :class:`HistoryDatabaseError`; a
+    missing file raises :class:`FileNotFoundError`.
+
+    Reader selection is a lock-free best-effort gate, so it carries the same
+    quiescence assumption :func:`connect_readonly` already documents for
+    ``list``/``show``: a writer that creates its ``-wal`` only after this check is
+    read through the quiescent branch instead of failing closed, so a commit that
+    races the check is missed rather than reported. A writer whose WAL frames are
+    already committed is always read WAL-consistently, which is the case
+    ``history costs`` cares about, and no read ever fabricates a missing row or
+    writes a sidecar.
     """
     target = Path(path).expanduser().absolute()
     _reject_symlinked_database(target)
     if not target.exists():
         raise FileNotFoundError(str(target))
     for suffix in ("-wal", "-shm", "-journal"):
-        sidecar = target.with_name(target.name + suffix)
+        sidecar = _sidecar_path(target, suffix)
         if sidecar.is_symlink():
             raise HistoryDatabaseError(f"history database sidecar must not be a symlink: {sidecar}")
-    journal = target.with_name(target.name + "-journal")
+    journal = _sidecar_path(target, "-journal")
     if journal.exists():
         raise HistoryDatabaseReadOnlyError(
             f"history database {target} has a journal sidecar; refusing to read a "
             "possibly unrolled-back main file"
         )
+    if not _sidecar_path(target, "-wal").exists():
+        return connect_readonly(target, migrations=migrations)
     connection = sqlite3.connect(f"{target.as_uri()}?mode=ro", uri=True, timeout=2.0)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")

@@ -1832,14 +1832,102 @@ def test_history_costs_reads_committed_rows_from_a_live_wal(monkeypatch, capsys,
     )
     # The writer is still open, so a live -wal holds the committed attempt and the
     # immutable reader would refuse this database.
-    assert (_isolated_home / "history.sqlite3-wal").exists()
+    wal_path = _isolated_home / "history.sqlite3-wal"
+    assert wal_path.exists()
+    committed_frames = wal_path.read_bytes()
     try:
         code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
+        assert code == 0
+        assert payload["totals"][0]["known_amount"] == "0.1"
+        # A WAL-consistent read reuses the live writer's frames and index and never
+        # removes or rewrites the sidecars a writer owns.
+        assert wal_path.read_bytes() == committed_frames
+        assert (_isolated_home / "history.sqlite3-shm").exists()
     finally:
         database.close()
 
+
+def test_history_costs_leaves_no_sidecar_and_keeps_later_reads_readable(
+    monkeypatch, capsys, _isolated_home
+):
+    """A quiescent ``costs`` read must not poison the home for ``list``/``show``.
+
+    Regression: ``costs`` opened ``mode=ro`` even when the database had no ``-wal``
+    at all, which created an empty ``-wal``/``-shm`` pair that a read-only
+    connection cannot remove again; every later immutable read then failed closed
+    with ``HISTORY_DATABASE_UNREADABLE``.
+    """
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.1"), currency="RUB")),
+            ("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.2"), currency="RUB")),
+        ],
+    )
+    before = _snapshot_tree(_isolated_home)
+    assert sorted(before) == ["history.sqlite3"]
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "costs", "--json")
+
     assert code == 0
-    assert payload["totals"][0]["known_amount"] == "0.1"
+    assert payload["totals"] == [
+        {
+            "currency": "RUB",
+            "known_amount": "0.3",
+            "known_attempts": 2,
+            "exact_attempts": 2,
+            "non_exact_attempts": 0,
+            "unknown_attempts": 0,
+        }
+    ]
+    assert _snapshot_tree(_isolated_home) == before
+    assert not (_isolated_home / "history.sqlite3-wal").exists()
+    assert not (_isolated_home / "history.sqlite3-shm").exists()
+
+    code, payload, _ = _invoke(monkeypatch, capsys, "history", "list", "--json")
+    assert code == 0
+    assert payload["count"] == 1
+    run_uuid = payload["runs"][0]["run_uuid"]
+
+    code, detail, _ = _invoke(monkeypatch, capsys, "history", "show", run_uuid, "--json")
+    assert code == 0
+    assert detail["run"]["run_uuid"] == run_uuid
+
+    connection = sqlite3.connect(_isolated_home / "history.sqlite3")
+    try:
+        assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+    finally:
+        connection.close()
+
+
+def test_history_costs_then_list_in_separate_processes_keeps_the_home_readable(
+    _isolated_home,
+):
+    """The manual smoke sequence across real processes: ``costs``, then ``list``."""
+    from conftest import cli_json
+
+    from voiceover_pipeline.history.repository import Cost
+
+    _isolated_home.mkdir(mode=0o700)
+    _seed_run_with_attempts(
+        _isolated_home / "history.sqlite3",
+        [("tts", "tts_chunk", "polza-tts", Cost.exact(Decimal("0.1"), currency="RUB"))],
+    )
+    before = _snapshot_tree(_isolated_home)
+
+    code, costs = cli_json("history", "costs", "--json")
+    assert code == 0
+    assert costs["attempts"] == 1
+    assert costs["totals"][0]["known_amount"] == "0.1"
+    assert _snapshot_tree(_isolated_home) == before
+
+    code, listed = cli_json("history", "list", "--json")
+    assert code == 0
+    assert listed["count"] == 1
 
 
 def test_history_costs_human_output_lists_totals(monkeypatch, capsys, _isolated_home):

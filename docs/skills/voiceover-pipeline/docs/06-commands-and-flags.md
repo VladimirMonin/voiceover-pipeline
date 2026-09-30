@@ -431,8 +431,10 @@ UUID и отсутствующая БД не создают ничего, `--ove
 выдаётся за exact: `exact_attempts`/`non_exact_attempts` видны, `"0"` отличимо
 от `null` (unknown), отсутствующая валюта — отдельный bucket. Локальные
 провайдеры из явного allowlist не считаются облачным unknown. Команда offline и
-ничего не пишет, читает WAL-consistent и не выводит текст, пути, signed URL или
-секреты; malformed decimal/небезопасная валюта — fail-closed exit `30`.
+ничего не пишет: читает immutable-снимком, когда рядом нет `-wal` (и не оставляет
+пустых sidecar), и по закоммиченным кадрам живого `-wal`, когда он есть. Текст,
+пути, signed URL и секреты не выводятся; malformed decimal/небезопасная валюта —
+fail-closed exit `30`.
 
 Фильтры, JSON-поля, коды ошибок и денежный контракт (exact/zero/null) — в
 [Agent CLI Contract](../../../agent-cli-contract.md).

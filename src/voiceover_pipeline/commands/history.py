@@ -17,10 +17,15 @@ Read guarantees:
 * Reads go through the narrow :func:`voiceover_pipeline.history.database.connect_readonly`
   seam, so no migration, DDL, WAL switch, or sidecar write happens and a
   corrupt, foreign, or newer database fails closed instead of being queried.
-* ``history costs`` reads the same way but through the WAL-consistent
-  :func:`voiceover_pipeline.history.database.connect_readonly_consistent` seam, so
-  an attempt a run in progress just committed (a live ``-wal``) is never missed;
-  it still runs no migration, DDL, or sidecar write of its own.
+* ``history costs`` asks for the same read-only contract through the
+  :func:`voiceover_pipeline.history.database.connect_readonly_consistent` seam: a
+  quiescent database (no ``-wal`` sidecar) is read by the immutable no-sidecar
+  reader, so the aggregate leaves no empty ``-wal``/``-shm`` behind that would
+  break later immutable reads, and only a database with a ``-wal`` sidecar is read
+  ``mode=ro`` over its committed WAL frames, so an attempt a run in progress just
+  committed is never missed. Either way it runs no migration and no DDL, and it
+  never deletes or overwrites a live ``-wal``/``-shm`` pair (only the quiescent
+  branch creates no sidecar at all, and it is the branch a normal home takes).
 * :func:`load_native_history_view` returns one verified read-only native
   prepared-TTS view for ``history resume ID``/``history sync ID``; a UUID that is
   not such a snapshot fails closed with a fixed, content-free ``NATIVE_HISTORY_UNSUPPORTED``
@@ -201,11 +206,14 @@ def _resolve_database_path(database_path: Path | str | None) -> Path:
 def _open_history(database_path: Path, *, consistent: bool = False) -> _OpenHistory:
     """Open the database read-only, or report it absent/empty without writing.
 
-    ``consistent`` selects the WAL-consistent reader for ``history costs``: it
-    accepts a live ``-wal``/``-shm`` pair written by a run in progress, because an
-    aggregate must never miss a just-committed attempt or create a sidecar of its
-    own. The default reader pins ``immutable=1`` and refuses any adjacent
-    sidecar, so ``list``/``show`` keep their post-run semantics.
+    ``consistent`` selects the :func:`connect_readonly_consistent` seam for
+    ``history costs``: a database without a ``-wal`` sidecar is read by the
+    immutable no-sidecar reader (so nothing is created), and a database with one
+    (a live writer's committed frames) is read ``mode=ro`` over its WAL, so an
+    aggregate never misses a just-committed attempt and never deletes or
+    overwrites a writer's sidecars. The default reader pins ``immutable=1`` and
+    refuses any adjacent sidecar, so ``list``/``show`` keep their post-run
+    fail-closed semantics.
     """
     if database_path.is_symlink() or database_path.parent.is_symlink():
         raise HistoryCommandError(
@@ -728,9 +736,10 @@ def costs_history(*, database_path: Path | str | None = None) -> dict[str, Any]:
     and ``non_exact_attempts`` expose the split and ``completeness`` is ``partial``
     when any cloud attempt is unknown or any known amount is not exact. A local
     provider attempt (the documented local allowlist) with no amount is counted in
-    ``local_attempts_without_api_charge``, not as a cloud unknown. The read uses
-    the WAL-consistent reader, so a run in progress is still visible, and it
-    creates nothing for an absent database.
+    ``local_attempts_without_api_charge``, not as a cloud unknown. The read goes
+    through the consistent read-only reader: a quiescent database is read
+    immutably without writing a sidecar, while a ``-wal`` sidecar means a run in
+    progress stays visible, and an absent database creates nothing.
     """
     resolved = _resolve_database_path(database_path)
     open_history = _open_history(resolved, consistent=True)
