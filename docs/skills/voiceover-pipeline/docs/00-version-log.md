@@ -8,9 +8,9 @@
 | Поле | Значение |
 |---|---|
 | **Целевая версия приложения** | voiceover-pipeline 0.6.1 |
-| **Skill revision** | 2026-08-24 |
+| **Skill revision** | 2026-10-01 (development/unreleased) |
 | **Минимальная версия CLI** | 0.4.0 |
-| **Максимальная проверенная** | 0.6.0 |
+| **Максимальная проверенная** | 0.6.1 |
 
 ## Что актуально в этой версии навыка
 
@@ -19,7 +19,7 @@
 - Общий `audio.cpp` runtime для локальных non-Whisper моделей с GPU lease,
   lifecycle, receipts и отдельными Linux/native-Windows launchers
 - 7 исторически протестированных моделей; текущая доступность сверяется отдельно
-- Полные списки голосов: OpenAI TTS (11), ElevenLabs через Polza (21), Gemini TTS через OpenRouter (30), Qwen preset (9)
+- Актуальные голоса, модели и флаги — только через `voiceover list providers/voices --json` и `voiceover <cmd> --help`; подсчёты в этом файле не гарантируют текущий каталог
 - `list voices --json` контракт: `voices` как плоский массив + `voice_categories` объект
 - ElevenLabs через Polza: async `/api/v1/media` (submit → poll → download)
 - Polza TTS OpenAI: JSON base64 через `/api/v1/audio/speech`
@@ -34,23 +34,19 @@
 - OpenRouter Whisper: CLI блокирует `timings`/`--with-timings` с exit code 40 (API не возвращает таймкоды)
 - Endpoint dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media`
 
-## Цены (smoke 2026-04-29, не гарантия провайдера)
+## Цены
 
-| Модель | Цена/мин | Валюта |
-|---|---|---|
-| `openai/gpt-audio-mini` | ~0.004 | RUB (anomalous) |
-| `openai/gpt-audio` | ~7.00 | RUB |
-| `openai/gpt-4o-mini-tts` | ~1.07 | RUB |
-| `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 | RUB |
-| `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 | RUB |
-| `google/gemini-3.1-flash-tts-preview` | ~$0.030 | USD |
-| `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | ~$0.00041 | USD |
-| Qwen-local | Бесплатно | — |
+Этот файл **не** публикует актуальные цены и **не** является потолком
+стоимости перед платным запросом. Исторические smoke-замеры устаревают; тариф,
+доступность и верхняя цена подтверждаются только на момент согласованного
+платного вызова. Смотри `voiceover help providers.polza` и `voiceover history
+costs`.
 
 ## История изменений
 
 | Дата | Изменения |
 |---|---|
+| 2026-10-01 | **S10 (unreleased):** упакованная атомарная справка `voiceover help [TOPIC] [--raw|--json]` читается из установленного пакета без ключей, `.env`, рабочего каталога и сети. README, docs index и skill приведены к фактическому разрешению секрета (непустое окружение процесса → явный `--env-file PATH` → `<CWD>/.env`, без поиска по родительским каталогам) и к явному согласию владельца на сетевые установки/загрузки моделей; из справочных файлов убраны волатильные цены и счётчики тестов. |
 | 2026-09-29 | **Development/unreleased, source-only:** платный TTS записывает attempt marker перед submit, не делает автоматический повтор через retry или fallback voice; неподтверждённый исход блокирует resume/overwrite, локальные retries сохранены. Нет live/paid provider acceptance или заявления о релизе. |
 | 2026-08-31 | **v0.6.1 candidate:** dialogue ASR quality gate удаляет из expected text только непроизносимые audio tags, нормализует `ё/е` и допускает эквивалентное деление ASR-токенов (`OmniVoice` / `Omni Voice`). Реальная лишняя речь и повторы остаются fail-closed. |
 | 2026-08-24 | OpenRouter dialogue переведён на строгий verbatim turn input: style/profile/vibe/labels/соседний текст не попадают в synthesis request. Перед final concat обязателен явный per-turn ASR quality gate с transcript-free receipt; вставки, пропуски и повторы дают exit `60`. |
@@ -64,8 +60,8 @@
 | 2026-05-10 | Добавлен Gemini prompting guide: `AUDIO PROFILE`/`SCENE`/`PERFORMANCE`/`CONTEXT`/`TRANSCRIPT`, safe audio tags, emotion recipes, voice selection, chunking guidance. |
 | 2026-05-10 | Добавлен generic `format: voiceover` для single-speaker режимов: provider/model/voice в frontmatter, CLI overrides, full-error validator, backward compatibility с plain Markdown. |
 | 2026-05-10 | Добавлен Gemini dialogue workflow: two speakers через OpenRouter `multi_speaker_voice_config` + обязательный top-level `voice`, full-error validator, `--speaker-voice`, `--agent`, chunk byte safety gates. **Устарело с 2026-08-22:** OpenRouter игнорирует `multi_speaker_voice_config` (один голос на запрос); двухголосый диалог BROKEN, перерабатывается по плану turn-by-turn (`docs/plans/2026-08-22-agent-first-twovoice-dialogue-fix-plan.md`). |
-| 2026-05-10 | Добавлен стабильный generation supervisor: state/log after each chunk, universal retry для всех провайдеров, безопасный `--resume`, защита paid chunks от overwrite, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`. |
+| 2026-05-10 | Добавлен generation supervisor: state/log after each chunk, безопасный `--resume`, защита paid chunks от overwrite, `status`, `concat`, `--limit-chunks`, `--dry-run-cost`. ~~Universal retry для всех провайдеров~~ — **устарело**: оплаченная попытка резервируется до POST, неопределённый submit не повторяется автоматически; локальные retries отделены от paid. |
 | 2026-05-09 | Gemini native prompt: отдельное поле `prompt` в request body вместо конкатенации в `input`. Флаги `--style-prompt-file`, `--no-style-prompt`. `prompt_mode` в manifest. Расширяемость под будущие Google/Polza модели. |
-| 2026-05-01 | UV-first Python: `uv python install 3.12` вместо winget. Агент сам создаёт `.env` из `.env.example`. Remotion scene grouping: Whisper-сегменты группируются по смысловым сценам, не по чанкам. Torch CPU-only диагностика. Qwen голоса обновлены до 9 актуальных. |
+| 2026-05-01 | UV-first Python: `uv python install 3.12` вместо winget. Remotion scene grouping: Whisper-сегменты группируются по смысловым сценам, не по чанкам. Torch CPU-only диагностика. Qwen голоса обновлены до 9 актуальных. ~~Агент сам создаёт `.env` из `.env.example`~~ — **Устарело:** агент не создаёт, не копирует и не читает реальный `.env`; пользователь ведёт приватный env-файл, порядок — окружение процесса → явный `--env-file` → `<CWD>/.env` (см. `docs/03-security-and-secrets.md`). |
 | 2026-04-29 | Добавлены `polza-tts`, ElevenLabs, OpenRouter OpenAI TTS. Обновлены все цены, голоса, workflows, evaluation. |
 | 2026-03 | Исходная версия навыка под voiceover-pipeline 0.3.x (Polza GPT Audio, OpenRouter Gemini, Qwen) |

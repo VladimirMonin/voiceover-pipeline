@@ -1,5 +1,12 @@
 # Voiceover Pipeline — Документация
 
+Пользовательское руководство распространяется как упакованная атомарная справка:
+`voiceover help [TOPIC] [--raw | --json]` читает один короткий Markdown-файл из
+установленного пакета — без ключей, `.env`, рабочего каталога, FFmpeg, GPU,
+истории и сети. Без темы печатается `index` со списком тем (`start.quick`,
+`speech.parts`, `runs.resume`, `search.lexical`, `search.semantic`,
+`providers.polza` и др.). Ниже — индекс репозиторных документов.
+
 ## Для агентов
 
 | Документ | Содержание |
@@ -49,56 +56,78 @@
 
 ## Быстрый старт
 
-### Установленный пакет (опубликован на PyPI)
+Сетевая установка пакета и загрузка локальных моделей требуют отдельного
+разрешения владельца; команды ниже — примеры, а не разрешение агенту запускать их
+самостоятельно.
+
+### Установленный пакет
 
 ```powershell
 pip install voiceover-pipeline
 # или: pipx install voiceover-pipeline
 # или: uvx voiceover-pipeline doctor  (без установки)
 
-# Проверить окружение
-voiceover doctor --json
+# Справка из пакета: без ключей, .env, рабочего каталога и сети
+voiceover help start.quick
+voiceover help --json
 
-# Проверить сценарий
+# Проверить сценарий (офлайн, без POST)
 voiceover validate --script "script.md" --json
 
-# Сгенерировать озвучку + тайминги
+# Проверить окружение. doctor читает наличие ключа и печатает разрешённый путь
+# (checks.env_file.path), но не значение; запускать только в одобренном окружении.
+voiceover doctor --json
+```
+
+Генерация потенциально платная и требует отдельного разрешения владельца.
+Оплаченные данные не перезаписываются: `--resume` продолжает прогон, а
+`--overwrite` требует явного `--confirm-delete-paid-audio`.
+
+```powershell
 voiceover generate `
   --provider polza-chat-audio `
   --model "openai/gpt-audio-mini" `
   --script "script.md" `
   --run-id "prod" `
-  --with-timings `
-  --word-timestamps `
   --json `
-  --overwrite
+  --resume
 ```
+
+Локальные тайминги (`--with-timings --word-timestamps`) требуют заранее
+установленной и закешированной модели; неявного скачивания нет.
 
 ### Локальная разработка (клон репозитория)
 
 ```powershell
-cd C:\PY\voiceover-pipeline
+cd voiceover-pipeline
 uv sync --group dev --extra timing-whisper
 uv run voiceover doctor --json
-uv run voiceover generate ... --with-timings --json --overwrite
+uv run voiceover generate --provider polza-chat-audio --script "script.md" --run-id "prod" --json --resume
 ```
 
 ## Образцы аудио
 
-Первый чанк каждого облачного провайдера (OGG Vorbis 24 kHz mono):
+Исторические образцы первых чанков (OGG Vorbis 24 kHz mono), не live-проверка
+текущей доступности. Зарегистрированные модели и голоса смотрите через
+`voiceover list providers --json` и `voiceover list voices --provider <id> --json`;
+эти команды не подтверждают текущий тариф или верхнюю границу стоимости.
+Цену перед платным вызовом необходимо доказать отдельно у провайдера с
+разрешением владельца.
 
-| Файл | Модель | Цена минуты |
-|---|---|---|
-| [polza-gpt-audio-mini-chunk-01.ogg](polza-gpt-audio-mini-chunk-01.ogg) | GPT Audio Mini (Polza) | 0.004 ₽/мин (anomalous) |
-| [polza-gpt-audio-chunk-01.ogg](polza-gpt-audio-chunk-01.ogg) | GPT Audio (Polza) | 7.00 ₽/мин |
-| [polza-elevenlabs-turbo-2-5-chunk-01.ogg](polza-elevenlabs-turbo-2-5-chunk-01.ogg) | ElevenLabs Turbo 2.5 (Polza) | 3.51 ₽/мин |
-| [polza-elevenlabs-multilingual-v2-chunk-01.ogg](polza-elevenlabs-multilingual-v2-chunk-01.ogg) | ElevenLabs Multilingual v2 (Polza) | 7.57 ₽/мин |
-| [polza-openai-gpt-4o-mini-tts-chunk-01.ogg](polza-openai-gpt-4o-mini-tts-chunk-01.ogg) | GPT-4o Mini TTS (Polza) | 1.07 ₽/мин |
-| [openrouter-gemini-tts-chunk-01.ogg](openrouter-gemini-tts-chunk-01.ogg) | Gemini TTS (OpenRouter) | $0.030/мин |
-| [openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg](openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg) | GPT-4o Mini TTS (OpenRouter) | $0.00041/мин |
+| Файл | Модель |
+|---|---|
+| [polza-gpt-audio-mini-chunk-01.ogg](polza-gpt-audio-mini-chunk-01.ogg) | GPT Audio Mini (Polza) |
+| [polza-gpt-audio-chunk-01.ogg](polza-gpt-audio-chunk-01.ogg) | GPT Audio (Polza) |
+| [polza-elevenlabs-turbo-2-5-chunk-01.ogg](polza-elevenlabs-turbo-2-5-chunk-01.ogg) | ElevenLabs Turbo 2.5 (Polza) |
+| [polza-elevenlabs-multilingual-v2-chunk-01.ogg](polza-elevenlabs-multilingual-v2-chunk-01.ogg) | ElevenLabs Multilingual v2 (Polza) |
+| [polza-openai-gpt-4o-mini-tts-chunk-01.ogg](polza-openai-gpt-4o-mini-tts-chunk-01.ogg) | GPT-4o Mini TTS (Polza) |
+| [openrouter-gemini-tts-chunk-01.ogg](openrouter-gemini-tts-chunk-01.ogg) | Gemini TTS (OpenRouter) |
+| [openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg](openrouter-openai-gpt-4o-mini-tts-chunk-01.ogg) | GPT-4o Mini TTS (OpenRouter) |
 
 ## OpenCode Skill
 
 Для агентов автоматизации: [skills/voiceover-pipeline/SKILL.md](skills/voiceover-pipeline/SKILL.md).
 
-Скачать `.skill` архив из GitHub Release assets.
+Опубликованный `.skill` в GitHub Release assets может отставать от текущего
+неопубликованного development skill в репозитории. Любое скачивание требует
+отдельного разрешения на сетевую операцию.

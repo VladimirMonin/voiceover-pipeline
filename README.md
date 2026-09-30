@@ -1,241 +1,167 @@
 # Voiceover Pipeline
 
-Standalone CLI для генерации озвучки + Whisper timing из Markdown-сценариев.
+CLI для генерации озвучки (TTS) из Markdown/YAML-сценариев и получения
+таймингов/субтитров. Машинный контракт для агентов: `--json`, семантические
+exit codes, `manifest.json` в каталоге прогона.
 
-Четыре TTS-провайдера: Polza GPT Audio, Polza TTS, OpenRouter TTS, Qwen3-TTS (GPU).
-Плюс локальный OmniVoice (auto / voice-bank preset / clone / design) и
-формат `gemini-dialogue` для двухспикерного подкаста через OpenRouter Gemini TTS
-(двухголосый результат перерабатывается — см. статус ниже).
-Whisper CPU small — точные тайминги для Remotion-анимаций и субтитров.
-Agent-grade JSON-контракт: `--json`, semantic exit codes, `manifest.json`.
-Сценарии могут быть plain Markdown или Markdown с frontmatter metadata для provider/model/voice.
+> **Статус.** Версия приложения в `pyproject.toml` — `0.6.1`. Обозначение
+> `v0.7.0` из плана развития — ещё не опубликованный целевой релиз. Всё ниже
+> описывает состояние репозитория, а не гарантию опубликованного пакета.
 
-## Install
+## Возможности
 
-Console scripts: `voiceover` and `voiceover-pipeline` (both work).
+- Облачные TTS: Polza GPT Audio (`/chat/completions`), Polza TTS
+  (`/audio/speech`, `/media`), OpenRouter Gemini TTS.
+- Локальные TTS: Qwen3-TTS (GPU) и OmniVoice.
+- Двухспикерный подкаст (`format: dialogue`) и явные части
+  (`format: speech-parts`).
+- Тайминги/субтитры: локальный `faster-whisper` либо облачные
+  `groq-whisper`/`xai-stt`; локальное распознавание `qwen-local`/`nemotron-local`.
+- Локальная SQLite-история и офлайн лексический FTS5-поиск по сохранённым текстам.
+- Упакованная атомарная справка: `voiceover help [TOPIC] [--raw | --json]`.
 
-| Manager | Base | + Whisper | + Qwen GPU | + All extras |
-|---|---|---|---|---|
-| **uvx** (no install) | `uvx voiceover-pipeline doctor` | `uvx --from "voiceover-pipeline[timing-whisper]" voiceover-pipeline generate --with-timings ...` | `uvx --from "voiceover-pipeline[voiceover-qwen]" voiceover-pipeline generate --provider qwen-local ...` | `uvx --from "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]" ...` |
-| **pipx** | `pipx install voiceover-pipeline` | `pipx install "voiceover-pipeline[timing-whisper]"` | `pipx install "voiceover-pipeline[voiceover-qwen]"` | `pipx install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
-| **pip** | `pip install voiceover-pipeline` | `pip install "voiceover-pipeline[timing-whisper]"` | `pip install "voiceover-pipeline[voiceover-qwen]"` | `pip install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
-| **uv pip** | `uv pip install voiceover-pipeline` | `uv pip install "voiceover-pipeline[timing-whisper]"` | `uv pip install "voiceover-pipeline[voiceover-qwen]"` | `uv pip install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
+## Установка из исходников
 
-### From source
+`git clone`, установка пакетов и загрузка моделей используют сеть: агент выполняет
+их только после отдельного разрешения владельца и в согласованном окружении.
 
-```powershell
+```bash
 git clone https://github.com/VladimirMonin/voiceover-pipeline
 cd voiceover-pipeline
-uv sync --group dev --extra timing-whisper
-uv run voiceover doctor
+uv sync --group dev                    # CLI + dev-инструменты (lint, mypy, pytest)
+uv sync --extra timing-whisper         # + локальный faster-whisper
+uv run voiceover doctor --json
 ```
 
-### First run
+Console scripts `voiceover` и `voiceover-pipeline` эквивалентны.
 
-- `.env` is searched in CWD and upwards through parent directories.
-- Whisper model (~486 MB) auto-downloads from HuggingFace on first `--with-timings`. Subsequent runs use cache.
-- Qwen-local requires NVIDIA GPU + CUDA drivers (~4 GB VRAM).
+### Extras
 
-## API Keys
+| Extra | Добавляет |
+|---|---|
+| `timing-whisper` | `faster-whisper` + `ctranslate2` |
+| `voiceover-qwen` | Qwen3-TTS (`torch`, `qwen-tts`, `soundfile`, `numpy`) |
+| `asr-qwen` | `qwen-asr` |
+| `asr-nemotron` | Nemotron ASR (`accelerate`, `librosa`, `torch`, `transformers`) |
+| `cuda` | CUDA-библиотеки для Windows/Linux |
 
-Create `.env` in your working directory (CWD or any parent directory — searched upwards):
+`asr-qwen`, `voiceover-qwen` и `asr-nemotron` **взаимоисключающие** (см.
+`[tool.uv] conflicts` в `pyproject.toml`): ставьте только тот локальный маршрут,
+который действительно нужен. Единого «all extras» набора нет.
 
-```env
-POLZA_API_KEY=pza_...
-OPENROUTER_API_KEY=sk-or-v1-...
+## Ключи и безопасность
+
+Реальные ключи пользователь хранит в приватном env-файле вне инструментов
+агента (или в уже существующих переменных окружения процесса). Агент никогда не
+создаёт, не копирует и не читает реальный `.env`; приложение может прочитать его
+только при обращении к ключу (включая `doctor`). В репозитории есть только шаблон
+[`.env.example`](docs/skills/voiceover-pipeline/examples/env-example.md) с
+синтетическими placeholder-ами. `.env` не коммитится.
+
+Порядок разрешения значения ключа при обращении команды к секрету:
+
+1. непустая переменная окружения процесса — приоритет; содержимое файла тогда не читается;
+2. явный глобальный `voiceover --env-file PATH <command> ...` (проверяется по метаданным как regular file);
+3. `<call-time CWD>/.env` — для совместимости.
+
+Поиска `.env` по родительским каталогам нет. Явный `--env-file` **заменяет**
+CWD-файл, а не дополняет его: фоллбэка на `<CWD>/.env` не происходит.
+Отсутствующий, не-regular или недоступный для проверки метаданных явный путь
+fail-closed с exit `20`, даже если в окружении есть пригодный ключ.
+
+Read-only справка не читает ключ и env-файл:
+
+```bash
+voiceover help                       # справка из установленного пакета, без ключей и .env
+voiceover help start.quick --json
 ```
 
-Never commit `.env`.
+`doctor` отдельно проверяет наличие ключей и сообщает разрешённый путь в
+`checks.env_file.path`, но никогда — значение. При непригодном явном `--env-file`
+он завершается с exit `0` и `status: "success"`, однако `workflow_ok: false`.
+Запускайте `doctor` только в одобренном окружении.
 
-## Golden Command
+## Быстрый старт
 
-```powershell
-voiceover generate `
-  --provider polza-chat-audio `
-  --model "openai/gpt-audio-mini" `
-  --script "script.md" `
-  --run-id "prod" `
-  --json `
+Офлайн-команды ничего не отправляют:
+
+```bash
+voiceover validate --script in/script.md --json
+voiceover list providers --json
+voiceover history list --json
+voiceover search "текст" --mode lexical --json
+```
+
+Генерация потенциально платная и требует отдельного разрешения владельца:
+
+```bash
+voiceover generate \
+  --provider polza-chat-audio \
+  --model openai/gpt-audio-mini \
+  --script in/script.md \
+  --run-id prod \
+  --json \
   --resume
 ```
 
-Recommended production flow: generate paid audio first, then run `voiceover timings`
-as a separate step. If you still use `--with-timings`, Whisper dependencies are
-checked before the first paid TTS request.
+`--resume` продолжает прерванный прогон без пересоздания готовых частей;
+платные данные не перезаписываются без явного `--confirm-delete-paid-audio`.
+Интегрированные локальные тайминги (`generate --with-timings`) требуют заранее
+закешированной модели: она проверяется до платного POST и не докачивается неявно.
+Отдельный `timings --timing-provider faster-whisper` может скачать модель Whisper
+при первом использовании — это сетевая операция с разрешения владельца.
 
-### Metadata script
-
-```markdown
----
-format: voiceover
-provider: polza-tts
-model: openai/gpt-4o-mini-tts
-voice: ash
-max_chunk_chars: 2000
----
-
-Первый фрагмент озвучки.
-
-******
-
-Второй фрагмент озвучки.
-```
-
-Для двухголосых podcasts доступен provider-neutral `format: dialogue` с двумя
-спикерами, voice map и inline tags вроде `[laughs]`, `[serious]`, `[short pause]`.
-`gemini-dialogue` остаётся compatibility alias; state и manifests пишут
-канонический `dialogue`.
-
-> OpenRouter получает один документированный top-level `voice` на каждую
-> реплику; `multi_speaker_voice_config` не используется. OmniVoice dialogue
-> использует один admitted runtime и отдельный bank profile на turn. Offline
-> contract проверен, но audible PASS OpenRouter и OmniVoice по-прежнему требует
-> human listening: не заявляй слышимое различие голосов или выпуск 0.6.0 без
-> двух PASS.
-
-### Agent-first podcast (два спикера)
-
-```powershell
-# 1. Валидация без платного запроса
-voiceover validate --script "podcast.md" --format dialogue --agent --json
-
-# 2. Проверка окружения (не читая .env)
-voiceover doctor --provider openrouter-tts --json
-
-# 3. Генерация (после явного одобрения платного вызова)
-voiceover generate --script "podcast.md" --run-id "podcast-prod" --json --resume
-```
-
-Provider/model/каст/направление берутся из frontmatter скрипта. Resume
-защищён `synthesis_identity`: смена голоса/profile/fingerprint, модели,
-текста, порядка, пауз или style/trim policy отклоняется (exit 30) до provider
-request; orphan dialogue MP3 не восстанавливается без trusted state.
-
-### Gemini prompting quick guide
-
-Gemini TTS works best as a directed voice performer, not as plain text-to-speech.
-Keep instructions separate from spoken transcript: `AUDIO PROFILE`, `SCENE`,
-`PERFORMANCE`, `CONTEXT`, then `#### TRANSCRIPT`.
-
-```text
-Synthesize speech for the performance defined below.
-The profile, scene, performance notes, and context are direction only.
-Do NOT speak them.
-Speak ONLY the lines under #### TRANSCRIPT.
-
-### PERFORMANCE
-Style: Warm, thoughtful, conversational, emotionally alive.
-Pace: Natural podcast pace with small pauses after important ideas.
-Accent: Natural Russian speech.
-
-#### TRANSCRIPT
-[thoughtfully] Сегодня разберём Gemini TTS, [short pause] и почему хороший голос начинается с режиссуры.
-```
-
-Use English service directions and English audio tags; keep the transcript in the
-target language. Use `PERFORMANCE` for global emotion and inline tags such as
-`[thoughtfully]`, `[sighs]`, `[laughs]`, `[gasp]`, `[medium pause]` for local
-delivery changes. For long podcasts, prefer semantic chunks of roughly 250-450
-Russian words, or 180-350 words for emotional material.
-
-Do not paste the whole prompt skeleton into the script body. In this project,
-put direction into `style_prompt`, `vibe`, and speaker `profile`; keep body text
-as spoken transcript only. See the full guides:
-`docs/skills/voiceover-pipeline/docs/11-gemini-prompting.md` and
-`docs/skills/voiceover-pipeline/docs/12-gemini-prompting-templates.md`.
-
-Результат (JSON stdout):
-
-```json
-{"status": "success", "provider": "polza-chat-audio", "run_id": "prod",
- "duration_ms": 25520, "segment_count": 8, "cost": {"total": 0.0146, "currency": "RUB"}}
-```
-
-## Что на выходе
+## Артефакты
 
 ```
 out/<run-id>/
 ├── manifest.json                          ← entry-point для агентов
-├── run_state.json                         ← resumable state after each chunk
-├── generation.log                         ← human-readable generation log
-├── <run-id>-voiceover-<model>.mp3         ← полный MP3
-├── <run-id>-voiceover-<model>.json        ← run-манифест
-├── <run-id>.timings.json                  ← Whisper-сегменты (ms)
+├── run_state.json                         ← resumable state после каждой части
+├── generation.log                         ← человекочитаемый лог
+├── <run-id>-voiceover-<model>.mp3         ← итоговый MP3
+├── <run-id>.timings.json                  ← тайминги (ms)
 ├── <run-id>.srt                           ← субтитры SRT
 └── chunks/
     ├── chunk_01.mp3 ... chunk_NN.mp3
     └── chunks.json
 ```
 
-## Команды
-
-| Команда | Зачем |
-|---|---|
-| `doctor` | Проверить окружение |
-| `validate --script X` | Проверить сценарий |
-| `list providers/voices/timing-models` | Доступные модели |
-| `split --script X` | Чанки сценария |
-| `generate` | Генерация аудио с resume/retry/state/log |
-| `timings --audio X` | Тайминги из готового MP3 |
-| `status --run-id X` | Статус partial/resumable run |
-| `concat --run-id X --format ogg` | Склеить существующие chunks в partial/full файл |
-
-Все команды поддерживают `--json`; `generate` также поддерживает `--json-events`.
-
-## Модели и цены
-
-| Провайдер | Модель | Цена минуты |
-|---|---|---|
-| Polza | `openai/gpt-audio-mini` | ~0.004 ₽/мин (anomalous 200s smoke — model added speech, needs rerun) |
-| Polza | `openai/gpt-audio` | ~7.00 ₽/мин |
-| Polza | `openai/gpt-4o-mini-tts` | ~1.07 ₽/мин |
-| Polza | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 ₽/мин |
-| Polza | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 ₽/мин |
-| OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
-| OpenRouter | `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | ~$0.00041/мин |
-| Qwen3-TTS | CustomVoice (preset/clone) | Бесплатно (GPU) |
-| OmniVoice | `audio-cpp/omnivoice-q8_0` (auto/preset/clone/design) | Бесплатно (GPU, локально) |
-
-## Тестирование
-
-```powershell
-uv sync --group dev --extra timing-whisper
-uv run pytest
-```
-
-120 тестов: JSON-контракт, exit codes, валидация, output policy, providers, prompt modes, script metadata, resume/retry/state/log/status/concat safety, Gemini safe tags.
-
-## Agent Skill
-
-OpenCode agent skill — устанавливает pipeline, выбирает провайдера, генерирует озвучку:
-
-- Source: https://github.com/VladimirMonin/voiceover-pipeline/tree/v0.4.5/docs/skills/voiceover-pipeline
-- Download: https://github.com/VladimirMonin/voiceover-pipeline/releases/tag/v0.4.5
-
-## Legal / Provider Notes
-
-This project is an independent CLI wrapper around third-party providers.
-It is not affiliated with OpenAI, Google, OpenRouter, Polza.ai, Qwen, or CTranslate2 / faster-whisper.
-Provider names and model names are used solely for integration and documentation purposes.
-Generated audio usage is subject to the selected provider's terms of service.
-Do not upload private voice samples or generated speech without permission.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+Необязательный `<CWD>/settings.toml` хранит несекретные настройки
+(`[history] enabled`, `[search] default_mode`, пути локальных ASR-моделей).
+Режим `search` по умолчанию — `lexical`; настроенные `semantic`/`hybrid`
+честно отказывают (`SEARCH_MODE_DEFERRED`), пока семантический поиск вынесен
+в отдельный план следующего релиза.
 
 ## Документация
 
-- [Agent Development Workflow](doc/agent-workflow.md) — безопасная работа с dirty tree, Kanban и Git/release approvals
-- [Agent CLI Contract](docs/agent-cli-contract.md) — JSON-контракт, exit codes, stdout/stderr, safety rules
-- [Remotion Workflow](docs/remotion-workflow.md) — как агент Remotion использует pipeline
-- [Artifacts & Analysis](docs/artifacts-and-analysis.md) — JSON-схемы, обработка аудио, сравнение моделей
-- [Whisper Timing](docs/whisper-timing.md) — модель, device, compute, word timestamps
-- [Troubleshooting](docs/troubleshooting.md) — типовые ошибки и их коды
-- [Polza Models](docs/polza-openai-audio-models.md) — голоса, цены, особенности
-- [Polza TTS Models](docs/polza-tts-models.md) — OpenAI TTS, ElevenLabs через Polza AI
-- [OpenRouter TTS](docs/openrouter-tts-models.md) — Gemini, OpenAI TTS через OpenRouter
-- [OpenCode Skill](docs/skills/voiceover-pipeline/SKILL.md) — Agent skill для установки и озвучки
-- [Gemini Prompting Skill Guide](docs/skills/voiceover-pipeline/docs/11-gemini-prompting.md) — режиссура Gemini TTS, эмоции, теги, chunk limits
-- [Gemini Prompting Templates](docs/skills/voiceover-pipeline/docs/12-gemini-prompting-templates.md) — project-native examples, шаблоны, QA checklist
-- [Qwen Local](docs/qwen-local-tts.md) — preset-голоса, клонирование, GPU
+- [Индекс документации](docs/README.md) — машинный контракт, планы, отчёты, skill.
+- [Agent CLI Contract](docs/agent-cli-contract.md) — JSON/exit codes, stdout/stderr, границы безопасности.
+- [Agent Skill](docs/skills/voiceover-pipeline/SKILL.md) — установка и озвучка агентом.
+- [Agent Development Workflow](doc/agent-workflow.md) — dirty tree, Kanban, Git/release approvals.
+- Установленная справка: `voiceover help`, `voiceover help start.quick`, `voiceover help search.semantic`.
+
+## Разработка
+
+После отдельно согласованной установки зависимостей проверки можно запускать
+без сети:
+
+```bash
+uv run --offline --frozen pytest
+uv run --offline --frozen ruff check src tests
+uv run --offline --frozen ruff format --check src tests
+uv run --offline --frozen mypy --no-incremental
+```
+
+Тесты детерминированные и офлайн: temp-каталоги, fixtures и моки; без реальных
+ключей, платных API и внешних загрузок.
+
+## Legal
+
+Независимая обёртка над сторонними провайдерами, не аффилирована с OpenAI,
+Google, OpenRouter, Polza.ai, Qwen или CTranslate2/faster-whisper. Условия
+использования сгенерированного аудио определяет выбранный провайдер. Не
+загружайте приватные голосовые образцы и сгенерированную речь без разрешения.
+
+## License
+
+MIT. См. [LICENSE](LICENSE).

@@ -5,12 +5,19 @@
 
 ## Правило установки
 
-Агент САМ проверяет и устанавливает всё, что можно.
-Пользователя просить выполнить команду ТОЛЬКО если среда не позволяет:
-нет прав, интерактивный installer требует GUI, корпоративная политика запрещает.
-Если агент может установить через winget/brew/apt/curl — ставит сам.
+Агент САМ проверяет окружение и предлагает установку. Любую сетевую установку
+(`uv`/`uvx`, `curl`-installer, `winget`/`brew`/`apt`, `pipx`/`pip`) и загрузку
+моделей выполняй **только с явного разрешения владельца** и в согласованном
+окружении: без разрешения пропусти шаг и спроси. Пользователя просить выполнить
+команду ТОЛЬКО если среда не позволяет: нет прав, интерактивный installer требует
+GUI, корпоративная политика запрещает.
 
 ## Probe Commands
+
+`voiceover doctor` может прочитать env-файл для проверки ключа: запускай только
+в одобренном окружении (см. `03-security-and-secrets.md`). Если такого согласия
+нет, проверяй наличие установленного CLI через `voiceover help --json` без
+секретов и сети.
 
 | Что | Windows | macOS/Linux |
 |---|---|---|
@@ -24,8 +31,9 @@
 Проверяй последовательно, на каждом шаге запускай probe-команду:
 
 **Шаг 1 — CLI уже работает?**
-`voiceover doctor --json`
-Если OK → пропустить установку, перейти к проверке extras.
+Сначала `voiceover help --json` (без env-файла). `voiceover doctor --json` —
+только после согласия на проверку env в выбранном окружении. Если CLI есть,
+пропустить установку и перейти к проверке extras.
 
 **Шаг 2 — Попробовать uvx**
 `uvx voiceover-pipeline doctor --json`
@@ -87,26 +95,29 @@
 
 | Extras | Добавляет | Для чего |
 |---|---|---|
-| (базовая) | CLI + все провайдеры + облачные TTS | Озвучка без таймингов |
-| `timing-whisper` | faster-whisper | Whisper-тайминги из аудио |
-| `voiceover-qwen` | Qwen3-TTS (PyTorch, transformers, soundfile) | Локальный бесплатный TTS на GPU |
-| `cuda` | CUDA-зависимости для Qwen | GPU-ускорение для Qwen |
+| (базовая) | CLI + облачные TTS | Озвучка без таймингов |
+| `timing-whisper` | `faster-whisper`, `ctranslate2` | Whisper-тайминги из аудио |
+| `voiceover-qwen` | Qwen3-TTS (`torch`, `qwen-tts`, `soundfile`, `numpy`) | Локальный TTS на GPU |
+| `asr-qwen` | `qwen-asr` | Локальное распознавание Qwen ASR |
+| `asr-nemotron` | `accelerate`, `librosa`, `torch`, `transformers` | Локальное распознавание Nemotron |
+| `cuda` | CUDA-библиотеки (Windows/Linux) | GPU-ускорение для локальных моделей |
 
 **Правило выбора:**
 
 - Только облачная озвучка → Base (без extras)
 - Нужны тайминги → + `timing-whisper`
-- Нужен Qwen (GPU) → + `voiceover-qwen`
-- Qwen + тайминги → + `timing-whisper`, `voiceover-qwen`
-- Всё сразу → + `timing-whisper`, `voiceover-qwen`, `cuda`
+- Нужен локальный Qwen TTS → + `voiceover-qwen` (+ `cuda`)
+- Нужно локальное распознавание → + `asr-qwen` ИЛИ `asr-nemotron`
 
-Для production-видео: **всегда ставь `timing-whisper`**.
+`asr-qwen`, `voiceover-qwen` и `asr-nemotron` **взаимоисключающие** (см.
+`[tool.uv] conflicts` в `pyproject.toml`): единого «all extras» набора нет,
+ставьте только нужный локальный маршрут.
 
 ## Команды установки пакета
 
 Console scripts: `voiceover` и `voiceover-pipeline` (работают оба).
 
-| Менеджер | Base | +Whisper | +Qwen GPU | +All extras |
+| Менеджер | Base | +Whisper | +Qwen GPU | +Whisper+Qwen+cuda |
 |---|---|---|---|---|
 | **uv tool** | `uv tool install voiceover-pipeline` | `uv tool install "voiceover-pipeline[timing-whisper]"` | `uv tool install "voiceover-pipeline[voiceover-qwen]"` | `uv tool install "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]"` |
 | **uvx** | `uvx voiceover-pipeline doctor` | `uvx --from "voiceover-pipeline[timing-whisper]" voiceover-pipeline generate --with-timings ...` | `uvx --from "voiceover-pipeline[voiceover-qwen]" voiceover-pipeline generate --provider qwen-local ...` | `uvx --from "voiceover-pipeline[timing-whisper,voiceover-qwen,cuda]" ...` |
@@ -143,13 +154,20 @@ voiceover doctor --provider qwen-local --json
 - Проверить: `nvidia-smi`, `voiceover doctor --provider qwen-local --json`.
 - Если CUDA unavailable → предложить cloud Polza/OpenRouter.
 - Установка: `voiceover-pipeline[voiceover-qwen]`.
-- Модель (~3.4 GB) скачивается из HuggingFace при первом запуске.
+- Модель (~3.4 GB) нужно заранее скачать/закешировать: неявной загрузки нет, и
+  агент не докачивает её без разрешения владельца.
 
 ## First-run особенности
 
-- Whisper модель (~486 MB, `small`) скачивается из HuggingFace при первом `--with-timings`.
-- Qwen модель (~3.4 GB) скачивается при первом `--provider qwen-local`.
-- Скачивание может занять несколько минут при первом запуске.
+- Локальная модель Qwen (~3.4 GB) и интегрированные локальные тайминги
+  (`generate --with-timings`, Whisper `small` ~486 MB) требуют заранее
+  закешированных весов: маршрут проверяет кэш и **не** докачивает неявно, чтобы
+  не заплатить за TTS до выяснения.
+- Отдельный `timings --timing-provider faster-whisper` может скачать модель Whisper
+  из HuggingFace при первом запуске: это сетевая операция, выполняемая с разрешения
+  владельца.
 - Модели кешируются, повторные запуски быстрые.
-- `.env` ищется в CWD и вверх по родительским директориям.
-  Если `.env` нет — агент создаёт `.env.example` (см. `docs/03-security-and-secrets.md`).
+- Значение ключа разрешается так: непустое окружение процесса → явный
+  `--env-file PATH` → `<CWD>/.env`; поиска по родительским каталогам нет. Реальный
+  env-файл создаёт пользователь; агент создаёт только `.env.example`
+  (см. `docs/03-security-and-secrets.md`).
