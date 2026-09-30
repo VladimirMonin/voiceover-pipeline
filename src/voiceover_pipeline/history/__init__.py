@@ -6,9 +6,12 @@ versioned checksummed migration ledger; :mod:`voiceover_pipeline.history.reposit
 owns the typed entity API (records, cost provenance, bounded metadata queries);
 :mod:`voiceover_pipeline.history.paths` resolves the private ``VOICEOVER_HOME``
 layout; :mod:`voiceover_pipeline.history.legacy_import` safely imports old
-``out/<run-id>`` trees without touching them; and
+``out/<run-id>`` trees without touching them;
 :mod:`voiceover_pipeline.history.native_snapshot` atomically persists a native
-prepared TTS run before any provider request exists.
+prepared TTS run before any provider request exists;
+:mod:`voiceover_pipeline.history.native_view` reads one verified view of such a
+run; and :mod:`voiceover_pipeline.history.native_resume` preflights a resume by
+comparing a candidate prepared run against that stored synthesis identity.
 """
 
 from .database import (
@@ -42,6 +45,12 @@ from .locking import (
     HistoryRunLockError,
     acquire_run_lock,
     run_lock_path,
+)
+from .native_resume import (
+    NativeResumeError,
+    NativeResumeIdentityConflictError,
+    NativeResumeValidationError,
+    preflight_native_tts_resume,
 )
 from .native_snapshot import (
     NATIVE_SNAPSHOT_FINGERPRINT_VERSION,
@@ -170,6 +179,9 @@ __all__ = [
     "LegacyRunPreview",
     "Migration",
     "MigrationChecksumError",
+    "NativeResumeError",
+    "NativeResumeIdentityConflictError",
+    "NativeResumeValidationError",
     "NativeSnapshotError",
     "NativeSnapshotInTransactionError",
     "NativeSnapshotRunRootConflictError",
@@ -201,6 +213,7 @@ __all__ = [
     "import_legacy_runs",
     "load_native_tts_view",
     "persist_prepared_tts_snapshot",
+    "preflight_native_tts_resume",
     "preview_legacy_import",
     "resolve_history_home",
     "run_lock_path",
