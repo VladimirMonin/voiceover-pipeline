@@ -411,14 +411,17 @@ provider/model/voice/script, с которыми позднее будет за�
 на весь сценарий, а снимок хеширует подготовленный текст частей, поэтому на
 часть не выдумывается ни провайдер, ни голос. Этого же маршрута касаются:
 записанная семантика обрезки
-(`--no-trim` либо обрезка по умолчанию), локальные
-`--with-timings --timing-provider faster-whisper`, которые дают аудио и
-локальные субтитры одной командой, и установленный локальный
+(`--no-trim` либо обрезка по умолчанию), интегрированные
+`--with-timings` для локального `faster-whisper` **или** платных облачных
+`groq-whisper`/`xai-stt` (последние идут через тот же платный boundary, что и
+standalone `timings`), и установленный локальный
 `--tts-quality-provider` (`qwen-local`, `nemotron-local`), дающий аудио и
-локальную проверку одной командой; локальные тайминги и локальная проверка
-могут быть запрошены вместе в одном прогоне. Облачный или
-незарегистрированный `--tts-quality-provider` и облачные timing-провайдеры
-(`openrouter-whisper`, `groq-whisper`, `xai-stt`) остаются вне среза. Все прочие
+локальную проверку одной командой; тайминги и локальная проверка
+могут быть запрошены вместе в одном прогоне. Облачный
+`--tts-quality-provider` (`xai-stt`) допускается **только** на двух диалоговых
+маршрутах (см. ниже) и на не-диалоговом маршруте по-прежнему игнорируется legacy
+executor'ом; `openrouter-whisper` (не даёт реальных таймстемпов) и
+незарегистрированный quality-провайдер остаются вне среза. Все прочие
 маршруты, все существующие legacy-каталоги и уже начатые JSON-прогоны
 продолжают использовать прежний executor и прежний JSON-writer без изменений.
 
@@ -507,6 +510,16 @@ provider/model/voice/script, с которыми позднее будет за�
   и удаляют только что записанные timing-файлы, чтобы экспорт не ссылался на
   несвязанные тайминги. Ссылки на тайминги попадают в экспорт/`files`
   (`timings_json`, `srt`) только при наличии verified связанного прогона.
+- **Платные облачные тайминги после готового аудио.** Интегрированный шаг
+  `--with-timings --timing-provider groq-whisper|xai-stt` проходит ту же стадию
+  через тот же платный boundary, что и standalone `timings`: до POST пишется
+  детерминированный приватный child-каталог (`.paid-timing`) с `submitting`-
+  попыткой, exact raw-ответ сохраняется до fallible parse, а `history resume`
+  воспроизводит/читает его локально без второго POST; неопределённый исход остаётся
+  `PAID_SUBMIT_UNCONFIRMED` и блокирует retry/fallback/resume/overwrite. `history
+  sync` никогда не отправляет запрос и сообщает pending тайминги неполными.
+  Стоимость такого child-прогона всегда `NULL` (unknown), а родительский
+  TTS-raw/cost остаются нетронутыми. Таблицы и schema не меняются.
 - **Записанная семантика обрезки.** `--no-trim` — часть нативного маршрута, а
   не повод уйти в legacy JSON: значение записывается в output-опции снимка
   (`trim_final_silence`), поэтому при обрезке по умолчанию каждый сконвертированный
@@ -545,8 +558,8 @@ provider/model/voice/script, с которыми позднее будет за�
   (`quality.complete: true, passed: false`) либо `quality.complete: false`, пока
   проверка не выполнена.
 
-Этот фрагмент не завершает S05: ASR/`verify-tts` и облачные
-`--timing-provider` остаются на legacy executor. Локальные семейства
+Этот фрагмент не завершает S05: standalone `verify-tts` остаётся на legacy
+executor. Локальные семейства
 `qwen-local`/`omnivoice-local` дополнительно допускают `format: voiceover`
 для фактически работающих сочетаний: любой режим `qwen-local` (preset сохраняет
 разрешённый voiceover-валидатором голос, clone/design подменяют его своим
@@ -569,22 +582,27 @@ OmniVoice-режимом, который отклоняет `--voice`, и с Omn
 `--provider openrouter-tts --model google/gemini-3.1-flash-tts-preview
 --format dialogue` (валидированный YAML, ровно два speaker'а с различными
 голосами из `GEMINI_TTS_VOICES`) с обязательным установленным локальным
-`--tts-quality-provider` (`qwen-local`/`nemotron-local`). Записанная семантика
-обрезки (`--no-trim`) и локальные
-`--with-timings --timing-provider faster-whisper` входят в тот же маршрут; любой
-`polza-tts` dialogue и облачный timing-провайдер остаются на legacy executor,
-новый обобщённый движок не добавляется.
+`--tts-quality-provider` (`qwen-local`/`nemotron-local`) или платным облачным
+`xai-stt`. Записанная семантика
+обрезки (`--no-trim`) и интегрированные
+`--with-timings` (локальный `faster-whisper` или платные `groq-whisper`/`xai-stt`)
+входят в тот же маршрут; любой `polza-tts` dialogue и `openrouter-whisper`
+остаются на legacy executor, новый обобщённый движок не добавляется.
 
 - Каждая реплика — один paid-запрос со своим cast-voice (`voice`, как в legacy);
   снимок хранит порядок реплик, speaker, cast/effective voice, паузу и текст.
-- Перед concat каждая реплика проходит обязательную локальную ASR-проверку,
-  причём локальная модель прощупывается до первого paid POST (без implicit
-  download). Наблюдённый вердикт PASS/FAIL и приватный
+- Перед concat каждая реплика проходит обязательную ASR-проверку. Локальная
+  модель (`qwen-local`/`nemotron-local`) прощупывается до первого paid POST (без
+  implicit download); платный облачный `xai-stt` проверяет наличие ключа до
+  первого paid TTS POST, а каждая реплика получает свой приватный child-root
+  `.paid-quality/<turn>` и `submitting`-попытку до своего POST. Наблюдённый
+  вердикт PASS/FAIL и приватный
   `verification_transcript` сохраняются на самом TTS-прогоне и связаны с этой
-  частью; провал проверки — exit `60` (`NATIVE_QUALITY_FAILED`), сбой локальной
-  транскрипции — exit `50` (`NATIVE_QUALITY_ASR_FAILED`), сбой записи — exit `50`
-  (`NATIVE_QUALITY_HISTORY_FAILED`), отсутствующая модель — exit `10`
-  (`NATIVE_QUALITY_MODEL_UNAVAILABLE`).
+  частью; провал проверки — exit `60` (`NATIVE_QUALITY_FAILED`), сбой ASR —
+  exit `50` (`NATIVE_QUALITY_ASR_FAILED`), сбой записи — exit `50`
+  (`NATIVE_QUALITY_HISTORY_FAILED`), отсутствующая локальная модель — exit `10`
+  (`NATIVE_QUALITY_MODEL_UNAVAILABLE`), отсутствующий ключ — exit `20`
+  (`NATIVE_PAID_QUALITY_KEY_MISSING`).
 - Записанный FAIL не повторяет POST и не перезапускает модель: `generate
   --resume`, `history resume ID` и `history sync ID` повторно сообщают exit `60`,
   сохраняя оплаченные raw/аудио/стоимость. Неопределённый синхронный submit
@@ -601,9 +619,10 @@ OmniVoice-режимом, который отклоняет `--voice`, и с Omn
 audio-cpp/omnivoice-q8_0 --mode preset --voice-bank <catalog.json> --format
 dialogue` (валидированный YAML, ровно два speaker'а с различными profile ID из
 admitted bank и различными `reference_sha256`). Записанная семантика обрезки
-(`--no-trim`), локальные `--with-timings --timing-provider faster-whisper` и
-установленный локальный `--tts-quality-provider` (`qwen-local`/`nemotron-local`)
-входят в тот же маршрут; облачный timing- или quality-провайдер, другие режимы
+(`--no-trim`), интегрированные `--with-timings` (локальный `faster-whisper` или
+платные `groq-whisper`/`xai-stt`) и установленный локальный **или** платный
+облачный `xai-stt` `--tts-quality-provider`
+входят в тот же маршрут; незарегистрированный quality-провайдер, другие режимы
 OmniVoice и любой `polza-tts` dialogue остаются на legacy executor.
 
 - Каждая реплика — один локальный запрос со своим cast voice-bank profile;
@@ -618,11 +637,13 @@ OmniVoice и любой `polza-tts` dialogue остаются на legacy execut
   повторного запуска модели; упавший или прерванный локальный запуск сохраняет
   свой truthful outcome (`local_failed` или pending-строка) и безопасно
   повторяется новой попыткой при явном `--resume`/`history resume`.
-- Опциональная локальная ASR-проверка: когда прогон запросил установленный
-  локальный `--tts-quality-provider`, каждая реплика проходит ту же строгую
-  сверку до concat, а наблюдённый вердикт PASS/FAIL и приватный
+- Опциональная ASR-проверка: когда прогон запросил установленный
+  локальный `--tts-quality-provider` (`qwen-local`/`nemotron-local`) или платный
+  облачный `xai-stt`, каждая реплика проходит ту же строгую
+  сверку до concat (для облачного провайдера — через тот же платный boundary и
+  свой child-root на реплику), а наблюдённый вердикт PASS/FAIL и приватный
   `verification_transcript` связываются с частью; записанный FAIL повторно
-  сообщается exit `60` без нового запуска модели, а без провайдера сохраняется
+  сообщается exit `60` без нового запуска модели/POST, а без провайдера сохраняется
   прежнее поведение без проверки.
 - Если reference-файл профиля пропал или его digest изменился, запуск
   завершается ошибкой (`NATIVE_LOCAL_REFERENCE_UNAVAILABLE` или
@@ -651,10 +672,11 @@ audio-cpp/omnivoice-q8_0` (plain Markdown без frontmatter, а для preset-�
   отклоняется существующей проверкой длины до admission, а короткий русский
   design остаётся experimental.
 
-Записанная семантика обрезки (`--no-trim`), локальные
-`--with-timings --timing-provider faster-whisper` и установленный локальный
+Записанная семантика обрезки (`--no-trim`), интегрированные
+`--with-timings` (локальный `faster-whisper` или платные `groq-whisper`/`xai-stt`)
+и установленный локальный
 `--tts-quality-provider` (`qwen-local`/`nemotron-local`) входят в тот же
-маршрут; облачный timing- или quality-провайдер остаётся на legacy executor.
+маршрут; облачный quality-провайдер остаётся на legacy executor.
 `--mode preset --voice-bank` допускается и для `format: voiceover`:
 валидатор такого сценария разрешает единственный голос
 `built-in-female-style-condition`, поэтому admitted-каталог обязан содержать
@@ -703,10 +725,11 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
 отклоняется как usage error (exit `2`) до провайдера, модели и снимка:
 автоматический выбор режима не подменяется на `preset`; неизвестное
 значение `VOICEOVER_QWEN_TTS_RUNTIME` остаётся на legacy executor. Записанная
-семантика обрезки (`--no-trim`), локальные
-`--with-timings --timing-provider faster-whisper` и установленный локальный
+семантика обрезки (`--no-trim`), интегрированные
+`--with-timings` (локальный `faster-whisper` или платные `groq-whisper`/`xai-stt`)
+и установленный локальный
 `--tts-quality-provider` (`qwen-local`/`nemotron-local`) входят в тот же
-маршрут; облачный timing- или quality-провайдер остаётся на legacy executor.
+маршрут; облачный quality-провайдер остаётся на legacy executor.
 
 - Снимок хранит полную неизменяемую идентичность клона: канонический абсолютный
   локатор референс-файла, его SHA-256 и размер (сами байты в снимок и публичные
@@ -745,9 +768,11 @@ OmniVoice-режимы всегда отклоняют `--voice`, который
 `verify-tts` записывают наблюдаемый результат в каноническую SQLite-историю по
 умолчанию. Это **фрагмент** S05: локальные timing-маршруты и облачный
 `timings --timing-provider groq-whisper|xai-stt` сохранены (см. ниже), а
-`openrouter-whisper` (не даёт реальных таймстемпов), облачный dialogue-QA
-(`xai-stt`) и будущий облачный ASR остаются legacy и ничего не сохраняют до
-подтверждённого paid-submit контракта (S01/S07).
+`openrouter-whisper` (не даёт реальных таймстемпов) и будущий облачный ASR
+остаются legacy и ничего не сохраняют до подтверждённого paid-submit контракта
+(S01/S07). Облачный dialogue-QA `xai-stt` больше не на legacy: он допущен на двух
+диалоговых маршрутах через тот же платный boundary (см. раздел «Облачный
+`timings`...» и описания диалоговых маршрутов).
 
 - Управление — `settings.toml` в текущем каталоге: `[history] enabled = false`
   отключает запись полностью, и команда работает как раньше, не создавая дом,
@@ -874,6 +899,25 @@ voiceover timings --audio recording.wav --timing-provider groq-whisper --output-
 voiceover history resume <run-uuid> --json   # локальный replay без второго POST
 voiceover history sync <run-uuid> --json     # только чтение, модель не запускается
 ```
+
+**Интегрированное переиспользование (фрагмент S05).** Тот же boundary обслуживает
+два ранее не мигрированных фактически работающих облачных post-audio маршрута:
+
+- `generate --with-timings --timing-provider groq-whisper|xai-stt` на
+  допустимом нативном TTS/dialogue: платёжный timing-child коммитится в
+  детерминированный приватный каталог `<run-root>/.paid-timing` (родительский
+  native-root не перезаписывается), raw сохраняется до парсинга, тайминги
+  публикуются в родительский root, а `history resume`/`sync` читают его локально.
+- `--tts-quality-provider xai-stt` только на двух диалоговых маршрутах
+  (OpenRouter Gemini и OmniVoice preset-банк), по реплике: каждая реплика
+  получает свой child-root `<run-root>/.paid-quality/<turn>` до POST; вердикт
+  PASS/FAIL и приватный transcript линкуются к родительской части (тот же per-turn
+  механизм, что и для локальной проверки), а записанный FAIL повторно сообщается
+  без нового POST. Не-диалоговый `xai-stt` по-прежнему игнорируется legacy
+  executor'ом.
+
+Стоимость каждого child-прогона `NULL` (unknown); ни один маршрут не создаёт
+новую схему или таблицу.
 
 ## `verify-tts` — fail-closed quality gate
 
@@ -1307,9 +1351,9 @@ voiceover history sync ID --json        # без нового оплаченно
 Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
 из S05; live/listening-приёмка при этом не проводилась. `history costs` —
 read-only offline-учёт расходов (см. выше). S05 целиком пока не принят:
-ASR/`verify-tts`, облачные timing-маршруты и локальные семейства в формате
-`voiceover` остаются на
-legacy executor; оба нативных диалоговых маршрута описаны ниже.
+standalone ASR/`verify-tts` остаётся на
+legacy executor; облачные timing-маршруты и облачный dialogue-QA `xai-stt` переведены
+на платный boundary (см. выше). Оба нативных диалоговых маршрута описаны ниже.
 
 ## Gemini Dialogue (machine-facing)
 

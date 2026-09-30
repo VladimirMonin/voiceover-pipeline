@@ -873,22 +873,21 @@ def test_native_local_dialogue_route_gate_requires_the_admitted_bank():
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.voice_bank_catalog = object()
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
-    # ``--no-trim``, integrated local timings, and an installed local quality
-    # provider are recorded on the route; a cloud timing or quality provider keeps
-    # it legacy.
+    # ``--no-trim``, integrated timings, and an installed local or paid cloud
+    # quality provider are recorded on the admitted dialogue route.
     args.no_trim = True
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.no_trim = False
     args.with_timings = True
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.timing_provider = "xai-stt"
-    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.timing_provider = "faster-whisper"
     args.with_timings = False
     args.tts_quality_provider = "qwen-local"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.tts_quality_provider = "xai-stt"
-    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.tts_quality_provider = None
     args.mode = "clone"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False

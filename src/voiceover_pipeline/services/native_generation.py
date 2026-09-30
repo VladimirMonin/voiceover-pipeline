@@ -148,9 +148,21 @@ from ..history.native_view import (
     load_native_tts_view,
 )
 from ..history.paid_transcription import (
+    ATTEMPT_CALL_TYPE_PAID_QUALITY,
+    ATTEMPT_CALL_TYPE_PAID_TIMING,
+    PAID_TRANSCRIPTION_ORIGIN,
     PaidTranscriptionError,
+    PaidTranscriptionRequest,
+    PaidTranscriptionReservation,
     committed_paid_run_for_root,
+    complete_paid_transcription,
+    load_paid_transcription_state,
     paid_local_evidence,
+    read_paid_transcription_raw,
+    record_paid_transcription_raw,
+    recover_paid_transcription_after_crash,
+    reservation_from_state,
+    reserve_paid_transcription,
 )
 from ..history.paths import HistoryPathsError, history_database_path
 from ..history.raw_receipt import (
@@ -203,6 +215,7 @@ from .synthesis import synthesize_part
 # service; only the documented stable codes are used here.
 _EXIT_ARGS = 2
 _EXIT_MISSING_DEP = 10
+_EXIT_NO_KEY = 20
 _EXIT_PROVIDER = 30
 _EXIT_OUTPUT = 50
 _EXIT_QUALITY = 60
@@ -286,6 +299,16 @@ _ERROR_QUALITY_CONFLICT = "NATIVE_QUALITY_CONFLICT"
 # sync``): the committed audio and cost stay, and an explicit resume is required
 # to run the pending local model.
 _ERROR_QUALITY_INCOMPLETE = "NATIVE_QUALITY_INCOMPLETE"
+# Paid cloud timing/quality steps run through the same boundary the standalone
+# ``timings`` command uses. Their own bounded codes report a missing provider key
+# before any paid submit, a reserve/complete failure, and a body that cannot be
+# re-parsed locally; an unconfirmed submit reuses ``PAID_SUBMIT_UNCONFIRMED``.
+_ERROR_PAID_TIMING_KEY_MISSING = "NATIVE_PAID_TIMING_KEY_MISSING"
+_ERROR_PAID_QUALITY_KEY_MISSING = "NATIVE_PAID_QUALITY_KEY_MISSING"
+_ERROR_PAID_TIMING_BOUNDARY = "NATIVE_PAID_TIMING_BOUNDARY_FAILED"
+_ERROR_PAID_QUALITY_BOUNDARY = "NATIVE_PAID_QUALITY_BOUNDARY_FAILED"
+_ERROR_PAID_TIMING_REPLAY = "NATIVE_PAID_TIMING_REPLAY_FAILED"
+_ERROR_PAID_QUALITY_REPLAY = "NATIVE_PAID_QUALITY_REPLAY_FAILED"
 
 # Stable mode names for the two history entry points.
 _MODE_RESUME = "resume"
@@ -352,11 +375,16 @@ _TIMING_WORD_TIMESTAMPS_KEY = "timing_word_timestamps"
 
 @dataclass(frozen=True)
 class NativeTimingOptions:
-    """The local timing settings a native run records and a resume must match.
+    """The timing settings a native run records and a resume must match.
 
-    Only the local ``faster-whisper`` provider is admitted for native timings;
-    cloud timing providers stay on the legacy executor. ``model`` is ``None``
-    when the command left it unset, in which case the adapter's default applies.
+    The local ``faster-whisper`` provider (:data:`NATIVE_LOCAL_TIMING_PROVIDERS`)
+    runs offline; the cloud ``groq-whisper``/``xai-stt`` providers
+    (:data:`NATIVE_PAID_TIMING_PROVIDERS`) run through the paid-transcription
+    boundary with the same record-before-POST contract. ``model`` is ``None`` when
+    the command left it unset, in which case the adapter's default applies.
+
+    ``device``/``compute`` are recorded for every provider, exactly as the command
+    line carried them; a cloud provider ignores them.
     """
 
     provider: str
@@ -365,6 +393,26 @@ class NativeTimingOptions:
     compute: str
     language: str
     word_timestamps: bool
+
+
+# The local timing provider (offline, no paid POST).
+NATIVE_LOCAL_TIMING_PROVIDERS = frozenset({"faster-whisper"})
+# The cloud timing providers whose one paid multipart POST is protected by the
+# shared paid-transcription boundary. ``openrouter-whisper`` is deliberately
+# absent: it returns no real timestamps and the legacy route already rejects it.
+NATIVE_PAID_TIMING_PROVIDERS = frozenset({"groq-whisper", "xai-stt"})
+NATIVE_TIMING_PROVIDERS = NATIVE_LOCAL_TIMING_PROVIDERS | NATIVE_PAID_TIMING_PROVIDERS
+# The adapter default model each paid timing provider uses when the command left
+# ``--timing-model`` unset; kept in sync with ``services.transcription``.
+_PAID_TIMING_DEFAULT_MODELS = {"groq-whisper": "whisper-large-v3-turbo", "xai-stt": "grok-stt"}
+# The public ``xai-stt`` model label; xAI STT has one model and the adapter does
+# not send the label, but it is recorded as the observed identity.
+_PAID_QUALITY_DEFAULT_MODEL = "grok-stt"
+# Deterministic private child output roots inside the parent native run root. The
+# paid boundary binds ownership, the private raw receipt, and the response body to
+# the child root, so it never overwrites the parent native run's own evidence.
+_PAID_TIMING_CHILD_DIR_NAME = ".paid-timing"
+_PAID_QUALITY_CHILD_DIR_NAME = ".paid-quality"
 
 
 def _timing_output_fields(timing: NativeTimingOptions | None) -> dict[str, Any]:
@@ -438,8 +486,8 @@ def _preflight_local_timing(options: NativeTimingOptions) -> None:
     """
     if options.provider != "faster-whisper":
         raise NativeGenerationError(
-            "only the local faster-whisper provider is admitted for native timings; cloud "
-            "timing providers stay on the legacy executor.",
+            "only the local faster-whisper provider reaches the local timing preflight; a "
+            "cloud timing provider is preflighted by its paid key check.",
             code=_EXIT_PROVIDER,
             error_code=_ERROR_TIMING_PROVIDER_UNSUPPORTED,
         )
@@ -452,6 +500,30 @@ def _preflight_local_timing(options: NativeTimingOptions) -> None:
             code=_EXIT_MISSING_DEP,
             error_code=_ERROR_TIMING_MODEL_UNAVAILABLE,
         )
+
+
+def _preflight_paid_timing(options: NativeTimingOptions) -> None:
+    """Fail closed before any paid TTS submit when the cloud timing key is absent.
+
+    The paid cloud timing route needs its provider key before the paid TTS POST so
+    a missing key stops the command instead of leaving finished, paid audio with an
+    unreachable timing step. No request leaves here; the key is only read.
+    """
+    try:
+        if options.provider == "groq-whisper":
+            from ..config import read_groq_key
+
+            read_groq_key()
+        else:
+            from ..config import read_xai_key
+
+            read_xai_key()
+    except RuntimeError as exc:
+        raise NativeGenerationError(
+            str(exc),
+            code=_EXIT_NO_KEY,
+            error_code=_ERROR_PAID_TIMING_KEY_MISSING,
+        ) from None
 
 
 # Flat keys recorded in a native run's output options so a resume can prove the
@@ -467,10 +539,14 @@ _QUALITY_COMPUTE_KEY = "quality_compute"
 _QUALITY_RUNTIME_KEY = "quality_runtime"
 _QUALITY_LANGUAGE_KEY = "quality_language"
 
-# The only quality providers a native run admits: the installed local ASR routes
-# whose dependency probe inspects local assets and never downloads. A cloud ASR
-# provider keeps the legacy executor, exactly as it did before this step.
+# The only quality providers a native run admits locally: the installed local ASR
+# routes whose dependency probe inspects local assets and never downloads.
 NATIVE_LOCAL_QUALITY_PROVIDERS = frozenset({"qwen-local", "nemotron-local"})
+# The cloud quality provider whose one paid multipart POST is protected by the
+# shared paid-transcription boundary. It is admitted only for the two admitted
+# dialogue routes and only per turn; a non-dialogue run keeps the exact legacy
+# behavior of ignoring ``--tts-quality-provider xai-stt``.
+NATIVE_PAID_QUALITY_PROVIDERS = frozenset({"xai-stt"})
 
 
 @dataclass(frozen=True)
@@ -563,8 +639,8 @@ def _preflight_local_quality(options: NativeQualityOptions) -> None:
     """
     if options.provider not in NATIVE_LOCAL_QUALITY_PROVIDERS:
         raise NativeGenerationError(
-            "only an installed local ASR provider is admitted for native quality "
-            "verification; cloud ASR providers stay on the legacy executor.",
+            "only an installed local ASR provider reaches the local quality preflight; a "
+            "cloud ASR provider is preflighted by its paid key check.",
             code=_EXIT_PROVIDER,
             error_code=_ERROR_QUALITY_PROVIDER_UNSUPPORTED,
         )
@@ -585,6 +661,111 @@ def _preflight_local_quality(options: NativeQualityOptions) -> None:
             code=_EXIT_MISSING_DEP,
             error_code=_ERROR_QUALITY_MODEL_UNAVAILABLE,
         )
+
+
+def _preflight_paid_quality(options: NativeQualityOptions) -> None:
+    """Fail closed before any paid TTS submit when the cloud quality key is absent.
+
+    The admitted dialogue cloud quality route needs its xAI key before the first
+    paid dialogue turn so a missing key stops the command instead of leaving paid
+    turns without their required per-turn verification. No request leaves here.
+    """
+    try:
+        from ..config import read_xai_key
+
+        read_xai_key()
+    except RuntimeError as exc:
+        raise NativeGenerationError(
+            str(exc),
+            code=_EXIT_NO_KEY,
+            error_code=_ERROR_PAID_QUALITY_KEY_MISSING,
+        ) from None
+
+
+def _paid_timing_request_options(timing_provider: str, word_timestamps: bool) -> dict[str, Any]:
+    """Return the exact provider request shape a paid timing request sends.
+
+    Kept in sync with ``services.transcription`` and the standalone ``timings``
+    route so the recorded fingerprint matches the request the adapter issues.
+    """
+    if timing_provider == "groq-whisper":
+        granularities = ["segment", "word"] if word_timestamps else ["segment"]
+        return {"response_format": "verbose_json", "timestamp_granularities": granularities}
+    return {"format": "true"}
+
+
+def _parse_paid_timing_body(
+    *,
+    provider: str,
+    body: bytes,
+    model: str,
+    language: str,
+    word_timestamps: bool,
+    audio_path: Path,
+) -> Any:
+    """Parse a saved paid timing body with the provider's own pure parser.
+
+    Reusing the adapter's pure parser means a fresh response and a locally
+    replayed response produce exactly the same evidence, and the honest
+    provider/derived/fallback ``timestamp_basis`` is never overwritten.
+    """
+    try:
+        raw = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise NativeGenerationError(
+            "the saved paid timing response is not valid JSON.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_PAID_TIMING_REPLAY,
+        ) from None
+    if not isinstance(raw, dict):
+        raise NativeGenerationError(
+            "the saved paid timing response is not a JSON object.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_PAID_TIMING_REPLAY,
+        )
+    if provider == "groq-whisper":
+        from ..providers.groq_whisper import parse_groq_timing_result
+
+        return parse_groq_timing_result(
+            raw,
+            model=model,
+            language=language,
+            word_timestamps=word_timestamps,
+            audio_path=audio_path,
+        )
+    from ..providers.xai_stt import parse_xai_timing_result
+
+    return parse_xai_timing_result(
+        raw,
+        model=model,
+        language=language,
+        word_timestamps=word_timestamps,
+        audio_path=audio_path,
+    )
+
+
+def _parse_paid_quality_transcript(
+    *,
+    body: bytes,
+    model: str,
+    language: str,
+    audio_path: Path,
+) -> str:
+    """Return the observed transcript a saved paid quality body holds.
+
+    The xAI STT body is parsed by the adapter's pure parser and its spans joined,
+    exactly as the legacy dialogue-quality route reads it, so a replayed verdict
+    matches the one the original response would have produced.
+    """
+    timing = _parse_paid_timing_body(
+        provider="xai-stt",
+        body=body,
+        model=model,
+        language=language,
+        word_timestamps=False,
+        audio_path=audio_path,
+    )
+    return " ".join(segment.text for segment in timing.segments).strip()
 
 
 @dataclass(frozen=True)
@@ -1920,15 +2101,20 @@ class _Executor:
         """
         options = self.quality_options
         if options is None:
-            # The dialogue route always records its local quality settings; a run
-            # without them cannot be verified and must not continue to a paid call.
+            # The dialogue route always records its quality settings; a run without
+            # them cannot be verified and must not continue to a paid call.
             raise NativeGenerationError(
-                "the dialogue native route requires an installed local --tts-quality-provider.",
+                "the dialogue native route requires a recorded --tts-quality-provider.",
                 code=_EXIT_PROVIDER,
                 error_code=_ERROR_QUALITY_OPTIONS_INVALID,
             )
         part = evidence.part
         audio_path = self.paths.chunks_dir / f"{part.chunk_id}.mp3"
+        if options.provider in NATIVE_PAID_QUALITY_PROVIDERS:
+            # The cloud per-turn gate reuses the shared paid-transcription boundary
+            # for its one paid multipart POST and the same parent turn verdict.
+            self._run_paid_turn_quality(part, audio_path)
+            return
         from .transcription import transcribe_local_asr_quality
 
         try:
@@ -1970,6 +2156,365 @@ class _Executor:
                 error_code=_ERROR_QUALITY_FAILED,
             )
         self.logger.event("info", "dialogue_turn_quality_verified", chunk=part.number)
+
+    def _run_paid_turn_quality(self, part: NativeTtsPart, audio_path: Path) -> None:
+        """Verify one converted dialogue turn with the paid xAI STT boundary.
+
+        The boundary commits the per-turn operation identity and one ``submitting``
+        attempt into a deterministic private child output root before the single
+        multipart POST, persists the exact response body before any parse, and
+        links the observed verdict and private transcript to the parent turn. A
+        crash, a lost response, or a provider error leaves the attempt
+        ``submitting`` so a resume reconciles the saved body locally with no second
+        POST and otherwise fails closed. A mismatch keeps the paid turn audio, its
+        raw bytes, and its cost intact and reraises the existing quality exit.
+        """
+        options = self.quality_options
+        assert options is not None  # guarded by the caller
+        model = options.model or _PAID_QUALITY_DEFAULT_MODEL
+        language = options.language or "ru"
+        child = self._paid_quality_child(part.record.part_uuid)
+        if child is None:
+            reservation = self._reserve_paid_turn_quality(part, audio_path, model, language)
+            self._post_paid_turn_quality(audio_path, model, language, reservation)
+            child_uuid = reservation.run_uuid
+        else:
+            child_uuid = child.run_uuid
+        transcript, quality = self._replay_paid_turn_quality(child_uuid, part.text, audio_path)
+        self._persist_paid_turn_quality(part, transcript, quality, audio_path)
+        if not quality.passed:
+            self.logger.event("warning", "dialogue_turn_quality_failed", chunk=part.number)
+            raise NativeGenerationError(
+                "the turn audio is complete, but the paid per-turn quality verification did "
+                "not pass; the paid audio and cost were kept and the failed verification was "
+                "recorded.",
+                code=_EXIT_QUALITY,
+                error_code=_ERROR_QUALITY_FAILED,
+            )
+        self.logger.event("info", "dialogue_turn_quality_verified", chunk=part.number)
+
+    def _paid_quality_child(self, part_uuid: str) -> RunRecord | None:
+        """Return this turn's committed paid quality child run, or ``None``.
+
+        A dialogue run may carry one paid quality child per turn, so the child is
+        matched by the ``part_uuid`` its reservation recorded, never by position.
+        Two children for one turn cannot be told apart and fail closed.
+        """
+        children = [
+            run
+            for run in self.repository.find_runs_by_parent(self._run_uuid(), limit=MAX_QUERY_LIMIT)
+            if run.operation == OPERATION_VERIFY
+            and run.legacy_source_root is None
+            and isinstance(run.config_snapshot, dict)
+            and run.config_snapshot.get("operation_origin") == PAID_TRANSCRIPTION_ORIGIN
+            and isinstance(run.config_snapshot.get("request_options"), dict)
+            and run.config_snapshot["request_options"].get("part_uuid") == part_uuid
+        ]
+        if len(children) > 1:
+            raise NativeGenerationError(
+                "more than one paid quality-verification run belongs to this dialogue turn; "
+                "refusing to choose one.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_QUALITY_CONFLICT,
+            )
+        return children[0] if children else None
+
+    def _paid_quality_child_root(self, chunk_id: str) -> Path:
+        return self.run_root / _PAID_QUALITY_CHILD_DIR_NAME / chunk_id
+
+    def _reserve_paid_turn_quality(
+        self, part: NativeTtsPart, audio_path: Path, model: str, language: str
+    ) -> PaidTranscriptionReservation:
+        """Commit this turn's paid quality attempt before its POST."""
+        child_root = self._paid_quality_child_root(part.chunk_id)
+        try:
+            child_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise NativeGenerationError(
+                "the paid per-turn quality child directory could not be created.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_OUTPUT_UNAVAILABLE,
+            ) from exc
+        request = PaidTranscriptionRequest(
+            call_type=ATTEMPT_CALL_TYPE_PAID_QUALITY,
+            provider="xai-stt",
+            model=model,
+            language=language,
+            word_timestamps=False,
+            source_audio=audio_path,
+            output_root=child_root,
+            request_options={
+                "format": "true",
+                "part_uuid": part.record.part_uuid,
+                "turn_index": part.number,
+                "turn_audio": f"chunks/{part.chunk_id}.mp3",
+            },
+            parent_run_root=self.run_root,
+        )
+        try:
+            return reserve_paid_transcription(request)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid per-turn quality attempt could not be reserved; no request was made.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_QUALITY_BOUNDARY,
+            ) from None
+
+    def _post_paid_turn_quality(
+        self,
+        audio_path: Path,
+        model: str,
+        language: str,
+        reservation: PaidTranscriptionReservation,
+    ) -> None:
+        """Send the single paid per-turn quality POST and persist its raw body."""
+        from ..providers.xai_stt import XAISttProvider
+
+        def raw_sink(body: bytes, content_type: str) -> None:
+            record_paid_transcription_raw(reservation, body=body, content_type=content_type)
+
+        try:
+            XAISttProvider(model=model).transcribe(
+                audio_path=audio_path,
+                language=language,
+                word_timestamps=False,
+                quiet=True,
+                on_raw_response=raw_sink,
+            )
+        except Exception as exc:
+            self.logger.event(
+                "error", "dialogue_quality_transcription_failed", error=type(exc).__name__
+            )
+            raise NativeGenerationError(
+                "the turn audio is complete, but the paid per-turn quality transcription failed.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_ASR_FAILED,
+            ) from None
+
+    def _replay_paid_turn_quality(
+        self, child_uuid: str, expected_text: str, audio_path: Path
+    ) -> tuple[str, TTSQualityResult]:
+        """Recover/replay one turn's saved paid response locally, with no POST.
+
+        A ``submitting`` attempt is reconciled from its validated receipt+body pair
+        only; an unconfirmed submit with no valid evidence fails closed with the
+        shared ``PAID_SUBMIT_UNCONFIRMED`` block so no second POST is ever issued.
+        The saved body is re-parsed locally, so this reuses exactly the bytes the
+        provider returned.
+        """
+        options = self.quality_options
+        assert options is not None  # guarded by the caller
+        model = options.model or _PAID_QUALITY_DEFAULT_MODEL
+        language = options.language or "ru"
+        state = self._paid_child_state(child_uuid)
+        if state.attempt_status == ATTEMPT_STATUS_SUBMITTING:
+            try:
+                recovered = recover_paid_transcription_after_crash(child_uuid)
+            except PaidTranscriptionError:
+                recovered = None
+            if recovered is None:
+                raise NativeGenerationError(
+                    "refusing to continue: the paid per-turn quality request has an "
+                    "unconfirmed submit; a new attempt is never made automatically.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_SUBMIT_UNCONFIRMED,
+                )
+            state = self._paid_child_state(child_uuid)
+        if state.status == RUN_STATUS_COMPLETED:
+            # A crash after the child closed but before the parent verdict was
+            # written: the completed child's stored private transcript is the local
+            # replay, so no POST and no raw re-read is needed.
+            transcript = self._paid_child_transcript(child_uuid)
+            quality = evaluate_tts_transcript(
+                expected_text=expected_text,
+                actual_transcript=transcript,
+                minimum_similarity=1.0,
+                maximum_missing_ratio=0.0,
+                maximum_unexpected_ratio=0.0,
+                maximum_repeated_ngram_excess=0,
+                strip_audio_tags=True,
+            )
+            return transcript, quality
+        if not state.raw_saved:
+            raise NativeGenerationError(
+                "refusing to continue: the paid per-turn quality run has no saved response "
+                "to replay.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_PAID_QUALITY_REPLAY,
+            )
+        try:
+            body = read_paid_transcription_raw(child_uuid)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the saved paid per-turn quality response could not be read.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_QUALITY_REPLAY,
+            ) from None
+        transcript = _parse_paid_quality_transcript(
+            body=body,
+            model=model,
+            language=language,
+            audio_path=audio_path,
+        )
+        quality = evaluate_tts_transcript(
+            expected_text=expected_text,
+            actual_transcript=transcript,
+            minimum_similarity=1.0,
+            maximum_missing_ratio=0.0,
+            maximum_unexpected_ratio=0.0,
+            maximum_repeated_ngram_excess=0,
+            strip_audio_tags=True,
+        )
+        self._complete_paid_turn_quality(child_uuid, transcript, quality)
+        return transcript, quality
+
+    def _paid_child_transcript(self, child_uuid: str) -> str:
+        """Return the private observed transcript one completed child stored."""
+        transcripts = [
+            source
+            for source in self.repository.get_text_sources(child_uuid)
+            if source.kind == TEXT_KIND_VERIFICATION_TRANSCRIPT
+        ]
+        if len(transcripts) != 1 or not isinstance(transcripts[0].content, str):
+            raise NativeGenerationError(
+                "the completed paid per-turn quality run does not carry exactly one stored "
+                "transcript.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_PAID_QUALITY_REPLAY,
+            )
+        content = transcripts[0].content
+        if transcripts[0].content_hash != sha256_text(content):
+            raise NativeGenerationError(
+                "the stored paid per-turn quality transcript does not match its hash.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_PAID_QUALITY_REPLAY,
+            )
+        return content
+
+    def _complete_paid_turn_quality(
+        self, child_uuid: str, transcript: str, quality: TTSQualityResult
+    ) -> None:
+        """Close a turn's paid quality child once, linking its private transcript.
+
+        The child links the observed transcript privately and records the
+        content-free verdict; the parent turn verdict is written by the caller. A
+        completion failure keeps the saved response for a later local replay and
+        never reissues the POST.
+        """
+        state = self._paid_child_state(child_uuid)
+        if state.status == RUN_STATUS_COMPLETED:
+            return
+        reservation = reservation_from_state(state)
+        metadata = {
+            "part_uuid": state.snapshot.get("request_options", {}).get("part_uuid")
+            if isinstance(state.snapshot.get("request_options"), dict)
+            else None,
+            "quality_passed": bool(quality.passed),
+            "timestamp_basis": "provider_text",
+            "cost_known": False,
+        }
+        try:
+            complete_paid_transcription(
+                reservation,
+                artifacts=(),
+                text_sources=(
+                    AsrHistoryText(
+                        kind=TEXT_KIND_VERIFICATION_TRANSCRIPT,
+                        content=transcript,
+                        language=None,
+                        text_completeness=(
+                            TEXT_COMPLETENESS_COMPLETE
+                            if transcript.strip()
+                            else TEXT_COMPLETENESS_INCOMPLETE
+                        ),
+                    ),
+                ),
+                result_metadata=metadata,
+            )
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid per-turn quality response was saved, but its run could not be closed.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_QUALITY_BOUNDARY,
+            ) from None
+
+    def _paid_child_state(self, child_uuid: str):
+        try:
+            return load_paid_transcription_state(child_uuid)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid per-turn quality run state could not be read.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_QUALITY_BOUNDARY,
+            ) from None
+
+    def _persist_paid_turn_quality(
+        self,
+        part: NativeTtsPart,
+        transcript: str,
+        quality: TTSQualityResult,
+        audio_path: Path,
+    ) -> None:
+        """Persist the paid turn verdict and private transcript on the parent run.
+
+        This mirrors the local per-turn writer: one content-free receipt artifact
+        and one private ``verification_transcript`` source linked to the parent
+        turn, committed together, so ``_turn_quality_evidence`` reads both exactly
+        as it does for a local verdict and no expected text is stored. A re-run
+        (a resume whose verdict is still pending) replaces the pending pair only
+        when no committed verdict exists; a committed verdict is left untouched so
+        a recorded FAIL is never silently rewritten.
+        """
+        self._reload_view()
+        if part.record.part_uuid in _turn_quality_evidence(self.view):
+            return
+        metadata: dict[str, Any] = quality.public_receipt(
+            audio_sha256=self.hooks.sha256_file(audio_path),
+            asr_provider="xai-stt",
+            asr_model=_PAID_QUALITY_DEFAULT_MODEL,
+            asr_runtime="cloud-api",
+            asr_model_revision=None,
+        )
+        metadata["turn_index"] = part.number
+        metadata["quality_passed"] = bool(quality.passed)
+        try:
+            size_bytes = audio_path.stat().st_size
+            with self.repository.transaction():
+                artifact = self.repository.add_artifact(
+                    self._run_uuid(),
+                    role=ARTIFACT_ROLE_TTS_TURN_QUALITY,
+                    path_kind=PATH_KIND_MANAGED_RELATIVE,
+                    path=f"chunks/{part.chunk_id}.mp3",
+                    part_uuid=part.record.part_uuid,
+                    mime="audio/mpeg",
+                    size_bytes=size_bytes,
+                    sha256=metadata["audio_sha256"],
+                    media_metadata=metadata,
+                )
+                self.repository.add_text_source(
+                    self._run_uuid(),
+                    kind=TEXT_KIND_VERIFICATION_TRANSCRIPT,
+                    origin=PAID_TRANSCRIPTION_ORIGIN,
+                    content=transcript,
+                    part_uuid=part.record.part_uuid,
+                    artifact_uuid=artifact.artifact_uuid,
+                    content_hash=sha256_text(transcript),
+                    language=None,
+                    text_completeness=(
+                        TEXT_COMPLETENESS_COMPLETE
+                        if transcript.strip()
+                        else TEXT_COMPLETENESS_INCOMPLETE
+                    ),
+                )
+        except (HistoryRepositoryError, OSError, ValueError):
+            self.logger.event("error", "dialogue_quality_history_failed", chunk=part.number)
+            raise NativeGenerationError(
+                "the paid per-turn quality verification ran, but the linked verification "
+                "history could not be stored; the paid audio and cost were kept.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_HISTORY_FAILED,
+            ) from None
+        self._reload_view()
 
     def _persist_turn_quality(
         self,
@@ -2547,7 +3092,7 @@ class _Executor:
         """
         if self.quality_options is None:
             raise NativeGenerationError(
-                "the dialogue native route requires an installed local --tts-quality-provider.",
+                "the dialogue native route requires a recorded --tts-quality-provider.",
                 code=_EXIT_PROVIDER,
                 error_code=_ERROR_QUALITY_OPTIONS_INVALID,
             )
@@ -2760,18 +3305,21 @@ class _Executor:
         )
 
     def preflight_timing(self) -> None:
-        """Fail closed before any paid submit when the pending local timing cannot run.
+        """Fail closed before any paid submit when the pending timing cannot run.
 
         A run whose timing is already linked, or one that runs under ``history
-        sync`` (where local model inference is not allowed), needs no local
-        timing and is skipped. Otherwise the availability probe runs before
-        ``run_parts`` so an unavailable or uncached model stops the command before
-        the paid TTS POST.
+        sync`` (where local model inference is not allowed), needs no timing and is
+        skipped. Otherwise the check runs before ``run_parts`` so an unavailable or
+        uncached local model, or an absent cloud timing key, stops the command
+        before the paid TTS POST.
         """
         options = self.timing_options
         if options is None or not self.local_timing_allowed:
             return
         if self._linked_timing() is not None:
+            return
+        if options.provider in NATIVE_PAID_TIMING_PROVIDERS:
+            _preflight_paid_timing(options)
             return
         _preflight_local_timing(options)
 
@@ -2872,15 +3420,18 @@ class _Executor:
         )
 
     def ensure_timing(self) -> None:
-        """Run the pending local timing step for a completed run, once only.
+        """Run the pending timing step for a completed run, once only.
 
-        The step runs only when the run recorded local timing, the timing is not
-        already linked, and this execution may run a local model (``generate``,
-        ``generate --resume``, and ``history resume``; never ``history sync``). A
-        timing failure or a timing-history persistence failure keeps the completed
-        TTS audio, its paid raw bytes, and its cost untouched: no legacy JSON
-        writer runs, the just-written timing artifacts are removed so no export can
-        reference unlinked timing, and the caller reports the fixed partial error.
+        The step runs only when the run recorded timing, the timing is not already
+        linked, and this execution may run the requested provider (``generate``,
+        ``generate --resume``, and ``history resume``; never ``history sync``). The
+        local ``faster-whisper`` provider runs one offline model; the cloud
+        ``groq-whisper``/``xai-stt`` providers run their one paid POST through the
+        shared paid-transcription boundary. A timing failure or a timing-history
+        persistence failure keeps the completed TTS audio, its paid raw bytes, and
+        its cost untouched: no legacy JSON writer runs, the just-written timing
+        artifacts are removed so no export can reference unlinked timing, and the
+        caller reports the fixed partial error.
         """
         options = self.timing_options
         if options is None:
@@ -2888,6 +3439,9 @@ class _Executor:
         if self._linked_timing() is not None:
             return
         if not self.local_timing_allowed:
+            return
+        if options.provider in NATIVE_PAID_TIMING_PROVIDERS:
+            self._ensure_paid_timing(options)
             return
         self._reload_view()
         audio_path = self._final_audio_path()
@@ -2951,6 +3505,304 @@ class _Executor:
             )
         self.logger.event("info", "timings_complete", segments=len(timing.segments))
 
+    # -- paid cloud timing (integrated via the shared paid boundary) ---------
+
+    def _paid_timing_child(self) -> RunRecord | None:
+        """Return this run's committed paid timing child, or ``None``.
+
+        Exactly one paid timing child may belong to a native run; two cannot be
+        told apart and fail closed rather than choosing one.
+        """
+        children = [
+            run
+            for run in self.repository.find_runs_by_parent(self._run_uuid(), limit=MAX_QUERY_LIMIT)
+            if run.operation == OPERATION_TIMINGS
+            and run.legacy_source_root is None
+            and isinstance(run.config_snapshot, dict)
+            and run.config_snapshot.get("operation_origin") == PAID_TRANSCRIPTION_ORIGIN
+        ]
+        if len(children) > 1:
+            raise NativeGenerationError(
+                "more than one paid timing run belongs to this run; refusing to choose one.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_TIMING_CONFLICT,
+            )
+        return children[0] if children else None
+
+    def _paid_timing_child_root(self) -> Path:
+        return self.run_root / _PAID_TIMING_CHILD_DIR_NAME
+
+    def _ensure_paid_timing(self, options: NativeTimingOptions) -> None:
+        """Run the one paid cloud timing POST (or its local replay) once only.
+
+        A fresh run reserves the paid timing attempt into a deterministic private
+        child output root before its POST, persists the exact response body before
+        any parse, and then publishes the timing artifacts into this parent run's
+        output root and closes the child. An existing child is reconciled: a
+        ``submitting`` marker replays only from a validated receipt+body pair and
+        otherwise fails closed with ``PAID_SUBMIT_UNCONFIRMED``; a saved body is
+        re-parsed and re-published locally with no second POST. The parent run's
+        completed audio, paid raw bytes, and cost are never touched.
+        """
+        self._reload_view()
+        audio_path = self._final_audio_path()
+        model = options.model or _PAID_TIMING_DEFAULT_MODELS.get(options.provider, "")
+        child = self._paid_timing_child()
+        if child is None:
+            child_root = self._paid_timing_child_root()
+            try:
+                child_root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise NativeGenerationError(
+                    "the paid timing child directory could not be created.",
+                    code=_EXIT_OUTPUT,
+                    error_code=_ERROR_OUTPUT_UNAVAILABLE,
+                ) from exc
+            reservation = self._reserve_paid_timing(options, audio_path, model)
+            self._post_paid_timing(options, audio_path, model, reservation)
+            child_uuid = reservation.run_uuid
+        else:
+            child_uuid = child.run_uuid
+        timing = self._replay_paid_timing(child_uuid, options, model, audio_path)
+        timings_json_path = self.paths.output_root / f"{self.paths.prefix}.timings.json"
+        srt_path = self.paths.output_root / f"{self.paths.prefix}.srt"
+        duration_ms = self.hooks.mp3_duration_ms(self.ffprobe_path, audio_path)
+        manifest = build_timing_manifest(timing, duration_ms)
+        published: list[Path] = []
+        try:
+            self._publish_timing_artifact(
+                timings_json_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+            )
+            published.append(timings_json_path)
+            self._publish_timing_artifact(srt_path, build_srt(timing))
+            published.append(srt_path)
+        except NativeGenerationError:
+            for path in published:
+                path.unlink(missing_ok=True)
+            raise
+        try:
+            self._complete_paid_timing(child_uuid, manifest, timings_json_path, srt_path)
+        except NativeGenerationError:
+            for path in published:
+                path.unlink(missing_ok=True)
+            raise
+        if self._linked_timing() is None:
+            raise NativeGenerationError(
+                "the linked paid timing history could not be verified after it was written.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_HISTORY_FAILED,
+            )
+        self.logger.event("info", "timings_complete", segments=len(timing.segments))
+
+    def _reserve_paid_timing(
+        self, options: NativeTimingOptions, audio_path: Path, model: str
+    ) -> PaidTranscriptionReservation:
+        """Commit the paid timing attempt before the adapter may POST."""
+        request = PaidTranscriptionRequest(
+            call_type=ATTEMPT_CALL_TYPE_PAID_TIMING,
+            provider=options.provider,
+            model=model,
+            language=options.language or None,
+            word_timestamps=options.word_timestamps,
+            source_audio=audio_path,
+            output_root=self._paid_timing_child_root(),
+            request_options={
+                **_paid_timing_request_options(options.provider, options.word_timestamps),
+                "timestamp_granularity": "word" if options.word_timestamps else "segment",
+                "output_dir": str(self.paths.output_root),
+                "output_prefix": self.paths.prefix,
+            },
+            parent_run_root=self.run_root,
+        )
+        try:
+            return reserve_paid_transcription(request)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid timing attempt could not be reserved; no request was made.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_TIMING_BOUNDARY,
+            ) from None
+
+    def _post_paid_timing(
+        self,
+        options: NativeTimingOptions,
+        audio_path: Path,
+        model: str,
+        reservation: PaidTranscriptionReservation,
+    ) -> None:
+        """Send the one paid timing POST and persist its raw body before parsing."""
+        from .transcription import transcribe_timing_audio
+
+        def raw_sink(body: bytes, content_type: str) -> None:
+            record_paid_transcription_raw(reservation, body=body, content_type=content_type)
+
+        try:
+            transcribe_timing_audio(
+                audio_path=audio_path,
+                timing_provider=options.provider,
+                model=model,
+                device=options.device,
+                compute_type=options.compute,
+                language=options.language,
+                word_timestamps=options.word_timestamps,
+                quiet=True,
+                local_files_only=True,
+                on_raw_response=raw_sink,
+            )
+        except Exception as exc:
+            self.logger.event("error", "timings_failed", error=type(exc).__name__)
+            raise NativeGenerationError(
+                "the voiceover audio is complete, but the paid timing provider failed.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_FAILED,
+            ) from None
+
+    def _replay_paid_timing(
+        self,
+        child_uuid: str,
+        options: NativeTimingOptions,
+        model: str,
+        audio_path: Path,
+    ) -> Any:
+        """Reconcile/replay a paid timing child locally, with no second POST.
+
+        A ``submitting`` attempt is reconciled only from its validated receipt+body
+        pair; an unconfirmed submit fails closed with ``PAID_SUBMIT_UNCONFIRMED`` so
+        a resume, overwrite, or sync can never issue a second paid request.
+        """
+        try:
+            state = load_paid_transcription_state(child_uuid)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid timing run state could not be read.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_TIMING_BOUNDARY,
+            ) from None
+        if state.attempt_status == ATTEMPT_STATUS_SUBMITTING:
+            try:
+                recovered = recover_paid_transcription_after_crash(child_uuid)
+            except PaidTranscriptionError:
+                recovered = None
+            if recovered is None:
+                raise NativeGenerationError(
+                    "refusing to continue: the paid timing request has an unconfirmed "
+                    "submit; a new attempt is never made automatically.",
+                    code=_EXIT_PROVIDER,
+                    error_code=_ERROR_SUBMIT_UNCONFIRMED,
+                )
+            try:
+                state = load_paid_transcription_state(child_uuid)
+            except PaidTranscriptionError as exc:
+                raise NativeGenerationError(
+                    "the paid timing run state could not be read.",
+                    code=_EXIT_OUTPUT,
+                    error_code=exc.error_code or _ERROR_PAID_TIMING_BOUNDARY,
+                ) from None
+        if state.status == RUN_STATUS_COMPLETED:
+            # ``_linked_timing`` already accepts a completed child whose artifacts
+            # verify, so reaching here means its committed timing evidence is no
+            # longer usable. Do not re-read or republish it.
+            raise NativeGenerationError(
+                "the paid timing run is complete, but its linked timing artifacts are not "
+                "verifiable.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_TIMING_HISTORY_FAILED,
+            )
+        if not state.raw_saved:
+            raise NativeGenerationError(
+                "refusing to continue: the paid timing run has no saved response to replay.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_PAID_TIMING_REPLAY,
+            )
+        try:
+            body = read_paid_transcription_raw(child_uuid)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the saved paid timing response could not be read.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_TIMING_REPLAY,
+            ) from None
+        return _parse_paid_timing_body(
+            provider=options.provider,
+            body=body,
+            model=model,
+            language=options.language,
+            word_timestamps=options.word_timestamps,
+            audio_path=audio_path,
+        )
+
+    def _complete_paid_timing(
+        self,
+        child_uuid: str,
+        manifest: dict[str, Any],
+        timings_json_path: Path,
+        srt_path: Path,
+    ) -> None:
+        """Close the paid timing child, linking its transcript and artifacts once."""
+        try:
+            state = load_paid_transcription_state(child_uuid)
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid timing run state could not be read.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_TIMING_BOUNDARY,
+            ) from None
+        if state.status == RUN_STATUS_COMPLETED:
+            return
+        segments = manifest.get("segments") or []
+        transcript = " ".join(str(segment.get("text") or "") for segment in segments).strip()
+        artifacts = (
+            AsrHistoryArtifact(
+                role=ARTIFACT_ROLE_TIMINGS_JSON,
+                path=timings_json_path,
+                mime="application/json",
+                media_metadata={
+                    "timestamp_basis": manifest.get("timestamp_basis") or "unknown",
+                    "segment_count": len(segments),
+                    "total_duration_ms": manifest.get("total_duration_ms"),
+                },
+            ),
+            AsrHistoryArtifact(
+                role=ARTIFACT_ROLE_SRT,
+                path=srt_path,
+                mime="application/x-subrip",
+            ),
+        )
+        text_sources = (
+            AsrHistoryText(
+                kind=TEXT_KIND_ASR_TRANSCRIPT,
+                content=transcript,
+                language=manifest.get("language") or None,
+                text_completeness=(
+                    TEXT_COMPLETENESS_COMPLETE
+                    if transcript.strip()
+                    else TEXT_COMPLETENESS_INCOMPLETE
+                ),
+            ),
+        )
+        metadata = {
+            "timestamp_basis": manifest.get("timestamp_basis") or "unknown",
+            "segment_count": len(segments),
+            "total_duration_ms": manifest.get("total_duration_ms"),
+            "backend": manifest.get("backend"),
+            "cost_known": False,
+        }
+        reservation = reservation_from_state(state)
+        try:
+            complete_paid_transcription(
+                reservation,
+                artifacts=artifacts,
+                text_sources=text_sources,
+                result_metadata=metadata,
+                required_artifact_roles=(ARTIFACT_ROLE_TIMINGS_JSON, ARTIFACT_ROLE_SRT),
+            )
+        except PaidTranscriptionError as exc:
+            raise NativeGenerationError(
+                "the paid timing response was saved, but its run could not be closed.",
+                code=_EXIT_OUTPUT,
+                error_code=exc.error_code or _ERROR_PAID_TIMING_BOUNDARY,
+            ) from None
+
     # -- linked local quality verification ------------------------------------
 
     def _linked_quality(self) -> NativeLinkedQuality | None:
@@ -3001,18 +3853,32 @@ class _Executor:
         return NativeLinkedQuality(run_uuid=run.run_uuid, passed=passed)
 
     def preflight_quality(self) -> None:
-        """Fail closed before any paid submit when the pending local quality cannot run.
+        """Fail closed before any paid submit when the pending quality cannot run.
 
-        A run whose verification is already linked, or one that runs under
-        ``history sync`` (where local model inference is not allowed), needs no
-        local model and is skipped. Otherwise the dependency and local-asset probe
-        runs before ``run_parts`` so an unavailable or absent local model stops the
-        command before the paid TTS POST.
+        A run whose quality is already linked, or one that runs under ``history
+        sync`` (where model inference is not allowed), needs no model and is
+        skipped. The dependency/local-asset probe for an installed local provider,
+        or the paid key check for a cloud dialogue provider, runs before
+        ``run_parts`` so a missing model or key stops the command before the paid
+        TTS POST. A dialogue run has no single linked ``verify`` child, so its
+        completeness is read from its per-turn verdicts.
         """
         options = self.quality_options
         if options is None or not self.local_quality_allowed:
             return
+        if self.dialogue:
+            complete, _passed = self._dialogue_quality_summary()
+            if complete:
+                return
+            if options.provider in NATIVE_PAID_QUALITY_PROVIDERS:
+                _preflight_paid_quality(options)
+                return
+            _preflight_local_quality(options)
+            return
         if self._linked_quality() is not None:
+            return
+        if options.provider in NATIVE_PAID_QUALITY_PROVIDERS:
+            _preflight_paid_quality(options)
             return
         _preflight_local_quality(options)
 
@@ -3338,21 +4204,23 @@ def execute_native_tts(
     another one. ``paid_submit_allowed`` is ``False`` for ``history sync``, which
     then fails closed on an unattempted part instead of submitting it.
     ``local_timing_allowed`` is ``False`` for ``history sync`` so it never runs a
-    local timing model; the pending timing work stays for an explicit resume.
+    local timing model or issues an integrated paid cloud timing POST; the pending
+    timing work stays for an explicit resume.
     ``local_quality_allowed`` is likewise ``False`` for ``history sync`` so it never
-    runs a local quality model either.
+    runs a local quality model or issues a paid cloud quality POST either.
     """
     if (
         is_dialogue_format(script_format)
         and prepared.provider == "openrouter-tts"
         and quality_options_from_output_options(output_options) is None
     ):
-        # The admitted OpenRouter dialogue route always records the local quality
-        # settings it verifies each turn with; a run without them cannot satisfy
-        # the required gate. The omnivoice-local preset dialogue route records no
-        # quality gate (its legacy route never had one), so it is exempt.
+        # The admitted OpenRouter dialogue route always records the quality provider
+        # (installed local or paid cloud xai-stt) it verifies each turn with; a run
+        # without one cannot satisfy the required gate. The omnivoice-local preset
+        # dialogue route records no quality gate (its legacy route never had one), so
+        # it is exempt.
         raise NativeGenerationError(
-            "the dialogue native route requires an installed local --tts-quality-provider.",
+            "the dialogue native route requires a recorded --tts-quality-provider.",
             code=_EXIT_PROVIDER,
             error_code=_ERROR_QUALITY_OPTIONS_INVALID,
         )
@@ -3504,8 +4372,8 @@ def run_native_generation(
     created or touched. The ownership recheck inside :func:`execute_native_tts`
     stays as defense in depth. ``local_timing_allowed`` and ``local_quality_allowed``
     are threaded to :func:`execute_native_tts` so an explicit resume may run the
-    pending local timing or quality verification while ``history sync`` never runs a
-    local model.
+    pending timing or quality step while ``history sync`` never runs a local model
+    or issues an integrated paid cloud POST.
     """
     try:
         with acquire_run_lock(paths.output_root):

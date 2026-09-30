@@ -1392,20 +1392,23 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     or voice is invented. Two bounded integrated steps and the recorded trimming
     semantics are admitted for that same route: an installed *local*
     ``--tts-quality-provider`` (``qwen-local``/``nemotron-local``),
-    ``--with-timings --timing-provider faster-whisper``, and ``--no-trim``. The
-    local timing and local quality steps may be requested together. Every other
-    route and mixture -- a cloud or unregistered quality provider and a cloud
-    timing provider -- keeps the legacy executor and its JSON writer unchanged.
+    ``--with-timings`` for the local ``faster-whisper`` or the paid cloud
+    ``groq-whisper``/``xai-stt`` provider, and ``--no-trim``. The timing and local
+    quality steps may be requested together. Every other route and mixture -- a
+    cloud quality provider on a non-dialogue route and an unregistered quality
+    provider, plus the ``openrouter-whisper`` timing provider -- keeps the legacy
+    executor and its JSON writer unchanged.
 
     One dialogue route is admitted separately: the existing validated
     ``openrouter-tts`` Gemini two-speaker script with the required installed local
-    ``--tts-quality-provider``. It runs each turn's required local quality gate
-    before the final concat and before the next paid turn. A second dialogue
-    route, the existing ``omnivoice-local`` preset two-profile bank script, is
-    likewise admitted and runs its optional local quality gate before concat only
-    when it recorded a local ``--tts-quality-provider``. Both dialogue routes also
-    admit the recorded trimming semantics of ``--no-trim`` and an integrated local
-    ``--with-timings --timing-provider faster-whisper`` step. Every ordinary
+    ``--tts-quality-provider`` (``qwen-local``/``nemotron-local``) or the paid
+    cloud ``xai-stt`` provider. It runs each turn's required quality gate before
+    the final concat and before the next paid turn. A second dialogue route, the
+    existing ``omnivoice-local`` preset two-profile bank script, is likewise
+    admitted and runs its optional quality gate before concat only when it recorded
+    a local or paid cloud ``--tts-quality-provider``. Both dialogue routes also
+    admit the recorded trimming semantics of ``--no-trim`` and an integrated
+    ``--with-timings`` step for the local or paid cloud timing providers. Every ordinary
     non-dialogue ``qwen-local`` mode (clone, and the instructed preset/design) and
     every non-dialogue ``omnivoice-local`` mode (preset bank, and
     ``auto``/``clone``/``design``) is admitted as a local route with the same
@@ -1456,25 +1459,49 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     )
 
 
-def _native_local_output_steps_admitted(args: argparse.Namespace) -> bool:
-    """Whether the requested local post-audio steps may run on the native route.
+def _native_timing_step_admitted(args: argparse.Namespace) -> bool:
+    """Whether the requested integrated timing step may run on the native route.
 
     The recorded trimming semantics of ``--no-trim`` are always part of the native
-    route and need no gate here. The two optional local steps are an integrated
-    ``--with-timings --timing-provider faster-whisper`` run and an installed local
-    ``--tts-quality-provider`` (``qwen-local``/``nemotron-local``). Either, both, or
-    neither may be requested: the native executor records each requested step in
-    the snapshot and runs the missing work on resume, so neither is silently
-    dropped. A cloud timing provider and a cloud or unregistered quality provider
-    keep the legacy executor until their paid-submit contract is confirmed.
+    route and need no gate here. An integrated ``--with-timings`` run is admitted
+    for the local ``faster-whisper`` provider and for the paid cloud
+    ``groq-whisper``/``xai-stt`` providers, whose one POST runs through the shared
+    paid-transcription boundary. ``openrouter-whisper`` is deliberately absent: it
+    returns no real timestamps and keeps the legacy route's explicit rejection.
     """
-    if getattr(args, "with_timings", False) and (
-        getattr(args, "timing_provider", "faster-whisper") != "faster-whisper"
-    ):
-        return False
+    if not getattr(args, "with_timings", False):
+        return True
+    return getattr(args, "timing_provider", "faster-whisper") in (
+        native_generation.NATIVE_TIMING_PROVIDERS
+    )
+
+
+def _native_quality_step_admitted(args: argparse.Namespace, *, dialogue: bool) -> bool:
+    """Whether the requested integrated quality step may run on the native route.
+
+    The installed local ``qwen-local``/``nemotron-local`` providers are always
+    admitted. The paid cloud ``xai-stt`` provider is admitted only for a dialogue
+    route, where it verifies each turn on the same boundary: a non-dialogue run
+    keeps the exact legacy behavior of ignoring the cloud quality flag.
+    """
     quality_provider = getattr(args, "tts_quality_provider", None)
-    return quality_provider is None or (
-        quality_provider in native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
+    if quality_provider is None:
+        return True
+    if quality_provider in native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS:
+        return True
+    return dialogue and quality_provider in native_generation.NATIVE_PAID_QUALITY_PROVIDERS
+
+
+def _native_local_output_steps_admitted(args: argparse.Namespace) -> bool:
+    """Whether the requested non-dialogue post-audio steps may run natively.
+
+    This is the non-dialogue combination of :func:`_native_timing_step_admitted`
+    (local or paid cloud timing) and :func:`_native_quality_step_admitted` with
+    ``dialogue=False`` (installed local quality only). A cloud quality provider on a
+    non-dialogue route keeps the legacy executor, exactly as before.
+    """
+    return _native_timing_step_admitted(args) and _native_quality_step_admitted(
+        args, dialogue=False
     )
 
 
@@ -1558,10 +1585,10 @@ def _native_qwen_local_route_eligible(args: argparse.Namespace) -> bool:
     unrecognized ``VOICEOVER_QWEN_TTS_RUNTIME`` all keep the legacy executor,
     because the native route records the mode, model, voice, instruction, and
     runtime as part of its identity. The recorded trimming semantics, an integrated
-    local ``--with-timings --timing-provider faster-whisper`` step, and an installed
-    local quality provider are admitted by
-    :func:`_native_local_output_steps_admitted`; a cloud timing or quality provider
-    keeps the legacy executor.
+    ``--with-timings`` step for the local or paid cloud timing providers, and an
+    installed local quality provider are admitted by
+    :func:`_native_local_output_steps_admitted`; a cloud quality provider keeps the
+    legacy executor, exactly as before.
     """
     if not _native_local_output_steps_admitted(args):
         return False
@@ -1616,7 +1643,9 @@ def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
             return False
         if (getattr(args, "mode", None) or "preset") != "preset":
             return False
-        if not _native_local_output_steps_admitted(args):
+        if not _native_timing_step_admitted(args):
+            return False
+        if not _native_quality_step_admitted(args, dialogue=True):
             return False
         if getattr(args, "voice_bank_catalog", None) is None:
             return False
@@ -1627,12 +1656,13 @@ def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
         return False
     if getattr(args, "tts_quality_provider", None) not in (
         native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
+        | native_generation.NATIVE_PAID_QUALITY_PROVIDERS
     ):
         return False
-    # The optional local timing step and the recorded trimming semantics are
-    # admitted alongside the required per-turn quality gate; a cloud timing
-    # provider still keeps this route on the legacy executor.
-    return _native_local_output_steps_admitted(args)
+    # The optional timing step and the recorded trimming semantics are admitted
+    # alongside the required per-turn quality gate; every admitted timing provider
+    # (local or paid cloud) and the paid xAI quality provider are covered.
+    return _native_timing_step_admitted(args)
 
 
 @contextmanager
@@ -3858,9 +3888,11 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
 def _native_timing_options(
     args: argparse.Namespace,
 ) -> native_generation.NativeTimingOptions | None:
-    """Return the recorded local timing settings for a native run, or ``None``.
+    """Return the recorded timing settings for a native run, or ``None``.
 
-    Only the local ``faster-whisper`` provider reaches a native run; the effective
+    The local ``faster-whisper`` provider and the paid cloud
+    ``groq-whisper``/``xai-stt`` providers reach a native run (``_native_route_eligible``
+    already sent ``openrouter-whisper`` to the legacy executor); the effective
     settings are recorded in the run snapshot so a resume proves they did not
     change. A run without ``--with-timings`` records nothing and keeps its output
     options byte-for-byte, so a completed run written before this route stays
@@ -3881,11 +3913,12 @@ def _native_timing_options(
 def _native_quality_options(
     args: argparse.Namespace,
 ) -> native_generation.NativeQualityOptions | None:
-    """Return the recorded local quality settings for a native run, or ``None``.
+    """Return the recorded quality settings for a native run, or ``None``.
 
-    Only an installed local ASR provider (``qwen-local`` or ``nemotron-local``)
-    reaches a native run; ``_native_route_eligible`` already sent every other
-    quality provider to the legacy executor. A run without
+    An installed local ASR provider (``qwen-local`` or ``nemotron-local``) reaches
+    a native run on any admitted route; the paid cloud ``xai-stt`` provider reaches
+    only the two admitted dialogue routes and is per-turn. ``_native_route_eligible``
+    already sent every other quality provider to the legacy executor. A run without
     ``--tts-quality-provider`` records nothing and keeps its output options
     byte-for-byte, so a completed run written before this route stays resumable and
     a non-dialogue legacy run keeps ignoring the flag exactly as before.

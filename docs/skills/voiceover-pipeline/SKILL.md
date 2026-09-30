@@ -124,7 +124,11 @@ description: >
    командой в canonical history; локальная модель должна быть уже установлена и
    закеширована (неявного скачивания нет — иначе команда падает до платного POST),
    а сбой только таймингов даёт exit `50` с сохранённым MP3 и завершается явным
-   `--resume`. Если тайминги нужны отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
+   `--resume`. `generate --with-timings --timing-provider groq-whisper|xai-stt`
+   идёт через тот же платный boundary (маркер до POST, raw до парсинга, unknown
+   цена); потерянный ответ не повторяется автоматически, а `history resume`
+   воспроизводит уже сохранённое тело без второго POST. Если тайминги нужны
+   отдельно — используй ДРУГОЙ `--output-dir`/`--run-id`,
    не перезаписывай папку платного прогона:
    `voiceover timings --audio "out/prod/<full>.mp3" --timing-provider <X> --output-dir "out" --run-id "prod-timings" --json`.
 8. **Локальная история.** Локальные `transcribe`, `timings` (без облачного
@@ -136,7 +140,11 @@ description: >
    (маркер до POST, приватное raw-тело+receipt до парсинга, unknown-цена, владение
    привязано к output-root — свежий `--overwrite` того же root завершается
    `PAID_TIMING_OUTPUT_OWNED` до POST; и наоборот, `generate` не трогает
-   paid-owned root, а `timings` — native-owned root). Отключить
+   paid-owned root, а `timings` — native-owned root). Тот же boundary обслуживает
+   интегрированные облачные шаги: `--with-timings --timing-provider
+   groq-whisper|xai-stt` и `--tts-quality-provider xai-stt` на двух диалоговых
+   маршрутах (OpenRouter Gemini и OmniVoice preset-банк, по реплике до concat).
+   Отключить
    запись: `settings.toml` рядом с CWD с `[history] enabled = false` (облачный
    `timings` тогда fail-closed до запроса). Если сохранение не удалось, `--json`
    даёт `status: "partial"` и `history.error_code = "HISTORY_PERSISTENCE_FAILED"`

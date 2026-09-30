@@ -1506,12 +1506,15 @@ def test_native_run_parts_shape_is_valid() -> None:
     assert cli._native_route_eligible(args, "markdown") is True
     args.provider = "polza-tts"
     args.model = POLZA_MEDIA_MODEL
-    # The one admitted integrated step is a local faster-whisper timing request.
+    # The one admitted integrated step is a local faster-whisper timing request,
+    # and the paid cloud groq-whisper/xai-stt providers reach the native route too.
     args.with_timings = True
     assert cli._native_route_eligible(args, "markdown") is True
-    # A cloud timing provider stays on the legacy executor.
     args.timing_provider = "groq-whisper"
-    assert cli._native_route_eligible(args, "markdown") is False
+    assert cli._native_route_eligible(args, "markdown") is True
+    args.timing_provider = "xai-stt"
+    assert cli._native_route_eligible(args, "markdown") is True
+    # ``openrouter-whisper`` can never return real timestamps.
     args.timing_provider = "openrouter-whisper"
     assert cli._native_route_eligible(args, "markdown") is False
     args.with_timings = False
@@ -1525,24 +1528,25 @@ def test_native_run_parts_shape_is_valid() -> None:
     assert cli._native_route_eligible(args, "markdown") is True
     args.tts_quality_provider = "nemotron-local"
     assert cli._native_route_eligible(args, "markdown") is True
-    # A cloud ASR quality provider keeps the legacy executor.
+    # A cloud ASR quality provider is admitted only on a dialogue route, so it keeps
+    # this non-dialogue run on the legacy executor.
     args.tts_quality_provider = "xai-stt"
     assert cli._native_route_eligible(args, "markdown") is False
     # Combined local timing and local quality are admitted in one run.
     args.tts_quality_provider = "qwen-local"
     args.with_timings = True
     assert cli._native_route_eligible(args, "markdown") is True
-    # A cloud timing provider keeps the combination on the legacy executor.
+    # A paid cloud timing provider is admitted alongside local quality too.
     args.timing_provider = "groq-whisper"
-    assert cli._native_route_eligible(args, "markdown") is False
+    assert cli._native_route_eligible(args, "markdown") is True
     args.timing_provider = "faster-whisper"
     assert cli._native_route_eligible(args, "markdown") is True
     args.with_timings = False
     args.tts_quality_provider = None
     assert cli._native_route_eligible(args, "dialogue") is False
-    # The one admitted dialogue route is the OpenRouter Gemini two-speaker script
-    # with the required installed local quality provider; the recorded trim and an
-    # integrated local timing step are admitted too.
+    # The one admitted OpenRouter dialogue route takes the required installed local
+    # quality provider or the paid cloud xai-stt provider; the recorded trim and an
+    # integrated timing step (local or paid cloud) are admitted too.
     args.provider = "openrouter-tts"
     args.model = "google/gemini-3.1-flash-tts-preview"
     args.tts_quality_provider = "qwen-local"
@@ -1553,11 +1557,11 @@ def test_native_run_parts_shape_is_valid() -> None:
     args.with_timings = True
     assert cli._native_route_eligible(args, "dialogue") is True
     args.timing_provider = "xai-stt"
-    assert cli._native_route_eligible(args, "dialogue") is False
+    assert cli._native_route_eligible(args, "dialogue") is True
     args.timing_provider = "faster-whisper"
     args.with_timings = False
     args.tts_quality_provider = "xai-stt"
-    assert cli._native_route_eligible(args, "dialogue") is False
+    assert cli._native_route_eligible(args, "dialogue") is True
     args.tts_quality_provider = "qwen-local"
     args.provider = "polza-tts"
     assert cli._native_route_eligible(args, "dialogue") is False

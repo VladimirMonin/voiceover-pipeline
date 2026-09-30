@@ -695,7 +695,11 @@ def test_native_qwen_mode_route_gate_admits_preset_and_design(monkeypatch):
         cli._native_route_eligible(
             _args(with_timings=True, timing_provider="groq-whisper"), "markdown"
         )
-        is False
+        is True
+    )
+    assert (
+        cli._native_route_eligible(_args(with_timings=True, timing_provider="xai-stt"), "markdown")
+        is True
     )
     assert cli._native_route_eligible(_args(), "dialogue") is False
     monkeypatch.setenv("VOICEOVER_QWEN_TTS_RUNTIME", "bogus")

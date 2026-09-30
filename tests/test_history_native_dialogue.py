@@ -931,7 +931,7 @@ def test_native_dialogue_no_trim_skips_the_trim_seam_and_is_recorded(
 
 
 def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route():
-    """The gate admits both dialogue routes with their recorded local steps."""
+    """The gate admits both dialogue routes with their recorded local and paid steps."""
     import argparse
 
     args = argparse.Namespace(
@@ -942,25 +942,33 @@ def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route()
         with_timings=False,
     )
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
-    # The required local quality provider is not optional on this route.
+    # The required quality provider is not optional on this route; the installed
+    # local providers and the paid cloud xai-stt provider are both admitted.
     args.tts_quality_provider = None
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.tts_quality_provider = "xai-stt"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.tts_quality_provider = "groq-whisper"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.tts_quality_provider = "qwen-local"
-    # The recorded trim and an integrated local timing step are admitted; a cloud
-    # timing provider keeps the legacy executor.
+    # The recorded trim and an integrated timing step are admitted; the local and
+    # paid cloud timing providers reach the native route, openrouter-whisper does
+    # not.
     args.no_trim = True
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.no_trim = False
     args.with_timings = True
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.timing_provider = "groq-whisper"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.timing_provider = "xai-stt"
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
+    args.timing_provider = "openrouter-whisper"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
     args.timing_provider = "faster-whisper"
     args.with_timings = False
     # OmniVoice is admitted with its own voice bank and an optional installed local
-    # quality provider; every Polza dialogue stays legacy.
+    # or paid cloud quality provider; every Polza dialogue stays legacy.
     args.provider = "omnivoice-local"
     args.model = "audio-cpp/omnivoice-q8_0"
     args.mode = "preset"
@@ -971,7 +979,7 @@ def test_native_dialogue_route_gate_admits_only_the_validated_openrouter_route()
     args.tts_quality_provider = "qwen-local"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.tts_quality_provider = "xai-stt"
-    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False
+    assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is True
     args.tts_quality_provider = None
     args.provider = "polza-tts"
     assert cli._native_route_eligible(args, DIALOGUE_FORMAT) is False

@@ -590,9 +590,9 @@ def test_native_qwen_local_route_gate_rejects_mismatched_model_per_mode(monkeypa
     assert cli._native_route_eligible(_args(mode="preset"), "markdown") is False
     assert cli._native_route_eligible(_args(mode="design"), "markdown") is False
     assert cli._native_route_eligible(_args(mode="auto"), "markdown") is False
-    # A missing sample keeps it legacy; the recorded trim, integrated local
-    # timings, and an installed local quality provider are recorded on the route,
-    # while a cloud timing or quality provider keeps it legacy.
+    # A missing sample keeps it legacy; the recorded trim, integrated timings
+    # (local or paid cloud), and an installed local quality provider are recorded
+    # on the route, while a cloud quality provider keeps it legacy.
     assert cli._native_route_eligible(_args(sample=None), "markdown") is False
     assert cli._native_route_eligible(_args(tts_quality_provider="qwen-local"), "markdown") is True
     assert cli._native_route_eligible(_args(with_timings=True), "markdown") is True
@@ -608,7 +608,11 @@ def test_native_qwen_local_route_gate_rejects_mismatched_model_per_mode(monkeypa
         cli._native_route_eligible(
             _args(with_timings=True, timing_provider="groq-whisper"), "markdown"
         )
-        is False
+        is True
+    )
+    assert (
+        cli._native_route_eligible(_args(with_timings=True, timing_provider="xai-stt"), "markdown")
+        is True
     )
     # A non-markdown format is not the admitted route.
     assert cli._native_route_eligible(_args(), "dialogue") is False
