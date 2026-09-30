@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NoReturn
 
+from . import help_system
 from . import settings as settings_module
 from .artifacts import (
     build_run_paths,
@@ -303,6 +304,8 @@ def main() -> None:
             search_cmd(args)
         elif args.command == "index":
             index_cmd(args)
+        elif args.command == "help":
+            help_cmd(args)
     except CliError as exc:
         _emit_error(args, str(exc), exc.code, details=exc.details)
     except SystemExit:
@@ -827,6 +830,32 @@ def build_parser() -> argparse.ArgumentParser:
         "rebuild", help="Drop and rebuild the whole derived index from SQLite only."
     )
     index_rebuild.add_argument("--json", dest="json_output", action="store_true")
+
+    # --------------- help ---------------
+    help_parser = subparsers.add_parser(
+        "help",
+        help="Show packaged help topics as Markdown (offline, no key, no network).",
+        description=(
+            "Show one packaged atomic help topic. The Markdown is read from the installed "
+            "package, so no key, .env, FFmpeg, GPU, history, or network is required. Without "
+            "TOPIC the index topic lists every available topic."
+        ),
+    )
+    help_parser.add_argument(
+        "topic",
+        nargs="?",
+        default=None,
+        metavar="TOPIC",
+        help="Topic name such as speech.parts; defaults to the index topic.",
+    )
+    help_output = help_parser.add_mutually_exclusive_group()
+    help_output.add_argument(
+        "--raw",
+        dest="raw_output",
+        action="store_true",
+        help="Print the packaged Markdown verbatim, without frontmatter or ANSI.",
+    )
+    help_output.add_argument("--json", dest="json_output", action="store_true")
 
     return parser
 
@@ -4421,6 +4450,31 @@ def _print_index(subcommand: str, payload: dict[str, Any]) -> None:
         f"labels_missing={status['labels_missing']} complete={status['complete']} "
         f"needs_rebuild={status['needs_rebuild']}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# help
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def help_cmd(args: argparse.Namespace) -> None:
+    """Print one packaged help topic as Markdown, human text, or one JSON object.
+
+    The topic is read from the installed package, so this command needs no key,
+    ``.env``, FFmpeg, GPU, history database, or network. ``--raw`` prints the
+    packaged Markdown verbatim; the default prints it with the topic title as a
+    heading; ``--json`` prints one object with the metadata and the same Markdown.
+    """
+    try:
+        topic = help_system.load_topic(args.topic)
+    except help_system.HelpError as exc:
+        fail(str(exc), exc.code, details=exc.details)
+    if args.json_output:
+        _json_ok(help_system.build_payload(topic))
+    if args.raw_output:
+        print(help_system.render_raw(topic), end="")
+        return
+    print(help_system.render_human(topic), end="")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
