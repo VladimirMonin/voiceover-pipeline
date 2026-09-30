@@ -22,6 +22,11 @@ execution services. It exposes:
   call type so an unconfirmed paid submit is never repeated. It owns its
   transaction and refuses to run inside a caller's open transaction, on an
   imported legacy run, or on a completed run.
+  :meth:`HistoryRepository.record_polza_media_task_accepted` is the matching
+  post-submit seam: in one transaction it binds the accepted opaque Polza Media
+  task id to that reserved attempt and advances the revision again, so a later
+  process may finish the already-paid task with GET calls instead of a second
+  POST. It too owns its transaction and refuses to join a caller's.
 
 Money contract: an attempt's cost is stored as a ``TEXT`` decimal string.
 ``NULL`` means *unknown*; the string ``"0"`` is a real observed zero. A value
@@ -85,13 +90,26 @@ class HistoryPaidAttemptConflictError(HistoryRepositoryError):
     """
 
 
-class HistoryPaidAttemptInTransactionError(HistoryRepositoryError):
-    """A paid reservation was attempted inside an already open transaction.
+class HistoryPaidMediaTaskConflictError(HistoryRepositoryError):
+    """An accepted Polza Media task id cannot be bound to the named attempt.
 
-    The reservation owns its transaction so the unconfirmed attempt marker
-    commits before the caller may make the paid request. Joining a caller's
-    still-open transaction would let a later rollback erase that marker after the
-    request had already been sent, so the seam refuses to run.
+    Raised when the target is not an existing ``submitting`` ``tts_chunk``
+    attempt of the named run, part, and ``polza-tts`` media route whose model
+    uses the async ``elevenlabs/`` prefix, when that attempt already carries a
+    remote id or a non-``submitting`` outcome, or when the guarded attempt
+    update affects no row. The accepted id is immutable, so a second or
+    different id is never rebound, and no partial binding is returned.
+    """
+
+
+class HistoryPaidAttemptInTransactionError(HistoryRepositoryError):
+    """A paid attempt transition was attempted inside an already open transaction.
+
+    The reservation and the accepted-id recording each own their transaction so
+    the durable attempt marker commits before the caller may make the paid
+    request or poll the accepted task. Joining a caller's still-open transaction
+    would let a later rollback erase that marker after the request had already
+    been sent, so the seam refuses to run.
     """
 
 
@@ -124,6 +142,13 @@ TEXT_KIND_VERIFICATION_TRANSCRIPT = "verification_transcript"
 # type, so imported and native attempts are guarded by one predicate.
 ATTEMPT_CALL_TYPE_TTS_CHUNK = "tts_chunk"
 ATTEMPT_STATUS_SUBMITTING = "submitting"
+# The attempt status once the provider accepted a paid Polza Media submit but its
+# result has not been fetched yet. It is written in the same transaction as the
+# accepted opaque task id, so a later process may poll the exact accepted task
+# with GET calls instead of a second paid POST.
+ATTEMPT_STATUS_REMOTE_ACCEPTED = "remote_accepted"
+# The only provider route whose accepted media task id this repository records.
+POLZA_TTS_PROVIDER_ID = "polza-tts"
 # A run whose work already finished. Repeating finished work creates a new run
 # with a link to the previous one, not another paid attempt on the closed run.
 RUN_STATUS_COMPLETED = "completed"
@@ -200,6 +225,38 @@ def _require_expected_revision(expected_revision: int) -> int:
     ):
         raise ValueError("expected_revision must be a positive integer")
     return expected_revision
+
+
+def _polza_media_route_model(model: object) -> bool:
+    """Whether a Polza TTS model submits through the async ``/media`` route.
+
+    Only the ElevenLabs ``elevenlabs/`` models POST to ``/media`` and can hold a
+    recoverable task id; every other ``polza-tts`` model uses the synchronous
+    ``/audio/speech`` route, so an accepted marker next to it can never name an
+    async media task. This mirrors ``services.recovery.polza_media_route_model``
+    as a pure prefix predicate without importing the higher service layer here.
+    """
+    return isinstance(model, str) and model.startswith("elevenlabs/")
+
+
+# An accepted paid media task id becomes part of a later ``/media/<id>`` GET
+# path, so only an opaque token may be stored. This is the same bounded contract
+# as ``run_state._bounded_media_task_id`` and ``polza_tts._safe_media_id``: a URL,
+# scheme, slash, query, whitespace, or newline could change the request target.
+_MEDIA_TASK_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _require_bounded_media_task_id(value: str) -> str:
+    """Return a bounded opaque media task id, or raise without echoing the input.
+
+    The accepted id is spliced into a later ``/media/<id>`` GET path, so only an
+    opaque token may be stored. The fixed message keeps an unsafe value (for
+    example a signed URL or tampered provider output) out of an error report or
+    log.
+    """
+    if not isinstance(value, str) or _MEDIA_TASK_ID_PATTERN.fullmatch(value) is None:
+        raise ValueError("remote_task_id is not a bounded opaque media task id")
+    return value
 
 
 def _require_identity_field(value: str, field_name: str) -> str:
@@ -650,6 +707,25 @@ class HistoryRepository:
                 "the attempt marker commits before any paid request"
             )
 
+    def _require_run_paid_transition_allowed(self, run: RunRecord) -> None:
+        """Fail closed when a paid transition must not extend this run.
+
+        The guard shared by the pre-submit reservation and the post-submit
+        accepted-id transition: an imported legacy run's paid work may live only
+        in a run-level total that no part-linked guard can see, and a completed
+        run's finished work belongs to a new run, so neither may gain a
+        part-linked paid attempt. Both leave the run unchanged.
+        """
+        if run.legacy_source_root is not None:
+            raise HistoryRunNotReservableError(
+                f"run {run.run_uuid!r} is an imported legacy run whose paid work cannot be "
+                "represented by a part-linked attempt; refusing a new paid transition"
+            )
+        if run.status == RUN_STATUS_COMPLETED:
+            raise HistoryRunNotReservableError(
+                f"run {run.run_uuid!r} is already completed; repeat finished work in a new run"
+            )
+
     # -- writes ---------------------------------------------------------------
 
     def create_run(
@@ -925,15 +1001,7 @@ class HistoryRepository:
             run = self.get_run(run_uuid)
             if run is None:
                 raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
-            if run.legacy_source_root is not None:
-                raise HistoryRunNotReservableError(
-                    f"run {run_uuid!r} is an imported legacy run whose paid work cannot be "
-                    "represented by a part-linked attempt; refusing a new paid reservation"
-                )
-            if run.status == RUN_STATUS_COMPLETED:
-                raise HistoryRunNotReservableError(
-                    f"run {run_uuid!r} is already completed; repeat finished work in a new run"
-                )
+            self._require_run_paid_transition_allowed(run)
             if not self._part_belongs_to_run(part_identifier, run_uuid):
                 raise HistoryPartNotFoundError(
                     f"part {part_identifier!r} does not belong to run {run_uuid!r}"
@@ -960,6 +1028,141 @@ class HistoryRepository:
                 cost=Cost.unknown(),
             )
             return advanced, attempt
+
+    def record_polza_media_task_accepted(
+        self,
+        run_uuid: str,
+        *,
+        attempt_uuid: str,
+        part_uuid: str,
+        expected_revision: int,
+        remote_task_id: str,
+    ) -> tuple[RunRecord, AttemptRecord]:
+        """Bind an accepted Polza Media task id to a reserved paid attempt durably.
+
+        This is the single seam that records the opaque task id an ElevenLabs
+        ``/media`` paid submit returned, before the caller may poll or download
+        that task. Inside one :meth:`transaction` it validates that ``attempt_uuid``
+        is an existing ``submitting`` ``tts_chunk`` attempt of ``run_uuid`` and
+        ``part_uuid`` whose provider is ``polza-tts``, whose model uses the async
+        ``elevenlabs/`` media route, and whose ``remote_id`` is still unknown,
+        compare-and-swaps the run revision through :meth:`advance_run_revision`,
+        and writes the bounded task id together with the
+        :data:`ATTEMPT_STATUS_REMOTE_ACCEPTED` status. It returns
+        ``(advanced_run, accepted_attempt)``, where ``advanced_run.revision`` is
+        the new revision and ``accepted_attempt.remote_id`` is the stored id.
+
+        The transition commits before the caller may issue a GET, so a crash
+        between the accepted response and the poll leaves a durable accepted task
+        id exactly once. The accepted id is immutable: the attempt's provider,
+        model, account alias, and unknown cost are never rewritten, and a second
+        or different id is refused rather than rebound. ``remote_task_id`` must be
+        a bounded opaque token (``[A-Za-z0-9_-]{1,128}``) matching the contract of
+        ``run_state._bounded_media_task_id`` and ``polza_tts._safe_media_id``; a
+        URL, secret, or newline is rejected with a fixed message that never echoes
+        the unsafe value.
+
+        The guarded attempt update must affect exactly one row. If a trigger,
+        constraint, or lost race makes it affect none, the transition raises
+        :class:`HistoryPaidMediaTaskConflictError` so the whole transaction,
+        including the revision bump, rolls back instead of returning a partial
+        accepted-id binding.
+
+        The call owns its transaction and refuses to run inside an already open
+        one, so its committed transition cannot be erased by a caller rollback
+        after a GET was sent. Like the pre-submit reservation, it also refuses an
+        imported legacy run and any run already in :data:`RUN_STATUS_COMPLETED`,
+        leaving both unchanged. Raises :class:`ValueError` for an invalid
+        ``expected_revision``, a non-UUID attempt or part, or a malformed task id
+        before any write; :class:`HistoryPaidAttemptInTransactionError` inside an
+        open transaction; :class:`HistoryRunNotFoundError` for a missing run;
+        :class:`HistoryRunNotReservableError` for a legacy or completed run;
+        :class:`HistoryPartNotFoundError` for a foreign or absent part;
+        :class:`HistoryPaidMediaTaskConflictError` when the attempt does not match
+        the named run, part, call type, model media route, and ``submitting``
+        state, when it already carries a remote id, or when the guarded update
+        affects no row; and :class:`HistoryRevisionConflictError` for a stale
+        revision. Every failure leaves the run and attempt unchanged.
+        """
+        attempt_identifier = _require_uuid(attempt_uuid, "attempt_uuid")
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_expected_revision(expected_revision)
+        bounded_task_id = _require_bounded_media_task_id(remote_task_id)
+        self._require_no_open_transaction("record_polza_media_task_accepted")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            self._require_run_paid_transition_allowed(run)
+            if not self._part_belongs_to_run(part_identifier, run_uuid):
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            attempt = self.get_attempt(attempt_identifier)
+            if (
+                attempt is None
+                or attempt.run_uuid != run_uuid
+                or attempt.part_uuid != part_identifier
+            ):
+                raise HistoryPaidMediaTaskConflictError(
+                    f"no paid attempt {attempt_identifier!r} for run {run_uuid!r} "
+                    f"part {part_identifier!r}"
+                )
+            if (
+                attempt.call_type != ATTEMPT_CALL_TYPE_TTS_CHUNK
+                or attempt.provider != POLZA_TTS_PROVIDER_ID
+            ):
+                raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} is not a {POLZA_TTS_PROVIDER_ID!r} "
+                    f"{ATTEMPT_CALL_TYPE_TTS_CHUNK!r} media attempt"
+                )
+            # Only an ``elevenlabs/`` model submits through the async ``/media``
+            # route and can hold a recoverable task id; a synchronous model's
+            # accepted marker would name a task that can never be polled.
+            if not _polza_media_route_model(attempt.model):
+                raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} model {attempt.model!r} does not use the "
+                    "async Polza /media route; it cannot carry a recoverable media task id"
+                )
+            if attempt.status != ATTEMPT_STATUS_SUBMITTING:
+                raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} is not {ATTEMPT_STATUS_SUBMITTING!r}"
+                )
+            if attempt.remote_id is not None:
+                raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} already records an accepted remote task id"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            # Only the accepted id, the status, and the timestamp change: the
+            # provider, model, account alias, usage, and unknown cost stay as the
+            # reservation wrote them, so no observed cost can be fabricated here.
+            cursor = self._connection.execute(
+                "UPDATE attempts SET remote_id = ?, status = ?, updated_at = ? "
+                "WHERE attempt_uuid = ? AND remote_id IS NULL AND status = ?",
+                (
+                    bounded_task_id,
+                    ATTEMPT_STATUS_REMOTE_ACCEPTED,
+                    utc_now(),
+                    attempt_identifier,
+                    ATTEMPT_STATUS_SUBMITTING,
+                ),
+            )
+            # The guarded write must be the only one that binds the id. A trigger,
+            # constraint, or lost race that makes it affect no row cannot yield a
+            # successful accepted id with an advanced revision; raise so the whole
+            # transaction, including the revision bump, rolls back.
+            if cursor.rowcount != 1:
+                raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} was not an unbound "
+                    f"{ATTEMPT_STATUS_SUBMITTING!r} attempt during the transition; "
+                    "refusing a partial accepted-id binding"
+                )
+            updated = self.get_attempt(attempt_identifier)
+            if updated is None:  # pragma: no cover - the attempt was just updated
+                raise HistoryPaidMediaTaskConflictError(
+                    f"attempt {attempt_identifier!r} vanished during the transition"
+                )
+            return advanced, updated
 
     def add_artifact(
         self,

@@ -32,6 +32,7 @@ from voiceover_pipeline.history.repository import (
     Cost,
     HistoryPaidAttemptConflictError,
     HistoryPaidAttemptInTransactionError,
+    HistoryPaidMediaTaskConflictError,
     HistoryPartNotFoundError,
     HistoryRepository,
     HistoryRevisionConflictError,
@@ -1229,3 +1230,558 @@ def test_advance_run_revision_two_connections_serialize(tmp_path):
 
             advanced_again = second.advance_run_revision(run.run_uuid, expected_revision=2)
             assert advanced_again.revision == 3
+
+
+# -- paid Polza Media task acceptance ---------------------------------------
+
+
+def _reserve_paid_attempt(repository, run_uuid, part_uuid, *, expected_revision):
+    """Reserve one paid Polza Media attempt as setup for an acceptance test."""
+    _, attempt = repository.reserve_paid_tts_attempt(
+        run_uuid,
+        part_uuid=part_uuid,
+        expected_revision=expected_revision,
+        provider="polza-tts",
+        model="elevenlabs/eleven_multilingual_v2",
+        account_alias="main",
+    )
+    return attempt
+
+
+def test_record_polza_media_task_accepted_binds_id_and_advances_revision(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+    part = repository.add_part(run.run_uuid, position=1, prepared_text="chunk text")
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+
+    advanced, accepted = repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=reserved.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        remote_task_id="media_task_01",
+    )
+
+    assert advanced.run_uuid == run.run_uuid
+    assert advanced.revision == 3
+    assert advanced.status == "running"
+    assert accepted.attempt_uuid == reserved.attempt_uuid
+    assert accepted.part_uuid == part.part_uuid
+    assert accepted.call_type == history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK
+    assert accepted.remote_id == "media_task_01"
+    assert accepted.status == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+    # The immutable provider/model/account identity and the unknown cost survive.
+    assert accepted.provider == "polza-tts"
+    assert accepted.model == "elevenlabs/eleven_multilingual_v2"
+    assert accepted.account_alias == "main"
+    assert accepted.cost.amount is None
+    assert accepted.cost.source == COST_SOURCE_UNKNOWN
+    assert accepted.cost.exact_available is False
+
+
+def test_record_polza_media_task_accepted_commits_before_poll(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+
+    repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=reserved.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        remote_task_id="task_abc",
+    )
+
+    # A separate connection already sees the committed transition, so a crash
+    # before the first synthetic GET leaves the accepted task id durable.
+    connection = sqlite3.connect(tmp_path / "history.sqlite3")
+    try:
+        revision = connection.execute(
+            "SELECT revision FROM runs WHERE run_uuid = ?", (run.run_uuid,)
+        ).fetchone()[0]
+        row = connection.execute(
+            "SELECT remote_id, status, provider, model, account_alias, cost, cost_source, "
+            "cost_exact_available FROM attempts WHERE attempt_uuid = ?",
+            (reserved.attempt_uuid,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert revision == 3
+    assert row[0] == "task_abc"
+    assert row[1] == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+    assert row[2] == "polza-tts"
+    assert row[3] == "elevenlabs/eleven_multilingual_v2"
+    assert row[4] == "main"
+    assert row[5] is None  # cost stays unknown, never fabricated
+    assert row[6] == COST_SOURCE_UNKNOWN
+    assert row[7] == 0
+
+
+def test_record_polza_media_task_accepted_rejects_stale_revision_without_mutation(
+    repository, tmp_path
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    first = repository.add_part(run.run_uuid, position=1)
+    second = repository.add_part(run.run_uuid, position=2)
+    first_reserved = _reserve_paid_attempt(
+        repository, run.run_uuid, first.part_uuid, expected_revision=1
+    )
+    repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=first_reserved.attempt_uuid,
+        part_uuid=first.part_uuid,
+        expected_revision=2,
+        remote_task_id="id-first",
+    )
+    second_reserved = _reserve_paid_attempt(
+        repository, run.run_uuid, second.part_uuid, expected_revision=3
+    )
+
+    with pytest.raises(HistoryRevisionConflictError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=second_reserved.attempt_uuid,
+            part_uuid=second.part_uuid,
+            expected_revision=3,
+            remote_task_id="id-second",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 4
+    unchanged = repository.get_attempt(second_reserved.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+def test_record_polza_media_task_accepted_rejects_foreign_attempt_run(repository, tmp_path):
+    run_a = repository.create_run(operation="tts", run_root=str(tmp_path / "a"))
+    run_b = repository.create_run(operation="tts", run_root=str(tmp_path / "b"))
+    part_a = repository.add_part(run_a.run_uuid, position=1)
+    part_b = repository.add_part(run_b.run_uuid, position=1)
+    reserved_a = _reserve_paid_attempt(
+        repository, run_a.run_uuid, part_a.part_uuid, expected_revision=1
+    )
+
+    # The attempt belongs to run_a, so naming run_b must not rebind it.
+    with pytest.raises(HistoryPaidMediaTaskConflictError):
+        repository.record_polza_media_task_accepted(
+            run_b.run_uuid,
+            attempt_uuid=reserved_a.attempt_uuid,
+            part_uuid=part_b.part_uuid,
+            expected_revision=2,
+            remote_task_id="id-1",
+        )
+
+    unchanged_a = repository.get_attempt(reserved_a.attempt_uuid)
+    assert unchanged_a is not None
+    assert unchanged_a.remote_id is None
+    assert unchanged_a.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+    reloaded_a = repository.get_run(run_a.run_uuid)
+    reloaded_b = repository.get_run(run_b.run_uuid)
+    assert reloaded_a is not None and reloaded_a.revision == 2
+    assert reloaded_b is not None and reloaded_b.revision == 1
+
+
+def test_record_polza_media_task_accepted_rejects_foreign_part(repository, tmp_path):
+    run_a = repository.create_run(operation="tts", run_root=str(tmp_path / "a"))
+    run_b = repository.create_run(operation="tts", run_root=str(tmp_path / "b"))
+    part_a = repository.add_part(run_a.run_uuid, position=1)
+    reserved_a = _reserve_paid_attempt(
+        repository, run_a.run_uuid, part_a.part_uuid, expected_revision=1
+    )
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.record_polza_media_task_accepted(
+            run_b.run_uuid,
+            attempt_uuid=reserved_a.attempt_uuid,
+            part_uuid=part_a.part_uuid,
+            expected_revision=1,
+            remote_task_id="id-1",
+        )
+
+    reloaded_b = repository.get_run(run_b.run_uuid)
+    assert reloaded_b is not None and reloaded_b.revision == 1
+
+
+def test_record_polza_media_task_accepted_rejects_missing_part_and_attempt(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=reserved.attempt_uuid,
+            part_uuid="11111111-2222-3333-4444-555555555555",
+            expected_revision=2,
+            remote_task_id="id-1",
+        )
+    with pytest.raises(HistoryPaidMediaTaskConflictError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid="11111111-2222-3333-4444-555555555555",
+            part_uuid=part.part_uuid,
+            expected_revision=2,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    unchanged = repository.get_attempt(reserved.attempt_uuid)
+    assert unchanged is not None and unchanged.remote_id is None
+
+
+@pytest.mark.parametrize(
+    "call_type, provider, status, remote_id",
+    [
+        ("asr_transcript", "polza-tts", "submitting", None),
+        ("tts_chunk", "openrouter-tts", "submitting", None),
+        ("tts_chunk", "polza-tts", "outcome_unknown", None),
+        ("tts_chunk", "polza-tts", "failed", None),
+        ("tts_chunk", "polza-tts", "remote_accepted", "task-abc"),
+    ],
+)
+def test_record_polza_media_task_accepted_rejects_wrong_type_provider_or_state(
+    repository, tmp_path, call_type, provider, status, remote_id
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    attempt = repository.add_attempt(
+        run.run_uuid,
+        call_type=call_type,
+        part_uuid=part.part_uuid,
+        provider=provider,
+        status=status,
+        remote_id=remote_id,
+    )
+
+    with pytest.raises(HistoryPaidMediaTaskConflictError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id == remote_id
+    assert unchanged.status == status
+
+
+@pytest.mark.parametrize(
+    "unsafe_id",
+    [
+        "https://cdn.example.invalid/media/SENTINEL?X-Amz-Signature=SENTINEL",
+        "task\nid",
+        "task id",
+        "task/id",
+        "a" * 129,
+    ],
+)
+def test_record_polza_media_task_accepted_rejects_unsafe_id_without_echo(
+    repository, tmp_path, unsafe_id
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+
+    with pytest.raises(ValueError) as excinfo:
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=reserved.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=2,
+            remote_task_id=unsafe_id,
+        )
+
+    # The fixed message never echoes the unsafe value.
+    assert str(excinfo.value) == "remote_task_id is not a bounded opaque media task id"
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    unchanged = repository.get_attempt(reserved.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+def test_record_polza_media_task_accepted_refuses_second_or_different_id(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+    repository.record_polza_media_task_accepted(
+        run.run_uuid,
+        attempt_uuid=reserved.attempt_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=2,
+        remote_task_id="id-first",
+    )
+
+    # The accepted id is immutable: neither the same id nor a different one may
+    # be rebound, and neither may advance the revision a second time.
+    for duplicate in ("id-first", "id-second"):
+        with pytest.raises(HistoryPaidMediaTaskConflictError):
+            repository.record_polza_media_task_accepted(
+                run.run_uuid,
+                attempt_uuid=reserved.attempt_uuid,
+                part_uuid=part.part_uuid,
+                expected_revision=3,
+                remote_task_id=duplicate,
+            )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 3
+    reloaded = repository.get_attempt(reserved.attempt_uuid)
+    assert reloaded is not None
+    assert reloaded.remote_id == "id-first"
+    assert reloaded.status == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+
+
+def test_record_polza_media_task_accepted_refuses_open_outer_transaction(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+    recorded = False
+
+    # A recording inside a caller's still-open transaction could return a usable
+    # accepted marker, be followed by the GET, and then be erased by a rollback.
+    # The seam must refuse before it can return.
+    with pytest.raises(HistoryPaidAttemptInTransactionError):
+        with repository.transaction():
+            repository.record_polza_media_task_accepted(
+                run.run_uuid,
+                attempt_uuid=reserved.attempt_uuid,
+                part_uuid=part.part_uuid,
+                expected_revision=2,
+                remote_task_id="id-1",
+            )
+            recorded = True
+
+    assert recorded is False
+    assert repository._connection.in_transaction is False
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    unchanged = repository.get_attempt(reserved.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+def test_record_polza_media_task_accepted_two_connections_cannot_overwrite(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as first_database:
+        first_database.migrate()
+        with HistoryDatabase(database_path) as second_database:
+            second_database.connect()
+            first = HistoryRepository(first_database)
+            second = HistoryRepository(second_database)
+            run = first.create_run(operation="tts", run_root=str(tmp_path))
+            first_part = first.add_part(run.run_uuid, position=1)
+            second_part = first.add_part(run.run_uuid, position=2)
+            first_reserved = _reserve_paid_attempt(
+                first, run.run_uuid, first_part.part_uuid, expected_revision=1
+            )
+            second_reserved = _reserve_paid_attempt(
+                first, run.run_uuid, second_part.part_uuid, expected_revision=2
+            )
+
+            first.record_polza_media_task_accepted(
+                run.run_uuid,
+                attempt_uuid=first_reserved.attempt_uuid,
+                part_uuid=first_part.part_uuid,
+                expected_revision=3,
+                remote_task_id="id-first",
+            )
+
+            # The second connection's stale view cannot advance the revision or
+            # bind part two's still-open attempt.
+            with pytest.raises(HistoryRevisionConflictError):
+                second.record_polza_media_task_accepted(
+                    run.run_uuid,
+                    attempt_uuid=second_reserved.attempt_uuid,
+                    part_uuid=second_part.part_uuid,
+                    expected_revision=2,
+                    remote_task_id="id-second",
+                )
+            # The already accepted id is immutable even at the current revision.
+            with pytest.raises(HistoryPaidMediaTaskConflictError):
+                second.record_polza_media_task_accepted(
+                    run.run_uuid,
+                    attempt_uuid=first_reserved.attempt_uuid,
+                    part_uuid=first_part.part_uuid,
+                    expected_revision=4,
+                    remote_task_id="id-second",
+                )
+
+            reloaded_run = second.get_run(run.run_uuid)
+            assert reloaded_run is not None and reloaded_run.revision == 4
+            accepted = second.get_attempt(first_reserved.attempt_uuid)
+            assert accepted is not None and accepted.remote_id == "id-first"
+            assert accepted.status == history_repository_module.ATTEMPT_STATUS_REMOTE_ACCEPTED
+            untouched = second.get_attempt(second_reserved.attempt_uuid)
+            assert untouched is not None and untouched.remote_id is None
+            assert untouched.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+@pytest.mark.parametrize("bad_revision", [0, -1, True, False, 1.0, "1"])
+def test_record_polza_media_task_accepted_rejects_invalid_expected_revision(
+    repository, tmp_path, bad_revision
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+
+    with pytest.raises(ValueError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=reserved.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=bad_revision,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    unchanged = repository.get_attempt(reserved.attempt_uuid)
+    assert unchanged is not None and unchanged.remote_id is None
+
+
+def test_record_polza_media_task_accepted_rejects_synchronous_polza_model(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    # ``openai/gpt-4o-mini-tts`` is the default ``polza-tts`` model. It submits
+    # through the synchronous ``/audio/speech`` route, so no recoverable async
+    # media task id can exist for it even though the provider matches.
+    _, reserved = repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="openai/gpt-4o-mini-tts",
+        account_alias="main",
+    )
+
+    with pytest.raises(HistoryPaidMediaTaskConflictError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=reserved.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=2,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    unchanged = repository.get_attempt(reserved.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+def test_record_polza_media_task_accepted_refuses_legacy_imported_run(repository, tmp_path):
+    legacy_root = str(tmp_path / "legacy-run")
+    with repository.transaction():
+        run, _ = repository.create_legacy_run(
+            operation="tts",
+            run_root=legacy_root,
+            legacy_source_root=legacy_root,
+            status="interrupted",
+        )
+        part = repository.add_part(run.run_uuid, position=1)
+        # A part-linked submitting marker on an imported run is not a recoverable
+        # async task; the run-level legacy guard must refuse it like the
+        # pre-submit reservation does.
+        attempt = repository.add_attempt(
+            run.run_uuid,
+            call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+            part_uuid=part.part_uuid,
+            provider="polza-tts",
+            model="elevenlabs/eleven_multilingual_v2",
+            status=history_repository_module.ATTEMPT_STATUS_SUBMITTING,
+        )
+
+    with pytest.raises(HistoryRunNotReservableError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert reloaded_run.legacy_source_root is not None
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+def test_record_polza_media_task_accepted_refuses_completed_run(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="completed")
+    part = repository.add_part(run.run_uuid, position=1)
+    attempt = repository.add_attempt(
+        run.run_uuid,
+        call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+        part_uuid=part.part_uuid,
+        provider="polza-tts",
+        model="elevenlabs/eleven_multilingual_v2",
+        status=history_repository_module.ATTEMPT_STATUS_SUBMITTING,
+    )
+
+    # Finishing a completed run's stale marker belongs to a new run, so the
+    # accepted-id transition must leave the closed run and attempt unchanged.
+    with pytest.raises(HistoryRunNotReservableError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=attempt.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    unchanged = repository.get_attempt(attempt.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+
+
+def test_record_polza_media_task_accepted_fails_closed_when_guarded_update_is_ignored(
+    repository, tmp_path
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    reserved = _reserve_paid_attempt(repository, run.run_uuid, part.part_uuid, expected_revision=1)
+
+    # A ``BEFORE UPDATE`` trigger that silently skips the row models any database
+    # condition under which the guarded UPDATE affects no row. The seam must not
+    # then return a successful accepted id with an advanced revision: it raises
+    # and rolls the revision bump back together with the binding.
+    repository._connection.execute(
+        "CREATE TRIGGER attempts_ignore_accept BEFORE UPDATE ON attempts "
+        "WHEN NEW.status = 'remote_accepted' "
+        "BEGIN SELECT RAISE(IGNORE); END"
+    )
+
+    with pytest.raises(HistoryPaidMediaTaskConflictError):
+        repository.record_polza_media_task_accepted(
+            run.run_uuid,
+            attempt_uuid=reserved.attempt_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=2,
+            remote_task_id="id-1",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    unchanged = repository.get_attempt(reserved.attempt_uuid)
+    assert unchanged is not None
+    assert unchanged.remote_id is None
+    assert unchanged.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
