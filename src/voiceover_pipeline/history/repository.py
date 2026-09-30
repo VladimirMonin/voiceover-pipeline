@@ -15,6 +15,13 @@ execution services. It exposes:
   never leave a committed run without its parts and costs.
   :meth:`HistoryRepository.advance_run_revision` is the typed revision
   compare-and-swap that resume and the compatibility state export build on.
+  :meth:`HistoryRepository.reserve_paid_tts_attempt` is the single atomic
+  pre-submit seam: it advances that revision and commits one ``submitting``
+  attempt marker with no remote id and an unknown cost before the caller may
+  make a paid request, and it refuses a second attempt for the same part and
+  call type so an unconfirmed paid submit is never repeated. It owns its
+  transaction and refuses to run inside a caller's open transaction, on an
+  imported legacy run, or on a completed run.
 
 Money contract: an attempt's cost is stored as a ``TEXT`` decimal string.
 ``NULL`` means *unknown*; the string ``"0"`` is a real observed zero. A value
@@ -65,6 +72,38 @@ class HistoryRunNotFoundError(HistoryRepositoryError):
     """A run-scoped update named a UUID that no history run carries."""
 
 
+class HistoryPartNotFoundError(HistoryRepositoryError):
+    """A part-scoped call named a part UUID that does not belong to the run."""
+
+
+class HistoryPaidAttemptConflictError(HistoryRepositoryError):
+    """A paid attempt is already recorded for this run part and call type.
+
+    Raised when a reservation would create a second paid submit for a part that
+    already carries an attempt of the same call type, whatever that earlier
+    attempt's outcome, so an unconfirmed paid submit is never repeated.
+    """
+
+
+class HistoryPaidAttemptInTransactionError(HistoryRepositoryError):
+    """A paid reservation was attempted inside an already open transaction.
+
+    The reservation owns its transaction so the unconfirmed attempt marker
+    commits before the caller may make the paid request. Joining a caller's
+    still-open transaction would let a later rollback erase that marker after the
+    request had already been sent, so the seam refuses to run.
+    """
+
+
+class HistoryRunNotReservableError(HistoryRepositoryError):
+    """A paid attempt cannot be reserved for this run's current state.
+
+    Raised for an imported legacy run, whose paid work may be recorded only as a
+    run-level total that no part-linked guard can see, and for any run already
+    marked ``completed``, because repeating finished work belongs to a new run.
+    """
+
+
 # Documented classification values. Writes validate the ones that steer file
 # handling, so a typo fails loudly instead of becoming an unclassifiable row.
 PATH_KIND_MANAGED_RELATIVE = "managed_relative"
@@ -80,6 +119,14 @@ TEXT_KIND_TTS_SCRIPT = "tts_script"
 TEXT_KIND_TTS_DIRECTION = "tts_direction"
 TEXT_KIND_ASR_TRANSCRIPT = "asr_transcript"
 TEXT_KIND_VERIFICATION_TRANSCRIPT = "verification_transcript"
+# Call type and stage of the paid TTS attempt marker this repository commits
+# before a network submit. The marker shares the legacy importer's chunk call
+# type, so imported and native attempts are guarded by one predicate.
+ATTEMPT_CALL_TYPE_TTS_CHUNK = "tts_chunk"
+ATTEMPT_STATUS_SUBMITTING = "submitting"
+# A run whose work already finished. Repeating finished work creates a new run
+# with a link to the previous one, not another paid attempt on the closed run.
+RUN_STATUS_COMPLETED = "completed"
 # Placeholder written in place of a string value that looks like a secret.
 REDACTED_VALUE = "[redacted]"
 
@@ -142,6 +189,24 @@ def _require_uuid(value: str, field_name: str) -> str:
         return str(uuid.UUID(value))
     except (ValueError, AttributeError, TypeError) as exc:
         raise ValueError(f"{field_name} must be a UUID string") from exc
+
+
+def _require_expected_revision(expected_revision: int) -> int:
+    """Return a positive, non-bool revision or raise loudly."""
+    if (
+        isinstance(expected_revision, bool)
+        or not isinstance(expected_revision, int)
+        or expected_revision < 1
+    ):
+        raise ValueError("expected_revision must be a positive integer")
+    return expected_revision
+
+
+def _require_identity_field(value: str, field_name: str) -> str:
+    """Return a non-empty identity string, or raise loudly before any write."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
 
 
 def _require_limit(limit: int) -> int:
@@ -570,6 +635,21 @@ class HistoryRepository:
                 "back together"
             )
 
+    def _require_no_open_transaction(self, method: str) -> None:
+        """Fail closed when a paid reservation would join an open transaction.
+
+        The reservation commits the unconfirmed attempt marker before the caller
+        may start the paid request. Inside a caller-managed :meth:`transaction` a
+        later rollback would erase that marker after the request was already sent,
+        so the method refuses to run instead of returning a value the caller could
+        act on and then lose.
+        """
+        if self._connection.in_transaction:
+            raise HistoryPaidAttemptInTransactionError(
+                f"{method} must not run inside an open transaction; call it on its own so "
+                "the attempt marker commits before any paid request"
+            )
+
     # -- writes ---------------------------------------------------------------
 
     def create_run(
@@ -680,12 +760,7 @@ class HistoryRepository:
         ``run_uuid``. Both leave the run unchanged: the compare-and-swap never
         runs a bare ``UPDATE`` without the revision predicate.
         """
-        if (
-            isinstance(expected_revision, bool)
-            or not isinstance(expected_revision, int)
-            or expected_revision < 1
-        ):
-            raise ValueError("expected_revision must be a positive integer")
+        _require_expected_revision(expected_revision)
         now = utc_now()
         with self.transaction():
             cursor = self._connection.execute(
@@ -790,6 +865,101 @@ class HistoryRepository:
         with self.transaction():
             self._insert_attempt(record)
         return record
+
+    def reserve_paid_tts_attempt(
+        self,
+        run_uuid: str,
+        *,
+        part_uuid: str,
+        expected_revision: int,
+        provider: str,
+        model: str,
+        account_alias: str,
+    ) -> tuple[RunRecord, AttemptRecord]:
+        """Atomically reserve one paid TTS attempt for a run part before any submit.
+
+        This is the single pre-submit seam for paid generation. Inside one
+        :meth:`transaction` it validates that the run exists and that ``part_uuid``
+        belongs to it, refuses a part that already carries any attempt of the same
+        call type, compare-and-swaps the run revision through
+        :meth:`advance_run_revision`, and inserts one ``submitting`` attempt marker
+        with ``remote_id=None`` and :meth:`Cost.unknown`. It returns
+        ``(advanced_run, attempt)``, where ``advanced_run.revision`` is the new
+        revision. The caller may only start the network request *after* this call
+        returns, so a crash between the marker and the response leaves a durable
+        unconfirmed marker instead of a silently repeatable submit.
+
+        The marker is committed before any provider call and must stay until the
+        outcome is resolved. Any earlier attempt for the same part and call type
+        blocks a new reservation even when ``expected_revision`` is still fresh,
+        because an ``outcome_unknown`` or accepted paid submit must never turn into
+        a second POST. A *known definitive* failure is not yet distinguishable at
+        this layer, so every earlier attempt of that call type is refused; a
+        narrower recovery policy remains a future slice. ``provider``, ``model``,
+        and ``account_alias`` must be non-empty.
+
+        The call owns its transaction and refuses to run inside an already open
+        one, so its committed marker cannot be erased by a caller rollback after
+        the request was sent. It also refuses a run that already carries a
+        ``legacy_source_root`` (an imported run's paid work may live only in a
+        run-level total no part-linked guard can see) and any run already in
+        :data:`RUN_STATUS_COMPLETED` (repeating finished work belongs to a new
+        run), leaving both unchanged.
+
+        Raises :class:`ValueError` for an invalid ``expected_revision`` or an empty
+        identity field before any database write, :class:`HistoryPaidAttemptInTransactionError`
+        when called inside an open transaction, :class:`HistoryRunNotFoundError`
+        for a missing run, :class:`HistoryRunNotReservableError` for a legacy or
+        completed run, :class:`HistoryPartNotFoundError` for a foreign or absent
+        part, :class:`HistoryPaidAttemptConflictError` for an existing attempt, and
+        :class:`HistoryRevisionConflictError` for a stale revision. Every failure
+        rolls the revision bump and the insertion back together.
+        """
+        part_identifier = _require_uuid(part_uuid, "part_uuid")
+        _require_identity_field(provider, "provider")
+        _require_identity_field(model, "model")
+        _require_identity_field(account_alias, "account_alias")
+        _require_expected_revision(expected_revision)
+        self._require_no_open_transaction("reserve_paid_tts_attempt")
+        with self.transaction():
+            run = self.get_run(run_uuid)
+            if run is None:
+                raise HistoryRunNotFoundError(f"no history run with UUID {run_uuid!r}")
+            if run.legacy_source_root is not None:
+                raise HistoryRunNotReservableError(
+                    f"run {run_uuid!r} is an imported legacy run whose paid work cannot be "
+                    "represented by a part-linked attempt; refusing a new paid reservation"
+                )
+            if run.status == RUN_STATUS_COMPLETED:
+                raise HistoryRunNotReservableError(
+                    f"run {run_uuid!r} is already completed; repeat finished work in a new run"
+                )
+            if not self._part_belongs_to_run(part_identifier, run_uuid):
+                raise HistoryPartNotFoundError(
+                    f"part {part_identifier!r} does not belong to run {run_uuid!r}"
+                )
+            existing_attempt = self._find_attempt_uuid_for_part(
+                run_uuid, part_identifier, ATTEMPT_CALL_TYPE_TTS_CHUNK
+            )
+            if existing_attempt is not None:
+                raise HistoryPaidAttemptConflictError(
+                    f"run {run_uuid!r} part {part_identifier!r} already has a paid "
+                    f"{ATTEMPT_CALL_TYPE_TTS_CHUNK!r} attempt {existing_attempt!r}; "
+                    "refusing a second submit"
+                )
+            advanced = self.advance_run_revision(run_uuid, expected_revision=expected_revision)
+            attempt = self.add_attempt(
+                run_uuid,
+                call_type=ATTEMPT_CALL_TYPE_TTS_CHUNK,
+                part_uuid=part_identifier,
+                provider=provider,
+                model=model,
+                account_alias=account_alias,
+                remote_id=None,
+                status=ATTEMPT_STATUS_SUBMITTING,
+                cost=Cost.unknown(),
+            )
+            return advanced, attempt
 
     def add_artifact(
         self,
@@ -1033,6 +1203,23 @@ class HistoryRepository:
             "SELECT * FROM runs WHERE legacy_source_root = ?", (canonical_root,)
         ).fetchone()
         return _row_to_run(row) if row is not None else None
+
+    def _part_belongs_to_run(self, part_uuid: str, run_uuid: str) -> bool:
+        row = self._connection.execute(
+            "SELECT 1 FROM parts WHERE part_uuid = ? AND run_uuid = ?",
+            (part_uuid, run_uuid),
+        ).fetchone()
+        return row is not None
+
+    def _find_attempt_uuid_for_part(
+        self, run_uuid: str, part_uuid: str, call_type: str
+    ) -> str | None:
+        row = self._connection.execute(
+            "SELECT attempt_uuid FROM attempts WHERE run_uuid = ? AND part_uuid = ? "
+            "AND call_type = ? LIMIT 1",
+            (run_uuid, part_uuid, call_type),
+        ).fetchone()
+        return row["attempt_uuid"] if row is not None else None
 
     def _insert_run(self, record: RunRecord) -> None:
         self._connection.execute(

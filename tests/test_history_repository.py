@@ -22,6 +22,7 @@ from voiceover_pipeline.history.repository import (
     AVAILABILITY_MISSING,
     AVAILABILITY_PRESENT,
     COST_SOURCE_LEGACY_FLOAT,
+    COST_SOURCE_UNKNOWN,
     MAX_QUERY_LIMIT,
     PATH_KIND_EXTERNAL_ABSOLUTE,
     PATH_KIND_MANAGED_RELATIVE,
@@ -29,9 +30,13 @@ from voiceover_pipeline.history.repository import (
     TEXT_KIND_ASR_TRANSCRIPT,
     TEXT_KIND_TTS_SCRIPT,
     Cost,
+    HistoryPaidAttemptConflictError,
+    HistoryPaidAttemptInTransactionError,
+    HistoryPartNotFoundError,
     HistoryRepository,
     HistoryRevisionConflictError,
     HistoryRunNotFoundError,
+    HistoryRunNotReservableError,
 )
 
 
@@ -799,6 +804,409 @@ def test_advance_run_revision_conflict_rolls_back_outer_transaction(repository, 
     assert unchanged is not None
     assert unchanged.revision == 2
     assert unchanged.status == "completed"
+
+
+# -- paid TTS attempt reservation -------------------------------------------
+
+
+def test_reserve_paid_tts_attempt_bumps_revision_and_commits_marker(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="running")
+    part = repository.add_part(run.run_uuid, position=1, prepared_text="chunk text")
+
+    advanced, attempt = repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="elevenlabs/eleven_multilingual_v2",
+        account_alias="main",
+    )
+
+    assert advanced.revision == 2
+    assert advanced.status == "running"
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+
+    assert attempt.run_uuid == run.run_uuid
+    assert attempt.part_uuid == part.part_uuid
+    assert attempt.call_type == history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK
+    assert attempt.provider == "polza-tts"
+    assert attempt.model == "elevenlabs/eleven_multilingual_v2"
+    assert attempt.account_alias == "main"
+    assert attempt.status == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+    assert attempt.remote_id is None
+    assert attempt.cost.amount is None
+    assert attempt.cost.source == COST_SOURCE_UNKNOWN
+    assert attempt.cost.exact_available is False
+
+    reloaded_attempt = repository.get_attempt(attempt.attempt_uuid)
+    assert reloaded_attempt is not None
+    assert reloaded_attempt.remote_id is None
+    assert reloaded_attempt.cost.amount is None
+
+
+def test_reserve_paid_tts_attempt_commits_marker_before_external_call(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+
+    _, attempt = repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="m",
+        account_alias="a",
+    )
+
+    # A separate connection already sees the committed marker, so the durable
+    # unconfirmed attempt exists before any caller could make a paid request.
+    connection = sqlite3.connect(tmp_path / "history.sqlite3")
+    try:
+        revision = connection.execute(
+            "SELECT revision FROM runs WHERE run_uuid = ?", (run.run_uuid,)
+        ).fetchone()[0]
+        row = connection.execute(
+            "SELECT remote_id, status, cost, cost_source, cost_exact_available "
+            "FROM attempts WHERE attempt_uuid = ?",
+            (attempt.attempt_uuid,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert revision == 2
+    assert row[0] is None  # remote_id: no remote id exists before the submit
+    assert row[1] == history_repository_module.ATTEMPT_STATUS_SUBMITTING
+    assert row[2] is None  # cost stays unknown, never fabricated
+    assert row[3] == COST_SOURCE_UNKNOWN
+    assert row[4] == 0
+
+
+def test_reserve_paid_tts_attempt_rejects_stale_revision_without_bump(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    first = repository.add_part(run.run_uuid, position=1)
+    second = repository.add_part(run.run_uuid, position=2)
+
+    repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=first.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="m",
+        account_alias="a",
+    )
+
+    with pytest.raises(HistoryRevisionConflictError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid=second.part_uuid,
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    assert len(repository.get_attempts(run.run_uuid)) == 1
+
+
+def test_reserve_paid_tts_attempt_rejects_foreign_part_without_bump(repository, tmp_path):
+    run_a = repository.create_run(operation="tts", run_root=str(tmp_path / "a"))
+    run_b = repository.create_run(operation="tts", run_root=str(tmp_path / "b"))
+    part_a = repository.add_part(run_a.run_uuid, position=1)
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.reserve_paid_tts_attempt(
+            run_b.run_uuid,
+            part_uuid=part_a.part_uuid,
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    unchanged_b = repository.get_run(run_b.run_uuid)
+    unchanged_a = repository.get_run(run_a.run_uuid)
+    assert unchanged_b is not None and unchanged_b.revision == 1
+    assert unchanged_a is not None and unchanged_a.revision == 1
+    assert repository.get_attempts(run_b.run_uuid) == []
+
+
+def test_reserve_paid_tts_attempt_rejects_missing_part_without_bump(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+
+    with pytest.raises(HistoryPartNotFoundError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid="11111111-2222-3333-4444-555555555555",
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert repository.get_attempts(run.run_uuid) == []
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"provider": ""},
+        {"provider": "   "},
+        {"model": ""},
+        {"account_alias": ""},
+    ],
+)
+def test_reserve_paid_tts_attempt_rejects_empty_identity(repository, tmp_path, overrides):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    arguments = {"provider": "polza-tts", "model": "m", "account_alias": "a", **overrides}
+
+    with pytest.raises(ValueError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid, part_uuid=part.part_uuid, expected_revision=1, **arguments
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert repository.get_attempts(run.run_uuid) == []
+
+
+@pytest.mark.parametrize("bad_revision", [0, -1, True, False, 1.0, "1"])
+def test_reserve_paid_tts_attempt_rejects_invalid_expected_revision(
+    repository, tmp_path, bad_revision
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+
+    with pytest.raises(ValueError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=bad_revision,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert repository.get_attempts(run.run_uuid) == []
+
+
+def test_reserve_paid_tts_attempt_missing_run_is_typed_not_found(repository):
+    with pytest.raises(HistoryRunNotFoundError):
+        repository.reserve_paid_tts_attempt(
+            "11111111-2222-3333-4444-555555555555",
+            part_uuid="22222222-3333-4444-5555-666666666666",
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+
+def test_reserve_paid_tts_attempt_rejects_duplicate_on_fresh_revision(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+
+    repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="m",
+        account_alias="a",
+    )
+
+    with pytest.raises(HistoryPaidAttemptConflictError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=2,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 2
+    assert len(repository.get_attempts(run.run_uuid)) == 1
+
+
+@pytest.mark.parametrize(
+    "status, remote_id",
+    [
+        ("outcome_unknown", None),
+        ("remote_accepted", "task-abc"),
+        ("submitting", None),
+    ],
+)
+def test_reserve_paid_tts_attempt_refuses_any_prior_attempt(
+    repository, tmp_path, status, remote_id
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    repository.add_attempt(
+        run.run_uuid,
+        call_type=history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK,
+        part_uuid=part.part_uuid,
+        status=status,
+        remote_id=remote_id,
+    )
+
+    with pytest.raises(HistoryPaidAttemptConflictError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert len(repository.get_attempts(run.run_uuid)) == 1
+
+
+def test_reserve_paid_tts_attempt_ignores_other_call_types(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    repository.add_attempt(run.run_uuid, call_type="asr_transcript", part_uuid=part.part_uuid)
+
+    advanced, attempt = repository.reserve_paid_tts_attempt(
+        run.run_uuid,
+        part_uuid=part.part_uuid,
+        expected_revision=1,
+        provider="polza-tts",
+        model="m",
+        account_alias="a",
+    )
+
+    assert advanced.revision == 2
+    assert attempt.call_type == history_repository_module.ATTEMPT_CALL_TYPE_TTS_CHUNK
+
+
+def test_reserve_paid_tts_attempt_refuses_open_outer_transaction(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path))
+    part = repository.add_part(run.run_uuid, position=1)
+    submitted = False
+
+    # A reservation inside a caller's still-open transaction could return a
+    # usable marker, be followed by the paid POST, and then be erased by the
+    # caller's rollback. The seam must refuse before it can return.
+    with pytest.raises(HistoryPaidAttemptInTransactionError):
+        with repository.transaction():
+            repository.reserve_paid_tts_attempt(
+                run.run_uuid,
+                part_uuid=part.part_uuid,
+                expected_revision=1,
+                provider="polza-tts",
+                model="m",
+                account_alias="a",
+            )
+            submitted = True
+
+    assert submitted is False
+    assert repository._connection.in_transaction is False
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert repository.get_attempts(run.run_uuid) == []
+
+
+def test_reserve_paid_tts_attempt_refuses_legacy_imported_run(repository, tmp_path):
+    legacy_root = str(tmp_path / "legacy-run")
+    with repository.transaction():
+        run, _ = repository.create_legacy_run(
+            operation="tts",
+            run_root=legacy_root,
+            legacy_source_root=legacy_root,
+            status="interrupted",
+        )
+        part = repository.add_part(run.run_uuid, position=1)
+        # An import with only a run-total price records no part-linked chunk, so
+        # the per-part duplicate guard alone would miss its paid work.
+        repository.add_attempt(
+            run.run_uuid,
+            call_type="tts_run_total",
+            cost=Cost.legacy_float("0.1000", currency="RUB"),
+        )
+
+    with pytest.raises(HistoryRunNotReservableError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert reloaded_run.legacy_source_root is not None
+    assert [attempt.call_type for attempt in repository.get_attempts(run.run_uuid)] == [
+        "tts_run_total"
+    ]
+
+
+def test_reserve_paid_tts_attempt_refuses_completed_run(repository, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path), status="completed")
+    part = repository.add_part(run.run_uuid, position=1)
+
+    # Repeating already completed work belongs to a new run, not a new paid
+    # attempt on the finished one.
+    with pytest.raises(HistoryRunNotReservableError):
+        repository.reserve_paid_tts_attempt(
+            run.run_uuid,
+            part_uuid=part.part_uuid,
+            expected_revision=1,
+            provider="polza-tts",
+            model="m",
+            account_alias="a",
+        )
+
+    reloaded_run = repository.get_run(run.run_uuid)
+    assert reloaded_run is not None and reloaded_run.revision == 1
+    assert repository.get_attempts(run.run_uuid) == []
+
+
+def test_reserve_paid_tts_attempt_cross_connection_cannot_double_reserve(tmp_path):
+    database_path = tmp_path / "history.sqlite3"
+    with HistoryDatabase(database_path) as first_database:
+        first_database.migrate()
+        with HistoryDatabase(database_path) as second_database:
+            second_database.connect()
+            first = HistoryRepository(first_database)
+            second = HistoryRepository(second_database)
+            run = first.create_run(operation="tts", run_root=str(tmp_path))
+            part = first.add_part(run.run_uuid, position=1)
+
+            first.reserve_paid_tts_attempt(
+                run.run_uuid,
+                part_uuid=part.part_uuid,
+                expected_revision=1,
+                provider="polza-tts",
+                model="m",
+                account_alias="a",
+            )
+
+            with pytest.raises(HistoryPaidAttemptConflictError):
+                second.reserve_paid_tts_attempt(
+                    run.run_uuid,
+                    part_uuid=part.part_uuid,
+                    expected_revision=1,
+                    provider="polza-tts",
+                    model="m",
+                    account_alias="a",
+                )
+
+            reloaded_run = second.get_run(run.run_uuid)
+            assert reloaded_run is not None and reloaded_run.revision == 2
+            assert len(second.get_attempts(run.run_uuid)) == 1
 
 
 def test_advance_run_revision_two_connections_serialize(tmp_path):
