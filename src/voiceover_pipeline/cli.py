@@ -806,8 +806,8 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("query", metavar="QUERY", help="Search terms (treated as literal words).")
     search.add_argument(
         "--mode",
-        choices=["lexical", "semantic", "hybrid"],
-        default="lexical",
+        choices=list(settings_module.SEARCH_MODES),
+        default=None,
         help="Search mode. semantic/hybrid are deferred; lexical is the offline FTS5 path.",
     )
     search.add_argument(
@@ -4409,11 +4409,31 @@ def _print_history(subcommand: str, payload: dict[str, Any]) -> None:
 
 
 def search_cmd(args: argparse.Namespace) -> None:
-    """Dispatch one ``search`` invocation to its handler."""
+    """Dispatch one ``search`` invocation to its handler.
+
+    An explicit ``--mode`` always wins. When ``--mode`` is omitted the default
+    mode comes from the non-secret ``settings.toml`` ``[search] default_mode``;
+    an unreadable or invalid settings file fails closed with one fixed, path-free
+    ``SEARCH_SETTINGS_INVALID`` instead of echoing the file or its path. A
+    configured ``semantic``/``hybrid`` mode still reaches ``search_history`` and
+    keeps its honest ``SEARCH_MODE_DEFERRED`` refusal; no embedding or provider
+    path is involved.
+    """
+    mode = args.mode
+    if mode is None:
+        try:
+            mode = settings_module.load_search_settings().default_mode
+        except settings_module.SettingsError:
+            fail(
+                "settings.toml is invalid; [search] default_mode must be "
+                "lexical, semantic, or hybrid.",
+                _EXIT_ARGS,
+                details={"error_code": "SEARCH_SETTINGS_INVALID"},
+            )
     try:
         payload = search_commands.search_history(
             args.query,
-            mode=args.mode,
+            mode=mode,
             scope=args.scope,
             limit=args.limit,
             kind=args.kind,

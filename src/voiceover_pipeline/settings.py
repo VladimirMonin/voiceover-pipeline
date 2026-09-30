@@ -3,8 +3,9 @@
 Plan section 9 keeps three independent configuration roles: ``.env`` for
 development secrets, ``settings.toml`` for durable non-secret settings, and
 ``speech-parts.yaml`` for content. This module is the small ``settings.toml``
-reader for the settings the application needs today: ``[history] enabled`` and
-the ``[asr.qwen_local]`` local asset locations.
+reader for the settings the application needs today: ``[history] enabled``, the
+``[asr.qwen_local]`` local asset locations, and the ``[search] default_mode``
+choice.
 
 The reader stays deliberately small: it reads one optional TOML file, imports no
 optional runtime (no Torch, no provider package), opens no network connection,
@@ -34,6 +35,11 @@ QWEN_ASR_LOCAL_SECTION = "qwen_local"
 QWEN_ASR_MODELS_ROOT_KEY = "models_root"
 QWEN_ASR_CACHE_DIR_KEY = "cache_dir"
 QWEN_ASR_REVISION_KEY = "revision"
+SEARCH_SECTION = "search"
+SEARCH_DEFAULT_MODE_KEY = "default_mode"
+# The only accepted search modes, in the order the CLI lists them; the semantic
+# and hybrid values stay valid settings that the command refuses as deferred.
+SEARCH_MODES = ("lexical", "semantic", "hybrid")
 
 
 class SettingsError(RuntimeError):
@@ -63,6 +69,13 @@ class QwenAsrLocalSettings:
     revision: str | None = None
 
 
+@dataclass(frozen=True)
+class SearchSettings:
+    """The ``[search]`` section of ``settings.toml``; ``default_mode`` defaults lexical."""
+
+    default_mode: str = "lexical"
+
+
 def default_settings_path() -> Path:
     """Return ``<cwd>/settings.toml`` resolved now, not at import time."""
     return Path.cwd() / SETTINGS_FILENAME
@@ -71,13 +84,13 @@ def default_settings_path() -> Path:
 def load_settings(path: Path | str | None = None) -> dict[str, Any]:
     """Read the optional settings file; a missing file yields an empty mapping."""
     target = default_settings_path() if path is None else Path(path).expanduser()
-    if not target.exists():
-        return {}
     try:
+        if not target.exists():
+            return {}
         with target.open("rb") as handle:
             data = tomllib.load(handle)
     except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise SettingsError(f"unable to read settings file {target}") from exc
+        raise SettingsError("unable to read settings.toml") from exc
     return data
 
 
@@ -119,6 +132,31 @@ def load_qwen_asr_local_settings(path: Path | str | None = None) -> QwenAsrLocal
         cache_dir=_optional_settings_string(qwen_local, QWEN_ASR_CACHE_DIR_KEY),
         revision=_optional_settings_string(qwen_local, QWEN_ASR_REVISION_KEY),
     )
+
+
+def load_search_settings(path: Path | str | None = None) -> SearchSettings:
+    """Return the validated ``[search]`` settings, failing closed on bad input.
+
+    A missing file, a missing section, and a missing key all mean the documented
+    default lexical mode. A non-table ``search`` section, a non-string or blank
+    ``default_mode``, or a value outside :data:`SEARCH_MODES` raises
+    :class:`SettingsError` so a typo cannot silently select a mode the user did not
+    write. ``semantic`` and ``hybrid`` are accepted here and refused by the search
+    command itself as deferred, so this reader never claims to run them.
+    """
+    data = load_settings(path)
+    section = data.get(SEARCH_SECTION, {})
+    if not isinstance(section, Mapping):
+        raise SettingsError("the [search] settings section must be a TOML table")
+    mode = section.get(SEARCH_DEFAULT_MODE_KEY, "lexical")
+    if not isinstance(mode, str) or not mode.strip():
+        raise SettingsError("settings.toml [search] default_mode must be a non-empty string")
+    value = mode.strip()
+    if value not in SEARCH_MODES:
+        raise SettingsError(
+            "settings.toml [search] default_mode must be lexical, semantic, or hybrid"
+        )
+    return SearchSettings(default_mode=value)
 
 
 def _optional_settings_string(section: Mapping[str, Any], key: str) -> str | None:
