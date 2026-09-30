@@ -1264,7 +1264,7 @@ def test_native_descriptor_is_required_for_ownership(monkeypatch, tmp_path, nati
 
 
 def test_native_run_parts_shape_is_valid() -> None:
-    """The native route is admitted for the ordinary non-dialogue sync and media runs."""
+    """The native route is admitted for the ordinary runs and the one dialogue route."""
     import argparse
 
     args = argparse.Namespace(
@@ -1312,6 +1312,20 @@ def test_native_run_parts_shape_is_valid() -> None:
     assert cli._native_route_eligible(args, "markdown") is False
     args.with_timings = False
     args.tts_quality_provider = None
+    assert cli._native_route_eligible(args, "dialogue") is False
+    # The one admitted dialogue route is the OpenRouter Gemini two-speaker script
+    # with the required installed local quality provider and the default trim.
+    args.provider = "openrouter-tts"
+    args.model = "google/gemini-3.1-flash-tts-preview"
+    args.tts_quality_provider = "qwen-local"
+    assert cli._native_route_eligible(args, "dialogue") is True
+    args.no_trim = True
+    assert cli._native_route_eligible(args, "dialogue") is False
+    args.no_trim = False
+    args.tts_quality_provider = "xai-stt"
+    assert cli._native_route_eligible(args, "dialogue") is False
+    args.tts_quality_provider = "qwen-local"
+    args.provider = "polza-tts"
     assert cli._native_route_eligible(args, "dialogue") is False
     # A provider outside the admitted set keeps the legacy executor.
     args.provider = "polza-chat-audio"

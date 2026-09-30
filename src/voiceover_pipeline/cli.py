@@ -64,6 +64,7 @@ from .config import (
 from .gemini_dialogue import (
     DIALOGUE_FORMAT,
     GEMINI_DIALOGUE_FORMAT,
+    GEMINI_TTS_MODEL,
     chunks_from_validation,
     dialogue_turns_from_validation,
     is_dialogue_format,
@@ -1216,6 +1217,7 @@ def generate(args: argparse.Namespace) -> None:
             native_ownership,
             ffmpeg_path=ffmpeg_path,
             ffprobe_path=ffprobe_path,
+            gemini_report=gemini_report,
         )
         return
 
@@ -1369,11 +1371,21 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     for that same route: an installed *local* ``--tts-quality-provider``
     (``qwen-local``/``nemotron-local``), and the recorded trimming semantics of
     ``--no-trim``. ``--with-timings --timing-provider faster-whisper`` stays
-    admitted as before. Every other route and mixture -- a dialogue script, a cloud
-    or unregistered quality provider, a cloud timing provider, and any command that
-    asks for local timings *and* local quality at once -- keeps the legacy executor
-    and its JSON writer unchanged.
+    admitted as before. Every other route and mixture -- a cloud or unregistered
+    quality provider, a cloud timing provider, and any command that asks for local
+    timings *and* local quality at once -- keeps the legacy executor and its JSON
+    writer unchanged.
+
+    One dialogue route is admitted separately: the existing validated
+    ``openrouter-tts`` Gemini two-speaker script with the required installed local
+    ``--tts-quality-provider`` and the default trimming semantics. It runs each
+    turn's required local quality gate before the final concat. Every other
+    dialogue route -- ``omnivoice-local``, and every ``polza-tts`` dialogue -- and
+    every dialogue option mixture (``--no-trim``, ``--with-timings``) stays on the
+    legacy executor.
     """
+    if is_dialogue_format(script_format):
+        return _native_dialogue_route_eligible(args)
     if script_format != "markdown":
         return False
     quality_provider = getattr(args, "tts_quality_provider", None)
@@ -1393,6 +1405,30 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
         # Only the local timing provider is admitted; a cloud timing route stays on
         # the legacy executor until its paid-submit contract is confirmed.
         return getattr(args, "timing_provider", "faster-whisper") == "faster-whisper"
+    return True
+
+
+def _native_dialogue_route_eligible(args: argparse.Namespace) -> bool:
+    """Whether this command is the one admitted native dialogue route.
+
+    Only the existing validated ``openrouter-tts`` Gemini two-speaker dialogue is
+    admitted, and only with the required installed local ``--tts-quality-provider``
+    and the default trimming semantics; the per-turn quality gate runs before the
+    final concat. ``--no-trim`` and ``--with-timings`` keep the legacy executor, as
+    do ``omnivoice-local`` and every ``polza-tts`` dialogue.
+    """
+    if getattr(args, "provider", None) != "openrouter-tts":
+        return False
+    if getattr(args, "model", None) != GEMINI_TTS_MODEL:
+        return False
+    if getattr(args, "tts_quality_provider", None) not in (
+        native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
+    ):
+        return False
+    if getattr(args, "no_trim", False):
+        return False
+    if getattr(args, "with_timings", False):
+        return False
     return True
 
 
@@ -1450,6 +1486,7 @@ def _run_native_route(
     *,
     ffmpeg_path: str,
     ffprobe_path: str,
+    gemini_report: dict[str, Any] | None = None,
 ) -> None:
     """Execute, resume, or re-export one native-owned run and print the result.
 
@@ -1458,11 +1495,13 @@ def _run_native_route(
     media GET recovery: a local raw rebuild or a completed-run export repair never
     reads an API key or constructs a provider. ``--overwrite`` is rejected for a
     native run so accepted paid evidence is never deleted; ``--skip-existing``
-    keeps its usual precedence.
+    keeps its usual precedence. ``gemini_report`` carries the validated dialogue
+    cast so a dialogue run resolves its first-cast voice identity exactly as the
+    legacy executor does.
     """
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
-            "This run directory is owned by native history. Only an ordinary non-dialogue "
+            "This run directory is owned by native history. Only an admitted native "
             "polza-tts or openrouter-tts run may continue it; choose a different --run-id for "
             "other options.",
             _EXIT_PROVIDER,
@@ -1497,7 +1536,7 @@ def _run_native_route(
         generation_identity = prepare_generation_identity(
             args,
             chunks,
-            None,
+            gemini_report,
             resolve_style_prompt=_resolve_provider_style_prompt,
         )
     except PreparationError as exc:
@@ -3206,6 +3245,7 @@ def _native_execution_hooks(args: argparse.Namespace) -> native_generation.Nativ
         trim_final_silence=trim_final_silence,
         mp3_duration_ms=mp3_duration_ms,
         concat_audio_files=concat_audio_files,
+        concat_dialogue_turns=concat_dialogue_turns,
         sha256_file=_sha256_file,
         progress=print if not args.json_output else (lambda _message: None),
     )

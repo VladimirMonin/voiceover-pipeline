@@ -408,7 +408,7 @@ provider/model/voice/script, с которыми позднее будет за�
 `--with-timings --timing-provider faster-whisper`, которые дают аудио и
 локальные субтитры одной командой, и — отдельно — установленный локальный
 `--tts-quality-provider` (`qwen-local`, `nemotron-local`), дающий аудио и
-локальную проверку одной командой. Dialogue, облачный или
+локальную проверку одной командой. Облачный или
 незарегистрированный `--tts-quality-provider`, облачные timing-провайдеры
 (`openrouter-whisper`, `groq-whisper`, `xai-stt`) и одновременный запрос
 локальных таймингов и локальной проверки остаются вне среза. Все прочие
@@ -536,13 +536,45 @@ provider/model/voice/script, с которыми позднее будет за�
   (`quality.complete: true, passed: false`) либо `quality.complete: false`, пока
   проверка не выполнена.
 
-Этот фрагмент не завершает S05: ASR/`verify-tts`, dialogue, облачные
+Этот фрагмент не завершает S05: ASR/`verify-tts`, облачные
 `--timing-provider` и остальные провайдеры остаются на legacy executor.
 Локальный faster-whisper timing и локальная проверка качества интегрированы в
-нативный прогон (см. выше).
+нативный прогон (см. выше). Единственный нативный диалоговый маршрут описан в
+подразделе ниже.
 Пользовательские глаголы
 `history resume ID` / `history sync ID`, которые восстанавливают такой прогон из
 снимка, описаны в разделе ниже.
+
+### Нативный OpenRouter Gemini dialogue (фрагмент S05)
+
+Единственный диалоговый маршрут, переведённый на canonical SQLite —
+`--provider openrouter-tts --model google/gemini-3.1-flash-tts-preview
+--format dialogue` (валидированный YAML, ровно два speaker'а с различными
+голосами из `GEMINI_TTS_VOICES`) с обязательным установленным локальным
+`--tts-quality-provider` (`qwen-local`/`nemotron-local`) и обрезкой по
+умолчанию. `--no-trim`, `--with-timings`, `omnivoice-local` и любой
+`polza-tts` dialogue остаются на legacy executor; новый обобщённый движок не
+добавляется.
+
+- Каждая реплика — один paid-запрос со своим cast-voice (`voice`, как в legacy);
+  снимок хранит порядок реплик, speaker, cast/effective voice, паузу и текст.
+- Перед concat каждая реплика проходит обязательную локальную ASR-проверку,
+  причём локальная модель прощупывается до первого paid POST (без implicit
+  download). Наблюдённый вердикт PASS/FAIL и приватный
+  `verification_transcript` сохраняются на самом TTS-прогоне и связаны с этой
+  частью; провал проверки — exit `60` (`NATIVE_QUALITY_FAILED`), сбой локальной
+  транскрипции — exit `50` (`NATIVE_QUALITY_ASR_FAILED`), сбой записи — exit `50`
+  (`NATIVE_QUALITY_HISTORY_FAILED`), отсутствующая модель — exit `10`
+  (`NATIVE_QUALITY_MODEL_UNAVAILABLE`).
+- Записанный FAIL не повторяет POST и не перезапускает модель: `generate
+  --resume`, `history resume ID` и `history sync ID` повторно сообщают exit `60`,
+  сохраняя оплаченные raw/аудио/стоимость. Неопределённый синхронный submit
+  остаётся `PAID_SUBMIT_UNCONFIRMED` и блокирует retry и `--overwrite`.
+- Сборка использует существующий `concat_dialogue_turns` с записанным планом пауз
+  `250`/`600`/`0` мс и порядком частей; совместимые JSON-экспорты строятся из БД
+  и несут `history_run_uuid`/`history_revision`, а также per-turn
+  `turn_index`/`speaker`/`voice`/`pause_after_ms`/`audio_sha256` и
+  контентно-пустой `tts_quality` receipt (без приватного транскрипта).
 
 ## Локальные ASR / timings / verify в канонической истории (фрагмент S05)
 
@@ -1020,8 +1052,8 @@ voiceover history sync ID --json        # без нового оплаченно
 Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
 из S05; live/listening-приёмка при этом не проводилась. `history costs` —
 read-only offline-учёт расходов (см. выше). S05 целиком пока не принят:
-ASR/`verify-tts`, dialogue, облачные timing-маршруты и остальные провайдеры
-остаются на legacy executor.
+ASR/`verify-tts`, облачные timing-маршруты и остальные провайдеры остаются на
+legacy executor; единственный нативный диалоговый маршрут описан ниже.
 
 ## Gemini Dialogue (machine-facing)
 

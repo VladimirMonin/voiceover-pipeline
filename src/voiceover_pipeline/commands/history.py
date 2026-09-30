@@ -827,8 +827,9 @@ def load_native_history_view(
             ) from None
         except NativeViewError:
             raise HistoryCommandError(
-                "This history run is not a reconstructable native TTS snapshot; only an ordinary "
-                "non-dialogue polza-tts or openrouter-tts native run can be resumed or synced.",
+                "This history run is not a reconstructable native TTS snapshot; only an admitted "
+                "openrouter-tts dialogue or polza-tts/openrouter-tts native run can be resumed "
+                "or synced.",
                 _EXIT_PROVIDER,
                 error_code="NATIVE_HISTORY_UNSUPPORTED",
             ) from None

@@ -51,6 +51,7 @@ from .native_view import NativeTtsPart, NativeTtsView, _config_required_str
 from .repository import (
     ARTIFACT_ROLE_CHUNK_AUDIO,
     ARTIFACT_ROLE_FINAL_AUDIO,
+    ARTIFACT_ROLE_TTS_TURN_QUALITY,
     AttemptRecord,
     Cost,
 )
@@ -151,6 +152,7 @@ def _chunk_artifact(
     artifact,
     *,
     start_ms: int,
+    dialogue: bool = False,
 ) -> tuple[ChunkArtifact, int]:
     """Build one ordered ``ChunkArtifact`` plus the exclusive end offset it reaches."""
     duration_ms = _metadata_int(artifact, "duration_ms")
@@ -171,12 +173,15 @@ def _chunk_artifact(
         start_ms=start_ms,
         end_ms=end_ms,
         text_characters=len(part.text),
-        transcript=part.text,
+        transcript=None if dialogue else part.text,
         client_path="requests",
         generation_id=generation_id,
         speaker=part.speaker,
         voice=part.effective_voice,
         voice_fingerprint=part.voice_fingerprint,
+        turn_index=part.number if dialogue else None,
+        speech_duration_ms=duration_ms if dialogue else None,
+        audio_sha256=artifact.sha256 if dialogue else None,
         pause_after_ms=part.pause_after_ms,
         **(_cost_fields(attempt.cost) if attempt is not None else {}),
     )
@@ -218,7 +223,7 @@ def _summarize_costs(
 
 
 def _ordered_chunk_artifacts(
-    view: NativeTtsView,
+    view: NativeTtsView, *, dialogue: bool = False
 ) -> tuple[list[ChunkArtifact], dict[str, ChunkArtifact]]:
     ordered: list[ChunkArtifact] = []
     by_part: dict[str, ChunkArtifact] = {}
@@ -226,10 +231,74 @@ def _ordered_chunk_artifacts(
     for part in view.parts:
         artifact = _chunk_artifact_for_part(view, part.record.part_uuid)
         attempt = _attempt_for_part(view, part.record.part_uuid)
-        chunk_artifact, start_ms = _chunk_artifact(view, part, attempt, artifact, start_ms=start_ms)
+        chunk_artifact, start_ms = _chunk_artifact(
+            view, part, attempt, artifact, start_ms=start_ms, dialogue=dialogue
+        )
         ordered.append(chunk_artifact)
         by_part[part.record.part_uuid] = chunk_artifact
     return ordered, by_part
+
+
+def _speaker_voice_map(view: NativeTtsView) -> dict[str, str] | None:
+    """Rebuild the dialogue cast map from committed parts, in first-seen order.
+
+    Only a run whose parts carry a speaker and a cast voice produces a map; an
+    ordinary non-dialogue run returns ``None`` so its manifest stays unchanged.
+    """
+    cast: dict[str, str] = {}
+    for part in view.parts:
+        if part.speaker and part.cast_voice:
+            cast.setdefault(part.speaker, part.cast_voice)
+    return cast or None
+
+
+def _dialogue_quality_receipt(view: NativeTtsView) -> dict[str, Any] | None:
+    """Rebuild the dialogue quality receipt from the committed per-turn verdicts.
+
+    Each turn's content-free receipt is read from its ``tts_turn_quality_receipt``
+    artifact in part order, so the aggregate ``tts_quality`` projection carries the
+    same fields the legacy ``tts_quality.json`` did and never the private
+    transcript. A run that recorded no per-turn evidence returns ``None``.
+    """
+    receipts = {
+        artifact.part_uuid: artifact
+        for artifact in view.artifacts
+        if artifact.role == ARTIFACT_ROLE_TTS_TURN_QUALITY and artifact.part_uuid is not None
+    }
+    if not receipts:
+        return None
+    turns: list[dict[str, Any]] = []
+    passed_all = True
+    provider: str | None = None
+    model: str | None = None
+    for part in view.parts:
+        artifact = receipts.get(part.record.part_uuid)
+        metadata = artifact.media_metadata if artifact is not None else None
+        if not isinstance(metadata, dict):
+            # A part without its committed verdict cannot be projected; the run is
+            # not a complete dialogue run, so no aggregate receipt is claimed.
+            return None
+        turn = dict(metadata)
+        turn.setdefault("turn_index", part.number)
+        turns.append(turn)
+        if metadata.get("quality_passed") is not True:
+            passed_all = False
+        asr = metadata.get("asr")
+        if isinstance(asr, dict):
+            if provider is None and isinstance(asr.get("provider"), str):
+                provider = asr["provider"]
+            if model is None and isinstance(asr.get("model"), str):
+                model = asr["model"]
+    return {
+        "artifact_type": "voiceover-dialogue-tts-quality-receipt",
+        "status": "success" if passed_all else "quality_failed",
+        "passed": passed_all,
+        "provider": provider,
+        "model": model,
+        "turn_count": len(view.parts),
+        "turns": turns,
+        "human_listening_required": True,
+    }
 
 
 def _script_chunks(view: NativeTtsView) -> list[ScriptChunk]:
@@ -276,8 +345,9 @@ def build_native_export(
     if execution_source is not None and not isinstance(execution_source, dict):
         raise NativeExportError("the final audio artifact carries a malformed execution source")
 
-    ordered, by_part = _ordered_chunk_artifacts(view)
+    ordered, by_part = _ordered_chunk_artifacts(view, dialogue=view.script_format == "dialogue")
     cost_total, cost_total_exact, cost_currency, cost_source = _summarize_costs(ordered)
+    dialogue = view.script_format == "dialogue"
 
     chunks_manifest = build_chunks_manifest(
         provider=_config_required_str(config, "provider"),
@@ -297,6 +367,8 @@ def build_native_export(
         ffprobe_path=ffprobe_path,
         prompt_mode=_config_required_str(config, "prompt_mode"),
         script_format=view.script_format,
+        speaker_voice_map=_speaker_voice_map(view) if dialogue else None,
+        tts_quality_receipt=_dialogue_quality_receipt(view) if dialogue else None,
         execution_source=execution_source,
     )
     run_manifest = build_run_manifest(chunks_manifest, paths, main_duration_ms)
@@ -347,6 +419,7 @@ def _build_run_state(
         script_format=view.script_format,
         run_id=paths.prefix,
     )
+    dialogue = view.script_format == "dialogue"
     for part in view.parts:
         artifact = by_part.get(part.record.part_uuid)
         if artifact is None:  # pragma: no cover - guarded by the ordered projection
@@ -357,6 +430,8 @@ def _build_run_state(
             model=_config_required_str(config, "model"),
             voice=part.effective_voice,
             text=part.text,
+            include_text=not dialogue,
+            include_transcript=not dialogue,
         )
     state["status"] = "completed"
     state["full_mp3"] = str(paths.full_mp3)

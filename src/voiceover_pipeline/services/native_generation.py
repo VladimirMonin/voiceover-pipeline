@@ -6,11 +6,22 @@ chunks, and final assembly live in the database, and the legacy JSON files becom
 compatibility exports. This module owns the bounded executor for the admitted
 routes -- an ordinary, non-dialogue ``polza-tts`` run without integrated timing
 processing, either its synchronous ``/audio/speech`` model or its async
-``elevenlabs/`` ``/media`` model, and the synchronous ``openrouter-tts`` route --
-and their recovery decisions. Two orthogonal integrated steps are admitted for
-that same ordinary route: the recorded silence-trimming semantics (``--no-trim``
-vs the default trim) and one local post-audio step -- either local
-``faster-whisper`` timings or, separately, a local ASR quality verification.
+``elevenlabs/`` ``/media`` model, the synchronous ``openrouter-tts`` route, and
+the validated ``openrouter-tts`` Gemini two-speaker dialogue route -- and their
+recovery decisions. Two orthogonal integrated steps are admitted for that same
+ordinary route: the recorded silence-trimming semantics (``--no-trim`` vs the
+default trim) and one local post-audio step -- either local ``faster-whisper``
+timings or, separately, a local ASR quality verification.
+
+The admitted dialogue route is deliberately narrower. It is one turn per request,
+keeps each turn's cast voice, and requires an installed local
+``--tts-quality-provider``: every converted turn is transcribed and checked before
+the next paid turn and before the final concat, and the observed PASS/FAIL verdict
+together with the private transcript is persisted on the TTS run, linked to that
+exact turn part. It records no integrated timing and no ``--no-trim`` mixture; the
+final audio is assembled with the recorded 250/600/0 ms pause plan. Every other
+dialogue route -- ``omnivoice-local`` and every ``polza-tts`` dialogue -- stays on
+the legacy executor.
 
 Contract:
 
@@ -42,17 +53,23 @@ Contract:
   transaction. A completed part is skipped only after its committed digest, size,
   and file presence verify; a mismatch fails closed instead of regenerating and
   re-billing. Final assembly uses the ordered database parts, never a directory
-  glob.
+  glob; a dialogue run concatenates the same ordered parts through the dialogue
+  turn seam so each recorded pause is preserved.
 * The provider is constructed lazily, only for a fresh unattempted submit or a
   known-id GET recovery. A local raw rebuild or a completed-run export repair
   never reads an API key and never builds a provider.
+* A dialogue run's per-turn verdict is durable: a recorded FAIL is re-reported by
+  ``generate --resume``, ``history resume``, and ``history sync`` without a second
+  paid POST or local model run, and the paid raw bytes, converted audio, and cost
+  stay on disk.
 
 Known limits: this slice admits the non-dialogue ``polza-tts`` and
-``openrouter-tts`` routes and the recorded trimming/timing/quality semantics in
-the snapshot. The crash window between a synchronous raw receipt and its database
-link (covered by local reconciliation) is the only place a synchronous observed
-cost cannot be rebuilt, because the receipt carries no cost. Dialogue, cloud ASR,
-cloud timing, and the other speech providers stay on the legacy executor until
+``openrouter-tts`` routes with the recorded trimming/timing/quality semantics in
+the snapshot, plus the one validated ``openrouter-tts`` Gemini dialogue route. The
+crash window between a synchronous raw receipt and its database link (covered by
+local reconciliation) is the only place a synchronous observed cost cannot be
+rebuilt, because the receipt carries no cost. Cloud ASR, cloud timing, the other
+speech providers, and every other dialogue route stay on the legacy executor until
 their own identity and processing paths are supported.
 """
 
@@ -72,6 +89,7 @@ from typing import Any, cast
 from ..artifacts import build_run_paths, build_srt, build_timing_manifest
 from ..config import DEFAULT_TIMING_MODEL
 from ..execution_identity import build_execution_identity
+from ..gemini_dialogue import is_dialogue_format
 from ..history.database import (
     HistoryDatabase,
     HistoryDatabaseError,
@@ -116,11 +134,13 @@ from ..history.repository import (
     ARTIFACT_ROLE_CHUNK_AUDIO,
     ARTIFACT_ROLE_FINAL_AUDIO,
     ARTIFACT_ROLE_PAID_RAW_AUDIO,
+    ARTIFACT_ROLE_TTS_TURN_QUALITY,
     ATTEMPT_STATUS_COMPLETED,
     ATTEMPT_STATUS_RAW_SAVED,
     ATTEMPT_STATUS_REMOTE_ACCEPTED,
     ATTEMPT_STATUS_SUBMITTING,
     MAX_QUERY_LIMIT,
+    PATH_KIND_MANAGED_RELATIVE,
     RUN_STATUS_COMPLETED,
     TEXT_COMPLETENESS_COMPLETE,
     TEXT_COMPLETENESS_INCOMPLETE,
@@ -138,6 +158,7 @@ from ..tts_quality import TTSQualityResult, evaluate_tts_transcript
 from . import costs
 from .prepare import PreparedPart, PreparedRun
 from .recovery import polza_media_route_model
+from .synthesis import synthesize_part
 
 # Numeric exit codes duplicated from ``cli.py`` because the CLI imports this
 # service; only the documented stable codes are used here.
@@ -207,6 +228,11 @@ _ERROR_QUALITY_ASR_FAILED = "NATIVE_QUALITY_ASR_FAILED"
 _ERROR_QUALITY_FAILED = "NATIVE_QUALITY_FAILED"
 _ERROR_QUALITY_HISTORY_FAILED = "NATIVE_QUALITY_HISTORY_FAILED"
 _ERROR_QUALITY_CONFLICT = "NATIVE_QUALITY_CONFLICT"
+# The per-turn dialogue gate has its own bounded code for a run whose local turn
+# verification never ran or could not be repaired without a model (``history
+# sync``): the committed audio and cost stay, and an explicit resume is required
+# to run the pending local model.
+_ERROR_QUALITY_INCOMPLETE = "NATIVE_QUALITY_INCOMPLETE"
 
 # Stable mode names for the two history entry points.
 _MODE_RESUME = "resume"
@@ -252,6 +278,7 @@ class NativeExecutionHooks:
     trim_final_silence: Callable[[str, str, Path], None]
     mp3_duration_ms: Callable[[str, Path], int]
     concat_audio_files: Callable[[str, list[Path], Path], None]
+    concat_dialogue_turns: Callable[[str, list[tuple[Path, int]], Path], None]
     sha256_file: Callable[[Path], str]
     progress: Callable[[str], None]
 
@@ -955,6 +982,84 @@ def _verified_raw_bytes(
         ) from exc
 
 
+# ── per-turn dialogue quality evidence ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _TurnQuality:
+    """One committed per-turn dialogue verdict read back from the verified view.
+
+    ``passed`` is the recorded PASS/FAIL the run must re-report, and
+    ``transcript`` is the private observed ASR text used only to re-verify the
+    stored hash. Neither value is ever projected into a public receipt or export.
+    """
+
+    passed: bool
+    transcript: str
+
+
+def _turn_quality_evidence(view: NativeTtsView) -> dict[str, _TurnQuality]:
+    """Return each part's committed per-turn dialogue verdict, keyed by part UUID.
+
+    The verdict is the pairing of one ``tts_turn_quality_receipt`` artifact and one
+    private ``verification_transcript`` source that names the same part, so a
+    half-written pair is treated as absent instead of trusted. A duplicate receipt
+    or transcript per part, a missing or non-boolean verdict, and a transcript
+    whose stored hash no longer matches its text all fail closed rather than
+    silently dropping a recorded failure. A part without committed evidence is
+    simply absent from the mapping, which the caller reads as pending work.
+    """
+    receipts: dict[str, ArtifactRecord] = {}
+    for artifact in view.artifacts:
+        if artifact.role != ARTIFACT_ROLE_TTS_TURN_QUALITY:
+            continue
+        if artifact.part_uuid is None or artifact.part_uuid in receipts:
+            raise NativeGenerationError(
+                "refusing to continue: the dialogue turn quality evidence is not unique per part.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_EVIDENCE_INCONSISTENT,
+            )
+        receipts[artifact.part_uuid] = artifact
+    transcripts: dict[str, str] = {}
+    for source in view.text_sources:
+        if source.kind != TEXT_KIND_VERIFICATION_TRANSCRIPT or source.part_uuid is None:
+            continue
+        if source.part_uuid in transcripts:
+            raise NativeGenerationError(
+                "refusing to continue: the dialogue turn verification transcript is not unique "
+                "per part.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_EVIDENCE_INCONSISTENT,
+            )
+        content = source.content
+        if not isinstance(content, str) or source.content_hash != sha256_text(content):
+            raise NativeGenerationError(
+                "refusing to continue: a committed dialogue turn verification transcript does "
+                "not match its stored hash.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_EVIDENCE_INCONSISTENT,
+            )
+        transcripts[source.part_uuid] = content
+    evidence: dict[str, _TurnQuality] = {}
+    for part in view.parts:
+        part_uuid = part.record.part_uuid
+        receipt = receipts.get(part_uuid)
+        transcript = transcripts.get(part_uuid)
+        if receipt is None or transcript is None:
+            continue
+        metadata = receipt.media_metadata if isinstance(receipt.media_metadata, dict) else {}
+        passed = metadata.get("quality_passed")
+        if not isinstance(passed, bool):
+            raise NativeGenerationError(
+                "refusing to continue: a committed dialogue turn quality receipt carries no "
+                "boolean verdict.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_EVIDENCE_INCONSISTENT,
+            )
+        evidence[part_uuid] = _TurnQuality(passed=passed, transcript=transcript)
+    return evidence
+
+
 # ── executor ──────────────────────────────────────────────────────────────────
 
 
@@ -1068,6 +1173,7 @@ class _Executor:
         self.prepared = prepared
         self.chunks = chunks
         self.script_format = script_format
+        self.dialogue = is_dialogue_format(script_format)
         self.script_path = script_path
         self.output_options = output_options
         self.timing_options = timing_options_from_output_options(output_options)
@@ -1234,6 +1340,168 @@ class _Executor:
             ) from exc
         self._revision = run.revision
         self.logger.event("info", "chunk_state_saved", chunk=part.number, id=part.chunk_id)
+        if self.dialogue:
+            # The required per-turn local quality gate runs on this just-committed
+            # turn audio, before any later turn's paid submit and before concat.
+            self._run_turn_quality(evidence)
+
+    # -- per-turn dialogue quality gate ---------------------------------------
+
+    def _run_turn_quality(self, evidence: _PartEvidence) -> None:
+        """Run the required local ASR quality check for one converted dialogue turn.
+
+        The check reuses the existing installed local ASR adapter and the existing
+        strict dialogue thresholds -- the same comparison the legacy gate applies
+        to every turn -- so no new model or threshold is invented. The observed
+        transcript and the content-free PASS/FAIL verdict are persisted together,
+        linked to the exact turn part, before any outcome is reported. A mismatch
+        keeps the paid raw bytes, converted audio, and cost intact and raises the
+        existing quality exit, while a local transcription failure raises the
+        fixed partial error; neither path ever repeats the paid submit.
+        """
+        options = self.quality_options
+        if options is None:
+            # The dialogue route always records its local quality settings; a run
+            # without them cannot be verified and must not continue to a paid call.
+            raise NativeGenerationError(
+                "the dialogue native route requires an installed local --tts-quality-provider.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_QUALITY_OPTIONS_INVALID,
+            )
+        part = evidence.part
+        audio_path = self.paths.chunks_dir / f"{part.chunk_id}.mp3"
+        from .transcription import transcribe_local_asr_quality
+
+        try:
+            result = transcribe_local_asr_quality(
+                provider_id=options.provider,
+                audio_path=audio_path,
+                model=options.model,
+                device=options.device,
+                compute=options.compute,
+                runtime=options.runtime,
+                language=options.language,
+            )
+        except Exception as exc:
+            self.logger.event(
+                "error", "dialogue_quality_transcription_failed", error=type(exc).__name__
+            )
+            raise NativeGenerationError(
+                "the turn audio is complete, but the local per-turn quality transcription failed.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_ASR_FAILED,
+            ) from None
+        quality = evaluate_tts_transcript(
+            expected_text=part.text,
+            actual_transcript=result.transcript,
+            minimum_similarity=1.0,
+            maximum_missing_ratio=0.0,
+            maximum_unexpected_ratio=0.0,
+            maximum_repeated_ngram_excess=0,
+            strip_audio_tags=True,
+        )
+        self._persist_turn_quality(part, result, quality, audio_path)
+        if not quality.passed:
+            self.logger.event("warning", "dialogue_turn_quality_failed", chunk=part.number)
+            raise NativeGenerationError(
+                "the turn audio is complete, but the local per-turn quality verification did "
+                "not pass; the paid audio and cost were kept and the failed verification was "
+                "recorded.",
+                code=_EXIT_QUALITY,
+                error_code=_ERROR_QUALITY_FAILED,
+            )
+        self.logger.event("info", "dialogue_turn_quality_verified", chunk=part.number)
+
+    def _persist_turn_quality(
+        self,
+        part: NativeTtsPart,
+        result: ASRResult,
+        quality: TTSQualityResult,
+        audio_path: Path,
+    ) -> None:
+        """Persist one turn's verdict and private transcript, linked to its part.
+
+        The content-free receipt artifact and the private transcript source commit
+        in one transaction, so a crash can never leave a verdict without its
+        transcript or the reverse. The receipt references the managed converted
+        turn audio (not the raw paid bytes) and carries the observed ASR identity
+        and the verdict the run re-reports; the transcript is stored verbatim and
+        is never projected into a receipt, machine output, or export. A write
+        failure reports the fixed partial error and keeps the paid evidence.
+        """
+        execution = result.execution
+        metadata: dict[str, Any] = quality.public_receipt(
+            audio_sha256=self.hooks.sha256_file(audio_path),
+            asr_provider=result.provider_id,
+            asr_model=result.model_id,
+            asr_runtime=execution.runtime,
+            asr_model_revision=execution.model_revision,
+        )
+        metadata["turn_index"] = part.number
+        metadata["quality_passed"] = bool(quality.passed)
+        try:
+            size_bytes = audio_path.stat().st_size
+            with self.repository.transaction():
+                artifact = self.repository.add_artifact(
+                    self._run_uuid(),
+                    role=ARTIFACT_ROLE_TTS_TURN_QUALITY,
+                    path_kind=PATH_KIND_MANAGED_RELATIVE,
+                    path=f"chunks/{part.chunk_id}.mp3",
+                    part_uuid=part.record.part_uuid,
+                    mime="audio/mpeg",
+                    size_bytes=size_bytes,
+                    sha256=metadata["audio_sha256"],
+                    media_metadata=metadata,
+                )
+                self.repository.add_text_source(
+                    self._run_uuid(),
+                    kind=TEXT_KIND_VERIFICATION_TRANSCRIPT,
+                    origin=NATIVE_ASR_ORIGIN,
+                    content=result.transcript,
+                    part_uuid=part.record.part_uuid,
+                    artifact_uuid=artifact.artifact_uuid,
+                    content_hash=sha256_text(result.transcript),
+                    language=result.language or None,
+                    text_completeness=(
+                        TEXT_COMPLETENESS_COMPLETE
+                        if result.transcript.strip()
+                        else TEXT_COMPLETENESS_INCOMPLETE
+                    ),
+                )
+        except (HistoryRepositoryError, OSError, ValueError):
+            self.logger.event("error", "dialogue_quality_history_failed", chunk=part.number)
+            raise NativeGenerationError(
+                "the local per-turn quality verification ran, but the linked verification "
+                "history could not be stored; the paid audio and cost were kept.",
+                code=_EXIT_OUTPUT,
+                error_code=_ERROR_QUALITY_HISTORY_FAILED,
+            ) from None
+        self._reload_view()
+
+    def _dialogue_quality_summary(self) -> tuple[bool, bool | None]:
+        """Return whether every turn carries a verdict and whether all passed."""
+        evidence = _turn_quality_evidence(self.view)
+        complete = all(part.record.part_uuid in evidence for part in self.view.parts)
+        if not complete:
+            return False, None
+        return True, all(item.passed for item in evidence.values())
+
+    def _reject_recorded_dialogue_failure(self) -> None:
+        """Re-report a durable dialogue FAIL before any paid or local work exists.
+
+        A recorded failure can never be repaired by another paid submit and its
+        verdict is already durable, so ``generate --resume``, ``history resume``,
+        and ``history sync`` all re-report it without running the model or sending
+        another POST. The paid raw bytes, converted audio, and cost stay on disk.
+        """
+        evidence = _turn_quality_evidence(self.view)
+        if any(not item.passed for item in evidence.values()):
+            raise NativeGenerationError(
+                "the run recorded a failed local per-turn quality verification; the paid audio "
+                "and cost were kept. Use a different --run-id for a new attempt.",
+                code=_EXIT_QUALITY,
+                error_code=_ERROR_QUALITY_FAILED,
+            )
 
     def _link_raw(
         self,
@@ -1325,7 +1593,7 @@ class _Executor:
             )
         self.logger.event("info", "paid_submit_started", chunk=part.number, id=part.chunk_id)
         try:
-            result = provider.synthesize_chunk(part.text, part.chunk_id)
+            result = self._invoke_provider(provider, part)
         except Exception:
             # The provider exception body is untrusted (it may carry an echoed
             # Authorization header), so it never reaches the public error message
@@ -1357,6 +1625,28 @@ class _Executor:
             result = replace(result, generation_id=bounded_opaque_token(result.generation_id))
             updated = self._link_sync_raw(part, attempt, result=result)
         self._convert_and_commit(evidence, result, updated)
+
+    def _invoke_provider(self, provider: Any, part: NativeTtsPart) -> SynthesisResult:
+        """Submit one part once, applying the per-turn dialogue cast voice as legacy did.
+
+        A non-dialogue native run keeps its run-level voice and calls the provider
+        directly. A dialogue turn goes through the same ``synthesize_part`` seam the
+        legacy executor uses, so an ``OpenRouterTTSProvider`` receives its own cast
+        voice as the ``voice`` keyword while a provider that does not accept one is
+        called unchanged. The provider is invoked exactly once; its error propagates.
+        """
+        if not self.dialogue:
+            return provider.synthesize_chunk(part.text, part.chunk_id)
+        chunk = ScriptChunk(
+            number=part.number,
+            id=part.chunk_id,
+            text=part.text,
+            speaker=part.speaker,
+            voice=part.cast_voice,
+            voice_fingerprint=part.voice_fingerprint,
+            pause_after_ms=part.pause_after_ms,
+        )
+        return synthesize_part(provider, PreparedPart(chunk=chunk, voice=part.effective_voice))
 
     def _recover_via_get(self, evidence: _PartEvidence, attempt: AttemptRecord) -> None:
         """Finish a known accepted task with GET calls only, then convert locally."""
@@ -1581,11 +1871,29 @@ class _Executor:
         ``history sync`` (``paid_submit_allowed`` is ``False``) fails closed on an
         unattempted part instead of submitting it, so sync never starts new paid
         work.
+
+        A dialogue run adds the required per-turn local quality gate: a recorded
+        FAIL is re-reported before any work, a verified chunk whose verdict is still
+        pending has that one check repaired locally with no provider request, and a
+        fresh or recovered turn is checked right after its conversion.
         """
         evidence = _collect_evidence(self.view)
+        if self.dialogue:
+            # A recorded per-turn FAIL is durable and can never be repaired by a
+            # paid submit, so every verb re-reports it before any work.
+            self._reject_recorded_dialogue_failure()
         first_incomplete_done = False
         for index, item in enumerate(evidence):
             if _verified_chunk_file(item, self.run_root, self.hooks.sha256_file) is not None:
+                if (
+                    self.dialogue
+                    and self.local_quality_allowed
+                    and item.part.record.part_uuid not in _turn_quality_evidence(self.view)
+                ):
+                    # A crash between a turn's conversion and its local check leaves
+                    # the chunk verified but the verdict pending; an explicit resume
+                    # repairs exactly that turn with no provider request at all.
+                    self._run_turn_quality(item)
                 self.hooks.progress(
                     f"Skipping {item.part.chunk_id}/{len(evidence):02d}: already committed"
                 )
@@ -1641,13 +1949,76 @@ class _Executor:
             ordered.append(verified)
         return ordered
 
+    def _ordered_dialogue_turns(self) -> list[tuple[Path, int]]:
+        """Return the ordered (turn audio, pause) pairs for the dialogue concat.
+
+        The pairs follow the committed part order, never a directory glob, so the
+        250 ms between turns, the 600 ms after a section delimiter, and the 0 ms
+        after the final turn are preserved exactly as the validated plan recorded
+        them.
+        """
+        evidence = _collect_evidence(self.view)
+        turns: list[tuple[Path, int]] = []
+        for item in evidence:
+            verified = _verified_chunk_file(item, self.run_root, self.hooks.sha256_file)
+            if verified is None:
+                raise NativeGenerationError(
+                    "refusing to assemble: a committed dialogue turn file is missing or does "
+                    "not match its history.",
+                    code=_EXIT_OUTPUT,
+                    error_code=_ERROR_ASSEMBLY_FAILED,
+                )
+            turns.append((verified, item.part.pause_after_ms))
+        return turns
+
+    def _require_dialogue_quality_before_concat(self) -> None:
+        """Fail closed until every turn carries a verdict, and re-report a FAIL.
+
+        The pending local check is run only when this execution may run a local
+        model (``generate``/``history resume``); ``history sync`` never runs one and
+        reports the incomplete state instead. A recorded FAIL is always re-reported
+        with the existing quality exit and never re-runs the model.
+        """
+        if self.quality_options is None:
+            raise NativeGenerationError(
+                "the dialogue native route requires an installed local --tts-quality-provider.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_QUALITY_OPTIONS_INVALID,
+            )
+        evidence = _collect_evidence(self.view)
+        verdicts = _turn_quality_evidence(self.view)
+        pending = [item for item in evidence if item.part.record.part_uuid not in verdicts]
+        if pending and self.local_quality_allowed:
+            for item in pending:
+                self._run_turn_quality(item)
+            verdicts = _turn_quality_evidence(self.view)
+            pending = [item for item in evidence if item.part.record.part_uuid not in verdicts]
+        if pending:
+            raise NativeGenerationError(
+                "the dialogue turns are complete, but their local quality verification has not "
+                "run; an explicit resume runs the pending local check before concat.",
+                code=_EXIT_PROVIDER,
+                error_code=_ERROR_QUALITY_INCOMPLETE,
+            )
+        if any(not item.passed for item in verdicts.values()):
+            raise NativeGenerationError(
+                "the dialogue turns are complete, but a local per-turn quality verification "
+                "recorded a failure; the paid audio and cost were kept.",
+                code=_EXIT_QUALITY,
+                error_code=_ERROR_QUALITY_FAILED,
+            )
+
     def assemble_and_complete(self) -> None:
         """Concatenate the ordered committed parts and close the run."""
-        ordered = self._all_chunks_verified()
         output_path = self.paths.full_mp3
         staged = _new_staging_path(output_path)
         try:
-            self.hooks.concat_audio_files(self.ffmpeg_path, ordered, staged)
+            if self.dialogue:
+                self.hooks.concat_dialogue_turns(
+                    self.ffmpeg_path, self._ordered_dialogue_turns(), staged
+                )
+            else:
+                self.hooks.concat_audio_files(self.ffmpeg_path, self._all_chunks_verified(), staged)
             duration_ms = self.hooks.mp3_duration_ms(self.ffprobe_path, staged)
             sha256 = self.hooks.sha256_file(staged)
             size_bytes = staged.stat().st_size
@@ -1725,6 +2096,11 @@ class _Executor:
         self._reload_view()
         if self.view.run.status == "completed" and self._final_artifact_verified():
             return
+        if self.dialogue:
+            # The required per-turn gate runs before the final concat, so a
+            # recorded or still-pending turn verdict stops here instead of
+            # assembling audio the project cannot claim is verified.
+            self._require_dialogue_quality_before_concat()
         self.assemble_and_complete()
 
     # -- linked local timing --------------------------------------------------
@@ -2147,6 +2523,11 @@ class _Executor:
         options = self.quality_options
         if options is None:
             return
+        if self.dialogue:
+            # A dialogue run verifies each turn before concat and re-reports any
+            # recorded failure through ``ensure_complete``; there is no single
+            # linked ``verify`` child to run here.
+            return
         linked = self._linked_quality()
         if linked is not None:
             # A recorded failure is re-surfaced by every command that may run a
@@ -2265,7 +2646,12 @@ class _Executor:
         # The private verification transcript is never projected into a result, the
         # JSON exports, or the compatibility manifests: only the content-free
         # verdict and whether a linked verification exists at all.
-        quality = self._linked_quality()
+        if self.dialogue:
+            quality_complete, quality_passed = self._dialogue_quality_summary()
+        else:
+            quality = self._linked_quality()
+            quality_complete = quality is not None
+            quality_passed = quality.passed if quality is not None else None
         return NativeGenerationSummary(
             run_uuid=view.run.run_uuid,
             revision=view.run.revision,
@@ -2277,8 +2663,8 @@ class _Executor:
             timing_requested=self.timing_options is not None,
             timing_complete=timing is not None,
             quality_requested=self.quality_options is not None,
-            quality_complete=quality is not None,
-            quality_passed=quality.passed if quality is not None else None,
+            quality_complete=quality_complete,
+            quality_passed=quality_passed,
         )
 
 
@@ -2390,6 +2776,17 @@ def execute_native_tts(
     ``local_quality_allowed`` is likewise ``False`` for ``history sync`` so it never
     runs a local quality model either.
     """
+    if (
+        is_dialogue_format(script_format)
+        and quality_options_from_output_options(output_options) is None
+    ):
+        # The dialogue route always records the local quality settings it verifies
+        # each turn with; a run without them cannot satisfy the required gate.
+        raise NativeGenerationError(
+            "the dialogue native route requires an installed local --tts-quality-provider.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_QUALITY_OPTIONS_INVALID,
+        )
     canonical_root = str(run_root.resolve())
     existing = _find_native_run_in_repository(repository, canonical_root)
     if expected_run_uuid is not None and (

@@ -245,6 +245,14 @@ PART_STAGE_COMPLETED = "completed"
 # the compatibility JSON without touching the filesystem again.
 ARTIFACT_ROLE_CHUNK_AUDIO = "chunk_audio"
 ARTIFACT_ROLE_FINAL_AUDIO = "final_audio"
+# One per-turn dialogue quality receipt the native dialogue route records on its
+# own TTS run, linked to the exact turn part it verified. It carries the
+# content-free verdict, the observed-turn audio digest, and the ASR identity;
+# the private transcript lives in a separate ``verification_transcript`` source
+# that names the same part and this artifact. The role is dialogue-only: an
+# ordinary non-dialogue native run records its one verification through the
+# linked ``verify`` child run instead.
+ARTIFACT_ROLE_TTS_TURN_QUALITY = "tts_turn_quality_receipt"
 # Attempt status once its converted chunk artifact is committed. A completed
 # attempt may never be reserved again, so finished paid work cannot be repeated.
 ATTEMPT_STATUS_COMPLETED = "completed"
