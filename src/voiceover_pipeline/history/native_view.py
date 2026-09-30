@@ -64,6 +64,7 @@ from typing import Any
 
 from ..models import ScriptChunk
 from ..services.prepare import (
+    OmniVoiceModeIdentity,
     OmniVoiceVoiceBankIdentity,
     QwenCloneVoiceIdentity,
     QwenModeVoiceIdentity,
@@ -180,6 +181,7 @@ class NativeTtsView:
     style_prompt: str | None
     output_options: dict[str, Any] | None
     voice_bank_identity: dict[str, Any] | None
+    omnivoice_mode_identity: dict[str, Any] | None
     qwen_clone_identity: dict[str, Any] | None
     qwen_mode_identity: dict[str, Any] | None
     parts: tuple[NativeTtsPart, ...]
@@ -283,6 +285,29 @@ def _config_optional_voice_bank(config: dict[str, Any]) -> dict[str, Any] | None
         OmniVoiceVoiceBankIdentity.from_payload(value)
     except ValueError as exc:
         raise NativeViewIntegrityError("native snapshot voice-bank identity is malformed") from exc
+    return value
+
+
+def _config_optional_omnivoice_mode(config: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the committed non-preset OmniVoice mode identity, or ``None``.
+
+    The writer stores this block only for the admitted ``omnivoice-local``
+    ``auto``/``clone``/``design`` modes. When present it must parse as the same
+    identity the writer hash-covered, or the view fails closed with a fixed
+    message; the block is returned verbatim so the recomputed run identity matches
+    the committed one byte-for-byte.
+    """
+    value = config.get("omnivoice_mode")
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise NativeViewIntegrityError("native snapshot omnivoice mode identity is not a mapping")
+    try:
+        OmniVoiceModeIdentity.from_payload(value)
+    except ValueError as exc:
+        raise NativeViewIntegrityError(
+            "native snapshot omnivoice mode identity is malformed"
+        ) from exc
     return value
 
 
@@ -655,10 +680,20 @@ def _read_committed_view(
     voice_identity = _config_optional_str(config, "voice_identity")
     synthesis_identity = _config_optional_str(config, "synthesis_identity")
     voice_bank = _config_optional_voice_bank(config)
-    if provider == "omnivoice-local" and voice_bank is None:
-        raise NativeViewIntegrityError(
-            "native snapshot local OmniVoice run is missing its voice-bank identity"
-        )
+    omnivoice_mode = _config_optional_omnivoice_mode(config)
+    if provider == "omnivoice-local":
+        # The writer stores exactly one local-OmniVoice identity block per run: the
+        # voice-bank block for the preset bank routes, or the mode block for
+        # auto/clone/design. A run with neither or both cannot have come from that
+        # writer unchanged.
+        if voice_bank is None and omnivoice_mode is None:
+            raise NativeViewIntegrityError(
+                "native snapshot local OmniVoice run is missing its voice-bank or mode identity"
+            )
+        if voice_bank is not None and omnivoice_mode is not None:
+            raise NativeViewIntegrityError(
+                "native snapshot local OmniVoice run carries two identity blocks"
+            )
     qwen_clone = _config_optional_qwen_clone(config)
     qwen_mode = _config_optional_qwen_mode(config)
     fallback_voice = _config_optional_str(config, "fallback_voice")
@@ -691,6 +726,7 @@ def _read_committed_view(
         voice_identity=voice_identity,
         synthesis_identity=synthesis_identity,
         voice_bank=voice_bank,
+        omnivoice_mode=omnivoice_mode,
         qwen_clone=qwen_clone,
         qwen_mode=qwen_mode,
         fallback_voice=fallback_voice,
@@ -737,6 +773,7 @@ def _read_committed_view(
         style_prompt=style_prompt,
         output_options=_config_optional_output(config),
         voice_bank_identity=voice_bank,
+        omnivoice_mode_identity=omnivoice_mode,
         qwen_clone_identity=qwen_clone,
         qwen_mode_identity=qwen_mode,
         parts=tuple(native_parts),

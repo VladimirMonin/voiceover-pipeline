@@ -4330,6 +4330,30 @@ def test_unprofiled_qwen_cli_dry_run_does_not_apply_omnivoice_digit_policy(tmp_p
     assert not (tmp_path / "out" / "qwen-digits").exists()
 
 
+def test_qwen_local_auto_mode_fails_before_any_generation(tmp_path):
+    script = tmp_path / "qwen-auto.md"
+    script.write_text("Первый фрагмент текста.", encoding="utf-8")
+
+    code, data = cli_json(
+        "generate",
+        "--provider",
+        "qwen-local",
+        "--mode",
+        "auto",
+        "--script",
+        str(script),
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        "qwen-auto",
+        "--json",
+    )
+
+    assert code == 2
+    assert "not implemented" in data["error"]
+    assert not (tmp_path / "out" / "qwen-auto").exists()
+
+
 def test_status_reports_partial_run_12_of_105(tmp_path):
     from voiceover_pipeline.run_state import atomic_write_json
 

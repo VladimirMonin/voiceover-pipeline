@@ -64,6 +64,7 @@ from typing import Any
 
 from ..models import ScriptChunk
 from ..services.prepare import (
+    OmniVoiceModeIdentity,
     OmniVoiceVoiceBankIdentity,
     PreparedPart,
     PreparedRun,
@@ -113,6 +114,10 @@ _RUN_IDENTITY_CONFLICT = (
 _VOICE_BANK_CONFLICT = (
     "native resume identity conflict: the omnivoice-local voice-bank catalog or referenced "
     "profile settings changed"
+)
+_OMNIVOICE_MODE_CONFLICT = (
+    "native resume identity conflict: the omnivoice-local auto/clone/design mode, model, "
+    "effective voice, reference audio, reference text, or design instruction changed"
 )
 _QWEN_CLONE_CONFLICT = (
     "native resume identity conflict: the qwen-local clone reference sample, reference text, "
@@ -192,6 +197,11 @@ def _require_prepared(prepared: object) -> PreparedRun:
     if voice_bank is not None and not isinstance(voice_bank, OmniVoiceVoiceBankIdentity):
         raise NativeResumeValidationError(
             "prepared voice-bank identity must be None or an OmniVoiceVoiceBankIdentity"
+        )
+    omnivoice_mode = prepared.omnivoice_mode_identity
+    if omnivoice_mode is not None and not isinstance(omnivoice_mode, OmniVoiceModeIdentity):
+        raise NativeResumeValidationError(
+            "prepared omnivoice mode identity must be None or an OmniVoiceModeIdentity"
         )
     qwen_clone = prepared.qwen_clone_identity
     if qwen_clone is not None and not isinstance(qwen_clone, QwenCloneVoiceIdentity):
@@ -325,6 +335,14 @@ def preflight_native_tts_resume(
     )
     if committed_voice_bank != candidate_voice_bank:
         raise NativeResumeIdentityConflictError(_VOICE_BANK_CONFLICT)
+    committed_omnivoice_mode = config.get("omnivoice_mode")
+    candidate_omnivoice_mode = (
+        None
+        if candidate.omnivoice_mode_identity is None
+        else candidate.omnivoice_mode_identity.to_payload()
+    )
+    if committed_omnivoice_mode != candidate_omnivoice_mode:
+        raise NativeResumeIdentityConflictError(_OMNIVOICE_MODE_CONFLICT)
     committed_qwen_clone = config.get("qwen_clone")
     candidate_qwen_clone = (
         None
@@ -362,6 +380,7 @@ def preflight_native_tts_resume(
         voice_identity=candidate_voice_identity,
         synthesis_identity=candidate_synthesis_identity,
         voice_bank=candidate_voice_bank,
+        omnivoice_mode=candidate_omnivoice_mode,
         qwen_clone=candidate_qwen_clone,
         qwen_mode=candidate_qwen_mode,
         fallback_voice=candidate.fallback_voice,

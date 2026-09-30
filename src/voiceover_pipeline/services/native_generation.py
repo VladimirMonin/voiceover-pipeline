@@ -183,6 +183,8 @@ from ..run_state import LOG_FILE, GenerationLogger
 from ..tts_quality import TTSQualityResult, evaluate_tts_transcript
 from . import costs
 from .prepare import (
+    OMNIVOICE_CLONE_MODE,
+    OmniVoiceModeIdentity,
     OmniVoiceVoiceBankIdentity,
     PreparedPart,
     PreparedRun,
@@ -1674,17 +1676,63 @@ class _Executor:
         committed identity's runtime still matches the environment and the installed
         runtime plus its cached model are available without a download before any
         local model runs. The clone route additionally proves its reference sample
-        still matches the committed digest and size. It runs only when a real local
-        invocation is pending and only when this execution may start new synthesis
-        (``generate`` and ``history resume``; never ``history sync``), so a
-        completed-run export repair and a local raw rebuild neither read a reference
-        nor probe the runtime.
+        still matches the committed digest and size. An admitted non-preset
+        ``omnivoice-local`` clone mode proves its committed reference audio still
+        matches the stored digest and size, so a changed or missing reference is
+        refused before the local model instead of being handed to the runtime. It
+        runs only when a real local invocation is pending and only when this
+        execution may start new synthesis (``generate`` and ``history resume``; never
+        ``history sync``), so a completed-run export repair and a local raw rebuild
+        neither read a reference nor probe the runtime.
         """
-        if self.prepared.provider != "qwen-local":
+        if self.prepared.provider not in ("qwen-local", "omnivoice-local"):
             return
         if not self.paid_submit_allowed or not self._has_pending_local_synthesis():
             return
-        self._preflight_qwen_local_identity()
+        if self.prepared.provider == "qwen-local":
+            self._preflight_qwen_local_identity()
+            return
+        self._preflight_omnivoice_clone_reference()
+
+    def _preflight_omnivoice_clone_reference(self) -> None:
+        """Verify the committed OmniVoice clone reference before the local model.
+
+        Only the non-preset ``clone`` mode carries an external reference file; the
+        ``auto``/``design`` modes and the preset bank routes hold no reference of
+        their own (a bank profile is verified by the catalog/profile admission that
+        builds the provider), so they have nothing to re-check here.
+        """
+        identity = self.prepared.omnivoice_mode_identity
+        if not isinstance(identity, OmniVoiceModeIdentity):
+            return
+        if identity.mode != OMNIVOICE_CLONE_MODE:
+            return
+        if self._reference_bytes_unchanged(
+            identity.reference_audio, identity.reference_sha256, identity.reference_size
+        ):
+            return
+        raise NativeGenerationError(
+            "the local OmniVoice clone reference audio is missing or changed; refusing to "
+            "run the local model.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_LOCAL_REFERENCE_UNAVAILABLE,
+        )
+
+    def _reference_bytes_unchanged(
+        self, path: str | None, sha256: str | None, size: int | None
+    ) -> bool:
+        """Whether a committed reference file still matches its stored digest and size."""
+        if path is None or sha256 is None or size is None:
+            return False
+        target = Path(path)
+        try:
+            return (
+                target.is_file()
+                and target.stat().st_size == size
+                and self.hooks.sha256_file(target) == sha256
+            )
+        except OSError:
+            return False
 
     def _preflight_qwen_local_identity(self) -> None:
         """Verify the committed local Qwen identity and runtime before any model.
@@ -1730,22 +1778,16 @@ class _Executor:
 
     def _preflight_qwen_clone_reference(self, identity: QwenCloneVoiceIdentity) -> None:
         """Verify the committed clone reference still matches before any local model."""
-        sample = Path(identity.sample_path)
-        try:
-            unchanged = (
-                sample.is_file()
-                and sample.stat().st_size == identity.sample_size
-                and self.hooks.sha256_file(sample) == identity.sample_sha256
-            )
-        except OSError:
-            unchanged = False
-        if not unchanged:
-            raise NativeGenerationError(
-                "the local clone reference audio is missing or changed; refusing to run the "
-                "local model.",
-                code=_EXIT_PROVIDER,
-                error_code=_ERROR_LOCAL_REFERENCE_UNAVAILABLE,
-            )
+        if self._reference_bytes_unchanged(
+            identity.sample_path, identity.sample_sha256, identity.sample_size
+        ):
+            return
+        raise NativeGenerationError(
+            "the local clone reference audio is missing or changed; refusing to run the "
+            "local model.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_LOCAL_REFERENCE_UNAVAILABLE,
+        )
 
     def _run_local_parts(self, evidence: list[_PartEvidence]) -> None:
         """Execute or recover every local part, stopping before any inconsistent gap.
@@ -3507,6 +3549,27 @@ def _stored_voice_bank_identity(config: dict[str, Any]) -> OmniVoiceVoiceBankIde
         ) from exc
 
 
+def _stored_omnivoice_mode_identity(config: dict[str, Any]) -> OmniVoiceModeIdentity | None:
+    """Return the committed OmniVoice mode identity, or ``None`` when absent.
+
+    The verified view already guarantees the committed block parses, so this only
+    narrows the type; a run without one (a preset bank route or every non-OmniVoice
+    route) reports ``None`` and its reconstruction stays exactly as before.
+    """
+    value = config.get("omnivoice_mode")
+    if value is None:
+        return None
+    try:
+        return OmniVoiceModeIdentity.from_payload(value)
+    except ValueError as exc:
+        raise NativeGenerationError(
+            "the committed snapshot omnivoice mode identity is malformed; refusing to "
+            "reconstruct the run.",
+            code=_EXIT_PROVIDER,
+            error_code=_ERROR_HISTORY_INCOMPLETE,
+        ) from exc
+
+
 def _stored_qwen_clone_identity(config: dict[str, Any]) -> QwenCloneVoiceIdentity | None:
     """Return the committed clone identity, or ``None`` when the run has none.
 
@@ -3582,6 +3645,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
     ]
     model = _stored_identity_str(config, "model")
     voice_bank_identity = _stored_voice_bank_identity(config)
+    omnivoice_mode_identity = _stored_omnivoice_mode_identity(config)
     qwen_clone_identity = _stored_qwen_clone_identity(config)
     qwen_mode_identity = _stored_qwen_mode_identity(config)
     fallback_voice = _stored_optional_identity_str(config, "fallback_voice")
@@ -3593,6 +3657,7 @@ def reconstruct_native_run(view: NativeTtsView) -> NativeRunReconstruction:
         prompt_mode=_stored_identity_str(config, "prompt_mode"),
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
         voice_bank_identity=voice_bank_identity,
+        omnivoice_mode_identity=omnivoice_mode_identity,
         qwen_clone_identity=qwen_clone_identity,
         qwen_mode_identity=qwen_mode_identity,
         fallback_voice=fallback_voice,

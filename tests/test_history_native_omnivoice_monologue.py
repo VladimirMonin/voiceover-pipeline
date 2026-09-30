@@ -604,8 +604,11 @@ def test_native_local_monologue_outputs_never_publish_the_reference_text(
 # ── route gate and route regressions ─────────────────────────────────────────
 
 
-def test_native_local_monologue_route_gate():
+def test_native_local_monologue_route_gate(tmp_path):
     import argparse
+
+    reference = tmp_path / "reference.wav"
+    reference.write_bytes(b"fixture")
 
     def _args(**overrides):
         base = dict(
@@ -617,16 +620,31 @@ def test_native_local_monologue_route_gate():
             no_trim=False,
             with_timings=False,
             tts_quality_provider=None,
+            reference_audio=None,
+            reference_text=None,
+            design_instruction=None,
         )
         base.update(overrides)
         return argparse.Namespace(**base)
 
     # The admitted bank preset run is native.
     assert cli._native_route_eligible(_args(), "markdown") is True
-    # ``auto``/``clone``/``design`` carry no bank profile and stay legacy.
-    assert cli._native_route_eligible(_args(mode="auto"), "markdown") is False
+    # The non-preset modes are native with their own required inputs; their own
+    # route contract is covered by test_history_native_omnivoice_modes.py.
+    assert cli._native_route_eligible(_args(mode="auto"), "markdown") is True
     assert cli._native_route_eligible(_args(mode="clone"), "markdown") is False
+    assert (
+        cli._native_route_eligible(
+            _args(mode="clone", reference_audio=reference, reference_text="reference"),
+            "markdown",
+        )
+        is True
+    )
     assert cli._native_route_eligible(_args(mode="design"), "markdown") is False
+    assert (
+        cli._native_route_eligible(_args(mode="design", design_instruction="female"), "markdown")
+        is True
+    )
     # A missing catalog or unresolved profile stays legacy.
     assert cli._native_route_eligible(_args(voice_bank_catalog=None), "markdown") is False
     assert cli._native_route_eligible(_args(voice_bank_profile=None), "markdown") is False
@@ -634,8 +652,10 @@ def test_native_local_monologue_route_gate():
     assert cli._native_route_eligible(_args(no_trim=True), "markdown") is False
     assert cli._native_route_eligible(_args(with_timings=True), "markdown") is False
     assert cli._native_route_eligible(_args(tts_quality_provider="qwen-local"), "markdown") is False
-    # A non-markdown script stays legacy, and the paid/openrouter route is unchanged.
-    assert cli._native_route_eligible(_args(), "voiceover") is False
+    # A plain non-Markdown script stays legacy; the preset bank route additionally
+    # admits a voiceover script, and the paid/openrouter route is unchanged.
+    assert cli._native_route_eligible(_args(), "voiceover") is True
+    assert cli._native_route_eligible(_args(mode="auto"), "voiceover") is False
     paid = argparse.Namespace(
         provider="polza-tts",
         model="openai/gpt-4o-mini-tts",

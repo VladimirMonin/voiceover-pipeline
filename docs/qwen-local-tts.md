@@ -81,8 +81,10 @@ voiceover generate --provider qwen-local --mode clone `
 - `history sync ID` не запускает модель: незавершённая часть сообщает
   `NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED`, завершённый прогон только переписывает
   совместимые JSON-экспорты из БД.
-- `--mode auto` (не разрешает модель), `--no-trim`, `--with-timings` и
-  `--tts-quality-provider` пока остаются на legacy-маршруте без SQLite-истории.
+- `--mode auto` не реализован: он отклоняется как usage error (`exit 2`) до
+  провайдера, модели и снимка, без подмены режима на `preset`. `--no-trim`,
+  `--with-timings` и `--tts-quality-provider` пока остаются на legacy-маршруте без
+  SQLite-истории.
 
 ## Как работает
 
@@ -106,6 +108,6 @@ voiceover generate --provider qwen-local --mode clone `
 Локальный Qwen не имеет внешнего API-начисления. На нативных локальных маршрутах
 (`clone`/`preset`/`design`) стоимость остаётся `null` (неизвестной), а не
 выдуманным нулём, и каждая реальная локальная попытка учитывается в
-`history costs` как `local_attempts_without_api_charge`. Legacy-маршруты (`auto`,
-а также смеси с `--no-trim`/`--with-timings`/`--tts-quality-provider`) помечают
+`history costs` как `local_attempts_without_api_charge`. Legacy-маршруты (смеси с
+`--no-trim`/`--with-timings`/`--tts-quality-provider`) помечают
 стоимость как `qwen-local (free)`.

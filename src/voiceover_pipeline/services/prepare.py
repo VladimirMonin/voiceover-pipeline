@@ -116,6 +116,198 @@ class OmniVoiceBankProfileIdentity:
         return cls(**fields)  # type: ignore[arg-type]
 
 
+OMNIVOICE_AUTO_MODE = "auto"
+OMNIVOICE_CLONE_MODE = "clone"
+OMNIVOICE_DESIGN_MODE = "design"
+# The three non-dialogue ``omnivoice-local`` modes whose identity is the mode plus
+# its own reference or instruction inputs. ``preset`` is not here: its identity is
+# the admitted voice-bank block below.
+OMNIVOICE_MODE_IDENTITY_MODES = frozenset(
+    {OMNIVOICE_AUTO_MODE, OMNIVOICE_CLONE_MODE, OMNIVOICE_DESIGN_MODE}
+)
+
+
+@dataclass(frozen=True)
+class OmniVoiceModeIdentity:
+    """The immutable inputs one non-preset local OmniVoice run commits to.
+
+    The standard run identity already covers the run's ``provider``, ``voice`` (the
+    mode marker), and ``model``; this block adds the remaining nonsecret inputs that
+    also change the synthesized bytes. ``clone`` carries the canonical absolute
+    reference locator with its byte digest and size (never the reference bytes
+    themselves) and the exact reference text; ``design`` carries the exact design
+    instruction the runtime speaks with; ``auto`` carries no extra input, because the
+    runtime selects the voice itself. Storing them lets a later resume prove it would
+    submit the exact same request instead of re-deriving it from a file that may have
+    changed.
+    """
+
+    mode: str
+    model: str
+    voice: str
+    reference_audio: str | None
+    reference_sha256: str | None
+    reference_size: int | None
+    reference_text: str | None
+    design_instruction: str | None
+
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "model": self.model,
+            "voice": self.voice,
+            "reference_audio": self.reference_audio,
+            "reference_sha256": self.reference_sha256,
+            "reference_size": self.reference_size,
+            "reference_text": self.reference_text,
+            "design_instruction": self.design_instruction,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "OmniVoiceModeIdentity":
+        if not isinstance(payload, Mapping):
+            raise ValueError("omnivoice mode identity must be a mapping")
+        mode = payload.get("mode")
+        if not isinstance(mode, str) or mode not in OMNIVOICE_MODE_IDENTITY_MODES:
+            raise ValueError("omnivoice mode identity mode must be auto, clone, or design")
+        fields: dict[str, str] = {}
+        for key in ("model", "voice"):
+            value = payload.get(key)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"omnivoice mode identity {key} must be a non-empty string")
+            fields[key] = value
+        reference_audio = payload.get("reference_audio")
+        reference_sha256 = payload.get("reference_sha256")
+        reference_size = payload.get("reference_size")
+        reference_text = payload.get("reference_text")
+        design_instruction = payload.get("design_instruction")
+        if mode == OMNIVOICE_CLONE_MODE:
+            if not isinstance(reference_audio, str) or not reference_audio:
+                raise ValueError(
+                    "omnivoice clone identity reference_audio must be a non-empty string"
+                )
+            if not isinstance(reference_sha256, str) or not reference_sha256:
+                raise ValueError(
+                    "omnivoice clone identity reference_sha256 must be a non-empty string"
+                )
+            if isinstance(reference_size, bool) or not isinstance(reference_size, int):
+                raise ValueError("omnivoice clone identity reference_size must be an integer")
+            if reference_size < 0:
+                raise ValueError("omnivoice clone identity reference_size must not be negative")
+            if not isinstance(reference_text, str) or not reference_text:
+                raise ValueError(
+                    "omnivoice clone identity reference_text must be a non-empty string"
+                )
+            if design_instruction is not None:
+                raise ValueError("omnivoice clone identity must not carry a design instruction")
+        elif mode == OMNIVOICE_DESIGN_MODE:
+            if not isinstance(design_instruction, str) or not design_instruction:
+                raise ValueError(
+                    "omnivoice design identity design_instruction must be a non-empty string"
+                )
+            if any(
+                value is not None
+                for value in (reference_audio, reference_sha256, reference_size, reference_text)
+            ):
+                raise ValueError("omnivoice design identity must not carry clone reference fields")
+        elif any(
+            value is not None
+            for value in (
+                reference_audio,
+                reference_sha256,
+                reference_size,
+                reference_text,
+                design_instruction,
+            )
+        ):
+            raise ValueError("omnivoice auto identity must not carry clone or design fields")
+        return cls(
+            mode=mode,
+            model=fields["model"],
+            voice=fields["voice"],
+            reference_audio=reference_audio if isinstance(reference_audio, str) else None,
+            reference_sha256=reference_sha256 if isinstance(reference_sha256, str) else None,
+            reference_size=reference_size if isinstance(reference_size, int) else None,
+            reference_text=reference_text if isinstance(reference_text, str) else None,
+            design_instruction=(
+                design_instruction if isinstance(design_instruction, str) else None
+            ),
+        )
+
+
+def build_omnivoice_mode_identity(
+    *,
+    mode: str,
+    model: str,
+    reference_audio: str | Path | None,
+    reference_text: str | None,
+    design_instruction: str | None,
+) -> OmniVoiceModeIdentity:
+    """Capture one non-preset ``omnivoice-local`` run's immutable mode inputs.
+
+    A clone run's reference file is read once, here, so its bytes are hashed without
+    ever being copied into the snapshot; a missing or unreadable reference raises
+    :class:`PreparationError` before any provider or model exists. An empty
+    instruction or reference text is refused the same way, mirroring the CLI's own
+    mode validation and the runtime's requirement. The committed ``voice`` is the
+    mode itself: these modes reject ``--voice`` and take their voice from the
+    runtime, so the mode marker is what the run's own voice identity can name.
+    """
+    if mode not in OMNIVOICE_MODE_IDENTITY_MODES:
+        raise PreparationError(
+            "omnivoice-local mode identity supports only auto, clone, or design."
+        )
+    if mode == OMNIVOICE_CLONE_MODE:
+        if reference_audio is None or reference_text is None or not reference_text.strip():
+            raise PreparationError(
+                "omnivoice-local clone mode requires a readable --reference-audio file and a "
+                "non-empty --reference-text."
+            )
+        path = Path(reference_audio).expanduser()
+        try:
+            resolved = path.resolve()
+            data = resolved.read_bytes()
+        except OSError as exc:
+            raise PreparationError(
+                "omnivoice-local clone mode requires a readable --reference-audio file."
+            ) from exc
+        return OmniVoiceModeIdentity(
+            mode=mode,
+            model=model,
+            voice=mode,
+            reference_audio=str(resolved),
+            reference_sha256=hashlib.sha256(data).hexdigest(),
+            reference_size=len(data),
+            reference_text=reference_text,
+            design_instruction=None,
+        )
+    if mode == OMNIVOICE_DESIGN_MODE:
+        if design_instruction is None or not design_instruction.strip():
+            raise PreparationError(
+                "omnivoice-local design mode requires a non-empty --design-instruction."
+            )
+        return OmniVoiceModeIdentity(
+            mode=mode,
+            model=model,
+            voice=mode,
+            reference_audio=None,
+            reference_sha256=None,
+            reference_size=None,
+            reference_text=None,
+            design_instruction=design_instruction,
+        )
+    return OmniVoiceModeIdentity(
+        mode=mode,
+        model=model,
+        voice=mode,
+        reference_audio=None,
+        reference_sha256=None,
+        reference_size=None,
+        reference_text=None,
+        design_instruction=None,
+    )
+
+
 @dataclass(frozen=True)
 class OmniVoiceVoiceBankIdentity:
     """The admitted preset voice bank one OmniVoice bank run commits to.
@@ -219,7 +411,7 @@ QWEN_PRESET_MODE = "preset"
 QWEN_DESIGN_MODE = "design"
 # The two instructed ``qwen-local`` modes whose identity is the run's model, its
 # preset speaker (or the ``design`` marker), and the per-run instruction plus the
-# selected runtime/language. ``auto`` is a CLI choice that resolves no model, so it
+# selected runtime/language. ``auto`` is rejected by the CLI as a usage error, so it
 # never reaches a provider and is not part of this family.
 QWEN_INSTRUCT_MODES = frozenset({QWEN_PRESET_MODE, QWEN_DESIGN_MODE})
 
@@ -329,13 +521,17 @@ class PreparedRun:
     ``voice`` is the run-level voice the CLI already resolved; a part without
     its own cast voice falls back to it. ``voice_bank_identity`` is present only
     for the admitted ``omnivoice-local`` preset bank routes (the two-cast dialogue
-    and the single-profile monologue), and
-    ``qwen_clone_identity``/``qwen_mode_identity`` only for the admitted
+    and the single-profile monologue), ``omnivoice_mode_identity`` only for the
+    admitted non-preset ``omnivoice-local`` modes (``auto``/``clone``/``design``),
+    and ``qwen_clone_identity``/``qwen_mode_identity`` only for the admitted
     ``qwen-local`` local routes (clone, or the instructed preset/design modes).
     ``fallback_voice`` is present only for the ordinary ``polza-chat-audio``
     route: it is that provider's compatibility ``--fallback-voice`` value, which
     selects no fallback but is part of the run's synthesis identity, so a resume
-    with a changed value is refused.
+    with a changed value is refused. A non-preset OmniVoice mode records its mode
+    as its run ``voice``, because the mode rejects any CLI voice control and the
+    snapshot still needs a non-empty run voice; the CLI attribute is left untouched
+    so that validation keeps refusing a user-supplied ``--voice`` there.
     """
 
     provider: str
@@ -345,6 +541,7 @@ class PreparedRun:
     prompt_mode: str
     parts: tuple[PreparedPart, ...]
     voice_bank_identity: OmniVoiceVoiceBankIdentity | None = None
+    omnivoice_mode_identity: OmniVoiceModeIdentity | None = None
     qwen_clone_identity: QwenCloneVoiceIdentity | None = None
     qwen_mode_identity: QwenModeVoiceIdentity | None = None
     fallback_voice: str | None = None
@@ -509,6 +706,7 @@ def prepare_run(
     *,
     qwen_clone_identity: QwenCloneVoiceIdentity | None = None,
     qwen_mode_identity: QwenModeVoiceIdentity | None = None,
+    omnivoice_mode_identity: OmniVoiceModeIdentity | None = None,
 ) -> PreparedRun:
     """Wrap the already-resolved run identity and chunks without changing them.
 
@@ -518,7 +716,9 @@ def prepare_run(
     other caller leaves both ``None``. The admitted ``omnivoice-local`` preset
     bank routes -- the two-cast dialogue and the single-profile monologue -- build
     their ``voice_bank_identity`` here from the admitted catalog and the profiles
-    the run actually references; every other OmniVoice mode leaves it ``None``.
+    the run actually references; the admitted non-preset ``omnivoice-local`` modes
+    supply the already-built ``omnivoice_mode_identity`` instead, and every other
+    route leaves it ``None``.
     The ordinary ``polza-chat-audio`` route records its resolved ``--fallback-voice``
     as ``fallback_voice`` so the native snapshot can keep that non-secret synthesis
     identity; every other route leaves it ``None``.
@@ -551,14 +751,22 @@ def prepare_run(
                 Path(bank_arg).expanduser().resolve(),
                 [bank_profile.id],
             )
+    voice = args.voice
+    if voice is None and omnivoice_mode_identity is not None:
+        # A non-preset ``omnivoice-local`` mode rejects ``--voice`` and receives its
+        # voice from the runtime, so its effective run voice is the mode marker the
+        # identity block carries. Binding it here leaves ``args.voice`` untouched, so
+        # the CLI's own voice-control validation still refuses a user-supplied value.
+        voice = omnivoice_mode_identity.voice
     return PreparedRun(
         provider=args.provider,
         model=args.model,
-        voice=args.voice,
+        voice=voice,
         style_prompt=style_prompt,
         prompt_mode=prompt_mode,
         parts=tuple(PreparedPart(chunk=chunk, voice=chunk.voice) for chunk in chunks),
         voice_bank_identity=voice_bank_identity,
+        omnivoice_mode_identity=omnivoice_mode_identity,
         qwen_clone_identity=qwen_clone_identity,
         qwen_mode_identity=qwen_mode_identity,
         fallback_voice=(

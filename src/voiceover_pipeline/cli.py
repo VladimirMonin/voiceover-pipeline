@@ -172,9 +172,14 @@ from .services import (
     transcription,
 )
 from .services.prepare import (
+    OMNIVOICE_AUTO_MODE,
+    OMNIVOICE_CLONE_MODE,
+    OMNIVOICE_DESIGN_MODE,
+    OMNIVOICE_MODE_IDENTITY_MODES,
     PreparationError,
     PreparedRun,
     bind_omnivoice_dialogue_fingerprints,
+    build_omnivoice_mode_identity,
     build_qwen_clone_identity,
     build_qwen_mode_identity,
     default_voice,
@@ -1372,7 +1377,11 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     ``/media`` model route or its synchronous ``/audio/speech`` model route, an
     ordinary non-dialogue ``polza-chat-audio`` chat-audio run, and an
     ordinary ``openrouter-tts`` run, are executed by the native executor when they
-    use no unsupported option mixture. Two bounded integrated steps are admitted
+    use no unsupported option mixture. Such a run is admitted for a plain Markdown
+    script and for a ``format: voiceover`` script: the voiceover validator has
+    already resolved the one provider, model, and voice the whole script speaks
+    with, and the snapshot hashes the prepared chunk text, so no per-chunk provider
+    or voice is invented. Two bounded integrated steps are admitted
     for that same route: an installed *local* ``--tts-quality-provider``
     (``qwen-local``/``nemotron-local``), and the recorded trimming semantics of
     ``--no-trim``. ``--with-timings --timing-provider faster-whisper`` stays
@@ -1387,22 +1396,46 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     turn's required local quality gate before the final concat. A second dialogue
     route, the existing ``omnivoice-local`` preset two-profile bank script, is
     likewise admitted with the default trimming semantics and records no quality
-    gate. The ordinary non-dialogue ``qwen-local`` clone mode is admitted as a
-    local route with the default trimming semantics and no timing or quality step,
-    and so is the existing non-dialogue ``omnivoice-local`` ``--mode preset`` bank
-    run (one merged session part that clones the selected bank profile).
-    Every other dialogue route -- every ``polza-tts`` dialogue -- and every
-    dialogue option mixture (``--no-trim``, ``--with-timings``) stays on the
-    legacy executor.
+    gate. Every ordinary non-dialogue ``qwen-local`` mode (clone, and the
+    instructed preset/design) and every non-dialogue ``omnivoice-local`` mode
+    (preset bank, and ``auto``/``clone``/``design``) is admitted as a local route
+    with the default trimming semantics and no timing or quality step. Both local
+    families also admit a ``format: voiceover`` script for the combinations that
+    already function on the legacy executor: every ``qwen-local`` mode, and the
+    ``omnivoice-local`` preset bank route. The voiceover validator resolves one
+    voice for the whole script and each mode then applies its own effective voice
+    (see the helpers below), so no new voice semantics is invented. An
+    ``omnivoice-local`` non-preset mode keeps the legacy executor for a
+    ``format: voiceover`` script because that script always supplies a voice the
+    mode rejects. Every other dialogue route -- every ``polza-tts``
+    dialogue -- and every dialogue option mixture (``--no-trim``,
+    ``--with-timings``) stays on the legacy executor.
     """
     if is_dialogue_format(script_format):
         return _native_dialogue_route_eligible(args)
-    if script_format != "markdown":
-        return False
     if getattr(args, "provider", None) == "qwen-local":
+        # The local Qwen routes admit a plain Markdown script and a
+        # ``format: voiceover`` script: the voiceover validator resolves one voice
+        # for the whole script and the CLI's ``_resolve_qwen_mode_identity`` then
+        # selects the mode's own effective voice -- ``preset`` keeps that validated
+        # voice, while ``clone``/``design`` replace it with their mode marker exactly
+        # as the legacy executor does. ``auto`` is a usage error before this gate.
+        if script_format not in ("markdown", VOICEOVER_FORMAT):
+            return False
         return _native_qwen_local_route_eligible(args)
     if getattr(args, "provider", None) == "omnivoice-local":
+        if script_format == VOICEOVER_FORMAT:
+            # Only the preset bank route accepts a voiceover script: that script
+            # always supplies a voice, which a non-preset mode rejects as a usage
+            # error, and the validator permits only the default bank marker voice,
+            # which the admitted catalog must resolve into the committed identity.
+            if (getattr(args, "mode", None) or "preset") != "preset":
+                return False
+        elif script_format != "markdown":
+            return False
         return _native_omnivoice_monologue_route_eligible(args)
+    if script_format not in ("markdown", VOICEOVER_FORMAT):
+        return False
     quality_provider = getattr(args, "tts_quality_provider", None)
     if quality_provider is not None and quality_provider not in (
         native_generation.NATIVE_LOCAL_QUALITY_PROVIDERS
@@ -1427,18 +1460,37 @@ def _native_route_eligible(args: argparse.Namespace, script_format: str) -> bool
     return True
 
 
-def _native_omnivoice_monologue_route_eligible(args: argparse.Namespace) -> bool:
-    """Whether this command is the admitted non-dialogue OmniVoice bank route.
+def _bind_native_omnivoice_monologue_voice(args: argparse.Namespace) -> None:
+    """Bind the effective voice of the admitted preset OmniVoice bank monologue.
 
-    The existing ordinary ``--mode preset`` run with an admitted ``--voice-bank``
-    catalog and a resolved profile is admitted with the default trimming semantics
-    and no integrated timing or quality step. Such a run merges into one OmniVoice
-    session part that clones the selected bank profile, and its identity (the
-    catalog locator, mode, the selected profile's reference locator/digest/text and
-    language, model, and effective voice) is captured on the prepared run. The
-    ``auto``, ``clone``, and ``design`` modes carry no bank profile, so they keep
-    the legacy executor, as do ``--no-trim``, ``--with-timings``, and any quality
-    provider.
+    That route's effective voice is its selected bank profile id. The native
+    snapshot needs a non-empty run voice and the run identity records it; the legacy
+    executor keeps its unchanged ``None`` voice. A non-preset mode has no CLI voice
+    at all (it rejects one) and records its mode marker on the prepared run instead.
+    """
+    if getattr(args, "voice_bank_profile", None) is not None and args.voice is None:
+        args.voice = args.voice_bank_profile.id
+
+
+def _native_omnivoice_monologue_route_eligible(args: argparse.Namespace) -> bool:
+    """Whether this command is an admitted non-dialogue OmniVoice route.
+
+    Two families are admitted, each with the default trimming semantics and no
+    integrated timing or quality step:
+
+    * the existing ``--mode preset`` run with an admitted ``--voice-bank`` catalog
+      and a resolved profile, which merges into one OmniVoice session part that
+      clones the selected bank profile; and
+    * the existing ``auto``, ``clone``, and ``design`` modes, whose identity is the
+      mode plus, for clone, a readable ``--reference-audio`` with a non-empty
+      ``--reference-text``, and, for design, a non-empty ``--design-instruction``.
+
+    ``--no-trim``, ``--with-timings``, a quality provider, an unexpected model, and
+    an unknown mode keep the legacy executor, because the native route records the
+    mode, its reference/instruction inputs, the model, and the effective voice as
+    part of its identity. The route gate admits the preset bank route for a
+    ``format: voiceover`` script too; a non-preset mode is never admitted there,
+    because such a script always supplies the ``--voice`` those modes reject.
     """
     if getattr(args, "no_trim", False):
         return False
@@ -1448,11 +1500,22 @@ def _native_omnivoice_monologue_route_eligible(args: argparse.Namespace) -> bool
         return False
     if getattr(args, "model", None) != OMNIVOICE_LOCAL_MODEL_ID:
         return False
-    if (getattr(args, "mode", None) or "preset") != "preset":
-        return False
-    if getattr(args, "voice_bank_catalog", None) is None:
-        return False
-    return getattr(args, "voice_bank_profile", None) is not None
+    mode = getattr(args, "mode", None) or "preset"
+    if mode == "preset":
+        if getattr(args, "voice_bank_catalog", None) is None:
+            return False
+        return getattr(args, "voice_bank_profile", None) is not None
+    if mode == OMNIVOICE_AUTO_MODE:
+        return True
+    if mode == OMNIVOICE_CLONE_MODE:
+        if getattr(args, "reference_audio", None) is None:
+            return False
+        reference_text = getattr(args, "reference_text", None)
+        return isinstance(reference_text, str) and bool(reference_text.strip())
+    if mode == OMNIVOICE_DESIGN_MODE:
+        design_instruction = getattr(args, "design_instruction", None)
+        return isinstance(design_instruction, str) and bool(design_instruction.strip())
+    return False
 
 
 def _qwen_tts_runtime() -> str:
@@ -1473,11 +1536,15 @@ def _native_qwen_local_route_eligible(args: argparse.Namespace) -> bool:
     The instructed ``preset``/``design`` modes additionally require a non-empty
     instruction (the ``--qwen-instruct`` value, or the ``QWEN_INSTRUCT`` default),
     because the runtime needs one and the snapshot stores it as the run's style
-    identity. ``auto`` (which resolves no model), an unexpected model, a missing
-    sample, ``--no-trim``, ``--with-timings``, a quality provider, and an
-    unrecognized ``VOICEOVER_QWEN_TTS_RUNTIME`` all keep the legacy executor,
-    because the native route records the mode, model, voice, instruction, and
-    runtime as part of its identity.
+    identity. The route gate admits these for a plain Markdown script and for a
+    ``format: voiceover`` script; the CLI's ``_resolve_qwen_mode_identity`` has
+    already selected the exact effective voice each mode speaks with. ``auto``
+    (rejected as a usage error before this gate, because the runtime implements no
+    automatic mode selection), an unexpected model, a missing sample, ``--no-trim``,
+    ``--with-timings``, a quality provider, and an unrecognized
+    ``VOICEOVER_QWEN_TTS_RUNTIME`` all keep the legacy executor, because the native
+    route records the mode, model, voice, instruction, and runtime as part of its
+    identity.
     """
     if getattr(args, "no_trim", False):
         return False
@@ -1623,15 +1690,16 @@ def _run_native_route(
     native run so accepted paid evidence is never deleted; ``--skip-existing``
     keeps its usual precedence. ``gemini_report`` carries the validated dialogue
     cast so a dialogue run resolves its first-cast voice identity exactly as the
-    legacy executor does; the non-dialogue OmniVoice bank route instead resolves
-    its effective voice from the selected bank profile before the snapshot.
+    legacy executor does; a non-dialogue OmniVoice route instead resolves its
+    effective voice before the snapshot from the selected bank profile (preset) or
+    the mode marker (``auto``/``clone``/``design``).
     """
     if ownership.route == "native_existing" and not _native_route_eligible(args, script_format):
         fail(
             "This run directory is owned by native history. Only an admitted native "
             "polza-tts, polza-chat-audio, openrouter-tts, local Qwen clone/preset/design, "
-            "or local OmniVoice dialogue/bank-mono run may continue it; choose a different "
-            "--run-id for other options.",
+            "or local OmniVoice auto/clone/design/bank-mono/dialogue run may continue it; "
+            "choose a different --run-id for other options.",
             _EXIT_PROVIDER,
             details={"error_code": "NATIVE_OPTIONS_UNSUPPORTED"},
         )
@@ -1660,16 +1728,8 @@ def _run_native_route(
                 "or a different --run-id.",
                 _EXIT_PROVIDER,
             )
-    if (
-        args.provider == "omnivoice-local"
-        and not is_dialogue_format(script_format)
-        and getattr(args, "voice_bank_profile", None) is not None
-        and args.voice is None
-    ):
-        # The monologue bank route's effective voice is its selected profile id.
-        # The native snapshot needs a non-empty run voice, and the run identity
-        # records it; the legacy executor keeps its unchanged ``None`` voice.
-        args.voice = args.voice_bank_profile.id
+    if args.provider == "omnivoice-local" and not is_dialogue_format(script_format):
+        _bind_native_omnivoice_monologue_voice(args)
     try:
         generation_identity = prepare_generation_identity(
             args,
@@ -1682,6 +1742,7 @@ def _run_native_route(
     chunks = generation_identity.chunks
     qwen_clone_identity = None
     qwen_mode_identity = None
+    omnivoice_mode_identity = None
     if args.provider == "qwen-local":
         # A clone reference is read and hashed here, before the snapshot, so a
         # missing sample fails as a usage error and the committed identity always
@@ -1709,6 +1770,23 @@ def _run_native_route(
                 )
         except PreparationError as exc:
             fail(str(exc), _EXIT_ARGS)
+    elif args.provider == "omnivoice-local" and not is_dialogue_format(script_format):
+        # A non-preset mode's identity is its mode plus, for clone, the reference
+        # file read and hashed here (so a missing file is a usage error and the
+        # committed identity always carries a digest this run actually read) and,
+        # for design, the exact instruction the runtime speaks with.
+        mode = getattr(args, "mode", "preset")
+        if mode in OMNIVOICE_MODE_IDENTITY_MODES:
+            try:
+                omnivoice_mode_identity = build_omnivoice_mode_identity(
+                    mode=mode,
+                    model=args.model,
+                    reference_audio=getattr(args, "reference_audio", None),
+                    reference_text=getattr(args, "reference_text", None),
+                    design_instruction=getattr(args, "design_instruction", None),
+                )
+            except PreparationError as exc:
+                fail(str(exc), _EXIT_ARGS)
     prepared = prepare_run(
         args,
         chunks,
@@ -1716,6 +1794,7 @@ def _run_native_route(
         generation_identity.prompt_mode,
         qwen_clone_identity=qwen_clone_identity,
         qwen_mode_identity=qwen_mode_identity,
+        omnivoice_mode_identity=omnivoice_mode_identity,
     )
     provider_cache: list[Any] = []
 
@@ -3457,17 +3536,37 @@ def _omnivoice_dialogue_cast_map(prepared: PreparedRun) -> dict[str, str]:
     return cast
 
 
-def _build_native_omnivoice_bank_provider(prepared: PreparedRun, api_key: str) -> Any:
-    """Rebuild the OmniVoice bank provider(s) for a reconstructed local bank run.
+def _build_native_omnivoice_provider(prepared: PreparedRun, api_key: str) -> Any:
+    """Rebuild the OmniVoice provider(s) for a reconstructed local OmniVoice run.
 
-    The committed voice-bank locator is re-loaded and every referenced profile's
-    current ``reference_sha256`` is required to match the digest this run stored
-    before any local model is constructed, so a changed or missing reference fails
-    closed instead of silently synthesizing a different voice. A dialogue run
-    (every part carries a cast profile) is cloned per cast profile by the same
-    ``bind_dialogue_voice_bank_providers`` seam the fresh route uses; a monologue
-    run's one referenced profile is bound as the run's clone reference.
+    The committed identity selects the admitted route and supplies its exact
+    settings. A non-preset ``auto``/``clone``/``design`` run is rebuilt from its
+    committed mode, reference path/text, or design instruction, and its mode-marker
+    voice; the executor has already proved a clone reference still matches its stored
+    digest before any local model. A preset bank run re-loads the committed catalog
+    locator and every referenced profile's current ``reference_sha256`` must match
+    the digest this run stored before any local model is constructed, so a changed or
+    missing reference fails closed instead of silently synthesizing a different
+    voice; a dialogue run (every part carries a cast profile) is cloned per cast
+    profile by the same ``bind_dialogue_voice_bank_providers`` seam the fresh route
+    uses, and a monologue run's one referenced profile is bound as the run's clone
+    reference.
     """
+    mode_identity = prepared.omnivoice_mode_identity
+    if mode_identity is not None:
+        # No ``voice`` here: these modes reject any voice control, and the provider
+        # takes its voice from the committed mode, so the rebuilt arguments carry
+        # only the inputs the mode actually speaks with.
+        mode_args = argparse.Namespace(
+            provider="omnivoice-local",
+            model=prepared.model,
+            mode=mode_identity.mode,
+            format="markdown",
+            reference_audio=mode_identity.reference_audio,
+            reference_text=mode_identity.reference_text,
+            design_instruction=mode_identity.design_instruction,
+        )
+        return build_provider(mode_args, api_key, prepared.style_prompt, prepared.prompt_mode)
     identity = prepared.voice_bank_identity
     if identity is None:
         fail(
@@ -3589,7 +3688,7 @@ def _native_history_provider_builder(prepared: PreparedRun) -> Any:
     )
     api_key = read_api_key(identity_args)
     if prepared.provider == "omnivoice-local":
-        return _build_native_omnivoice_bank_provider(prepared, api_key)
+        return _build_native_omnivoice_provider(prepared, api_key)
     return build_provider(identity_args, api_key, prepared.style_prompt, prepared.prompt_mode)
 
 
@@ -4103,6 +4202,13 @@ def _resolve_model(args: argparse.Namespace) -> None:
 
 
 def _resolve_qwen_mode_identity(args: argparse.Namespace) -> None:
+    """Resolve the admitted ``qwen-local`` mode's model and effective voice.
+
+    ``auto`` is rejected here as a usage error before any provider, model, or
+    snapshot exists: the CLI offers the choice but the runtime implements no
+    automatic mode selection, so silently substituting ``preset`` would speak with
+    a mode this run was never asked for.
+    """
     if args.provider != "qwen-local":
         return
     mode = getattr(args, "mode", "preset")
@@ -4114,6 +4220,12 @@ def _resolve_qwen_mode_identity(args: argparse.Namespace) -> None:
     elif mode == "design":
         args.model = QWEN_MODEL_VOICE_DESIGN
         args.voice = "design"
+    else:
+        fail(
+            "qwen-local --mode auto is not implemented: choose --mode preset, clone, or "
+            "design. No mode was substituted and no provider was selected.",
+            _EXIT_ARGS,
+        )
 
 
 def _validate_model_for_provider(provider: str, model: str) -> None:

@@ -489,6 +489,41 @@ def test_omnivoice_auto_mode_rejects_voice_controls():
     assert error.value.code == 2
 
 
+def test_qwen_local_auto_mode_is_rejected_as_a_usage_error():
+    from voiceover_pipeline.cli import CliError, _resolve_qwen_mode_identity, build_parser
+
+    args = build_parser().parse_args(["generate", "--provider", "qwen-local", "--mode", "auto"])
+
+    with pytest.raises(CliError, match="not implemented") as error:
+        _resolve_qwen_mode_identity(args)
+    assert error.value.code == 2
+
+
+def test_qwen_local_admitted_modes_still_resolve_model_and_voice():
+    from voiceover_pipeline.cli import _resolve_qwen_mode_identity, build_parser
+    from voiceover_pipeline.config import (
+        QWEN_MODEL_BASE,
+        QWEN_MODEL_CUSTOMVOICE,
+        QWEN_MODEL_VOICE_DESIGN,
+    )
+
+    resolved = {}
+    for mode, model, voice in (
+        ("preset", QWEN_MODEL_CUSTOMVOICE, None),
+        ("clone", QWEN_MODEL_BASE, "clone"),
+        ("design", QWEN_MODEL_VOICE_DESIGN, "design"),
+    ):
+        args = build_parser().parse_args(["generate", "--provider", "qwen-local", "--mode", mode])
+        _resolve_qwen_mode_identity(args)
+        resolved[mode] = (args.model, args.voice)
+
+    assert resolved == {
+        "preset": (QWEN_MODEL_CUSTOMVOICE, None),
+        "clone": (QWEN_MODEL_BASE, "clone"),
+        "design": (QWEN_MODEL_VOICE_DESIGN, "design"),
+    }
+
+
 class TestStylePromptFlags:
     def test_no_style_prompt_flag(self):
         import argparse

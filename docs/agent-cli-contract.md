@@ -406,7 +406,11 @@ provider/model/voice/script, с которыми позднее будет за�
 не-диалоговые запуски `polza-tts` — как async `--model elevenlabs/...`
 (`/media`), так и синхронный `/audio/speech` (любая другая модель) — обычный
 не-диалоговый `polza-chat-audio` и
-`openrouter-tts`. Этого же маршрута касаются: записанная семантика обрезки
+`openrouter-tts`. Такой запуск допускается и для plain Markdown, и для
+`format: voiceover`: voiceover-валидатор уже разрешил один provider/model/voice
+на весь сценарий, а снимок хеширует подготовленный текст частей, поэтому на
+часть не выдумывается ни провайдер, ни голос. Этого же маршрута касаются:
+записанная семантика обрезки
 (`--no-trim` либо обрезка по умолчанию), локальные
 `--with-timings --timing-provider faster-whisper`, которые дают аудио и
 локальные субтитры одной командой, и — отдельно — установленный локальный
@@ -541,11 +545,20 @@ provider/model/voice/script, с которыми позднее будет за�
   (`quality.complete: true, passed: false`) либо `quality.complete: false`, пока
   проверка не выполнена.
 
-Этот фрагмент не завершает S05: ASR/`verify-tts`, облачные
-`--timing-provider` и остальные провайдеры остаются на legacy executor.
-Локальный faster-whisper timing и локальная проверка качества интегрированы в
-нативный прогон (см. выше). Единственный нативный диалоговый маршрут описан в
-подразделе ниже.
+Этот фрагмент не завершает S05: ASR/`verify-tts` и облачные
+`--timing-provider` остаются на legacy executor. Локальные семейства
+`qwen-local`/`omnivoice-local` дополнительно допускают `format: voiceover`
+для фактически работающих сочетаний: любой режим `qwen-local` (preset сохраняет
+разрешённый voiceover-валидатором голос, clone/design подменяют его своим
+маркером режима, как и в legacy) и preset-ветку OmniVoice-банка. Голоса
+voiceover-сценария по-прежнему валидируются до маршрута: `format: voiceover` с
+`openrouter-tts` и style prompt, с недопустимым для provider/model голосом, с
+OmniVoice-режимом, который отклоняет `--voice`, и с OmniVoice-банком, у которого
+нет профиля с разрешённым маркерным id, остаётся usage error (exit `2`)
+до любого провайдера. Локальный faster-whisper timing и локальная проверка
+качества интегрированы в
+нативный прогон (см. выше). Оба нативных диалоговых маршрута описаны в
+подразделах ниже.
 Пользовательские глаголы
 `history resume ID` / `history sync ID`, которые восстанавливают такой прогон из
 снимка, описаны в разделе ниже.
@@ -609,20 +622,41 @@ OmniVoice и любой `polza-tts` dialogue остаются на legacy execut
   переписывает совместимые JSON-экспорты из БД. Реальный локальный запуск модели
   в тестах — `NOT_RUN`.
 
-### Нативный локальный OmniVoice monologue (фрагмент S05)
+### Нативный локальный OmniVoice (фрагмент S05)
 
-Обычный не-диалоговый маршрут `--provider omnivoice-local --model
-audio-cpp/omnivoice-q8_0 --mode preset --voice-bank <catalog.json>` (plain Markdown
-без frontmatter) с обрезкой по умолчанию также переведён на каноническую
-историю. Весь script сливается в одну OmniVoice session (один локальный вызов),
-которая клонирует выбранный profile каталога. `--mode auto`/`clone`/`design` (нет
-bank profile), `--no-trim`, `--with-timings`, `--tts-quality-provider` и
-`format: voiceover` остаются на legacy executor.
+Нативные не-диалоговые маршруты `--provider omnivoice-local --model
+audio-cpp/omnivoice-q8_0` (plain Markdown без frontmatter, а для preset-ветки
+банка — ещё и `format: voiceover`) с обрезкой по умолчанию:
 
-- Снимок хранит выбранную идентичность: локатор каталога, mode, локатор/SHA/
-text/language выбранного профиля, model и effective voice (= profile id).
-Публичные JSON-экспорты публикуют provider/model/voice (profile id) и текст, но
-не reference text каталога.
+- `--mode preset --voice-bank <catalog.json>`: весь script сливается в одну
+  OmniVoice session (один локальный вызов), которая клонирует выбранный profile
+  каталога.
+- `--mode auto`, `--mode clone --reference-audio <файл> --reference-text <текст>`
+  и `--mode design --design-instruction <инструкция>`: те же один session-вызов и
+  существующие local attempt/raw seams. `auto` отправляет в runtime только
+  `omnivoice_mode=auto` без style/reference/design полей — голос выбирает
+  upstream-модель (`voice_selection.kind = auto-voice`), никакой preset не
+  подменяется; записанный effective voice прогона — только маркер режима
+  (`auto`, `clone`, `design`). Длинный design по-прежнему
+  отклоняется существующей проверкой длины до admission, а короткий русский
+  design остаётся experimental.
+
+`--no-trim`, `--with-timings` и `--tts-quality-provider` остаются на legacy
+executor. `--mode preset --voice-bank` допускается и для `format: voiceover`:
+валидатор такого сценария разрешает единственный голос
+`built-in-female-style-condition`, поэтому admitted-каталог обязан содержать
+профиль с этим id, а прогон коммитит именно его identity. Остальные
+OmniVoice-режимы всегда отклоняют `--voice`, который voiceover поставляет, так
+что `format: voiceover` с `auto`/`clone`/`design` остаётся usage error.
+
+- Снимок хранит выбранную идентичность: для preset — локатор каталога, mode,
+  локатор/SHA/text/language выбранного профиля, model и effective voice (= profile
+  id); для `auto`/`clone`/`design` — свой блок `omnivoice_mode` (mode, model,
+  effective voice, а для clone — канонический локатор референса с SHA-256 и
+  размером и точный reference text, для design — точная инструкция; сами байты
+  референса и инструкция в публичные JSON не попадают). Публичные JSON-экспорты
+  публикуют provider/model/voice (profile id или маркер режима) и текст, но не
+  reference text каталога и не design-инструкцию.
 - Платной попытки нет: единственный локальный вызов пишет свою durable-попытку
 `local_tts_chunk` (`status`/`cost` NULL, никогда не платный маркер), а raw-байты
 линкуются к попытке до конвертации, поэтому сбой FFmpeg восстанавливается из raw
@@ -631,7 +665,11 @@ text/language выбранного профиля, model и effective voice (= p
 как выдуманный ноль.
 - Пропавший reference или изменившийся digest даёт
 `NATIVE_LOCAL_REFERENCE_UNAVAILABLE` / `NATIVE_RESUME_IDENTITY_CHANGED` до вызова
-локальной модели. `history sync ID` локальную модель не запускает: незавершённая
+локальной модели. Для non-preset режимов тот же fail-closed порядок применяется
+к `omnivoice_mode`-блоку: изменившиеся reference-байты, инструкция или mode
+дают `NATIVE_RESUME_IDENTITY_CHANGED` до провайдера на `generate --resume`, а на
+`history resume` — проверка коммитнутого reference до модели. `history sync ID`
+локальную модель не запускает: незавершённая
 локальная часть сообщает `NATIVE_SYNC_LOCAL_SYNTHESIS_REQUIRED`, завершённый
 прогон только переписывает совместимые JSON-экспорты из БД.
 - Реальный локальный запуск модели (audio.cpp/OmniVoice) в тестах — `NOT_RUN`.
@@ -643,8 +681,15 @@ text/language выбранного профиля, model и effective voice (= p
 `--provider qwen-local --mode clone --sample <файл> [--sample-text <текст>]` и
 инструктированные маршруты `--mode preset` (модель CustomVoice, `--voice` из
 каталога `QWEN_PRESET_SPEAKERS`) и `--mode design` (модель VoiceDesign,
-обязательный непустой `--qwen-instruct`). Режим `auto` (который не разрешает
-модель), `--no-trim`, `--with-timings`, `--tts-quality-provider` и неизвестное
+обязательный непустой `--qwen-instruct`). Эти же режимы допускаются и для
+`format: voiceover`: валидатор разрешает один голос на весь сценарий, затем
+`preset` сохраняет его как effective voice, а `clone`/`design` подменяют его
+своим маркером режима (`clone`/`design`) точно так же, как legacy executor, —
+голос из frontmatter для этих двух режимов в legacy игнорируется, и новая
+семантика не вводится. Режим `auto` не реализован и
+отклоняется как usage error (exit `2`) до провайдера, модели и снимка:
+автоматический выбор режима не подменяется на `preset`. `--no-trim`,
+`--with-timings`, `--tts-quality-provider` и неизвестное
 значение `VOICEOVER_QWEN_TTS_RUNTIME` остаются на legacy executor.
 
 - Снимок хранит полную неизменяемую идентичность клона: канонический абсолютный
@@ -1115,8 +1160,9 @@ Dry-run сообщает найденные каталоги/записи, impor
 
 `history resume ID` и `history sync ID` восстанавливают **один уже
 закоммиченный нативный TTS-прогон** (обычный не-диалоговый `polza-tts` /
-`polza-chat-audio` / `openrouter-tts`, локальный Qwen clone или `omnivoice-local`, который записал
-снимок в canonical SQLite) из его сохранённого
+`polza-chat-audio` / `openrouter-tts`, локальный Qwen (clone или instructed
+preset/design) или `omnivoice-local` (preset bank или non-preset
+auto/clone/design), записавший снимок в canonical SQLite) из его сохранённого
 снимка и запускают тот же нативный исполнитель, что и `generate --resume`. `ID`
 — внутренний `run_uuid`; метка не разрешается, потому что resume и sync меняют
 один конкретный прогон. Оригинальный файл `script.md` **не перечитывается**: текст
@@ -1169,8 +1215,9 @@ voiceover history sync ID --json        # без нового оплаченно
 Эти два глагола реализуют запланированные `history resume ID` и `history sync ID`
 из S05; live/listening-приёмка при этом не проводилась. `history costs` —
 read-only offline-учёт расходов (см. выше). S05 целиком пока не принят:
-ASR/`verify-tts`, облачные timing-маршруты и остальные провайдеры остаются на
-legacy executor; единственный нативный диалоговый маршрут описан ниже.
+ASR/`verify-tts`, облачные timing-маршруты и локальные семейства в формате
+`voiceover` остаются на
+legacy executor; оба нативных диалоговых маршрута описаны ниже.
 
 ## Gemini Dialogue (machine-facing)
 

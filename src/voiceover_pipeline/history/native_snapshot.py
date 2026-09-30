@@ -58,17 +58,16 @@ Known limits at this foundation stage:
   are snapshotted: ``polza-tts``, ``openrouter-tts``, the ``polza-chat-audio``
   ordinary chat-audio route (its resolved ``fallback_voice``), the
   ``omnivoice-local``
-  preset bank routes (the two-cast dialogue and the single-profile monologue),
-  and every admitted ``qwen-local`` local route (the
+  preset bank routes (the two-cast dialogue and the single-profile monologue) and
+  its admitted non-preset ``auto``/``clone``/``design`` modes, and every admitted
+  ``qwen-local`` local route (the
   clone route, and the instructed preset/design routes). Every other route
   raises :class:`NativeSnapshotValidationError` before any insert, because it
-  omits nonsecret identity a later ``history resume UUID`` would need:
-  ``omnivoice-local`` auto/clone/design modes carry no catalog locator or
-  reference fingerprint, and a ``qwen-local`` run with neither identity block
-  carries no reference/mode inputs. This is a temporary S05 integration gap, not
-  a disabled live path: those routes still perform their own run and JSON state
-  writes. A further route is enabled only once its missing nonsecret inputs are
-  captured on the prepared run.
+  omits nonsecret identity a later ``history resume UUID`` would need: a
+  ``qwen-local`` run with neither identity block carries no reference/mode inputs.
+  This is a temporary S05 integration gap, not a disabled live path: those routes
+  still perform their own run and JSON state writes. A further route is enabled
+  only once its missing nonsecret inputs are captured on the prepared run.
 * The run-level voice must be non-empty, so a deferred route whose identity lives
   only in ``voice_identity`` or a per-part cast voice still needs an effective
   run voice supplied by the execution wiring before the route is enabled.
@@ -89,8 +88,10 @@ from typing import Any
 
 from ..models import ScriptChunk
 from ..services.prepare import (
+    OMNIVOICE_MODE_IDENTITY_MODES,
     QWEN_CLONE_MODE,
     QWEN_INSTRUCT_MODES,
+    OmniVoiceModeIdentity,
     OmniVoiceVoiceBankIdentity,
     PreparedPart,
     PreparedRun,
@@ -132,7 +133,11 @@ _REDACTED_IDENTITY_REJECTED = (
 #   * ``omnivoice-local`` -- the admitted preset bank routes, whose
 #     ``PreparedRun.voice_bank_identity`` carries the catalog locator and each
 #     referenced profile's reference locator, digest, text, and language (the
-#     dialogue's two cast profiles, or the monologue's one selected profile).
+#     dialogue's two cast profiles, or the monologue's one selected profile), and
+#     the admitted non-preset ``auto``/``clone``/``design`` modes, whose
+#     ``PreparedRun.omnivoice_mode_identity`` carries the mode/model/effective voice
+#     plus, for clone, the reference locator/digest/size/text, and, for design, the
+#     exact instruction. Exactly one of the two blocks is present per run.
 #   * ``qwen-local`` -- an admitted local route. Its clone mode's
 #     ``PreparedRun.qwen_clone_identity`` carries the reference sample locator,
 #     digest, and size, the reference text, and the runtime/language knobs, and
@@ -141,12 +146,12 @@ _REDACTED_IDENTITY_REJECTED = (
 #     runtime/language knobs. Exactly one block is present per run.
 # Every other route fails closed before any insert, whether it is a known route
 # whose resume inputs ``PreparedRun`` does not carry (a ``qwen-local`` run with
-# neither identity block, or an ``omnivoice-local`` auto/clone/design mode) or an
-# unknown identifier. A supported provider whose route-specific identity block is
-# missing fails the same way, so only a run that captured its full identity is
-# persisted. The rejection is one fixed message because an unknown identifier is
-# not admitted input and could be a secret, so the message echoes no provider
-# value.
+# neither identity block, or an ``omnivoice-local`` run with neither the bank nor
+# the mode identity) or an unknown identifier. A supported provider whose
+# route-specific identity block is missing fails the same way, so only a run that
+# captured its full identity is persisted. The rejection is one fixed message
+# because an unknown identifier is not admitted input and could be a secret, so the
+# message echoes no provider value.
 _NATIVE_SNAPSHOT_SUPPORTED_TTS_PROVIDERS = frozenset(
     {"polza-tts", "polza-chat-audio", "openrouter-tts", "omnivoice-local", "qwen-local"}
 )
@@ -289,6 +294,7 @@ def _run_identity_payload(
     voice_identity: str | None,
     synthesis_identity: str | None,
     voice_bank: dict[str, Any] | None = None,
+    omnivoice_mode: dict[str, Any] | None = None,
     qwen_clone: dict[str, Any] | None = None,
     qwen_mode: dict[str, Any] | None = None,
     fallback_voice: str | None = None,
@@ -304,11 +310,16 @@ def _run_identity_payload(
         "synthesis_identity": synthesis_identity,
     }
     if voice_bank is not None:
-        # Only the ``omnivoice-local`` preset dialogue route records a voice-bank
+        # Only the ``omnivoice-local`` preset bank routes record a voice-bank
         # identity. The key is added only when present, so a polza/openrouter run
         # keeps the exact version-1 payload it committed before this route existed
         # and needs no fingerprint-version bump.
         payload["voice_bank"] = voice_bank
+    if omnivoice_mode is not None:
+        # Only the admitted non-preset ``omnivoice-local`` modes record a mode
+        # identity. As with the voice bank, the key is added only when present so
+        # every other route keeps its committed version-1 payload byte-for-byte.
+        payload["omnivoice_mode"] = omnivoice_mode
     if qwen_clone is not None:
         # Only the ``qwen-local`` clone route records a clone identity. As with the
         # voice bank, the key is added only when present so every other route keeps
@@ -380,6 +391,7 @@ def _build_snapshot_config(
     part_entries: list[dict[str, Any]],
     output_options: dict[str, Any] | None,
     voice_bank: dict[str, Any] | None = None,
+    omnivoice_mode: dict[str, Any] | None = None,
     qwen_clone: dict[str, Any] | None = None,
     qwen_mode: dict[str, Any] | None = None,
     fallback_voice: str | None = None,
@@ -408,6 +420,8 @@ def _build_snapshot_config(
     }
     if voice_bank is not None:
         snapshot["voice_bank"] = voice_bank
+    if omnivoice_mode is not None:
+        snapshot["omnivoice_mode"] = omnivoice_mode
     if qwen_clone is not None:
         snapshot["qwen_clone"] = qwen_clone
     if qwen_mode is not None:
@@ -444,28 +458,52 @@ def _require_output_options(value: object) -> dict[str, Any] | None:
     return validated
 
 
-def _require_voice_bank_identity(prepared: PreparedRun, provider: str) -> dict[str, Any] | None:
-    """Return the committed voice-bank identity payload, or ``None`` when absent.
+def _require_omnivoice_route_identity(
+    prepared: PreparedRun, provider: str
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return the committed local OmniVoice identity payloads for this run, if any.
 
-    Only the admitted ``omnivoice-local`` preset bank routes carry one, and
-    they must always carry one: an ``omnivoice-local`` auto/clone/design run (or
-    any other provider) that somehow reached this writer would otherwise commit
-    an identity whose voice-bank inputs were never captured. The rejection echoes
-    no value.
+    An ``omnivoice-local`` run carries exactly one block: the preset voice-bank block
+    (the catalog locator and each referenced profile's settings), built by
+    ``prepare_run`` from the admitted catalog, or the non-preset mode block (``auto``,
+    ``clone``, or ``design`` with that mode's reference or instruction inputs). A run
+    with neither cannot have come from this writer, and one with both is ambiguous;
+    either fails the fixed route rejection. The mode block must agree with the run
+    route: its mode is one of the three admitted non-preset modes and its model and
+    effective voice equal the run's, so a resume can never rebuild a provider the run
+    never captured. Every other provider must carry neither block. Rejections echo no
+    value.
     """
-    identity = prepared.voice_bank_identity
-    if provider == "omnivoice-local":
-        if not isinstance(identity, OmniVoiceVoiceBankIdentity):
-            # A local run without a committed voice-bank identity (an auto, clone,
-            # or design mode) did not capture its resume inputs, so the
-            # same fixed route-rejection message applies and names no value.
+    voice_bank = prepared.voice_bank_identity
+    mode_identity = prepared.omnivoice_mode_identity
+    if provider != "omnivoice-local":
+        if voice_bank is not None:
+            raise NativeSnapshotValidationError(
+                "a voice-bank identity is only valid for a local OmniVoice bank route"
+            )
+        if mode_identity is not None:
+            raise NativeSnapshotValidationError(
+                "an OmniVoice mode identity is only valid for a local OmniVoice mode route"
+            )
+        return None, None
+    if voice_bank is not None and mode_identity is not None:
+        raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
+    if voice_bank is not None:
+        if not isinstance(voice_bank, OmniVoiceVoiceBankIdentity):
             raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
-        return identity.to_payload()
-    if identity is not None:
-        raise NativeSnapshotValidationError(
-            "a voice-bank identity is only valid for a local OmniVoice bank route"
-        )
-    return None
+        return voice_bank.to_payload(), None
+    if mode_identity is not None:
+        if (
+            not isinstance(mode_identity, OmniVoiceModeIdentity)
+            or mode_identity.mode not in OMNIVOICE_MODE_IDENTITY_MODES
+            or mode_identity.model != prepared.model
+            or mode_identity.voice != prepared.voice
+        ):
+            raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
+        return None, mode_identity.to_payload()
+    # A local OmniVoice run with neither block did not capture its resume inputs,
+    # so the same fixed route-rejection message applies and names no value.
+    raise NativeSnapshotValidationError(_UNSUPPORTED_TTS_ROUTE_REJECTED)
 
 
 def _require_voice_bank_consistency(
@@ -629,11 +667,13 @@ def persist_prepared_tts_snapshot(
     identity is accepted: ``polza-tts``, ``polza-chat-audio`` (with its resolved
     compatibility ``fallback_voice``), ``openrouter-tts``, the
     ``omnivoice-local`` preset bank routes (the two-cast dialogue and the
-    single-profile monologue), and an admitted ``qwen-local`` local
+    single-profile monologue) and non-preset ``auto``/``clone``/``design`` modes,
+    and an admitted ``qwen-local`` local
     route (the clone route or the instructed preset/design routes).
     Any other provider, or a supported provider whose route-specific identity
     block is missing -- a ``qwen-local`` run with neither identity block, an
-    ``omnivoice-local`` auto/clone/design mode, a ``polza-chat-audio`` run without
+    ``omnivoice-local`` run with neither the bank nor the mode identity, a
+    ``polza-chat-audio`` run without
     its fallback voice, or an unknown identifier -- is
     rejected with :class:`NativeSnapshotValidationError` before any insert: its
     resume identity inputs are not persisted on ``PreparedRun``, so the snapshot
@@ -678,10 +718,13 @@ def persist_prepared_tts_snapshot(
     if style_prompt is not None and (not isinstance(style_prompt, str) or not style_prompt):
         raise NativeSnapshotValidationError("style_prompt must be None or a non-empty string")
     validated_output_options = _require_output_options(output_options)
-    # The ``omnivoice-local`` preset dialogue route is the only one that carries a
-    # voice-bank identity; every other route must not, so a mismatched pairing
-    # fails closed instead of committing an identity the reader cannot rebuild.
-    voice_bank_payload = _require_voice_bank_identity(prepared, provider)
+    # The ``omnivoice-local`` preset bank routes and non-preset modes carry exactly
+    # one local OmniVoice identity block; every other route must carry neither, so a
+    # mismatched pairing fails closed instead of committing an identity the reader
+    # cannot rebuild.
+    voice_bank_payload, omnivoice_mode_payload = _require_omnivoice_route_identity(
+        prepared, provider
+    )
     _require_voice_bank_consistency(prepared, voice_bank_payload)
 
     identity = _run_identity_payload(
@@ -693,6 +736,7 @@ def persist_prepared_tts_snapshot(
         voice_identity=voice_identity,
         synthesis_identity=synthesis_identity,
         voice_bank=voice_bank_payload,
+        omnivoice_mode=omnivoice_mode_payload,
         qwen_clone=qwen_clone_payload,
         qwen_mode=qwen_mode_payload,
         fallback_voice=fallback_voice_payload,
@@ -767,6 +811,7 @@ def persist_prepared_tts_snapshot(
         part_entries=[item.config_entry for item in planned],
         output_options=validated_output_options,
         voice_bank=voice_bank_payload,
+        omnivoice_mode=omnivoice_mode_payload,
         qwen_clone=qwen_clone_payload,
         qwen_mode=qwen_mode_payload,
         fallback_voice=fallback_voice_payload,
