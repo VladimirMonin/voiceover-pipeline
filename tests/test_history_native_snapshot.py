@@ -8,7 +8,8 @@ exact text/voice/structural persistence, identity stability and variation,
 ``run_root`` collision protection (including an imported run), atomic rollback
 when a part or text insert aborts, zero filesystem side effects, fail-closed
 rejection of a secret-looking identity, rejection of a sparse, reordered, or
-malformed chunk identity, refusal to join a caller's open transaction, acceptance
+malformed chunk identity, rejection of a supplied empty style prompt before any
+insert, refusal to join a caller's open transaction, acceptance
 of the two allowlisted routes, and fail-closed rejection of every non-allowlisted
 route (OmniVoice dialogue and preset/clone/design, Qwen preset/clone/design, Polza
 chat-audio, and an unknown provider) before any write even when the provider, ids,
@@ -312,6 +313,23 @@ def test_missing_style_prompt_writes_no_direction_source(repository, tmp_path):
     sources = repository.get_text_sources(result.run.run_uuid)
     assert not [s for s in sources if s.kind == TEXT_KIND_TTS_DIRECTION]
     assert result.run.config_snapshot["script_path"] is None
+
+
+def test_empty_style_prompt_is_rejected_before_any_insert(repository, tmp_path):
+    run_root = tmp_path / "runs" / "empty-style"
+
+    with pytest.raises(NativeSnapshotValidationError) as excinfo:
+        _persist(repository, _scenario(style_prompt=""), run_root)
+
+    # The run identity hashes the style prompt but the ``tts_direction`` source is
+    # written only for a truthy prompt, so an empty-string prompt would commit a
+    # run the read view could never rebuild from committed rows. Fail first.
+    assert str(excinfo.value) == "style_prompt must be None or a non-empty string"
+    assert _row_count(repository, "runs") == 0
+    assert _row_count(repository, "parts") == 0
+    assert _row_count(repository, "text_sources") == 0
+    assert not run_root.exists()
+    assert list(tmp_path.rglob("*.json")) == []
 
 
 def test_cast_voice_overrides_run_voice_per_part(repository, tmp_path):

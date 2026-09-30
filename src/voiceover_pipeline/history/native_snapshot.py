@@ -43,6 +43,11 @@ Contract:
   rejected with a fixed privacy-safe message instead of committing an
   unreconstructable snapshot. Full script and style-direction text is private
   verbatim data and is never suppressed.
+* A ``style_prompt`` is stored as a private ``tts_direction`` source only when it
+  is a non-empty string. ``None`` means the run has no direction; a supplied empty
+  string is rejected before any insert, because the run identity still hashes it
+  while no source would record it, and the read view could never rebuild such a run
+  from committed rows.
 * Run, parts, and text sources commit in one transaction, so a failed insert
   rolls every entity back. No transaction is ever held across a filesystem or
   network call.
@@ -367,8 +372,11 @@ def persist_prepared_tts_snapshot(
     with their resolved effective voice, a per-part fingerprint, and a NULL stage;
     the run-level fingerprint and the structural resume map go into
     ``config_snapshot``. The full script text and each part text are stored as
-    ``tts_script`` sources, and the style prompt, when present, as a private
-    ``tts_direction`` source.
+    ``tts_script`` sources, and a non-empty style prompt as a private
+    ``tts_direction`` source; an empty-string style prompt is rejected with
+    :class:`NativeSnapshotValidationError` before any insert, because it would be
+    hashed into the run identity while no direction source recorded it, so the view
+    could never verify the committed run.
 
     Validation runs before any insert, and a ``run_root`` already owned by any
     run (including a ``legacy_import`` one) raises
@@ -414,12 +422,21 @@ def persist_prepared_tts_snapshot(
         _require_nonempty_text(voice_identity, "voice_identity")
     if synthesis_identity is not None:
         _require_nonempty_text(synthesis_identity, "synthesis_identity")
+    # ``None`` means this run has no style direction, and a non-empty string is
+    # stored verbatim below. A supplied empty string is neither: it would be hashed
+    # into the run identity while the ``tts_direction`` source is written only for a
+    # truthy prompt, so the view -- which rebuilds that identity from committed rows
+    # -- could never verify the run. Reject it before any insert instead of
+    # committing a snapshot its own reader must refuse.
+    style_prompt = prepared.style_prompt
+    if style_prompt is not None and (not isinstance(style_prompt, str) or not style_prompt):
+        raise NativeSnapshotValidationError("style_prompt must be None or a non-empty string")
 
     identity = _run_identity_payload(
         provider=provider,
         model=model,
         voice=voice,
-        style_prompt=prepared.style_prompt,
+        style_prompt=style_prompt,
         prompt_mode=prompt_mode,
         voice_identity=voice_identity,
         synthesis_identity=synthesis_identity,
@@ -521,13 +538,13 @@ def persist_prepared_tts_snapshot(
             content_hash=script_sha256,
             text_completeness=TEXT_COMPLETENESS_COMPLETE,
         )
-        if prepared.style_prompt:
+        if style_prompt:
             repository.add_text_source(
                 run.run_uuid,
                 kind=TEXT_KIND_TTS_DIRECTION,
                 origin=NATIVE_SNAPSHOT_ORIGIN,
-                content=prepared.style_prompt,
-                content_hash=_sha256_text(prepared.style_prompt),
+                content=style_prompt,
+                content_hash=_sha256_text(style_prompt),
                 text_completeness=TEXT_COMPLETENESS_COMPLETE,
             )
         parts: list[PartRecord] = []
