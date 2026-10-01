@@ -721,3 +721,163 @@ def test_sync_response_with_object_audio_blocks_resume_without_generic_error(
     assert payload["details"]["error_code"] == "PAID_SUBMIT_UNCONFIRMED"
     assert "sk-not-a-real-key" not in json.dumps(payload)
     assert len(posts) == 1
+
+
+# ── per-part voice on the synchronous route ───────────────────────────────────
+
+
+def _receipts(run_root: Path) -> list[dict]:
+    """Return every stored private sync-response receipt under ``raw/``."""
+    return [
+        json.loads(path.with_name(path.name + ".receipt.json").read_text(encoding="utf-8"))
+        for path in _response_files(run_root)
+    ]
+
+
+def _speech_parts_script(tmp_path: Path) -> Path:
+    """Write a two-voice speech-parts script with no instruction (no vibe)."""
+    path = tmp_path / "parts.yaml"
+    path.write_text(
+        "version: 1\nformat: speech-parts\nparts:\n"
+        "  - voice: Kore\n    text: |-\n      Первая реплика.\n"
+        "  - voice: Puck\n    text: |-\n      Вторая реплика.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _speech_parts_argv(tmp_path, script, run_id):
+    return [
+        "voiceover-pipeline",
+        "generate",
+        "--script",
+        str(script),
+        "--format",
+        "speech-parts",
+        "--provider",
+        "polza-tts",
+        "--model",
+        POLZA_SYNC_MODEL,
+        "--output-dir",
+        str(tmp_path / "out"),
+        "--run-id",
+        run_id,
+        "--json",
+    ]
+
+
+def _voice_named_post(posts: list[str]):
+    """Patch target that records the request voice and echoes it as the audio."""
+
+    def post(_url, **kwargs):
+        voice = kwargs["json"]["voice"]
+        posts.append(voice)
+        return _response(_speech_body(audio=voice.encode()))
+
+    return post
+
+
+def test_audio_speech_direct_call_retains_per_part_voice_over_run_default():
+    """The synchronous call honors a per-part voice and defaults to the run voice."""
+    provider = PolzaTTSProvider(api_key="sk-test", model=POLZA_SYNC_MODEL, voice="alloy")
+    seen: list[str] = []
+
+    from unittest.mock import patch
+
+    with patch(POST_TARGET, _voice_named_post(seen)):
+        default = provider.synthesize_chunk("Hello", "chunk_01")
+        override = provider.synthesize_chunk("Hello", "chunk_01", voice="nova")
+
+    assert seen == ["alloy", "nova"]
+    assert default.raw_metadata["voice"] == "alloy"
+    assert override.raw_metadata["voice"] == "nova"
+
+
+def test_audio_speech_media_route_refuses_a_per_part_voice_override():
+    """ElevenLabs ``/media`` fails closed instead of silently ignoring a new voice."""
+    provider = PolzaTTSProvider(
+        api_key="sk-test", model="elevenlabs/text-to-speech-turbo-2-5", voice="Rachel"
+    )
+    with pytest.raises(ValueError, match="per-part voice"):
+        provider.synthesize_chunk("Hello", "chunk_01", voice="alloy")
+
+
+def test_speech_parts_two_voices_bind_each_cast_voice_to_post_and_receipt(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """Each speech-parts part posts and privately receipts its own cast voice."""
+    monkeypatch.setattr(cli, "require_confirmed_speech_parts_route", lambda **_kwargs: None)
+    provider = PolzaTTSProvider(api_key="sk-test", model=POLZA_SYNC_MODEL, voice="alloy")
+    _install_provider(monkeypatch, provider)
+    posts: list[str] = []
+    monkeypatch.setattr(POST_TARGET, _voice_named_post(posts))
+    script = _speech_parts_script(tmp_path)
+
+    code, payload = _json_run(
+        monkeypatch, capsys, _speech_parts_argv(tmp_path, script, "sp-voices")
+    )
+
+    assert code == 0, payload
+    assert posts == ["Kore", "Puck"]
+    run_root = _run_root(tmp_path, "sp-voices")
+    assert {receipt["number"]: receipt["voice"] for receipt in _receipts(run_root)} == {
+        1: "Kore",
+        2: "Puck",
+    }
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"Kore"
+    assert (run_root / "chunks" / "chunk_02.mp3").read_bytes() == b"Puck"
+
+
+def _crash_on_nth_decoded_write(monkeypatch, nth: int):
+    """Make the ``nth`` decoded-raw write fail, simulating a crash after the sink."""
+    real_write = raw_receipt.write_paid_raw_receipt
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == nth:
+            raise RuntimeError("crash after the response body, before the decoded link")
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(native_generation, "write_paid_raw_receipt", flaky)
+    return real_write
+
+
+def test_speech_parts_second_part_crash_replays_locally_without_second_post(
+    tmp_path, monkeypatch, capsys, native_env
+):
+    """A crash after the second stored response replays that part locally, one voice each."""
+    monkeypatch.setattr(cli, "require_confirmed_speech_parts_route", lambda **_kwargs: None)
+    real_write = _crash_on_nth_decoded_write(monkeypatch, 2)
+    provider = PolzaTTSProvider(api_key="sk-test", model=POLZA_SYNC_MODEL, voice="alloy")
+    _install_provider(monkeypatch, provider)
+    posts: list[str] = []
+    monkeypatch.setattr(POST_TARGET, _voice_named_post(posts))
+    script = _speech_parts_script(tmp_path)
+
+    code, _payload = _json_run(
+        monkeypatch, capsys, _speech_parts_argv(tmp_path, script, "sp-crash")
+    )
+    assert code == 30
+    assert posts == ["Kore", "Puck"]
+    run_root = _run_root(tmp_path, "sp-crash")
+    assert (run_root / "chunks" / "chunk_01.mp3").read_bytes() == b"Kore"
+    assert not (run_root / "chunks" / "chunk_02.mp3").exists()
+    assert len(_response_files(run_root)) == 2
+
+    monkeypatch.setattr(native_generation, "write_paid_raw_receipt", real_write)
+    monkeypatch.setattr(cli, "build_provider", _explode)
+    monkeypatch.setattr(POST_TARGET, _explode)
+    run_uuid = _run_uuid("sp-crash")
+    # The original script is gone, so the resume can only rebuild from the snapshot.
+    script.unlink()
+    monkeypatch.setattr(
+        sys, "argv", ["voiceover-pipeline", "history", "resume", run_uuid, "--json"]
+    )
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+    assert excinfo.value.code == 0, capsys.readouterr().out
+    # Only the stored second body replayed locally: no third POST was sent.
+    assert posts == ["Kore", "Puck"]
+    assert (run_root / "chunks" / "chunk_02.mp3").read_bytes() == b"Puck"
+    assert (run_root / "raw" / "chunk_02.mp3").read_bytes() == b"Puck"

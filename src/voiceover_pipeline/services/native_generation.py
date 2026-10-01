@@ -1649,7 +1649,11 @@ class _Executor:
         number = part.number
         provider_id = self.prepared.provider
         model = self._model()
-        voice = self.prepared.voice
+        # The receipt binds this part's own effective voice, not the run-level
+        # voice: a ``speech-parts`` part or a dialogue turn may carry a different
+        # cast voice, so the private evidence and its later replay must name the
+        # exact voice that request used.
+        voice = part.effective_voice
         response_format = str(
             getattr(provider, "response_format", DEFAULT_POLZA_TTS_RESPONSE_FORMAT)
         )
@@ -3012,7 +3016,7 @@ class _Executor:
                 number=part.number,
                 provider=self.prepared.provider,
                 model=self._model(),
-                voice=self.prepared.voice,
+                voice=part.effective_voice,
                 response_format=DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
             )
         except (PaidSyncResponseError, ValueError):
@@ -3030,7 +3034,7 @@ class _Executor:
                 header_generation_id=receipt.generation_id,
                 transcript=part.text,
                 model=self._model(),
-                voice=self.prepared.voice,
+                voice=part.effective_voice,
             )
         except (ValueError, RuntimeError):
             # A malformed or unsupported stored response stays private and unknown;

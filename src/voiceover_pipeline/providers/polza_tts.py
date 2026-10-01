@@ -184,12 +184,30 @@ class PolzaTTSProvider(TTSProvider):
     def _is_elevenlabs(self) -> bool:
         return self.model.startswith("elevenlabs/")
 
-    def synthesize_chunk(self, text: str, chunk_id: str) -> SynthesisResult:
-        if self._is_elevenlabs:
-            return self._synthesize_media(text, chunk_id)
-        return self._synthesize_audio_speech(text, chunk_id)
+    def synthesize_chunk(
+        self, text: str, chunk_id: str, voice: str | None = None
+    ) -> SynthesisResult:
+        """Synthesize one part, honoring an optional per-part voice override.
 
-    def _synthesize_audio_speech(self, text: str, chunk_id: str) -> SynthesisResult:
+        The synchronous ``/audio/speech`` route carries the effective voice in its
+        request and result, so a caller may pass a different per-part cast voice
+        (as a ``speech-parts`` part or a dialogue turn does) while an omitted
+        ``voice`` keeps the configured run voice exactly as before. The ElevenLabs
+        ``/media`` route speaks with its one configured voice and cannot carry a
+        per-part override, so a different voice fails closed here instead of being
+        silently dropped.
+        """
+        effective_voice = voice or self.voice
+        if self._is_elevenlabs:
+            if effective_voice != self.voice:
+                raise ValueError("Polza TTS media route cannot carry a per-part voice override.")
+            return self._synthesize_media(text, chunk_id)
+        return self._synthesize_audio_speech(text, chunk_id, effective_voice)
+
+    def _synthesize_audio_speech(
+        self, text: str, chunk_id: str, voice: str | None = None
+    ) -> SynthesisResult:
+        effective_voice = voice or self.voice
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
@@ -199,7 +217,7 @@ class PolzaTTSProvider(TTSProvider):
             json={
                 "model": self.model,
                 "input": text,
-                "voice": self.voice,
+                "voice": effective_voice,
                 "response_format": self.response_format,
             },
             timeout=self.timeout_seconds,
@@ -225,7 +243,7 @@ class PolzaTTSProvider(TTSProvider):
             header_generation_id=response.headers.get("X-Generation-Id"),
             transcript=text,
             model=self.model,
-            voice=self.voice,
+            voice=effective_voice,
         )
 
     def _synthesize_media(self, text: str, chunk_id: str) -> SynthesisResult:
