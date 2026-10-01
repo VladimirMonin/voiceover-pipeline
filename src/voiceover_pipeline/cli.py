@@ -1024,6 +1024,11 @@ def _validate_omnivoice_voice_bank(args: argparse.Namespace) -> VoiceBankCatalog
 
 
 def _resolve_provider_style_prompt(args: argparse.Namespace) -> str | None:
+    if getattr(args, "format", None) == SPEECH_PARTS_FORMAT:
+        # Explicit per-part vibes own this route's direction. The generic Polza
+        # default is not sent by the speech-parts adapter and must not be saved
+        # as a misleading searchable run-level direction.
+        return None
     if getattr(args, "provider", None) == "openrouter-tts":
         return None
     if getattr(args, "provider", None) == "omnivoice-local":
@@ -1323,6 +1328,13 @@ def generate(args: argparse.Namespace) -> None:
             fail(
                 "--text does not accept --format: a single line is always one speech part.",
                 _EXIT_ARGS,
+            )
+        if args.style_prompt is not None or args.style_prompt_file is not None:
+            fail(
+                "--text supplies its direction with --vibe; remove "
+                "--style-prompt/--style-prompt-file instead of silently dropping it.",
+                _EXIT_ARGS,
+                details={"error_code": "STYLE_PROMPT_UNSUPPORTED_FORMAT"},
             )
         script_format = SPEECH_PARTS_FORMAT
     else:

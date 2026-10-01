@@ -1,7 +1,8 @@
 """Offline FTS5 index maintenance rebuilt from SQLite alone.
 
-Plan section 8 stage S08 keeps the lexical index derived: the canonical text lives
-in ``text_sources``, and every table this module writes -- ``search_chunks``,
+Plan section 8 stage S08 keeps the lexical index derived: canonical text lives
+in ``text_sources`` and explicit part vibes in ``parts.vibe_effective``. Every
+table this module writes -- ``search_chunks``,
 ``search_fts``, ``search_index_state``, ``search_index_pending`` -- can be dropped
 and rebuilt from SQLite with no model, key, network, or user-file scan. The
 transcription/synthesis parts, audio, and cost are never touched.
@@ -34,12 +35,13 @@ from typing import Any, Iterable, Iterator, Sequence
 from ..asr_timing_map import ObservedTimingSpan, chunk_time_range, observed_spans_from_snapshot
 from ..history.database import utc_now
 from ..history.native_asr import NATIVE_ASR_ORIGIN
-from ..history.repository import TEXT_KIND_ASR_TRANSCRIPT
+from ..history.repository import TEXT_KIND_ASR_TRANSCRIPT, TEXT_KIND_TTS_DIRECTION
 from .lexical import (
     CHUNKER_VERSION,
     KIND_RUN_LABEL,
     PRIVATE_TEXT_KINDS,
     ROLE_BY_KIND,
+    ROLE_DIRECTIONS,
     ROLE_LABEL,
     chunk_text,
     is_indexable_kind,
@@ -99,6 +101,16 @@ def index_committed_text_sources(
             if row is None:
                 continue
             runs_to_label.add(row["run_uuid"])
+            if _is_unused_style_source(connection, row):
+                # Old speech-parts snapshots saved the generic Polza default as a
+                # direction although the adapter never sent it. Keep the canonical
+                # source for snapshot identity, but remove misleading FTS rows.
+                _delete_source_chunks(connection, text_source_uuid)
+                connection.execute(
+                    "DELETE FROM search_index_pending WHERE text_source_uuid = ?",
+                    (text_source_uuid,),
+                )
+                continue
             if not _is_indexable_source(row["kind"], row["content"]):
                 connection.execute(
                     "DELETE FROM search_index_pending WHERE text_source_uuid = ?",
@@ -112,6 +124,11 @@ def index_committed_text_sources(
             )
         for run_uuid in runs_to_label:
             _ensure_run_label_chunks(connection, run_uuid, now)
+            # Speech-parts directions are canonical columns on parts, not separate
+            # text_sources. Derive their opt-in search chunks after that run's
+            # normal text-source save commits, without changing paid history.
+            for part in _unindexed_part_directions(connection, run_uuid=run_uuid):
+                written += _replace_part_direction_chunks(connection, part, now)
         _ensure_state_chunker_version(connection)
     return written
 
@@ -138,17 +155,19 @@ def mark_text_sources_pending(
 
 
 def build_index(connection: sqlite3.Connection) -> dict[str, Any]:
-    """Index every label and indexable source not yet in the index.
+    """Index missing labels, text sources and part vibes; drop unused old styles.
 
-    One atomic transaction. A run label is added to a run that lacks a label chunk,
-    and a source is indexed only when it has no chunks yet, so a repeat build is a
-    no-op. Returns the number of sources and chunks written and the remaining
-    pending count.
+    One atomic transaction. Only absent sources/part directions are added, so a
+    repeat build is a no-op; historical speech-parts defaults never sent to a
+    provider are removed from the derived index, not from canonical history.
     """
     now = utc_now()
     sources_written = 0
+    part_directions_written = 0
     chunks_written = 0
     with _immediate(connection):
+        inactive_style_chunks_removed = _purge_unused_style_chunks(connection)
+        inactive_style_pending_removed = _purge_unused_style_pending(connection)
         for run_uuid in _runs_missing_label_chunk(connection):
             chunks_written += _ensure_run_label_chunks(connection, run_uuid, now)
         for row in _unindexed_sources(connection):
@@ -158,18 +177,29 @@ def build_index(connection: sqlite3.Connection) -> dict[str, Any]:
                 (row["text_source_uuid"],),
             )
             sources_written += 1
-        _record_build(connection, mode="build", sources=sources_written, chunks=chunks_written)
+        for part in _unindexed_part_directions(connection):
+            chunks_written += _replace_part_direction_chunks(connection, part, now)
+            part_directions_written += 1
+        _record_build(
+            connection,
+            mode="build",
+            sources=sources_written + part_directions_written,
+            chunks=chunks_written,
+        )
         pending = _pending_count(connection)
     return {
         "mode": "build",
         "sources_written": sources_written,
+        "part_directions_written": part_directions_written,
+        "inactive_style_chunks_removed": inactive_style_chunks_removed,
+        "inactive_style_pending_removed": inactive_style_pending_removed,
         "chunks_written": chunks_written,
         "pending_remaining": pending,
     }
 
 
 def rebuild_index(connection: sqlite3.Connection) -> dict[str, Any]:
-    """Drop and rebuild the whole index from ``text_sources`` and ``runs`` only.
+    """Rebuild the derived index from ``text_sources``, ``parts`` and ``runs`` only.
 
     One atomic transaction, so a failure leaves the previous index intact. Every
     pending marker is cleared because the rebuild re-attempts every source, and the
@@ -182,16 +212,27 @@ def rebuild_index(connection: sqlite3.Connection) -> dict[str, Any]:
         connection.execute("DELETE FROM search_fts")  # clear any historical orphan rows as well
         connection.execute("DELETE FROM search_index_pending")
         sources_written = 0
+        part_directions_written = 0
         chunks_written = 0
         for run_uuid in _runs_with_label(connection):
             chunks_written += _ensure_run_label_chunks(connection, run_uuid, now)
         for row in _indexable_sources(connection):
             chunks_written += _replace_source_chunks(connection, row, now)
             sources_written += 1
-        _record_build(connection, mode="rebuild", sources=sources_written, chunks=chunks_written)
+        for part in _unindexed_part_directions(connection):
+            chunks_written += _replace_part_direction_chunks(connection, part, now)
+            part_directions_written += 1
+        _record_build(
+            connection,
+            mode="rebuild",
+            sources=sources_written + part_directions_written,
+            chunks=chunks_written,
+        )
     return {
         "mode": "rebuild",
         "sources_written": sources_written,
+        "part_directions_written": part_directions_written,
+        "inactive_style_chunks_removed": 0,  # full rebuild clears every old derived row
         "chunks_written": chunks_written,
     }
 
@@ -200,7 +241,8 @@ def index_status(connection: sqlite3.Connection) -> dict[str, Any]:
     """Return truthful counts of the derived index from the database alone.
 
     ``complete`` is true only when the index exists, nothing is pending, every
-    indexable source is indexed, and no source is stored as an incomplete hash --
+    indexable source and part vibe is indexed, no unused style remains, and no
+    source is stored as an incomplete hash --
     so an old imported corpus that only kept a hash is reported ``complete: false``
     with its ``sources_incomplete`` count instead of being claimed searchable.
     ``needs_rebuild`` is true when the index is missing or was built by another
@@ -217,7 +259,9 @@ def index_status(connection: sqlite3.Connection) -> dict[str, Any]:
         "last_build_chunks FROM search_index_state WHERE id = 1"
     ).fetchone()
     sources_total = _scalar(connection, "SELECT COUNT(*) FROM text_sources")
-    sources_indexable = _count_kinds(connection, ROLE_BY_KIND, require_content=True)
+    sources_indexable = _count_kinds(
+        connection, ROLE_BY_KIND, require_content=True, exclude_unused_style=True
+    )
     sources_private = _count_kinds(connection, PRIVATE_TEXT_KINDS)
     sources_incomplete = _scalar(
         connection,
@@ -225,10 +269,27 @@ def index_status(connection: sqlite3.Connection) -> dict[str, Any]:
     )
     sources_indexed = _scalar(
         connection,
-        "SELECT COUNT(DISTINCT text_source_uuid) FROM search_chunks "
-        "WHERE text_source_uuid IS NOT NULL",
+        "SELECT COUNT(DISTINCT c.text_source_uuid) FROM search_chunks AS c "
+        "JOIN text_sources AS s ON s.text_source_uuid = c.text_source_uuid "
+        f"WHERE {_active_source_clause('s')}",
+        (TEXT_KIND_TTS_DIRECTION,),
     )
+    inactive_style_chunks = _count_unused_style_chunks(connection)
     indexed_chunks = _scalar(connection, "SELECT COUNT(*) FROM search_chunks")
+    part_directions_total = _scalar(
+        connection,
+        "SELECT COUNT(*) FROM parts WHERE vibe_effective IS NOT NULL "
+        "AND TRIM(vibe_effective) <> ''",
+    )
+    part_directions_indexed = _scalar(
+        connection,
+        "SELECT COUNT(*) FROM parts AS p WHERE p.vibe_effective IS NOT NULL "
+        "AND TRIM(p.vibe_effective) <> '' AND EXISTS ("
+        "SELECT 1 FROM search_chunks AS c WHERE c.part_uuid = p.part_uuid "
+        "AND c.text_source_uuid IS NULL AND c.kind = ? AND c.role = ?)",
+        (TEXT_KIND_TTS_DIRECTION, ROLE_DIRECTIONS),
+    )
+    part_directions_missing = part_directions_total - part_directions_indexed
     pending = _pending_count(connection)
     label_runs = _scalar(
         connection,
@@ -244,6 +305,8 @@ def index_status(connection: sqlite3.Connection) -> dict[str, Any]:
         and labels_missing == 0
         and sources_incomplete == 0
         and sources_indexed == sources_indexable
+        and part_directions_missing == 0
+        and inactive_style_chunks == 0
         and built_chunker_version == CHUNKER_VERSION
     )
     return {
@@ -258,6 +321,10 @@ def index_status(connection: sqlite3.Connection) -> dict[str, Any]:
         "sources_total": sources_total,
         "sources_indexable": sources_indexable,
         "sources_indexed": sources_indexed,
+        "part_directions_total": part_directions_total,
+        "part_directions_indexed": part_directions_indexed,
+        "part_directions_missing": part_directions_missing,
+        "inactive_style_chunks": inactive_style_chunks,
         "sources_pending": pending,
         "sources_private_excluded": sources_private,
         "sources_incomplete": sources_incomplete,
@@ -275,6 +342,67 @@ def index_status(connection: sqlite3.Connection) -> dict[str, Any]:
 def _is_indexable_source(kind: str, content: str | None) -> bool:
     """Whether a source contributes chunks: an indexable kind with real text."""
     return is_indexable_kind(kind) and content is not None and content.strip() != ""
+
+
+def _unused_style_clause(alias: str) -> str:
+    """An old run-level direction unused by an explicit speech-parts adapter.
+
+    Only speech-parts persists a non-NULL ``vibe_effective`` on its parts, even
+    when the authored vibe is empty. Its generic run-level style prompt was never
+    transmitted; preserve that canonical source for native-view integrity, but
+    exclude it from the derived lexical index.
+    """
+    return (
+        f"{alias}.kind = ? AND {alias}.part_uuid IS NULL "
+        "AND EXISTS (SELECT 1 FROM parts AS p "
+        f"WHERE p.run_uuid = {alias}.run_uuid AND p.vibe_effective IS NOT NULL)"
+    )
+
+
+def _active_source_clause(alias: str) -> str:
+    return f"NOT ({_unused_style_clause(alias)})"
+
+
+def _is_unused_style_source(connection: sqlite3.Connection, row: sqlite3.Row) -> bool:
+    if row["kind"] != TEXT_KIND_TTS_DIRECTION or row["part_uuid"] is not None:
+        return False
+    return (
+        connection.execute(
+            "SELECT 1 FROM parts WHERE run_uuid = ? AND vibe_effective IS NOT NULL LIMIT 1",
+            (row["run_uuid"],),
+        ).fetchone()
+        is not None
+    )
+
+
+def _count_unused_style_chunks(connection: sqlite3.Connection) -> int:
+    return _scalar(
+        connection,
+        "SELECT COUNT(*) FROM search_chunks AS c "
+        "JOIN text_sources AS s ON s.text_source_uuid = c.text_source_uuid "
+        f"WHERE {_unused_style_clause('s')}",
+        (TEXT_KIND_TTS_DIRECTION,),
+    )
+
+
+def _purge_unused_style_chunks(connection: sqlite3.Connection) -> int:
+    cursor = connection.execute(
+        "DELETE FROM search_chunks WHERE text_source_uuid IN ("
+        "SELECT s.text_source_uuid FROM text_sources AS s "
+        f"WHERE {_unused_style_clause('s')})",
+        (TEXT_KIND_TTS_DIRECTION,),
+    )
+    return int(cursor.rowcount)
+
+
+def _purge_unused_style_pending(connection: sqlite3.Connection) -> int:
+    cursor = connection.execute(
+        "DELETE FROM search_index_pending WHERE text_source_uuid IN ("
+        "SELECT s.text_source_uuid FROM text_sources AS s "
+        f"WHERE {_unused_style_clause('s')})",
+        (TEXT_KIND_TTS_DIRECTION,),
+    )
+    return int(cursor.rowcount)
 
 
 def _replace_source_chunks(connection: sqlite3.Connection, row: sqlite3.Row, now: str) -> int:
@@ -315,6 +443,60 @@ def _replace_source_chunks(connection: sqlite3.Connection, row: sqlite3.Row, now
             now=now,
         )
     return written
+
+
+def _replace_part_direction_chunks(
+    connection: sqlite3.Connection, part: sqlite3.Row, now: str
+) -> int:
+    """Derive direction FTS rows from committed parts without rewriting paid history.
+
+    A NULL text_source_uuid is intentional: the canonical instruction is the
+    immutable ``parts.vibe_effective`` column. This is the same derived-only
+    representation used by run-label chunks. The part UUID preserves attribution.
+    """
+    connection.execute(
+        "DELETE FROM search_chunks WHERE text_source_uuid IS NULL "
+        "AND kind = ? AND role = ? AND part_uuid = ?",
+        (TEXT_KIND_TTS_DIRECTION, ROLE_DIRECTIONS, part["part_uuid"]),
+    )
+    written = 0
+    for index, (start, end, chunk) in enumerate(chunk_text(part["vibe_effective"])):
+        written += _insert_chunk(
+            connection,
+            text_source_uuid=None,
+            run_uuid=part["run_uuid"],
+            part_uuid=part["part_uuid"],
+            artifact_uuid=None,
+            kind=TEXT_KIND_TTS_DIRECTION,
+            role=ROLE_DIRECTIONS,
+            chunk_index=index,
+            char_start=start,
+            char_end=end,
+            chunk=chunk,
+            start_ms=None,
+            end_ms=None,
+            now=now,
+        )
+    return written
+
+
+def _unindexed_part_directions(
+    connection: sqlite3.Connection, *, run_uuid: str | None = None
+) -> list[sqlite3.Row]:
+    """Find canonical part vibes whose derived direction chunks are absent."""
+    sql = (
+        "SELECT p.part_uuid, p.run_uuid, p.vibe_effective FROM parts AS p "
+        "WHERE p.vibe_effective IS NOT NULL AND TRIM(p.vibe_effective) <> '' "
+        "AND NOT EXISTS (SELECT 1 FROM search_chunks AS c "
+        "WHERE c.part_uuid = p.part_uuid AND c.text_source_uuid IS NULL "
+        "AND c.kind = ? AND c.role = ?)"
+    )
+    parameters: list[str] = [TEXT_KIND_TTS_DIRECTION, ROLE_DIRECTIONS]
+    if run_uuid is not None:
+        sql += " AND p.run_uuid = ?"
+        parameters.append(run_uuid)
+    sql += " ORDER BY p.run_uuid, p.position"
+    return list(connection.execute(sql, parameters))
 
 
 def _observed_spans_for_run(
@@ -457,10 +639,11 @@ def _delete_label_chunks(connection: sqlite3.Connection, run_uuid: str) -> None:
 def _indexable_sources(connection: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(
         connection.execute(
-            f"SELECT {_SOURCE_COLUMNS} FROM text_sources "
-            f"WHERE kind IN ({_INDEXABLE_KIND_PLACEHOLDERS}) "
-            "AND content IS NOT NULL AND TRIM(content) <> ''",
-            _INDEXABLE_KIND_VALUES,
+            f"SELECT {_SOURCE_COLUMNS} FROM text_sources AS s "
+            f"WHERE s.kind IN ({_INDEXABLE_KIND_PLACEHOLDERS}) "
+            "AND s.content IS NOT NULL AND TRIM(s.content) <> '' "
+            f"AND {_active_source_clause('s')}",
+            (*_INDEXABLE_KIND_VALUES, TEXT_KIND_TTS_DIRECTION),
         )
     )
 
@@ -471,10 +654,11 @@ def _unindexed_sources(connection: sqlite3.Connection) -> list[sqlite3.Row]:
             f"SELECT {_SOURCE_COLUMNS} FROM text_sources AS s "
             f"WHERE s.kind IN ({_INDEXABLE_KIND_PLACEHOLDERS}) "
             "AND s.content IS NOT NULL AND TRIM(s.content) <> '' "
+            f"AND {_active_source_clause('s')} "
             "AND NOT EXISTS ("
             "SELECT 1 FROM search_chunks AS c WHERE c.text_source_uuid = s.text_source_uuid"
             ")",
-            _INDEXABLE_KIND_VALUES,
+            (*_INDEXABLE_KIND_VALUES, TEXT_KIND_TTS_DIRECTION),
         )
     )
 
@@ -530,18 +714,26 @@ def _pending_count(connection: sqlite3.Connection) -> int:
 
 
 def _count_kinds(
-    connection: sqlite3.Connection, kinds: Iterable[str], *, require_content: bool = False
+    connection: sqlite3.Connection,
+    kinds: Iterable[str],
+    *,
+    require_content: bool = False,
+    exclude_unused_style: bool = False,
 ) -> int:
     if not kinds:
         return 0
     placeholders = ", ".join("?" for _ in kinds)
-    condition = f"kind IN ({placeholders})"
+    condition = f"s.kind IN ({placeholders})"
+    parameters = list(kinds)
     if require_content:
-        condition += " AND content IS NOT NULL AND TRIM(content) <> ''"
+        condition += " AND s.content IS NOT NULL AND TRIM(s.content) <> ''"
+    if exclude_unused_style:
+        condition += f" AND {_active_source_clause('s')}"
+        parameters.append(TEXT_KIND_TTS_DIRECTION)
     return _scalar(
         connection,
-        f"SELECT COUNT(*) FROM text_sources WHERE {condition}",
-        list(kinds),
+        f"SELECT COUNT(*) FROM text_sources AS s WHERE {condition}",
+        parameters,
     )
 
 

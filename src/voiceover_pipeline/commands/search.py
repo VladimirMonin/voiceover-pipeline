@@ -327,6 +327,18 @@ def search_history(
                         f"{labels_missing} run label(s) are missing from the index; "
                         "run `voiceover index build`."
                     )
+                missing_part_directions = status.get("part_directions_missing", 0)
+                if missing_part_directions:
+                    warnings.append(
+                        f"{missing_part_directions} saved part direction(s) are not indexed; "
+                        "run `voiceover index build`."
+                    )
+                inactive_style_chunks = status.get("inactive_style_chunks", 0)
+                if inactive_style_chunks:
+                    warnings.append(
+                        f"{inactive_style_chunks} unused run-level direction chunk(s) remain "
+                        "indexed; run `voiceover index build`."
+                    )
                 incomplete = status.get("sources_incomplete", 0)
                 if incomplete:
                     warnings.append(

@@ -6,6 +6,7 @@ provider, network call, API key, ``.env``, model, or paid request is used. The o
 real-FFmpeg test is skipped when ``ffmpeg`` is not installed.
 """
 
+import argparse
 import json
 import shutil
 import sqlite3
@@ -53,6 +54,17 @@ parts:
 
 
 # ── parser and budget (pure) ──────────────────────────────────────────────────
+
+
+def test_speech_parts_does_not_record_an_unsubmitted_default_style_prompt():
+    args = argparse.Namespace(
+        provider="polza-tts",
+        format="speech-parts",
+        style_prompt=None,
+        style_prompt_file=None,
+        no_style_prompt=False,
+    )
+    assert cli._resolve_provider_style_prompt(args) is None
 
 
 def test_build_document_keeps_text_and_both_vibes_separate():
@@ -214,6 +226,28 @@ def test_speech_parts_script_rejects_a_cli_voice_override(media_env, capsys, mon
     )
     assert code == 2
     assert "hidden override" in payload["error"]
+
+
+@pytest.mark.parametrize(
+    "style_option",
+    ["--style-prompt", "--style-prompt-file"],
+)
+def test_text_rejects_explicit_run_style_before_key_or_provider(
+    media_env, capsys, monkeypatch, style_option
+):
+    def explode(*_args, **_kwargs):  # pragma: no cover - asserted never to run
+        raise AssertionError("no key, style file, or provider must be accessed")
+
+    monkeypatch.setattr(cli, "build_provider", explode)
+    monkeypatch.setattr(cli, "read_api_key", explode)
+    code, payload = _run_generate(
+        capsys,
+        monkeypatch,
+        ["--text", "Привет", "--voice", "ash", style_option, str(media_env / "unused")],
+    )
+    assert code == 2
+    assert payload["details"]["error_code"] == "STYLE_PROMPT_UNSUPPORTED_FORMAT"
+    assert not (media_env / "out").exists()
 
 
 def test_vibe_is_blocked_before_any_key_or_provider(media_env, capsys, monkeypatch):

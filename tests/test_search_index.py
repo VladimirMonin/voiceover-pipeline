@@ -21,6 +21,7 @@ from voiceover_pipeline.history.repository import (
     TEXT_COMPLETENESS_INCOMPLETE,
     TEXT_KIND_ASR_CONTEXT,
     TEXT_KIND_ASR_TRANSCRIPT,
+    TEXT_KIND_TTS_DIRECTION,
     TEXT_KIND_TTS_SCRIPT,
     HistoryRepository,
 )
@@ -105,6 +106,133 @@ def test_index_build_is_idempotent(repository, database, tmp_path):
     indexing.build_index(database.connection)
     after = database.connection.execute("SELECT COUNT(*) FROM search_chunks").fetchone()[0]
     assert before == after
+
+
+def test_saved_part_vibe_is_indexed_as_direction_without_speech_leak(
+    repository, database, tmp_path
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path / "runs" / "mood"))
+    part = repository.add_part(
+        run.run_uuid,
+        position=1,
+        voice="Kore",
+        vibe_shared="Спокойно по-русски.",
+        vibe_specific="Говори задумчиво.",
+        vibe_effective="Спокойно по-русски.\n\nГовори задумчиво.",
+    )
+
+    before = indexing.index_status(database.connection)
+    assert before["part_directions_missing"] == 1
+    assert before["complete"] is False
+    assert (
+        search_lexical(
+            database.connection, "задумчиво", limit=20, roles=roles_for_scope("directions")
+        )["results"]
+        == []
+    )
+
+    first = indexing.build_index(database.connection)
+    assert first["part_directions_written"] == 1
+    assert indexing.index_status(database.connection)["part_directions_missing"] == 0
+    results = search_lexical(
+        database.connection, "задумчиво", limit=20, roles=roles_for_scope("directions")
+    )["results"]
+    assert len(results) == 1
+    assert results[0]["kind"] == TEXT_KIND_TTS_DIRECTION
+    assert results[0]["role"] == "directions"
+    assert results[0]["part_uuid"] == part.part_uuid
+    assert results[0]["text_source_uuid"] is None  # derived from canonical parts
+    assert _search(database.connection, "задумчиво")["results"] == []
+    assert indexing.build_index(database.connection)["chunks_written"] == 0
+    assert indexing.rebuild_index(database.connection)["part_directions_written"] == 1
+    assert (
+        len(
+            search_lexical(
+                database.connection, "задумчиво", limit=20, roles=roles_for_scope("directions")
+            )["results"]
+        )
+        == 1
+    )
+
+
+def test_part_vibe_indexes_on_following_canonical_text_save(repository, database, tmp_path):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path / "runs" / "immediate"))
+    repository.add_part(
+        run.run_uuid,
+        position=1,
+        voice="Puck",
+        vibe_effective="Говори энергично.",
+    )
+    assert indexing.index_status(database.connection)["part_directions_missing"] == 1
+    repository.add_text_source(
+        run.run_uuid, kind=TEXT_KIND_TTS_SCRIPT, origin="native_snapshot", content="Сцена."
+    )
+    assert indexing.index_status(database.connection)["part_directions_missing"] == 0
+    results = search_lexical(
+        database.connection, "энергично", limit=20, roles=roles_for_scope("directions")
+    )["results"]
+    assert len(results) == 1
+    assert results[0]["part_uuid"] is not None
+    assert _search(database.connection, "энергично")["results"] == []
+
+
+@pytest.mark.parametrize("effective_vibe", ["Говори загадочно.", ""])
+@pytest.mark.parametrize("has_old_style_chunk", [True, False])
+def test_index_build_removes_unused_default_style_from_old_speech_parts_run(
+    repository, database, tmp_path, effective_vibe, has_old_style_chunk
+):
+    run = repository.create_run(operation="tts", run_root=str(tmp_path / "runs" / "old-mood"))
+    old_style = repository.add_text_source(
+        run.run_uuid,
+        kind=TEXT_KIND_TTS_DIRECTION,
+        origin="native_snapshot",
+        content="Неотправленный спокойный стиль.",
+    )
+    assert (
+        len(
+            search_lexical(
+                database.connection, "неотправленный", limit=20, roles=roles_for_scope("directions")
+            )["results"]
+        )
+        == 1
+    )
+    repository.add_part(run.run_uuid, position=1, voice="Kore", vibe_effective=effective_vibe)
+    if not has_old_style_chunk:
+        database.connection.execute(
+            "DELETE FROM search_chunks WHERE text_source_uuid = ?", (old_style.text_source_uuid,)
+        )
+    database.connection.execute(
+        "INSERT INTO search_index_pending (text_source_uuid, reason, created_at) VALUES (?, ?, ?)",
+        (old_style.text_source_uuid, "legacy_failed_index", "2026-10-01T00:00:00Z"),
+    )
+    before = indexing.index_status(database.connection)
+    assert before["sources_pending"] == 1
+    assert before["part_directions_missing"] == bool(effective_vibe)
+    assert before["inactive_style_chunks"] == int(has_old_style_chunk)
+    assert before["complete"] is False
+
+    result = indexing.build_index(database.connection)
+    assert result["inactive_style_chunks_removed"] == int(has_old_style_chunk)
+    assert result["inactive_style_pending_removed"] == 1
+    assert indexing.index_status(database.connection)["sources_pending"] == 0
+    assert indexing.index_status(database.connection)["complete"] is True
+    assert (
+        search_lexical(
+            database.connection, "неотправленный", limit=20, roles=roles_for_scope("directions")
+        )["results"]
+        == []
+    )
+    assert len(
+        search_lexical(
+            database.connection, "загадочно", limit=20, roles=roles_for_scope("directions")
+        )["results"]
+    ) == bool(effective_vibe)
+    assert (
+        repository.get_text_sources(run.run_uuid)[0].text_source_uuid == old_style.text_source_uuid
+    )
+    assert indexing.build_index(database.connection)["chunks_written"] == 0
+    assert indexing.rebuild_index(database.connection)["inactive_style_chunks_removed"] == 0
+    assert indexing.index_status(database.connection)["complete"] is True
 
 
 def test_index_rebuild_is_deterministic(repository, database, tmp_path):
