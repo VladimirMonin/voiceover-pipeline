@@ -119,7 +119,6 @@ packages = ["src/voiceover_pipeline"]
 include = [
   "/src",
   "/tests",
-  "/in",
   "/docs",
   "/pyproject.toml",
   "/README.md",
