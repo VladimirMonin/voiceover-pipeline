@@ -59,6 +59,7 @@
 | [S09 deferral: план следующего релиза](reports/2026-10-01-s09-deferred-plan.md) | Только документированный перенос semantic/hybrid/embeddings/`sqlite-vec` в отдельный план следующего релиза; Sol6 `ACCEPT_PLAN_ONLY`, реализации и live-проверок нет, v0.7.0 сохраняет обязательный S08 FTS5. |
 | [S10 пакетная справка и skill](reports/2026-10-01-s10-packaged-help-and-skill.md) | 13 help-тем в установленном wheel, путь вне checkout, CLI settings/секреты и согласованный skill; 2372 offline passed / 2 skipped, Sol6 review skill `ACCEPT_OFFLINE`; чистая offline установка всех зависимостей `BLOCKED_CACHE`, Gemini live/listening и S12 ещё открыты. |
 | [S11 офлайн E2E и пакетная/платформенная матрица](reports/2026-10-01-s11-offline-journey-and-platform-matrix.md) | На macOS arm64 fake TTS/ASR → real FFmpeg/SQLite → FTS5 → resume/sync → exact Decimal; wheel/sdist без пользовательских `in/` по именам файлов, 2374 passed / 2 skipped, Sol6 `ACCEPT_OFFLINE`; полная установка зависимостей `BLOCKED_CACHE`, другой OS/live/listening `NOT_RUN`; release-relevant gaps требуют решения владельца. |
+| [S10/S11 установленный CLI на сохранённых пробах](reports/2026-10-01-s10-s11-gemini-installed-cli-recheck.md) | Новый offline wheel 0.6.1: key-free help, history list/show/costs, lexical search/index status и заблокированный Gemini validate на пяти изолированных DB; исправлен отказ list/show при легитимной WAL-паре. Экспортный repair через sync и paid resume не запускались. |
 
 ## Быстрый старт
 

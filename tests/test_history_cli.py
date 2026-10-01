@@ -23,6 +23,7 @@ import pytest
 
 import voiceover_pipeline.cli as cli
 from voiceover_pipeline.history.database import MIGRATIONS, HistoryDatabase, Migration
+from voiceover_pipeline.history.repository import HistoryRepository
 
 _SLUG = "openai-gpt-4o-mini-tts"
 _MODEL = "openai/gpt-4o-mini-tts"
@@ -825,6 +826,99 @@ def test_history_list_sidecar_present_is_unreadable_without_writes(
     assert _entries(_isolated_home) == before
     assert not (_isolated_home / "history.sqlite3-shm").exists()
     assert wal.read_bytes() == b"uncheckpointed-frames"
+
+
+def test_history_list_and_show_read_committed_live_wal_without_changing_main_or_wal(
+    monkeypatch, capsys, _isolated_home
+):
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    try:
+        repository = HistoryRepository(database)
+        run = repository.create_run(operation="tts", run_root="/tmp/run", status="completed")
+        wal = _isolated_home / "history.sqlite3-wal"
+        assert wal.is_file() and wal.stat().st_size > 0
+        before = _snapshot_tree(_isolated_home)
+
+        code, listed, _ = _invoke(monkeypatch, capsys, "history", "list", "--json")
+        assert code == 0
+        assert listed["runs"][0]["run_uuid"] == run.run_uuid
+        code, shown, _ = _invoke(monkeypatch, capsys, "history", "show", run.run_uuid, "--json")
+        assert code == 0
+        assert shown["run"]["run_uuid"] == run.run_uuid
+        after = _snapshot_tree(_isolated_home)
+        assert after.keys() == before.keys()
+        assert after["history.sqlite3"] == before["history.sqlite3"]
+        assert after["history.sqlite3-wal"] == before["history.sqlite3-wal"]
+        # SQLite read locks may update bytes in the existing shared-memory index.
+        assert len(after["history.sqlite3-shm"]) == len(before["history.sqlite3-shm"])
+    finally:
+        database.close()
+
+
+def test_history_list_and_show_read_stale_empty_wal_without_changing_main_or_wal(
+    monkeypatch, capsys, _isolated_home
+):
+    _isolated_home.mkdir(mode=0o700)
+    database_path = _isolated_home / "history.sqlite3"
+    with HistoryDatabase(database_path) as database:
+        database.migrate()
+        run = HistoryRepository(database).create_run(
+            operation="tts", run_root="/tmp/run", status="completed"
+        )
+    database_path.with_name("history.sqlite3-wal").write_bytes(b"")
+    database_path.with_name("history.sqlite3-shm").write_bytes(b"\0" * 32768)
+    before = _snapshot_tree(_isolated_home)
+
+    code, listed, _ = _invoke(monkeypatch, capsys, "history", "list", "--json")
+    assert code == 0
+    assert listed["runs"][0]["run_uuid"] == run.run_uuid
+    code, shown, _ = _invoke(monkeypatch, capsys, "history", "show", run.run_uuid, "--json")
+    assert code == 0
+    assert shown["run"]["run_uuid"] == run.run_uuid
+    after = _snapshot_tree(_isolated_home)
+    assert after.keys() == before.keys()
+    assert after["history.sqlite3"] == before["history.sqlite3"]
+    assert after["history.sqlite3-wal"] == before["history.sqlite3-wal"]
+    assert len(after["history.sqlite3-shm"]) == len(before["history.sqlite3-shm"])
+
+
+def test_history_show_keeps_one_snapshot_when_writer_commits_between_queries(
+    monkeypatch, capsys, _isolated_home
+):
+    _isolated_home.mkdir(mode=0o700)
+    database = HistoryDatabase(_isolated_home / "history.sqlite3")
+    database.migrate()
+    try:
+        writer = HistoryRepository(database)
+        run = writer.create_run(operation="tts", run_root="/tmp/run", status="running")
+        original_get_parts = HistoryRepository.get_parts
+        writer_committed = False
+
+        def commit_during_detail(self, run_uuid):
+            nonlocal writer_committed
+            if not writer_committed:
+                writer_committed = True
+                database.connection.execute(
+                    "UPDATE runs SET status = 'completed' WHERE run_uuid = ?", (run_uuid,)
+                )
+                database.connection.commit()
+                writer.add_attempt(
+                    run_uuid, call_type="tts_chunk", provider="polza-tts", status="completed"
+                )
+            return original_get_parts(self, run_uuid)
+
+        monkeypatch.setattr(HistoryRepository, "get_parts", commit_during_detail)
+        code, shown, _ = _invoke(monkeypatch, capsys, "history", "show", run.run_uuid, "--json")
+        assert code == 0
+        assert writer_committed
+        assert shown["run"]["status"] == "running"
+        assert shown["attempts"] == []  # no newly committed attempt in an old run snapshot
+        assert writer.get_run(run.run_uuid).status == "completed"
+        assert len(writer.get_attempts(run.run_uuid)) == 1
+    finally:
+        database.close()
 
 
 def test_history_import_future_schema_is_provider_error_without_writes(

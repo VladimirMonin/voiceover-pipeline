@@ -14,18 +14,16 @@ Read guarantees:
   history, ``history show`` reports a missing run, and ``history resume``/
   ``history sync`` report a missing run, all without creating the home directory or
   the database file.
-* Reads go through the narrow :func:`voiceover_pipeline.history.database.connect_readonly`
-  seam, so no migration, DDL, WAL switch, or sidecar write happens and a
-  corrupt, foreign, or newer database fails closed instead of being queried.
-* ``history costs`` asks for the same read-only contract through the
-  :func:`voiceover_pipeline.history.database.connect_readonly_consistent` seam: a
-  quiescent database (no ``-wal`` sidecar) is read by the immutable no-sidecar
-  reader, so the aggregate leaves no empty ``-wal``/``-shm`` behind that would
-  break later immutable reads, and only a database with a ``-wal`` sidecar is read
-  ``mode=ro`` over its committed WAL frames, so an attempt a run in progress just
-  committed is never missed. Either way it runs no migration and no DDL, and it
-  never deletes or overwrites a live ``-wal``/``-shm`` pair (only the quiescent
-  branch creates no sidecar at all, and it is the branch a normal home takes).
+* All history reads use the validated
+  :func:`voiceover_pipeline.history.database.connect_readonly_consistent` seam:
+  without a ``-wal`` it opens the immutable no-sidecar reader; with a valid
+  ``-wal``/``-shm`` pair it reads committed WAL frames in ``mode=ro``. Thus
+  ``list``/``show``/``costs`` and native-view preflight see the same saved run
+  after an index build, even when empty sidecars remain. No reader performs
+  migrations, DDL, journal-mode switches, creates an empty sidecar in a
+  quiescent home, or changes the canonical database/WAL. SQLite may update
+  existing shared-memory index bytes for read-lock bookkeeping. Missing/invalid ``-shm``,
+  a hot journal, a symlink, and corrupt/foreign/newer databases fail closed.
 * :func:`load_native_history_view` returns one verified read-only native
   prepared-TTS view for ``history resume ID``/``history sync ID``; a UUID that is
   not such a snapshot fails closed with a fixed, content-free ``NATIVE_HISTORY_UNSUPPORTED``
@@ -79,7 +77,6 @@ from ..history.database import (
     HistoryDatabaseReadOnlyError,
     MigrationChecksumError,
     SchemaVersionTooNewError,
-    connect_readonly,
     connect_readonly_consistent,
 )
 from ..history.legacy_import import (
@@ -203,17 +200,13 @@ def _resolve_database_path(database_path: Path | str | None) -> Path:
         raise HistoryCommandError(str(exc), _EXIT_ARGS, error_code="HISTORY_HOME_INVALID") from exc
 
 
-def _open_history(database_path: Path, *, consistent: bool = False) -> _OpenHistory:
-    """Open the database read-only, or report it absent/empty without writing.
+def _open_history(database_path: Path) -> _OpenHistory:
+    """Open a validated read-only view, or report the database absent.
 
-    ``consistent`` selects the :func:`connect_readonly_consistent` seam for
-    ``history costs``: a database without a ``-wal`` sidecar is read by the
-    immutable no-sidecar reader (so nothing is created), and a database with one
-    (a live writer's committed frames) is read ``mode=ro`` over its WAL, so an
-    aggregate never misses a just-committed attempt and never deletes or
-    overwrites a writer's sidecars. The default reader pins ``immutable=1`` and
-    refuses any adjacent sidecar, so ``list``/``show`` keep their post-run
-    fail-closed semantics.
+    The existing consistent reader chooses immutable when quiescent, or opens
+    a WAL with an existing reusable shared-memory file (which SQLite may update
+    for read-lock bookkeeping) without creating a new sidecar. All
+    history reads therefore observe committed runs after index maintenance.
     """
     if database_path.is_symlink() or database_path.parent.is_symlink():
         raise HistoryCommandError(
@@ -223,9 +216,8 @@ def _open_history(database_path: Path, *, consistent: bool = False) -> _OpenHist
         )
     if not database_path.exists():
         return _OpenHistory(database_path, None, None, None)
-    opener = connect_readonly_consistent if consistent else connect_readonly
     try:
-        connection = opener(database_path)
+        connection = connect_readonly_consistent(database_path)
     except FileNotFoundError:
         return _OpenHistory(database_path, None, None, None)
     except SchemaVersionTooNewError as exc:
@@ -587,11 +579,23 @@ def show_history(
     carries it, the same string is looked up as an exact user label, so a legacy
     run whose ``run_id`` happens to be UUID-shaped still resolves. A label that
     matches runs in more than one root fails with ``HISTORY_LABEL_AMBIGUOUS`` and
-    bounded candidates instead of choosing the first match.
+    bounded candidates instead of choosing the first match. Run, parts, attempts,
+    artifacts, and text-source metadata share one deferred read snapshot even
+    while another writer commits new WAL frames.
     """
     resolved = _resolve_database_path(database_path)
     open_history = _open_history(resolved)
+    connection = open_history.connection
     try:
+        if connection is not None:
+            try:
+                connection.execute("BEGIN DEFERRED")
+            except sqlite3.Error as exc:
+                raise HistoryCommandError(
+                    _DATABASE_UNREADABLE_MESSAGE,
+                    _EXIT_PROVIDER,
+                    error_code="HISTORY_DATABASE_UNREADABLE",
+                ) from exc
         if open_history.repository is None:
             raise _run_not_found_error(identifier)
         repository = open_history.repository
@@ -620,8 +624,12 @@ def show_history(
             **_run_detail(repository, candidates[0]),
         }
     finally:
-        if open_history.connection is not None:
-            open_history.connection.close()
+        if connection is not None:
+            try:
+                if connection.in_transaction:
+                    connection.rollback()  # release one coherent read snapshot
+            finally:
+                connection.close()
 
 
 # -- costs --------------------------------------------------------------------
@@ -742,7 +750,7 @@ def costs_history(*, database_path: Path | str | None = None) -> dict[str, Any]:
     progress stays visible, and an absent database creates nothing.
     """
     resolved = _resolve_database_path(database_path)
-    open_history = _open_history(resolved, consistent=True)
+    open_history = _open_history(resolved)
     exists = open_history.connection is not None or resolved.exists()
     totals: dict[str | None, _CostBucket] = {}
     operations: dict[tuple[str | None, str | None], _CostBucket] = {}

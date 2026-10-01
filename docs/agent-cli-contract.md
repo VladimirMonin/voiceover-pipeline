@@ -1145,25 +1145,26 @@ voiceover history costs --json
   (подписанные URL, Authorization) не печатаются. Присутствие текста/ошибки
   сообщается булевым полем (`has_content`, `has_error`), а не значением.
 
-### Ноль-записывающее чтение и sidecar
+### Чтение без изменения канонической БД и sidecar
 
 - Отсутствующая БД: `list` возвращает пустой список (`runs: []`, `count: 0`,
   `database.exists: false`), `show` — `HISTORY_RUN_NOT_FOUND` (exit `2`); ни дом,
   ни `runs/`, ни БД не создаются.
-- Reader открывает существующую БД `mode=ro&immutable=1` и не запускает миграции,
-  DDL или WAL-switch. Если рядом лежит живой `-wal`/`-journal` sidecar, чтение
-  отказывается (`HISTORY_DATABASE_UNREADABLE`, exit `30`), чтобы не отдать
-  устаревший снимок и не создать sidecar. Иностранная, повреждённая или более
-  новая БД тоже fail-closed: `HISTORY_DATABASE_TOO_NEW` /
-  `HISTORY_DATABASE_CHECKSUM_MISMATCH` (exit `30`).
-- `history costs` выбирает reader по наличию `-wal` на момент открытия. Без `-wal`
-  читается тем же immutable reader'ом, поэтому quiescent-дом не остаётся с пустой
-  парой `-wal`/`-shm`, которую read-only соединение не может удалить. При живом
-  `-wal` читается `mode=ro` по закоммиченным кадрам: такой `-wal`/`-shm` не
-  удаляется и не перезаписывается. Устаревшую пустую пару `-wal`/`-shm` (след
-  старой версии) команда не удаляет: `list`/`show`/`resume`/`sync` остаются
-  fail-closed, а `costs` читает БД через `-wal`. Ручная починка — удалить такую
-  пару только когда ни один прогон не активен.
+- `list`/`show`/`costs` и read-only preflight для `resume`/`sync` используют
+  один проверенный consistent reader без миграций, DDL и WAL-switch. При
+  отсутствии `-wal` это `mode=ro&immutable=1`: quiescent-дом не получает новую
+  пустую пару `-wal`/`-shm`. При наличии `-wal` и уже существующего пригодного
+  `-shm` применяется `mode=ro`: читаются закоммиченные WAL-кадры, в том числе
+  после `index build`; устаревшая **пустая** пара тоже не блокирует `list/show`.
+  Основной файл и `-wal` не переписываются, пара не удаляется; SQLite может
+  обновить байты **существующего** `-shm` для read-lock/index bookkeeping.
+  `history show` читает метаданные run/parts/attempts/artifacts/text sources в
+  одной deferred read-транзакции: соседний commit не смешивает версии строк.
+  Нельзя удалять sidecar вручную во время работы другого процесса.
+- `-wal` без пригодного `-shm`, hot `-journal`, symlink и иностранная/повреждённая
+  БД fail-closed (`HISTORY_DATABASE_UNREADABLE`, exit `30`); более новая схема
+  и чужой migration ledger также отказываются с
+  `HISTORY_DATABASE_TOO_NEW`/`HISTORY_DATABASE_CHECKSUM_MISMATCH` (exit `30`).
 - `import --dry-run` ничего не пишет: не создаёт БД, каталоги, sidecar и не меняет
   оригиналы. При нечитаемой/WAL/иностранной БД dry-run возвращает exit `0`,
   помечает `database.readable: false` и добавляет `database_status_unknown` в
@@ -1433,8 +1434,9 @@ Dry-run сообщает найденные каталоги/записи, impor
   `unknown_attempts`.
 - Чтение read-only: при отсутствии `-wal` это immutable-снимок без создания
   sidecar, поэтому quiescent-дом не теряет читаемость; при наличии `-wal`
-  читаются его закоммиченные кадры, и живой `-wal`/`-shm` не удаляется и не
-  перезаписывается. Выбор reader'а — lock-free проверка на момент открытия:
+  читаются его закоммиченные кадры, а основной файл/`-wal` не изменяются и
+  sidecar не удаляются; SQLite может обновлять существующий `-shm`.
+  Выбор reader'а — lock-free проверка на момент открытия:
   прогон, создавший `-wal` уже после неё, в этом снимке не виден, но значение
   никогда не выдумывается. Пустая БД → пустые `totals`/`operations`
   и `completeness: "complete"`; отсутствующая БД ничего не создаёт.
@@ -2072,7 +2074,8 @@ voiceover index rebuild --json
 
 ### Поведение `index`
 
-- `index status` открывает БД read-only (никаких sidecar-записей) и отдаёт
+- `index status` открывает БД read-only (не создаёт новые sidecar; при чтении
+  действительного WAL SQLite может обновить существующий `-shm`) и отдаёт
   честные счётчики: `sources_indexable`, `sources_indexed`, `sources_pending`,
   `sources_private_excluded` (приватный `asr_context`), `sources_incomplete`
   (только hash, без текста), `indexed_chunks`, `label_runs`, `labels_missing`,
