@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.0
+
+- Added canonical SQLite-first generation and local history: reserve each paid
+  attempt before submit, retain private response and receipt before parsing,
+  recover saved results without repeating an unconfirmed paid POST, and report
+  observed Decimal costs without inventing unknown amounts.
+- Added strict `speech-parts` YAML, one-part `--text`, per-part voice selection,
+  MP3/WAV finalization and DB-derived run artifacts. The optional Polza Gemini
+  3.8 Flash path requires `--allow-experimental-gemini-speech-parts`: each part
+  sends **one scalar voice per POST**, with spoken `input` separate from an
+  `instructions` field that Polza does not document for Gemini. It is an
+  empirical opt-in, not a stable provider guarantee or multi-speaker POST.
+- Added local Qwen ASR provenance, offline FTS5 lexical search over saved speech
+  and directions, and packaged `voiceover help`. Semantic/hybrid/vector search
+  remains deferred to a later release.
+- Offline end-to-end tests cover FFmpeg, SQLite, search, exact costs and safe
+  recovery; a six-minute experimental three-voice MP3 received a positive
+  overall listening assessment. That recording used a one-use runner, not the
+  newly packaged CLI. External provider billing, undocumented instruction
+  behavior, other operating systems and an offline dependency-clean install
+  remain separate, unverified boundaries.
+
 ## 0.6.1
 
 - Fixed false dialogue quality failures for non-spoken audio tags, Russian

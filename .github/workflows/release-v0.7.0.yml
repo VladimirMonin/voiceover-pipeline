@@ -1,0 +1,49 @@
+name: Release v0.7.0 on GitHub
+
+"on":
+  push:
+    tags:
+      - v0.7.0
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    if: github.repository == 'VladimirMonin/voiceover-pipeline' && github.ref == 'refs/tags/v0.7.0'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create the GitHub Release for the verified tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/release-notes.md" <<'NOTES'
+          v0.7.0: SQLite-first history and safe recovery, strict speech-parts YAML,
+          offline FTS5 lexical search, local Qwen ASR provenance, and packaged help.
+
+          Polza Gemini 3.8 Flash speech-parts requires the explicit
+          --allow-experimental-gemini-speech-parts opt-in. One authored part uses
+          one scalar voice and one POST; Gemini instructions are not documented.
+          The default route and Flash-Lite remain blocked. A previous one-use
+          6:17 recording received a positive overall listening assessment;
+          this is not a live acceptance of the newly packaged CLI. External
+          provider billing remains unverified. Semantic/hybrid search is planned
+          for a later release.
+
+          Local wheel/sdist were built and checked offline; this GitHub Release
+          supplies GitHub-generated source archives, not wheel/sdist uploads or
+          a PyPI publication. The offline clean dependency install was blocked
+          because openai was absent from the cache. Local gates and their exact
+          evidence: https://github.com/VladimirMonin/voiceover-pipeline/blob/v0.7.0/docs/reports/2026-10-01-s12-v0.7.0-release-readiness.md
+          NOTES
+          gh release create v0.7.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title 'voiceover-pipeline v0.7.0' \
+            --notes-file "$RUNNER_TEMP/release-notes.md" \
+            --latest
+          gh release view v0.7.0 \
+            --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,url \
+            --jq '{tagName,isDraft,isPrerelease,url}'

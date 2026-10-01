@@ -7,10 +7,10 @@
 
 | Поле | Значение |
 |---|---|
-| **Целевая версия приложения** | voiceover-pipeline 0.6.1 |
-| **Skill revision** | 2026-10-01 (development/unreleased) |
+| **Целевая версия приложения** | voiceover-pipeline 0.7.0 |
+| **Skill revision** | 2026-10-01 (v0.7.0) |
 | **Минимальная версия CLI** | 0.4.0 |
-| **Максимальная проверенная** | 0.6.1 |
+| **Максимальная проверенная** | 0.7.0 (offline wheel metadata/help; dependency-clean install `BLOCKED_CACHE`) |
 
 ## Что актуально в этой версии навыка
 
@@ -47,7 +47,7 @@ costs`.
 
 | Дата | Изменения |
 |---|---|
-| 2026-10-01 | **Development/unreleased:** явный эмпирический opt-in `--allow-experimental-gemini-speech-parts` допускает `polza-tts/google/gemini-3.8-flash-tts` для `--text`/`speech-parts`: один scalar `voice` на POST, эффективная инструкция в отдельном (не документированном для Gemini) поле `instructions`, наблюдённый WAV → MP3, приватный response body/receipt до разбора и запрет следования редиректам. По умолчанию маршрут и Flash-Lite остаются `BLOCKED_PROVIDER_CONTRACT`; флаг записывается в снимок, поэтому resume не может сменить политику. Не заявлять stable Gemini-маршрут или документацию инструкций. |
+| 2026-10-01 | **v0.7.0:** явный эмпирический opt-in `--allow-experimental-gemini-speech-parts` допускает `polza-tts/google/gemini-3.8-flash-tts` для `--text`/`speech-parts`: один scalar `voice` на POST, эффективная инструкция в отдельном (не документированном для Gemini) поле `instructions`, наблюдённый WAV → MP3, приватный response body/receipt до разбора и запрет следования редиректам. По умолчанию маршрут и Flash-Lite остаются `BLOCKED_PROVIDER_CONTRACT`; флаг записывается в снимок, поэтому resume не может сменить политику. Не заявлять stable Gemini-маршрут или документацию инструкций. |
 | 2026-10-01 | **S10 (unreleased):** упакованная атомарная справка `voiceover help [TOPIC] [--raw|--json]` читается из установленного пакета без ключей, `.env`, рабочего каталога и сети. README, docs index и skill приведены к фактическому разрешению секрета (непустое окружение процесса → явный `--env-file PATH` → `<CWD>/.env`, без поиска по родительским каталогам) и к явному согласию владельца на сетевые установки/загрузки моделей; из справочных файлов убраны волатильные цены и счётчики тестов. |
 | 2026-09-29 | **Development/unreleased, source-only:** платный TTS записывает attempt marker перед submit, не делает автоматический повтор через retry или fallback voice; неподтверждённый исход блокирует resume/overwrite, локальные retries сохранены. Нет live/paid provider acceptance или заявления о релизе. |
 | 2026-08-31 | **v0.6.1 candidate:** dialogue ASR quality gate удаляет из expected text только непроизносимые audio tags, нормализует `ё/е` и допускает эквивалентное деление ASR-токенов (`OmniVoice` / `Omni Voice`). Реальная лишняя речь и повторы остаются fail-closed. |
