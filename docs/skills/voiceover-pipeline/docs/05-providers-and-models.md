@@ -122,11 +122,14 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 - **ElevenLabs resume:** принятый `/media` task ID сохраняется до poll, поэтому после сбоя `--resume` при совпадении provider/model/voice/script и наличии более ранних MP3 доводит ту же часть GET-запросами без второго платного POST; маркер без ID по-прежнему блокирует `--resume`/`--overwrite`
 - Единый `POLZA_API_KEY` для обоих polza-провайдеров
 - Style prompt НЕ используется для Polza TTS (не поддерживается endpoint).
-- Polza Gemini 3.8 Flash и Flash-Lite ID были увидены в одном разрешённом GET
-  каталога, но endpoint, поле инструкции, голоса, контейнер и потолок цены не
-  подтверждены. `speech-parts` для Flash остаётся `BLOCKED_PROVIDER_CONTRACT`;
-  POST было ноль. Новый GET/POST запрещён без отдельного решения владельца,
-  доказанного тарифа и верхней границы затрат (`voiceover help speech.parts`).
+- Polza Gemini 3.8 Flash наблюдался в каталоге и ограниченных `/audio/speech`
+  live-пробах: scalar `voice` работал по отдельным частям, возвращался WAV при
+  запросе MP3. Попытка двух голосов в одном POST дала на слух один голос;
+  документированной multi-speaker схемы нет, `instructions` для Gemini в
+  опубликованном контракте не описан. Flash-Lite не испытывался. `speech-parts`
+  Flash остаётся `BLOCKED_PROVIDER_CONTRACT`; published цена не равна внешнему
+  счёту. Новые GET/POST — только с разрешением и доказанным ценовым пределом
+  (`voiceover help speech.parts`, датированный Gemini live-отчёт в репозитории).
 
 ---
 

@@ -234,13 +234,16 @@ voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спо
   консервативная политика, не доказанный предел Gemini). Поздняя over-limit
   часть не отправляет ни одного запроса (JSON `SPEECH_PART_TOO_LONG`, exit `2`).
 - Маршрут `speech-parts` идёт только через DB-first нативную генерацию; legacy
-  fallback отсутствует. Один разрешённый GET `/models` наблюдал оба ID
-  `google/gemini-3.8-flash-tts` и `google/gemini-3.8-flash-lite-tts`, но не
-  подтвердил endpoint, поле per-part инструкции, голоса, контейнер, применимую
-  цену и верхнюю границу стоимости; POST было ноль, а дополнительные GET/POST
-  требуют отдельного разрешения владельца и документированного потолка
-  (см. `docs/reports/2026-10-01-s06-paid-sync-response.md`). Поэтому
-  candidate-маршрут Flash (и любая непустая vibe) не регистрируется как stable и
+  fallback отсутствует. Каталог Polza и ограниченные реальные пробы подтвердили
+  модель `google/gemini-3.8-flash-tts`, endpoint `/audio/speech`, отдельный
+  scalar `voice` на запрос, WAV вместо запрошенного MP3 и опубликованные
+  компоненты цены. Но схема Polza не описывает два голоса в одном POST;
+  инструкция со вторым голосом дала на слух один голос, а поле `instructions`
+  не документировано для Gemini. Общий MP3 с тремя голосами в исследовательском
+  прогоне потребовал отдельных POST по частям, не подтверждая stable API или
+  внешний счёт (см. `docs/reports/2026-10-01-s06-gemini38-live-probes.md`).
+  Flash-Lite не проверялся. Поэтому candidate-маршрут Flash (и любая непустая
+  vibe) не регистрируется как stable и
   fail-closed: JSON `error_code` `BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до**
   чтения ключа и любого POST. Наблюдённый ID каталога не является подтверждённым
   speech-parts-контрактом.
