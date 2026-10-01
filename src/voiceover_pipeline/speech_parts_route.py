@@ -1,20 +1,22 @@
 """Offline admission policy for the ``speech-parts`` / ``--text`` request route.
 
-The Gemini speech-parts contract through Polza is **not verified**. One approved
-``/models`` catalog GET observed both Flash and Flash-Lite model IDs, but did not
-establish the endpoint, per-part instruction field, supported voices, audio
-container, applicable price, or a safe upper cost bound. This module therefore
-keeps the Flash candidate route inert: it names the candidate model so the format
-can be validated and its character budget checked fully offline, and it refuses
-a live submit with a fixed ``BLOCKED_PROVIDER_CONTRACT`` before any API key is read
-or any request is built.
+The stable Gemini speech-parts contract through Polza remains **blocked**.
+Authenticated model details and live experiments established its ``/audio/speech``
+endpoint, scalar per-part voices, a returned WAV container despite requesting
+MP3, and published RUB price components. A text instruction requesting a second
+voice in the same POST produced one audible voice. Polza's published schemas show
+one scalar voice per request, not a model-specific multi-speaker payload; the
+``instructions`` field is documented only for a different model, and actual
+external billing remains unverified. The separate experimental parts that yielded
+one 6:17 MP3 with three voices required twelve distinct POSTs; they do not make
+a multi-speaker request or the stable provider route confirmed. This module keeps
+the candidate inert and refuses a stable submit before key access or network.
 
-Two independent facts decide admission of a real request:
+Two independent rules decide admission of a real request:
 
-* a per-part *voice* is only confirmed on the existing ``openrouter-tts`` Gemini
-  route, whose dialogue executor already sends one cast voice per request; and
-* no confirmed route can carry an instruction without the provider reading it, so
-  any non-empty effective vibe is blocked until a real contract is confirmed.
+* only a confirmed provider/model route may send a per-part voice on its own
+  request (currently the OpenRouter Gemini dialogue route); and
+* no admitted route may silently discard or read aloud an effective vibe.
 
 The candidate model is deliberately absent from the stable ``POLZA_TTS_MODELS``
 catalog and from the ``list`` command, so nothing advertises it as available. It
@@ -28,11 +30,11 @@ from dataclasses import dataclass
 
 BLOCKED_PROVIDER_CONTRACT = "BLOCKED_PROVIDER_CONTRACT"
 
-# The one candidate model the plan names. Its ID was observed in a permitted
-# catalog GET, but its endpoint, instruction field, voices, container, and cost
-# ceiling remain UNVERIFIED. Flash-Lite's ID was also observed but is deliberately
-# absent from this candidate route. Registering either as a stable model-list entry
-# would advertise an unconfirmed route, so neither appears there.
+# The one candidate model the plan names. Its endpoint, scalar voice transport,
+# actual WAV response and published price components were observed, but a
+# documented multi-speaker payload and external billing were not. Experimental
+# per-part instructions do not establish stable instruction semantics. Flash-Lite
+# remains absent, and neither model is advertised as a stable route.
 _CANDIDATE_GEMINI_SPEECH_PARTS_MODEL = "google/gemini-3.8-flash-tts"
 
 # Routes on which a per-part cast voice is already confirmed: the OpenRouter Gemini
@@ -123,11 +125,13 @@ def require_confirmed_speech_parts_route(
         raise SpeechPartsRouteError(
             f"BLOCKED_PROVIDER_CONTRACT: the provider/model route {provider}/{model} is a "
             "candidate only; its catalog-confirmed ID is not a verified speech-parts route. "
-            "Endpoint, instruction field, voices, audio container, applicable price, and "
-            "upper cost bound remain unverified; no paid request will be sent on an assumed "
-            "payload. Further provider probes require separate owner approval and a documented "
-            "cost ceiling. Use an existing confirmed route instead. No request was sent and no "
-            "API key was read."
+            "Polza lists /audio/speech, but its published schema has one scalar voice per POST; "
+            "there is no documented payload for two distinct voices in one POST. An approved "
+            "instruction-only two-voice experiment was heard as one voice. Separate single-voice "
+            "POSTs have produced a multi-voice final MP3, but do not verify that request contract "
+            "or stable Gemini instruction behavior. Published prices and API usage are not an "
+            "external invoice or a guaranteed bill ceiling. This candidate remains blocked "
+            "before key access or any paid request; no request was sent and no API key was read."
         )
     if has_vibe:
         raise SpeechPartsRouteError(
