@@ -85,7 +85,7 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 Запрос `/media`: `{"model":"...","input":{"prompt":"...","voice":"Rachel","language_code":"ru"},"async":true}`
 → poll `GET /media/{id}` → download MP3 с `data[0].url`.
 
-### Голоса OpenAI TTS (Polza TTS + OpenRouter)
+### Зарегистрированные голоса OpenAI TTS через Polza
 
 | Голос | Пол | Характер |
 |---|---|---|
@@ -101,8 +101,11 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 | `shimmer` | Ж | — |
 | `verse` | М | Выразительный |
 
-Все 11 голосов доступны в `polza-tts` и `openrouter-tts` (OpenAI-модели).
-**Дефолт:** `alloy` для Polza TTS и OpenRouter OpenAI TTS.
+Все 11 имён зарегистрированы для OpenAI-модели `polza-tts`; регистрация не
+доказывает live-доступность. **Дефолт Polza TTS:** `alloy`. Текущий реестр
+`openrouter-tts` содержит только Gemini-модель, не OpenAI TTS: проверяй
+`voiceover list providers --json` и `voiceover list voices --provider openrouter-tts --json`
+вместо переноса Polza-голосов на другой маршрут.
 
 ### Голоса ElevenLabs через Polza
 

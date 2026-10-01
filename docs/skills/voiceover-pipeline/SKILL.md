@@ -228,24 +228,25 @@ dotted identifier; неизвестная тема — exit `2`. Актуаль�
 
 ## Режим G: Короткая реплика и `speech-parts` (S06)
 
-Когда нужна одна реплика или явный список частей с одним голосом на часть:
+Одна реплика или части: `podcast.yaml` здесь без vibe.
 
 ```bash
-voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спокойный ведущий." --json
+voiceover generate --provider polza-chat-audio --text "Добрый вечер." --voice ash --run-id greeting-01 --json
 voiceover validate --script ./podcast.yaml --format speech-parts --json
 voiceover generate --script ./podcast.yaml --format speech-parts --run-id podcast-01 --json
 ```
 
-- `--vibe` при обычном `--script`/legacy-формате отклоняется до ключа и платного
-  запроса, а не игнорируется; использовать его с `--text` или записать в YAML.
+- Примеры `generate` платные: только после разрешения владельца и доказанного
+  потолка расходов; зарегистрированный голос не подтверждает live-доступность.
+- Непустой `--vibe` в legacy отклоняется как формат. С `--text` и в YAML он
+  синтаксически допустим, но **любой текущий маршрут** возвращает
+  `BLOCKED_PROVIDER_CONTRACT` до ключа и POST; примеры выше — без vibe.
 - `speech-parts` — строгий YAML (`version: 1`, `format: speech-parts`, непустой
-  `parts`, ровно одна непустая `voice` и непустой `text` на часть, общий и
-  частный `vibe`). `provider`/`model` задаёт CLI; CLI `--voice`/`--vibe` для
-  такого сценария отклоняются — скрытых override нет.
-- Эффективная инструкция = общий vibe, пустая строка, vibe части; в произносимый
-  текст не попадает; прогон и resume идут через DB-first нативную историю без
-  чтения исходного файла. Все части проверяются до первого POST, поздняя
-  слишком длинная часть не отправляет ничего.
+  `parts` с `voice`/`text`). `provider`/`model` задаёт CLI; CLI `--voice`/`--vibe`
+  с этим сценарием отклоняются без скрытых override. Общий и частный vibe
+  составляют отдельную инструкцию, не произносимый текст, но пока заблокированы.
+- Прогон и resume идут через DB-first историю без повторного чтения YAML;
+  все части проверяются до POST, поздняя слишком длинная часть не отправляется.
 - `--audio-format {mp3,wav}` меняет контейнер только итогового файла (default
   mp3); `wav` — только нативный маршрут.
 - **Статус Gemini-маршрута:** Polza Gemini 3.8 speech-parts **не подтверждён**
