@@ -1111,6 +1111,7 @@ def build_output_options(
     timing: NativeTimingOptions | None = None,
     quality: NativeQualityOptions | None = None,
     audio_format: str = "mp3",
+    experimental_speech_parts: bool = False,
 ) -> dict[str, Any]:
     """Return the fixed output-processing settings the native route records.
 
@@ -1122,6 +1123,10 @@ def build_output_options(
     resume proves they did not change either. The merged-output container is recorded
     only when it is not the default ``mp3``, so every existing run keeps the exact
     recorded options it committed and its resume is not invalidated by this stage.
+    ``experimental_speech_parts`` is recorded only for a run explicitly opted into
+    the empirical experimental Polza Gemini speech-parts route, so the durable
+    record keeps that policy and a later ``generate --resume`` cannot continue the
+    run without the same opt-in.
     """
     options: dict[str, Any] = {
         "trim_final_silence": not no_trim,
@@ -1131,6 +1136,8 @@ def build_output_options(
         options["audio_format"] = audio_format
     options.update(_timing_output_fields(timing))
     options.update(_quality_output_fields(quality))
+    if experimental_speech_parts:
+        options["experimental_speech_parts"] = True
     return options
 
 

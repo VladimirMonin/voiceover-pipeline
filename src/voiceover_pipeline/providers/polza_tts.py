@@ -11,6 +11,7 @@ import requests
 from voiceover_pipeline.config import (
     DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
     POLZA_BASE_URL,
+    POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL,
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
@@ -185,42 +186,66 @@ class PolzaTTSProvider(TTSProvider):
         return self.model.startswith("elevenlabs/")
 
     def synthesize_chunk(
-        self, text: str, chunk_id: str, voice: str | None = None
+        self, text: str, chunk_id: str, voice: str | None = None, vibe: str | None = None
     ) -> SynthesisResult:
         """Synthesize one part, honoring an optional per-part voice override.
 
         The synchronous ``/audio/speech`` route carries the effective voice in its
         request and result, so a caller may pass a different per-part cast voice
         (as a ``speech-parts`` part or a dialogue turn does) while an omitted
-        ``voice`` keeps the configured run voice exactly as before. The ElevenLabs
-        ``/media`` route speaks with its one configured voice and cannot carry a
-        per-part override, so a different voice fails closed here instead of being
-        silently dropped.
+        ``voice`` keeps the configured run voice exactly as before. A non-empty
+        ``vibe`` is an effective instruction the caller already admitted for exactly
+        one experimental route; it is sent as that route's separate ``instructions``
+        field and never mixed into the spoken text. The ElevenLabs ``/media`` route
+        speaks with its one configured voice and cannot carry a per-part override or
+        an instruction, so either fails closed here instead of being silently
+        dropped.
         """
         effective_voice = voice or self.voice
         if self._is_elevenlabs:
             if effective_voice != self.voice:
                 raise ValueError("Polza TTS media route cannot carry a per-part voice override.")
+            if vibe:
+                raise ValueError("Polza TTS media route cannot carry an instruction.")
             return self._synthesize_media(text, chunk_id)
-        return self._synthesize_audio_speech(text, chunk_id, effective_voice)
+        return self._synthesize_audio_speech(text, chunk_id, effective_voice, vibe)
 
     def _synthesize_audio_speech(
-        self, text: str, chunk_id: str, voice: str | None = None
+        self, text: str, chunk_id: str, voice: str | None = None, vibe: str | None = None
     ) -> SynthesisResult:
         effective_voice = voice or self.voice
+        payload: dict[str, str] = {
+            "model": self.model,
+            "input": text,
+            "voice": effective_voice,
+            "response_format": self.response_format,
+        }
+        if vibe:
+            # Only the explicitly opt-in experimental Polza Gemini speech-parts
+            # model carries an instruction, and only through the ``instructions``
+            # field no published schema documents for it. Any other model fails
+            # closed before the POST instead of sending an instruction that could
+            # be read aloud or silently dropped; the spoken ``input`` is never
+            # composed with the instruction.
+            if self.model != POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL:
+                raise ValueError(
+                    "Polza TTS instructions are only carried by the explicit experimental "
+                    "Gemini speech-parts route."
+                )
+            payload["instructions"] = vibe
         response = requests.post(
             f"{self.base_url}/audio/speech",
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": self.model,
-                "input": text,
-                "voice": effective_voice,
-                "response_format": self.response_format,
-            },
+            json=payload,
             timeout=self.timeout_seconds,
+            # A redirect would let the transport re-send this paid POST body to
+            # another target, which the one-submit invariant forbids. The observed
+            # response (including any 3xx) is therefore reported back unchanged and
+            # handled as a bounded status below.
+            allow_redirects=False,
         )
         if self.on_raw_response is not None:
             # Hand the exact response body to the caller before the status check
@@ -232,7 +257,7 @@ class PolzaTTSProvider(TTSProvider):
                 response.status_code,
                 response.headers.get("X-Generation-Id"),
             )
-        if response.status_code >= 400:
+        if response.status_code >= 300:
             # The provider error body is untrusted and may echo the request text
             # or a signed URL, so only the bounded status is reported.
             raise RuntimeError(f"HTTP {response.status_code}")

@@ -78,6 +78,14 @@ POLZA_TTS_MODELS = [
     "elevenlabs/text-to-speech-multilingual-v2",
 ]
 
+# The one experimental Polza Gemini TTS model whose scalar per-part request was
+# observed but never documented. It is deliberately absent from
+# ``POLZA_TTS_MODELS`` and from ``list`` so nothing advertises it as a stable
+# route; only the ordinary CLI's explicit opt-in flag admits it, and only for the
+# ``speech-parts`` format. ``instructions`` is an undocumented field for this
+# model, so the provider sends it only behind that same opt-in.
+POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL = "google/gemini-3.8-flash-tts"
+
 TTS_PROMPT_MODE_NONE = "none"
 TTS_PROMPT_MODE_PREFIX = "prefix"
 TTS_PROMPT_MODE_NATIVE = "native"

@@ -239,21 +239,21 @@ voiceover generate --script ./podcast.yaml --format speech-parts --run-id podcas
 - Примеры `generate` платные: только после разрешения владельца и доказанного
   потолка расходов; зарегистрированный голос не подтверждает live-доступность.
 - Непустой `--vibe` в legacy отклоняется как формат. С `--text` и в YAML он
-  синтаксически допустим, но **любой текущий маршрут** возвращает
+  синтаксически допустим, но **по умолчанию любой маршрут** возвращает
   `BLOCKED_PROVIDER_CONTRACT` до ключа и POST; примеры выше — без vibe.
 - `speech-parts` — строгий YAML (`version: 1`, `format: speech-parts`, непустой
   `parts` с `voice`/`text`). `provider`/`model` задаёт CLI; CLI `--voice`/`--vibe`
   с этим сценарием отклоняются без скрытых override. Общий и частный vibe
-  составляют отдельную инструкцию, не произносимый текст, но пока заблокированы.
+  составляют отдельную инструкцию, не произносимый текст.
+- **Polza Gemini Flash:** `--allow-experimental-gemini-speech-parts` допускает
+  только `polza-tts/google/gemini-3.8-flash-tts` с `--text`/YAML: один scalar
+  `voice` POST на часть, отдельное недокументированное `instructions`; эффект
+  не гарантирован ([подробности](docs/05-providers-and-models.md)).
 - Прогон и resume идут через DB-first историю без повторного чтения YAML;
   все части проверяются до POST, поздняя слишком длинная часть не отправляется.
-- `--audio-format {mp3,wav}` меняет контейнер только итогового файла (default
-  mp3); `wav` — только нативный маршрут.
-- **Статус Gemini-маршрута:** Polza Gemini 3.8 speech-parts заблокирован
-  (`BLOCKED_PROVIDER_CONTRACT`). Live scalar-voice пробы дали аудио, но запрос
-  двух голосов в одном POST дал один голос; multi-speaker схема не описана,
-  внешний счёт неизвестен ([отчёт](../../reports/2026-10-01-s06-gemini38-live-probes.md)).
-  Не рекламируй stable маршрут; live-запросы — только с разрешением и потолком.
+- `--audio-format {mp3,wav}` меняет только итоговый файл (default mp3); `wav` — только нативный маршрут.
+- По умолчанию Gemini `BLOCKED_PROVIDER_CONTRACT`, Flash-Lite недоступен.
+  Ни multi-speaker POST, ни внешний счёт не подтверждены ([S06-пробы](../../reports/2026-10-01-s06-gemini38-live-probes.md)); live — только с разрешением и потолком.
 
 ## Поиск по сохранённому тексту (S08)
 

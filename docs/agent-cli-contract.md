@@ -243,10 +243,24 @@ voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спо
   прогоне потребовал отдельных POST по частям, не подтверждая stable API или
   внешний счёт (см. `docs/reports/2026-10-01-s06-gemini38-live-probes.md`).
   Flash-Lite не проверялся. Поэтому candidate-маршрут Flash (и любая непустая
-  vibe) не регистрируется как stable и
-  fail-closed: JSON `error_code` `BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до**
-  чтения ключа и любого POST. Наблюдённый ID каталога не является подтверждённым
-  speech-parts-контрактом.
+  vibe на любом другом маршруте) по умолчанию fail-closed: JSON `error_code`
+  `BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до** чтения ключа и любого POST.
+  Наблюдённый ID каталога не является подтверждённым speech-parts-контрактом.
+- `--allow-experimental-gemini-speech-parts` — **явный opt-in** к эмпирическому
+  экспериментальному маршруту `polza-tts/google/gemini-3.8-flash-tts`. Флаг
+  принимается только с `--text` или `--format speech-parts`, только с этой
+  provider/model парой и только на нативном DB-first маршруте; иначе — usage
+  error до ключа и POST. Он не подтверждает Gemini-контракт и не делает модель
+  stable: `list` её не показывает, а каждый POST по-прежнему несёт ровно один
+  scalar `voice`. Эффективная инструкция части уходит отдельным полем
+  `instructions` (для Gemini не документировано), а произносимый `input` —
+  ровно `text`, без инструкции и без смешивания. Маршрут не обещает, что
+  инструкция применена или не прочитана вслух. Флаг записывается в
+  `config_snapshot.output.experimental_speech_parts`; `generate --resume` без
+  того же флага отказывает, а `history resume`/`sync` продолжают ровно
+  записанную политику. Принятое тело ответа и receipt сохраняются до разбора,
+  наблюдённый WAV конвертируется в обычный MP3-чанк, а редиректы не следуются:
+  3xx — это один наблюдённый ответ, а не повторный платный POST.
 - `--audio-format {mp3,wav}` задаёт контейнер итогового merged-файла (default
   `mp3`); промежуточные части в `chunks/` остаются MP3. `wav` пишет реальный
   RIFF/WAVE через ffmpeg и допускается только на нативном маршруте; смена
@@ -256,7 +270,8 @@ voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спо
 `validate --format speech-parts --json` возвращает `parts`, `request_chars`,
 `route.admitted` и `route.reason`; синтаксическая/бюджетная ошибка — exit `2`,
 неподтверждённый маршрут — предупреждение `BLOCKED_PROVIDER_CONTRACT` при
-валидном документе.
+валидном документе. С `--allow-experimental-gemini-speech-parts` тот же отчёт
+возвращает `route.admitted: true`; `validate` никогда не отправляет запрос.
 
 ## `generate` — Style Prompt Flags
 
@@ -600,7 +615,9 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
   HTTP status, size/SHA-256 и очищенный opaque generation ID. Ключ, заголовок
   Authorization, текст запроса, тело или JSON keys ошибки не публикуются.
   HTTP-ошибка и malformed/неподдержанный audio сохраняются приватно, но не
-  считаются успешным raw и не порождают retry. На `--resume`/`history resume`
+  считаются успешным raw и не порождают retry. Ответ `3xx` не следует
+  (`allow_redirects=False`) и обрабатывается как bounded HTTP status, так что
+  редирект не превращается во второй платный POST. На `--resume`/`history resume`
   при `submitting` сначала проверяется **любая** часть response-evidence: только
   полный совпавший 2xx receipt+body разбирается локально с Decimal cost,
   сверяется с существующим decoded raw receipt при его наличии и сохраняет
@@ -610,8 +627,9 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
   Если response-evidence **вообще не существует**, прежний decoded raw receipt
   может восстановить старую попытку локально с неизвестной стоимостью:
   её нельзя придумать из аудиофайла. Для legacy/OpenRouter эта новая pre-parse
-  гарантия не заявляется; Gemini 3.8 через Polza остаётся
-  `BLOCKED_PROVIDER_CONTRACT`, live не подтверждён.
+  гарантия не заявляется; Gemini 3.8 через Polza остаётся нестабильным и
+  отправляется только по явному
+  `--allow-experimental-gemini-speech-parts` (см. раздел S06), live не подтверждён.
 - **Экспорт — проекция.** `run_state.json`, `chunks.json`, run/manifest JSON из
   одного verified DB-вида; каждый файл несёт `history_run_uuid` и
   `history_revision`, пишется атомарно и не даёт legacy JSON-разрешения на

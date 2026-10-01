@@ -10,17 +10,29 @@ one scalar voice per request, not a model-specific multi-speaker payload; the
 external billing remains unverified. The separate experimental parts that yielded
 one 6:17 MP3 with three voices required twelve distinct POSTs; they do not make
 a multi-speaker request or the stable provider route confirmed. This module keeps
-the candidate inert and refuses a stable submit before key access or network.
+the candidate inert by default and refuses a stable submit before key access or
+network.
+
+One ordinary-CLI opt-in flag (``--allow-experimental-gemini-speech-parts``) admits
+the same candidate for the ``speech-parts`` format only, and admits it as exactly
+what was observed: one scalar voice per POST, one POST per part, and the effective
+instruction carried in a separate ``instructions`` field that no published Gemini
+schema documents. That opt-in never confirms a multi-speaker payload or guarantees
+that the provider will obey or not speak an instruction: the application keeps
+instructions out of spoken ``input``, but provider audible behavior and external
+billing remain unverified. The run records the opt-in for safe resume.
 
 Two independent rules decide admission of a real request:
 
 * only a confirmed provider/model route may send a per-part voice on its own
-  request (currently the OpenRouter Gemini dialogue route); and
-* no admitted route may silently discard or read aloud an effective vibe.
+  request (currently the OpenRouter Gemini dialogue route, plus that explicit
+  experimental Polza opt-in); and
+* no admitted route may silently discard an effective vibe or put it into spoken
+  ``input``; actual audible behavior still needs human verification.
 
 The candidate model is deliberately absent from the stable ``POLZA_TTS_MODELS``
 catalog and from the ``list`` command, so nothing advertises it as available. It
-exists here only as an inert, unverified mapping.
+exists here only as the explicit, flagged experimental route.
 """
 
 from __future__ import annotations
@@ -28,21 +40,25 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 
+from .config import POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL
+
 BLOCKED_PROVIDER_CONTRACT = "BLOCKED_PROVIDER_CONTRACT"
 
-# The one candidate model the plan names. Its endpoint, scalar voice transport,
-# actual WAV response and published price components were observed, but a
-# documented multi-speaker payload and external billing were not. Experimental
-# per-part instructions do not establish stable instruction semantics. Flash-Lite
-# remains absent, and neither model is advertised as a stable route.
-_CANDIDATE_GEMINI_SPEECH_PARTS_MODEL = "google/gemini-3.8-flash-tts"
-
+# The named candidate is never a stable route: its endpoint, scalar voice transport,
+# actual WAV response and published price components were observed, but a documented
+# multi-speaker payload, a documented Gemini instruction field, and external billing
+# were not. Flash-Lite remains absent entirely.
 # Routes on which a per-part cast voice is already confirmed: the OpenRouter Gemini
 # dialogue route sends one cast voice per request today. Any other provider speaks
 # with its single run-level voice, so parts whose voices differ cannot be honored.
 _CONFIRMED_PER_PART_VOICE_ROUTES = frozenset(
     {("openrouter-tts", "google/gemini-3.1-flash-tts-preview")}
 )
+
+
+def is_experimental_gemini_speech_parts_route(provider: str, model: str) -> bool:
+    """Whether this provider/model is the one explicitly opt-in experimental route."""
+    return provider == "polza-tts" and model == POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL
 
 
 @dataclass(frozen=True)
@@ -52,7 +68,10 @@ class SpeechPartsRoute:
     ``required_text_wrapper`` is the exact service text the adapter must add around
     the spoken transcript to carry the instruction; it is charged to the pre-submit
     character budget. For the unverified candidate it is empty because no real
-    wrapper has been observed, which is recorded as a residual rather than guessed.
+    wrapper has been observed: the experimental opt-in carries the instruction in a
+    separate ``instructions`` field instead, which is recorded as a residual rather
+    than guessed as stable Gemini behavior. ``verified`` stays ``False`` because the
+    candidate is never a stable route; only the explicit opt-in admits it.
     """
 
     provider: str
@@ -66,7 +85,7 @@ class SpeechPartsRoute:
 _CANDIDATE_ROUTES: tuple[SpeechPartsRoute, ...] = (
     SpeechPartsRoute(
         provider="polza-tts",
-        model=_CANDIDATE_GEMINI_SPEECH_PARTS_MODEL,
+        model=POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL,
         verified=False,
         carries_vibe=False,
         per_part_voice=False,
@@ -110,18 +129,36 @@ def speech_parts_required_text_wrapper(provider: str, model: str) -> str:
 
 
 def require_confirmed_speech_parts_route(
-    *, provider: str, model: str, voices: Iterable[str], has_vibe: bool
+    *,
+    provider: str,
+    model: str,
+    voices: Iterable[str],
+    has_vibe: bool,
+    experimental_gemini_opt_in: bool = False,
 ) -> None:
-    """Fail closed unless this exact speech-parts request is a confirmed route.
+    """Fail closed unless this exact speech-parts request is an admitted route.
 
-    A named candidate route is unverified and always refused; a non-empty effective
-    vibe is refused because no confirmed route can carry an instruction without the
-    provider reading it; and parts whose voices differ are refused unless this exact
-    provider/model is a route that already sends one cast voice per request. The
-    message names the actionable state and never claims a route works.
+    The one explicitly opt-in experimental route (``polza-tts`` +
+    ``google/gemini-3.8-flash-tts``) is admitted only when
+    ``experimental_gemini_opt_in`` is true: it is then treated exactly as observed,
+    one scalar voice per POST with the effective instruction in a separate
+    undocumented ``instructions`` field, so different per-part voices are honored
+    by separate requests and the instruction is not inserted into spoken ``input``.
+    Provider audible behavior remains unverified. Without the opt-in the same
+    candidate stays refused. Every other named candidate route is
+    unverified and always refused; a non-empty effective vibe is refused because no
+    confirmed route can carry an instruction without the provider reading it; and
+    parts whose voices differ are refused unless this exact provider/model is a
+    route that already sends one cast voice per request. The message names the
+    actionable state and never claims a route works.
     """
     route = candidate_speech_parts_route(provider, model)
-    if route is not None and not route.verified:
+    if route is not None:
+        if (
+            is_experimental_gemini_speech_parts_route(provider, model)
+            and experimental_gemini_opt_in
+        ):
+            return
         raise SpeechPartsRouteError(
             f"BLOCKED_PROVIDER_CONTRACT: the provider/model route {provider}/{model} is a "
             "candidate only; its catalog-confirmed ID is not a verified speech-parts route. "

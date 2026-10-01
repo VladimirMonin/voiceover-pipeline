@@ -126,10 +126,15 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
   live-пробах: scalar `voice` работал по отдельным частям, возвращался WAV при
   запросе MP3. Попытка двух голосов в одном POST дала на слух один голос;
   документированной multi-speaker схемы нет, `instructions` для Gemini в
-  опубликованном контракте не описан. Flash-Lite не испытывался. `speech-parts`
-  Flash остаётся `BLOCKED_PROVIDER_CONTRACT`; published цена не равна внешнему
-  счёту. Новые GET/POST — только с разрешением и доказанным ценовым пределом
-  (`voiceover help speech.parts`, датированный Gemini live-отчёт в репозитории).
+  опубликованном контракте не описан. Flash-Lite не испытывался. По умолчанию
+  `speech-parts` Flash — `BLOCKED_PROVIDER_CONTRACT`; published цена не равна
+  внешнему счёту. Новые GET/POST — только с разрешением и доказанным ценовым
+  пределом (`voiceover help speech.parts`, датированный Gemini live-отчёт в
+  репозитории). Явный эмпирический opt-in
+  `--allow-experimental-gemini-speech-parts` допускает только эту пару с `--text`
+  или `speech-parts`: один scalar `voice` на POST и отдельное поле `instructions`
+  (для Gemini не документировано); он не делает маршрут stable и не обещает,
+  что инструкция применена или не прочитана вслух.
 
 ---
 
