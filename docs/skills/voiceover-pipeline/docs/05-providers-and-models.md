@@ -1,8 +1,8 @@
-# Провайдеры, модели, голоса и цены
+# Провайдеры, модели и голоса
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
-> Здесь: облачные и локальные TTS-провайдеры, голоса и реальные цены.
-> Это главный справочник для выбора провайдера/модели/голоса.
+> Здесь: выбор класса TTS-маршрута и его ограничений; это не каталог текущих тарифов.
+> Каноническая справка — `voiceover help providers.polza`, текущие регистрации — `voiceover list`.
 
 ## Обзор
 
@@ -10,13 +10,20 @@ voiceover-pipeline поддерживает облачные TTS-провайд�
 модельные линии. Подробности нового hybrid runtime и его benchmark boundaries:
 [`docs/14-local-audio-cpp-models.md`](14-local-audio-cpp-models.md).
 
+> Зарегистрированные модели и голоса смотрите в `voiceover list providers --json` /
+> `voiceover list voices --provider <X> --json`, а маршрут и ключи — в
+> `voiceover help providers.polza`. Ни одна из этих команд не подтверждает
+> доступность, качество или тариф внешнего провайдера. Исторические цены остаются
+> в отчётах, а не в инструкции по выбору: до любого provider GET/POST нужны
+> отдельное разрешение владельца и доказанная верхняя граница платного вызова.
+
 | Провайдер | Тип | API | Валюта | Ключ | Provider ID |
 |---|---|---|---|---|---|
 | Polza Chat Audio | Cloud, chat-based | `/chat/completions` | RUB | `POLZA_API_KEY` | `polza-chat-audio` |
 | Polza TTS | Cloud, TTS + ElevenLabs | `/audio/speech`, `/media` | RUB | `POLZA_API_KEY` | `polza-tts` |
 | OpenRouter TTS | Cloud, агрегатор | `/audio/speech` | USD | `OPENROUTER_API_KEY` | `openrouter-tts` |
-| Qwen-local | Local GPU | Внутрипроцессный | Бесплатно | Не нужен | `qwen-local` |
-| OmniVoice local | Local GPU | `audio.cpp` | Бесплатно, CC-BY-NC | Не нужен | `omnivoice-local` |
+| Qwen-local | Local GPU | Внутрипроцессный | Нет тарифа провайдера | Не нужен | `qwen-local` |
+| OmniVoice local | Local GPU | `audio.cpp` | Нет тарифа провайдера, CC-BY-NC | Не нужен | `omnivoice-local` |
 
 ---
 
@@ -27,10 +34,9 @@ voiceover-pipeline поддерживает облачные TTS-провайд�
 
 ### Модели
 
-| Модель | ID | Качество | Цена/мин | Примечание |
-|---|---|---|---|---|
-| GPT Audio Mini | `openai/gpt-audio-mini` | Хорошее, чистое | **~0.004 RUB** | anomalous benchmark, модель добавила речь |
-| GPT Audio | `openai/gpt-audio` | Заметно лучше, естественные интонации | **~7.00 RUB** | Самый качественный из Polza Chat Audio |
+В реестре есть `openai/gpt-audio-mini` и `openai/gpt-audio`. Это chat-audio,
+а не гарантия дословного TTS: модель может добавить речь. Фактическая
+доступность и стоимость требуют отдельной проверки до платного запроса.
 
 ### Голоса
 
@@ -53,7 +59,7 @@ voiceover-pipeline поддерживает облачные TTS-провайд�
 - Stream SSE — аудио base64-чанками, пайплайн собирает и конвертирует
 - Обрезка тишины после речи (отключить: `--no-trim`)
 - Один streaming POST на чанк: `--fallback-voice` (default `onyx`) принимается только для совместимости и не отправляет второй запрос при ошибке. Другой голос требует нового явного прогона.
-- Точная стоимость: `GET /api/v1/history/generations/{id}` → `clientCost`
+- Наблюдённая стоимость может поступить из `GET /api/v1/history/generations/{id}` → `clientCost`; этот GET является сетью, не выполняйте его без отдельного разрешения владельца.
 
 ---
 
@@ -63,18 +69,18 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 ### Модели OpenAI TTS через Polza
 
-| Модель | ID | Цена/мин | Endpoint |
-|---|---|---|---|
-| GPT-4o Mini TTS | `openai/gpt-4o-mini-tts` | **~1.07 RUB** | `POST /api/v1/audio/speech` |
+| Зарегистрированная модель | Endpoint |
+|---|---|
+| `openai/gpt-4o-mini-tts` | `POST /api/v1/audio/speech` |
 
 Ответ: `{"audio":"<base64>","contentType":"audio/mpeg","usage":{"cost_rub":...}}`
 
 ### Модели ElevenLabs через Polza
 
-| Модель | ID | Цена/мин | Endpoint |
-|---|---|---|---|
-| ElevenLabs Turbo | `elevenlabs/text-to-speech-turbo-2-5` | **~3.51 RUB** | `POST /api/v1/media` |
-| ElevenLabs Multilingual | `elevenlabs/text-to-speech-multilingual-v2` | **~7.57 RUB** | `POST /api/v1/media` |
+| Зарегистрированная модель | Endpoint |
+|---|---|
+| `elevenlabs/text-to-speech-turbo-2-5` | `POST /api/v1/media` |
+| `elevenlabs/text-to-speech-multilingual-v2` | `POST /api/v1/media` |
 
 Запрос `/media`: `{"model":"...","input":{"prompt":"...","voice":"Rachel","language_code":"ru"},"async":true}`
 → poll `GET /media/{id}` → download MP3 с `data[0].url`.
@@ -98,11 +104,13 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 Все 11 голосов доступны в `polza-tts` и `openrouter-tts` (OpenAI-модели).
 **Дефолт:** `alloy` для Polza TTS и OpenRouter OpenAI TTS.
 
-### Голоса ElevenLabs через Polza (21 имя)
+### Голоса ElevenLabs через Polza
 
-`Rachel` (Ж, тёплый, **дефолт**), `Aria`, `Roger`, `Sarah`, `Laura`, `Charlie`, `George`, `Callum`, `River`, `Liam`, `Charlotte`, `Alice`, `Matilda`, `Will`, `Jessica`, `Eric`, `Chris`, `Brian`, `Daniel`, `Lily`, `Bill`.
-
-Это Polza display-names из их allowlist, не native ElevenLabs `voice_id`.
+**Дефолт:** `Rachel`. `voiceover list voices --provider polza-tts --json`
+возвращает **и** OpenAI-, и ElevenLabs-голоса в общем `voices`; для последних
+используй `voice_categories.elevenlabs` в том же JSON. Это Polza display-names
+из allowlist, не native ElevenLabs `voice_id`; CLI-регистрация не доказывает
+доступность или звучание у внешнего провайдера.
 
 ### Особенности Polza TTS
 
@@ -110,7 +118,12 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 - **ElevenLabs:** `--voice Rachel` (дефолт), async `/media` — submit → poll (до 5 мин) → download
 - **ElevenLabs resume:** принятый `/media` task ID сохраняется до poll, поэтому после сбоя `--resume` при совпадении provider/model/voice/script и наличии более ранних MP3 доводит ту же часть GET-запросами без второго платного POST; маркер без ID по-прежнему блокирует `--resume`/`--overwrite`
 - Единый `POLZA_API_KEY` для обоих polza-провайдеров
-- Style prompt НЕ используется для Polza TTS (не поддерживается endpoint)
+- Style prompt НЕ используется для Polza TTS (не поддерживается endpoint).
+- Polza Gemini 3.8 Flash и Flash-Lite ID были увидены в одном разрешённом GET
+  каталога, но endpoint, поле инструкции, голоса, контейнер и потолок цены не
+  подтверждены. `speech-parts` для Flash остаётся `BLOCKED_PROVIDER_CONTRACT`;
+  POST было ноль. Новый GET/POST запрещён без отдельного решения владельца,
+  доказанного тарифа и верхней границы затрат (`voiceover help speech.parts`).
 
 ---
 
@@ -120,15 +133,15 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 
 ### Модели
 
-| Модель | ID | Цена/мин | Style prompt | Голоса |
-|---|---|---|---|---|
-| Gemini TTS | `google/gemini-3.1-flash-tts-preview` | **~$0.030** | Нет | Google (30) |
+| Зарегистрированная модель | Style prompt | Голоса |
+|---|---|---|
+| `google/gemini-3.1-flash-tts-preview` | Нет | `voiceover list voices --provider openrouter-tts --json` |
 
-### Голоса Gemini TTS (30 имён)
+### Голоса Gemini TTS
 
-**Дефолт:** `Puck` (М, спокойный, вдумчивый).
-
-`Puck`, `Charon`, `Fenrir`, `Orus`, `Aoede`, `Kore`, `Zephyr`, `Leda`, `Callirrhoe`, `Autonoe`, `Enceladus`, `Iapetus`, `Umbriel`, `Algieba`, `Despina`, `Erinome`, `Algenib`, `Rasalgethi`, `Laomedeia`, `Achernar`, `Alnilam`, `Schedar`, `Gacrux`, `Pulcherrima`, `Achird`, `Zubenelgenubi`, `Vindemiatrix`, `Sadachbia`, `Sadaltager`, `Sulafat`.
+**Дефолт:** `Puck`. Поддерживаемые в CLI голоса —
+`voiceover list voices --provider openrouter-tts --json`; фактическое качество
+и доступность определяет только разрешённая проверка провайдера.
 
 ### Verbatim input (Gemini)
 
@@ -150,7 +163,7 @@ generation retry или fallback-запроса с другим prompt нет.
 - Отсутствующий в текущем speech-каталоге model ID отклоняется до billing.
 - `openai/gpt-audio-mini` и `openai/gpt-audio` используют chat-audio контракт,
   а не `/audio/speech`, поэтому не добавляются как ложная замена.
-- Ретраи для цены: `GET /api/v1/generation?id=...` до 4 попыток с паузой 3 сек.
+- Наблюдение цены может потребовать `GET /api/v1/generation?id=...`; в рамках агента такой сетевой шаг допускается только после отдельного разрешения владельца, а `null` остаётся неизвестной ценой.
 - Cost может быть `null` если OpenRouter не успел обновить usage.
 
 ---
@@ -173,7 +186,7 @@ Open-source модель синтеза речи. Работает локаль�
 ### Требования
 
 - NVIDIA GPU + CUDA (~4 GB VRAM)
-- Модель ~3.4 GB, скачивается один раз
+- Веса должны быть подготовлены заранее; приложение не скачивает их неявно, а загрузка требует отдельного разрешения на сеть.
 - Extras: `voiceover-pipeline[voiceover-qwen]`
 
 ---
@@ -186,21 +199,18 @@ Groq Whisper и xAI STT, их модели, виды таймкодов и ог�
 
 ---
 
-## Быстрый выбор
+## Быстрый выбор без обещания цены
 
-| Задача | Провайдер | Модель | Цена |
-|---|---|---|---|
-| Самый дешёвый, рубли | Polza Chat Audio | `openai/gpt-audio-mini` | ~0.004 RUB/мин |
-| Классический TTS, рубли | Polza TTS | `openai/gpt-4o-mini-tts` | ~1.07 RUB/мин |
-| Чистый голос, рубли | Polza TTS | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 RUB/мин |
-| Лучшее качество речи, рубли | Polza TTS | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 RUB/мин |
-| Качество интонаций (chat) | Polza Chat Audio | `openai/gpt-audio` | ~7.00 RUB/мин |
-| Западные голоса, качество | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
-| Бесплатно, есть GPU | Qwen-local | CustomVoice (preset) | Бесплатно |
-| Локальные тайминги, сегменты | faster-whisper | `small` | Бесплатно (CPU) |
-| Облачные тайминги + сегменты | groq-whisper | `whisper-large-v3-turbo` | $0.04/час |
-| Облачные тайминги, слова + conf | xai-stt | `grok-stt` | xAI pricing |
-| Только текст, облачно | openrouter-whisper | `openai/whisper-1` | ~$0.002/мин |
+- Нужна дословная речь с выбором голоса — сначала изучите зарегистрированный
+  `polza-tts` или `openrouter-tts` маршрут; доступность проверьте отдельно.
+- Допустима chat-audio генерация, которая может добавить речь, — рассмотрите
+  `polza-chat-audio`, но не предполагайте точность текста или цену по старому smoke.
+- Есть заранее подготовленные веса и поддерживаемое GPU-окружение — явным
+  выбором пользователя доступны Qwen-local и OmniVoice без тарифа API; ресурсы
+  машины и права на голоса остаются отдельной ответственностью.
+- Тайминги и распознавание — отдельный [ASR-справочник](13-speech-recognition-providers.md).
+  `voiceover list timing-providers --json` показывает регистрацию, не стоимость.
 
-Цены — реальные smoke-прогоны 2026-04-29 (TTS) / 2026-05-27 (STT), не гарантия провайдера.
-Актуальный список всегда в `docs/00-version-log.md`.
+Для платного варианта до каждого live-вызова нужен подтверждённый применимый
+тариф и доказанный потолок расходов в разрешённом бюджете; прежние smoke-цены
+не годятся для такого расчёта.

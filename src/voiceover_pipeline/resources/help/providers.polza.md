@@ -11,21 +11,22 @@ related: start.quick, speech.simple, history.costs
 
 ## Зарегистрированные маршруты
 
-| Провайдер | Модели | Транспорт |
-|---|---|---|
-| `polza-chat-audio` | `openai/gpt-audio-mini` (default), `openai/gpt-audio` | `/chat/completions`, ответ со встроенным аудио |
-| `polza-tts` | `openai/gpt-4o-mini-tts` | `/audio/speech` |
-| `polza-tts` | `elevenlabs/text-to-speech-turbo-2-5`, `elevenlabs/text-to-speech-multilingual-v2` | `/media` |
+`polza-chat-audio` — chat-completions с аудио в ответе; `polza-tts` выбирает
+`/audio/speech` или асинхронный `/media` по модели. Список **текущих
+зарегистрированных** моделей и голосов берите из CLI, а не из статической
+таблицы справки:
 
 ```bash
-voiceover doctor --provider polza-chat-audio --json
 voiceover list providers --json
 voiceover list voices --provider polza-tts --json
+voiceover generate --help
 ```
 
-Голос по умолчанию: `ash` для `polza-chat-audio`, `alloy` для `polza-tts` + `openai/*`, `Rachel` для `polza-tts` + `elevenlabs/*`. Голос указывается явно или берётся из сценария; приложение не подменяет названный пользователем голос.
-
-Таблица выше — зарегистрированные маршруты на момент выпуска, а не исчерпывающий каталог: актуальные провайдеры, модели, голоса и флаги читайте из `voiceover list providers --json`, `voiceover list voices --provider <id> --json` и `voiceover generate --help`, а не из справки.
+Голос можно указать явно или взять из сценария; приложение не подменяет
+названный пользователем голос. `voiceover doctor --provider polza-chat-audio
+--json` проверяет наличие ключа через приложение и может прочитать env-файл;
+агент запускает его только в одобренном окружении. Ни `list`, ни `help` не
+подтверждают фактический тариф, качество или доступность внешнего API.
 
 ## Границы, которые важно не переоценить
 

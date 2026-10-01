@@ -2,7 +2,13 @@
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Здесь: готовые end-to-end цепочки для типовых задач.
-> Полный список моделей и голосов: `docs/05-providers-and-models.md`.
+> Канонические команды и офлайн-границы — `voiceover help start.quick` / `runs.resume`;
+> текущие модели и голоса — `voiceover list ...`, курируемый обзор — `docs/05-providers-and-models.md`.
+> Все команды `doctor` могут проверить ключ через env-файл приложения: запускайте
+> их только в одобренном окружении; сам агент файл не читает. Каждый live/provider
+> GET/POST, сетевая установка и загрузка модели требуют отдельного разрешения
+> владельца и применимого доказанного потолка для платного вызова. Примеры ниже
+> не являются таким разрешением.
 
 ## Fresh Project Bootstrap (нет ничего)
 
@@ -10,15 +16,19 @@
 
 1. **Установи пререквизиты.** Проверь Python/UV/FFmpeg, если нет — поставь сам.
    Если среда не позволяет — попроси пользователя (см. `docs/02-install.md`).
+   Сетевые установки и загрузку моделей выполняй только с явного разрешения владельца.
    Если на любом шаге команда не найдена — `docs/09-troubleshooting.md`.
 2. **Выбери сборку.** Production → `voiceover-pipeline[timing-whisper]`.
    Запусти без установки: `uvx voiceover-pipeline doctor` или установи постоянно: `pipx install "voiceover-pipeline[timing-whisper]"`.
-3. **Создай `.env.example`.** Из шаблона `examples/env-example.md`.
+3. **Создай `.env.example`.** Из шаблона `examples/env-example.md` (только placeholder-ы).
 4. **Создай `.gitignore`.** Если файла нет — создай. Добавь строку `.env`.
 5. **Создай `script.md`.** Если сценария нет — создай из шаблона `examples/minimal-script.md`.
 6. **Создай `out/`.** Папка для артефактов, будет использована как `--output-dir`.
-7. **Попроси ключи.** Создай `.env` из `.env.example` сам, попроси ОДИН раз вписать ключи в `.env`.
-   Больше не спрашивать. Проверить через `voiceover doctor --provider <X> --json`.
+7. **Ключи — только владелец.** Агент НЕ создаёт, не копирует и не читает реальный `.env`.
+   Попроси владельца ОДИН раз поместить ключи в приватный env-файл вне инструментов агента
+   или выставить их в окружении процесса (см. `docs/03-security-and-secrets.md`).
+   В одобренном окружении проверь наличие ключа через
+   `voiceover doctor --provider <X> --json` (путь, не значение). Больше не спрашивать.
 8. **Дальше — выбери workflow ниже.**
 
 ## Golden Cloud Workflow — Polza Chat Audio (рубли, chat-based)
@@ -33,8 +43,15 @@ voiceover generate `
   --run-id "prod" `
   --json `
   --resume
-voiceover timings --audio "out/prod/prod-voiceover-openai-gpt-audio-mini.mp3" --run-id "prod" --json --overwrite
+voiceover timings --audio "out/prod/prod-voiceover-openai-gpt-audio-mini.mp3" --run-id "prod-timings" --json
 ```
+
+`prod-timings` — отдельный root: возьми `files.timings_json` и `files.srt`
+из JSON-ответа именно `timings`, а не из `out/prod/manifest.json`. Если нужны
+пути к таймингам в манифесте генерации, выбирай интегрированный
+`generate --with-timings` заранее: локальная модель должна быть в кеше до
+платного TTS; отдельная команда `timings` может скачать веса и требует
+разрешения на сеть.
 
 ## Golden Cloud Workflow — Polza TTS (рубли, классический TTS)
 
@@ -68,7 +85,7 @@ voiceover generate `
 
 ## Golden Cloud Workflow — OpenRouter (доллары)
 
-Gemini TTS — западные голоса, style prompt:
+Gemini TTS — западные голоса через `/audio/speech`:
 
 ```powershell
 voiceover generate `
@@ -81,49 +98,15 @@ voiceover generate `
   --resume
 ```
 
-С style prompt (Gemini):
+- OpenRouter принимает только top-level `voice`; `input` byte-equals произносимому
+  тексту реплики. Явные `--style-prompt`/`--style-prompt-file` отклоняются до
+  платного запроса, а `--no-style-prompt` — совместимый no-op.
+- Для этого OpenRouter-маршрута только произносимый turn text (включая допустимые
+  inline audio tags) попадает в `input`; метаданные `vibe`/profile не становятся
+  отдельной инструкцией провайдеру. Не обещайте эффект режиссуры без live/listening
+  приёмки (см. `docs/11-gemini-prompting.md`).
 
-```powershell
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --voice "Kore" `
-  --style-prompt "Энергичный голос ведущего: громкий, быстрый, уверенный." `
-  --script "script.md" `
-  --run-id "podcast-ep1" `
-  --json `
-  --resume
-```
-
-С длинным prompt из файла (WVM-ассеты, expressive, stutter):
-
-```powershell
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --voice "Zephyr" `
-  --style-prompt-file "prompts/expressive-narrator.txt" `
-  --script "script.md" `
-  --run-id "wvm-expressive" `
-  --json `
-  --resume
-```
-
-Без prompt (чистый Gemini TTS):
-
-```powershell
-voiceover generate `
-  --provider openrouter-tts `
-  --model "google/gemini-3.1-flash-tts-preview" `
-  --voice "Puck" `
-  --no-style-prompt `
-  --script "script.md" `
-  --run-id "gemini-clean" `
-  --json `
-  --resume
-```
-
-## Qwen Local Workflow (бесплатно, GPU)
+## Qwen Local Workflow (без тарифа API, GPU)
 
 Требуется NVIDIA GPU + CUDA + extras `voiceover-qwen`:
 
@@ -170,7 +153,7 @@ voiceover generate `
    ```powershell
    voiceover validate --script "podcast.md" --format dialogue --agent --json
    ```
-3. **Проверка окружения** (не читая `.env`):
+3. **Проверка окружения** (приложение может проверить ключ/env-файл; агент его не читает; только в одобренном окружении):
    ```powershell
    voiceover doctor --provider openrouter-tts --json
    ```
@@ -187,7 +170,7 @@ voiceover generate `
    безопасном прогоне. Отдельный `voiceover timings` — только с ДРУГИМ
    `--output-dir`/`--run-id`, никогда с `--overwrite` по папке платного прогона.
 
-## OmniVoice Local Workflows (бесплатно, GPU)
+## OmniVoice Local Workflows (без тарифа API, GPU)
 
 Требуется NVIDIA GPU + CUDA + native audio.cpp package
 (см. `docs/14-local-audio-cpp-models.md`). Обычная озвучка использует один
@@ -274,9 +257,11 @@ voiceover timings `
   --compute int8 `
   --language ru `
   --word-timestamps `
-  --json `
-  --overwrite
+  --json
 ```
+
+Если output уже существует, выберите новый `--run-id`; не удаляйте чужие
+артефакты по умолчанию.
 
 ## Безопасный повторный запуск
 
@@ -284,47 +269,26 @@ voiceover timings `
 voiceover generate ... --resume            # продолжить безопасно
 voiceover generate ... --skip-existing     # пропустить если есть
 voiceover generate ... --run-id "prod-02"  # новый run-id
-voiceover generate ... --overwrite --confirm-delete-paid-audio  # удалить paid chunks явно
+voiceover generate ... --overwrite --confirm-delete-paid-audio  # только по явному решению владельца о потере и цене
 ```
 
-## Интеграция с Remotion (полный поток)
+## Интеграция с Remotion
 
-```text
-1. Установка:
-   pip install "voiceover-pipeline[timing-whisper]"
+Полный поток «сценарий → сцены» (код `scene plan`, чтение `manifest.json`/`.timings.json`,
+группировка Whisper-сегментов по смысловым сценам) — в примере
+[examples/remotion-agent-flow.md](../examples/remotion-agent-flow.md).
 
-2. Проверка:
-   voiceover doctor --provider polza-chat-audio --with-timings --json
+- `manifest.json` — entry-point генерации; `timings_json`/`srt` в нём есть
+  только при успешных интегрированных таймингах в том же root. Для standalone
+  `timings` читай `files.timings_json`/`files.srt` из его JSON-ответа.
+- Если `.timings.json` действительно получен, используй его durations, а не
+  words-per-second и не `chunks[].duration_ms`.
+- Платный прогон не перезаписывай `--overwrite`; оборванный прогон продолжай через `--resume`.
 
-3. Генерация аудио:
-   voiceover generate --provider polza-chat-audio --model "openai/gpt-audio-mini" --script "script.md" --run-id "production" --json --resume
+## Выбор провайдера
 
-4. Тайминги (отдельный run-id, без перезаписи папки прогона):
-   voiceover timings --audio "out/production/production-voiceover-openai-gpt-audio-mini.mp3" --output-dir "out" --run-id "production-timings" --word-timestamps --json
-
-5. Чтение артефактов:
-   manifest = json.load(open("out/production/manifest.json"))
-   timings = json.load(open(manifest["timings_json"]))
-
-6. Использование в Remotion:
-   for seg in timings["segments"]:
-       scene = {
-           "start_ms": seg["start_ms"],
-           "end_ms": seg["end_ms"],
-           "duration_ms": seg["duration_ms"],
-           "narration": seg["text"],
-           "words": seg.get("words")
-       }
-```
-
-## Provider selection table
-
-| Задача | Провайдер | Модель | Цена |
-|---|---|---|---|
-| Самый дешёвый, рубли | Polza Chat Audio | `openai/gpt-audio-mini` | ~0.004 RUB/мин |
-| Классический TTS, рубли | Polza TTS | `openai/gpt-4o-mini-tts` | ~1.07 RUB/мин |
-| Чистый голос, рубли | Polza TTS | `elevenlabs/text-to-speech-turbo-2-5` | ~3.51 RUB/мин |
-| Лучшее качество речи | Polza TTS | `elevenlabs/text-to-speech-multilingual-v2` | ~7.57 RUB/мин |
-| Качество интонаций | Polza Chat Audio | `openai/gpt-audio` | ~7.00 RUB/мин |
-| Западные голоса | OpenRouter | `google/gemini-3.1-flash-tts-preview` | ~$0.030/мин |
-| Бесплатно, GPU | Qwen-local | CustomVoice | Бесплатно |
+Канонично — `voiceover help providers.polza`, `voiceover list providers --json` и
+`voiceover list voices --provider <X> --json`; тариф эти команды не подтверждают.
+Краткий обзор классов маршрутов и их ограничений —
+[docs/05-providers-and-models.md](05-providers-and-models.md); старые цены не
+используйте для выбора или бюджета.

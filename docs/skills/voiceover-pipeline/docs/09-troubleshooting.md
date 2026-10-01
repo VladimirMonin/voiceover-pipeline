@@ -5,24 +5,29 @@
 
 ## Правило диагностики
 
-Агент САМ чинит всё, что может.
-Пользователя спрашивает ТОЛЬКО для: API-ключа, прав администратора,
-GUI-инсталлятора, CUDA-драйверов.
-Никогда не просит «выполните эту команду», если сам может выполнить.
+Агент сам чинит локальные неисправности в пределах разрешённого scope.
+Права администратора, GUI-инсталлятор, CUDA-драйверы, сетевая установка,
+загрузка модели, provider GET и платный POST требуют отдельного решения владельца.
+Никогда не просит ключ в чат и не читает приватный env-файл. Для платного
+вызова нужен подтверждённый тариф и безопасный потолок расходов; неопределённый
+submit агент не повторяет автоматически.
 
 ## Doctor-guided Recovery
 
-Запусти `voiceover doctor --provider <X> --with-timings --json`.
-Смотри на `checks` в JSON-ответе:
+Только в одобренном окружении запусти
+`voiceover doctor --provider <X> --with-timings --json`: приложение может
+прочитать env-файл ради наличия ключа (агент его не читает). Без такого согласия
+используй безопасную справку `voiceover help start.quick --json` и сообщи,
+что проверка ключа `NOT_RUN`. Смотри на `checks` в JSON-ответе:
 
 | Check | Если `ok: false` + `required: true` | Действие |
 |---|---|---|
-| `python` | Python отсутствует | Установи Python ≥3.10 (см. `docs/02-install.md`) |
+| `python` | Python отсутствует | Требуется Python ≥3.11 (см. `docs/02-install.md`) |
 | `ffmpeg` | FFmpeg не найден | Установи FFmpeg + открой новый terminal |
 | `ffprobe` | FFprobe не найден | Установи FFmpeg (идёт в комплекте) |
-| `env_file` | `.env` отсутствует | Создай `.env.example`, попроси ключи ОДИН раз (см. `docs/03-security-and-secrets.md`) |
-| `polza_key` | POLZA_API_KEY missing | Попроси добавить в `.env` ключ `pza_...`, НЕ читай `.env` |
-| `openrouter_key` | OPENROUTER_API_KEY missing | Попроси добавить в `.env` ключ `sk-or-v1-...`, НЕ читай `.env` |
+| `env_file` | файла env нет или явный `--env-file` непригоден | Создай только `.env.example`; реальный env заводит владелец вне инструментов агента, агент его не читает. При непригодном явном `--env-file` doctor даёт exit `0`, `status: success`, но `workflow_ok: false` |
+| `polza_key` | POLZA_API_KEY missing | Попроси владельца поместить `pza_...` в приватный env-файл/окружение; НЕ создавай и НЕ читай `.env` |
+| `openrouter_key` | OPENROUTER_API_KEY missing | Попроси владельца поместить `sk-or-v1-...` в приватный env-файл/окружение; НЕ создавай и НЕ читай `.env` |
 | `faster_whisper` | Whisper не установлен | Переустанови с extra `timing-whisper` |
 | `cuda` | CUDA отсутствует | CUDA не нужна для cloud TTS; для Qwen — предложи Polza/OpenRouter |
 
@@ -42,7 +47,7 @@ GUI-инсталлятора, CUDA-драйверов.
 
 1. Установить UV (см. `docs/02-install.md`)
 2. Если PowerShell script blocked: попробовать `pipx install uv`
-3. Если curl/irm blocked: `pip install uv` 
+3. Если curl/irm blocked: `pip install uv`
 4. После установки: новый terminal
 
 ### `pipx` не найден
@@ -100,21 +105,17 @@ uv pip install --python .venv/Scripts/python.exe --index-url https://download.py
 - Установить: `pip install "voiceover-pipeline[voiceover-qwen]"`
 - При ошибке: `pip install soundfile transformers`
 
-## Model Downloads (first-run)
+## Локальные модели: подготовить заранее
 
-### Whisper model (~486 MB)
-
-- Скачивается автоматически при первом `--with-timings`
-- Источник: HuggingFace (hf-mirror.com как fallback)
-- Если долго: это нормально, не зависание
-- Если ошибка сети: проверить интернет, повторить
-- Если диск полон: освободить место (~500 MB)
-
-### Qwen model (~3.4 GB)
-
-- Скачивается при первом `--provider qwen-local`
-- Проверить диск: нужно ~4 GB свободно
-- HuggingFace кеш: `~/.cache/huggingface/`
+- Нативная `generate --with-timings` проверяет локальную модель до платного TTS:
+  без заранее подготовленного кеша отказывает, а не скачивает веса после оплаты.
+  Qwen-local тоже требует заранее подготовленные веса.
+- Отдельная `timings --timing-provider faster-whisper` может загрузить веса
+  при первом запуске. Это сеть: перед командой нужно отдельное разрешение
+  владельца; без него — `NOT_RUN`, а не пробный вызов.
+- Кеш HuggingFace обычно находится в `~/.cache/huggingface/`; отсутствие модели
+  не доказывает неисправность API. Нельзя читать приватные модели или скачивать
+  новые веса без согласия владельца.
 
 ## Provider / API Errors
 
@@ -124,10 +125,10 @@ uv pip install --python .venv/Scripts/python.exe --index-url https://download.py
 POLZA_API_KEY not found / OPENROUTER_API_KEY is required
 ```
 
-- НЕ читай `.env`
+- НЕ читай и не создавай `.env`
 - Запусти `voiceover doctor --provider <X> --json`
-- Если `polza_key.ok: false` — попроси добавить `POLZA_API_KEY=pza_...`
-- Если `openrouter_key.ok: false` — попроси добавить `OPENROUTER_API_KEY=sk-or-v1-...`
+- Если `polza_key.ok: false` — попроси владельца добавить `POLZA_API_KEY=pza_...` в приватный env/окружение процесса
+- Если `openrouter_key.ok: false` — попроси владельца добавить `OPENROUTER_API_KEY=sk-or-v1-...` в приватный env/окружение процесса
 - Больше не спрашивать
 
 ### Invalid key / 401 / 403
@@ -139,31 +140,41 @@ POLZA_API_KEY not found / OPENROUTER_API_KEY is required
 
 ### Rate limit / provider down (code 30)
 
-- Подождать и попробовать снова
-- Сменить провайдера: Polza → OpenRouter, или наоборот
-- Qwen-local не зависит от облачных лимитов
+- Платный POST с неизвестным исходом CLI НЕ повторяет автоматически: попытка
+  остаётся `submitting`, а `--resume` блокируется (`PAID_SUBMIT_UNCONFIRMED`).
+- Новую попытку делает только владелец явным решением, после проверки возможной
+  прежней оплаты и доказанного нового потолка, с ДРУГИМ `--run-id` (папка с
+  `pending_attempt` защищена).
+- Смена провайдера — только новый явный прогон с разрешения владельца.
+- Qwen-local/OmniVoice не зависят от облачных лимитов; их локальный retry отделён.
 
 ### OpenRouter cost `null` (не ошибка)
 
 - Нормально: OpenRouter асинхронно обновляет usage
 - Пайплайн делает до 4 попыток с паузой 3 секунды
 - Если cost не получен — он `null` в JSON, `status` при этом `success`
-- Повторить проверку позже, если нужна точная стоимость
+- Дополнительный price GET допускается только как отдельно разрешённая сетевая
+  операция; если он недоступен, стоимость остаётся `null`, а не оценкой.
 
-### Style prompt rejected (OpenRouter)
+### OpenRouter provider error
 
 ```
 No successful provider responses
 ```
 
-- Автоматического fallback/retry-запроса нет: один turn делает один платный запрос
-- Задайте свой `--style-prompt "..."` покороче и продолжите через `--resume`
+- OpenRouter `/audio/speech` не принимает style prompt:
+  `--style-prompt`/`--style-prompt-file` отклоняются до платного запроса, а
+  `--no-style-prompt` — no-op. Подача задаётся внутри сценария.
+- Один turn делает ровно один платный synthesis POST; автоматического retry/fallback нет.
+- Оборванный ответ не повторяй: `--resume` только при проверенном raw или известном
+  Media ID, иначе новый `--run-id` с разрешения владельца.
 
 ## Output / Filesystem
 
 ### Папка уже существует (code 30)
 
-- `--overwrite` — удалить и пересоздать (осторожно!)
+- `--overwrite` — удалить и пересоздать (осторожно!); для платного прогона — только
+  по явному решению владельца о потере и цене
 - `--skip-existing` — пропустить, вернуть `status: skipped`
 - Новый `--run-id` — создать рядом
 
@@ -186,10 +197,16 @@ No successful provider responses
 
 ## Whisper Timing Failure
 
-### Exit 40 — Whisper упал, но MP3 сохранён
+### Сбой таймингов после TTS — проверяй код и сохранённое аудио
 
-- **MP3 уже на диске!** Не запускай генерацию заново
-- Восстановление: `voiceover timings --audio "out/<run-id>/<run-id>-voiceover-<model>.mp3" --run-id "prod" --json --overwrite`
+- Legacy timing error может дать exit `40`; нативный partial/result-preserved
+  маршрут — exit `50`. Сначала проверь JSON/state/history и наличие MP3, не
+  запускай TTS заново по одному числовому коду.
+- Для локального восстановления используй `history resume` только если прогон
+  и попытка допущены к resume; команда потенциально платна на других частях.
+  Альтернатива: отдельный `timings --audio <saved-mp3> --run-id <new-id> --json`
+  без `--overwrite` по папке платного прогона, с разрешением на возможную
+  загрузку модели или облачный вызов.
 
 ### Exit 10 — faster-whisper отсутствует
 
@@ -210,8 +227,8 @@ No successful provider responses
 
 ## Если ничего не помогает
 
-1. `voiceover doctor --json` — полный diagnostic output
+1. В одобренном окружении `voiceover doctor --json` — diagnostic output (приложение может прочитать env-файл)
 2. `python --version`, `ffmpeg -version`, `ffprobe -version`
 3. `python -m pip show voiceover-pipeline`
-4. Проверить `.env` через `doctor` (НЕ читая файл)
+4. Проверить наличие ключа через `voiceover doctor --json` (путь, не значение; файл не читать)
 5. Проверить интернет (HuggingFace, Polza, OpenRouter могут быть недоступны)

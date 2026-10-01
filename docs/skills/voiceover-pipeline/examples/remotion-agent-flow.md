@@ -2,9 +2,14 @@
 
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ.
 > Полный поток для интеграции voiceover-pipeline с Remotion.
-> Универсальный для всех провайдеров (замени `<PROVIDER>` и `<MODEL>`).
+> Пример для двух зарегистрированных маршрутов Polza; другие провайдеры требуют
+> собственного подтверждённого контракта и явного выбора владельца.
 
 ## Шаг 1: Установка
+
+Установка использует сеть: агент выполняет её только после отдельного
+разрешения владельца. Без разрешения отметь установку `NOT_RUN`, не запускай
+`pip`/`uvx` для пробы.
 
 ```powershell
 pip install "voiceover-pipeline[timing-whisper]"
@@ -12,11 +17,16 @@ pip install "voiceover-pipeline[timing-whisper]"
 
 ## Шаг 2: Проверка окружения
 
+`doctor` может прочитать приватный env-файл приложением ради проверки наличия
+ключа и показать разрешённый путь, но не значение; агент файл не читает.
+Запускай команду только в одобренном окружении. Без согласия проверь лишь
+`voiceover help --json` и пометь key-preflight как `NOT_RUN`.
+
 ```powershell
 voiceover doctor --provider <PROVIDER> --with-timings --json
 ```
 
-Убедись что `workflow_ok: true`.
+Убедись что `workflow_ok: true`, а не только что exit code равен нулю.
 
 ## Шаг 3: Валидация сценария
 
@@ -28,7 +38,15 @@ voiceover validate --script "script.md" --json
 
 ## Шаг 4: Генерация озвучки + таймингов
 
-Polza Chat Audio (рубли, дёшево):
+Обе команды ниже потенциально платные. До запуска владелец должен отдельно
+разрешить именно выбранный provider/model и число POST с доказанной верхней
+границей стоимости в согласованном бюджете; старые smoke-цены не годятся.
+Без такого доказательства — `BLOCKED`, не пробный запрос. Локальная модель
+Whisper для интегрированного `--with-timings` должна быть заранее установлена
+и закеширована: preflight откажет до платного TTS, не скачивая веса неявно.
+Отдельный standalone `timings` может скачать модель и требует разрешения на сеть.
+
+Polza Chat Audio (chat-based, может добавить речь):
 
 ```powershell
 voiceover generate `
@@ -42,7 +60,7 @@ voiceover generate `
   --timing-device cpu `
   --word-timestamps `
   --json `
-  --overwrite
+  --resume
 ```
 
 Polza TTS (рубли, классический TTS):
@@ -57,7 +75,7 @@ voiceover generate `
   --with-timings `
   --word-timestamps `
   --json `
-  --overwrite
+  --resume
 ```
 
 ## Шаг 5: Чтение артефактов
@@ -65,8 +83,11 @@ voiceover generate `
 ```python
 import json
 
-# Entry-point — manifest.json знает все пути
+# Только после успешного integrated generate --with-timings: без таймингов
+# manifest не содержит timings_json/srt. Partial/failed результат не принимаем.
 manifest = json.load(open("out/production/manifest.json"))
+if not manifest.get("timings_json") or not manifest.get("srt"):
+    raise RuntimeError("timings/srt absent: inspect JSON, do not guess paths")
 
 # Точные тайминги в миллисекундах
 timings = json.load(open(manifest["timings_json"]))
@@ -74,7 +95,7 @@ timings = json.load(open(manifest["timings_json"]))
 # Субтитры
 srt_path = manifest["srt"]
 
-# Чанки для per-scene alignment и цен
+# Чанки — пути/метаданные, не источник точной суммы; её смотри в history costs.
 chunks = json.load(open(manifest["chunks_json"]))
 ```
 
@@ -89,6 +110,8 @@ def normalize(text):
     return re.sub(r'[^\w\s]', '', text.lower().strip())
 
 manifest = json.load(open("out/production/manifest.json"))
+if not manifest.get("timings_json"):
+    raise RuntimeError("integrated timings missing; inspect CLI result")
 timings = json.load(open(manifest["timings_json"]))
 
 # Смысловые сцены из script.md (текст каждой сцены)
@@ -132,11 +155,18 @@ for scene in script_scenes:
 ## Важные правила
 
 1. **НЕ оценивай длительность по словам.** Есть `.timings.json` → используй его.
-2. **НЕ гадай имена файлов.** Читай `manifest.json` → он знает все пути.
-3. **НЕ игнорируй exit codes.** Если `generate` упал с 40 — MP3 сохранён,
-   запусти `voiceover timings --audio` отдельно.
-4. **НЕ перезаписывай output без `--overwrite`.** Используй `--skip-existing`.
-5. **Выбор провайдера** — читай `docs/05-providers-and-models.md` для 7 моделей и цен.
+2. **НЕ гадай имена файлов.** При успешных интегрированных таймингах проверь
+   `manifest.json`; отдельный `voiceover timings --run-id <другой-id> --json`
+   пишет в другой root, и его `files.timings_json`/`files.srt` берутся из
+   ответа именно этой команды, а не из манифеста генерации.
+3. **НЕ игнорируй exit codes.** Legacy timing может дать `40`, нативный partial
+   результат — `50`; сперва проверь JSON/history и сохранённый MP3, не повторяй
+   TTS и не скачивай модель без разрешения.
+4. **НЕ перезаписывай платный output.** Используй безопасный `--resume` или
+   `--skip-existing`; новая попытка требует отдельного решения владельца.
+5. **Выбор провайдера** — читай `docs/05-providers-and-models.md`; актуальные
+   зарегистрированные модели/голоса даёт `voiceover list ...`, но тариф и
+   слышимое качество он не подтверждает.
 6. **НЕ используй `chunks[].duration_ms` для длительности сцен.**
    Whisper-сегменты — источник истины. Границы чанков НЕ совпадают со смысловыми границами.
 7. **Группируй Whisper-сегменты по смысловым сценам.**

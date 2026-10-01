@@ -100,7 +100,7 @@ dotted identifier; неизвестная тема — exit `2`. Актуаль�
 | По ситуации | [docs/05-providers-and-models.md](docs/05-providers-and-models.md) | Нужно выбрать TTS-провайдера, модель или голос |
 | По ситуации | [docs/13-speech-recognition-providers.md](docs/13-speech-recognition-providers.md) | Нужно выбрать локальное/облачное распознавание и вид таймкодов |
 | По ситуации | [docs/14-local-audio-cpp-models.md](docs/14-local-audio-cpp-models.md) | Нужны Qwen3-ASR, Nemotron, Qwen3-TTS, OmniVoice, benchmark или Windows boundary |
-| По ситуации | [docs/06-commands-and-flags.md](docs/06-commands-and-flags.md) | Нужен полный CLI-справочник |
+| По ситуации | [docs/06-commands-and-flags.md](docs/06-commands-and-flags.md) | Навигация по командам, ключи, exit codes, безопасность платных прогонов |
 | По ситуации | [docs/07-artifacts.md](docs/07-artifacts.md) | Нужно понять что на выходе |
 | По ситуации | [docs/08-workflows.md](docs/08-workflows.md) | Нужен готовый end-to-end сценарий |
 | По ситуации | [docs/09-troubleshooting.md](docs/09-troubleshooting.md) | Что-то пошло не так |

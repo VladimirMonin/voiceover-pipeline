@@ -12,7 +12,7 @@ SRT-субтитры и `manifest.json` как единую точку вход�
 Это не просто обёртка над TTS API. Это agent-grade инструмент с:
 
 - жёстким JSON-контрактом (`--json` → stdout содержит ровно один JSON object)
-- семантическими exit codes (0/2/10/11/20/30/40/50)
+- семантическими exit codes (0/2/10/11/20/30/40/50/60)
 - safe output policy (overwrite/skip/error)
 - `manifest.json` как единый entry-point для последующей автоматизации
 
@@ -38,7 +38,7 @@ Markdown-сценарий (script.md)
 voiceover validate --script script.md    ← валидация
        │
        ▼
-voiceover generate --with-timings        ← TTS + Whisper
+voiceover generate --with-timings        ← TTS + выбранный timing route (после разрешения на paid/сеть)
        │
        ├──► chunks/*.mp3                 ← MP3 по сценам
        ├──► full.mp3                     ← склеенный файл
@@ -51,46 +51,41 @@ voiceover generate --with-timings        ← TTS + Whisper
          Remotion / монтаж / подкаст
 ```
 
-## Четыре TTS-провайдера
+## Зарегистрированные TTS-маршруты
 
-| Провайдер | Тип | API | Валюта | Ключ |
-|---|---|---|---|---|
-| Polza Chat Audio | Cloud, chat-based | `/chat/completions` | RUB | `POLZA_API_KEY` |
-| Polza TTS | Cloud, классический TTS + ElevenLabs | `/audio/speech` или `/media` | RUB | `POLZA_API_KEY` |
-| OpenRouter TTS | Cloud, агрегатор TTS | `/audio/speech` | USD | `OPENROUTER_API_KEY` |
-| Qwen-local | Local GPU | Внутрипроцессный | Бесплатно | Не нужен |
+Облачные: `polza-chat-audio`, `polza-tts`, `openrouter-tts`; локальные без
+платы провайдеру: `qwen-local`, `omnivoice-local` (требуются собственные ресурсы
+и подготовленные веса). `voiceover list providers --json` показывает реестр,
+а не доступность, тариф или слуховое качество внешнего API. Следуйте
+`voiceover help providers.polza` и [обзору маршрутов](05-providers-and-models.md).
 
 **Polza TTS** — model-aware dispatch:
 - `openai/*` → `POST /api/v1/audio/speech` (JSON с base64 audio, `contentType: audio/mpeg`)
 - `elevenlabs/*` → `POST /api/v1/media` (async task → poll `GET /media/{id}` → download URL)
 
 **OpenRouter TTS** — текущий speech-каталог поддерживает Gemini:
-- Gemini: `input` строго verbatim, подача выбирается только голосом Google (30 имён)
+- Gemini: `input` строго verbatim, голос из зарегистрированного списка
+  `voiceover list voices --provider openrouter-tts --json`; эффект голоса не
+  доказан без отдельной live/listening приёмки.
 - исторический OpenAI Mini TTS ID больше не допускается до запроса
 
-## Семь протестированных моделей
+## История и поиск
 
-| # | Модель | Провайдер | Цена/мин | Валюта |
-|---|---:|---|---|---:|
-| 1 | `openai/gpt-audio-mini` | polza-chat-audio | ~0.004 | RUB |
-| 2 | `openai/gpt-audio` | polza-chat-audio | ~7.00 | RUB |
-| 3 | `openai/gpt-4o-mini-tts` | polza-tts | ~1.07 | RUB |
-| 4 | `elevenlabs/text-to-speech-turbo-2-5` | polza-tts | ~3.51 | RUB |
-| 5 | `elevenlabs/text-to-speech-multilingual-v2` | polza-tts | ~7.57 | RUB |
-| 6 | `google/gemini-3.1-flash-tts-preview` | openrouter-tts | ~$0.030 | USD |
-| 7 | `openai/gpt-4o-mini-tts-2025-12-15` (исторический, withdrawn) | openrouter-tts | ~$0.00041 | USD |
-
-Цены — реальные smoke-прогоны 2026-04-29, не гарантия провайдера.
-Модель Qwen-local не показана — бесплатно на локальном GPU.
+Canonical SQLite сохраняет прогоны, попытки, наблюдённые точные стоимости и
+приватные текстовые источники; JSON — совместимый экспорт. Лексический FTS5
+ищет только сохранённые тексты (`voiceover help search.lexical`).
+`semantic`/`hybrid` честно возвращают `SEARCH_MODE_DEFERRED` и отнесены к S09
+следующего релиза, а не к текущей возможности. Исторические smoke-цены
+не подтверждают будущий тариф и не дают потолок платного вызова.
 
 ## Whisper Timing
 
-Для точных таймингов используется `faster-whisper` — CPU-оптимизированная
-реализация OpenAI Whisper. Модель `small` (244M параметров, ~486 MB) —
-минимальная рабочая для русского языка, ~2× realtime на CPU с int8.
-
-Тайминги первичны, точность текста вторична — для captions используется
-утверждённый сценарий, а не Whisper-транскрипция.
+Для локальных таймингов доступен `faster-whisper`; cloud timing-маршруты —
+отдельные платные вызовы (см. [ASR-справочник](13-speech-recognition-providers.md)). Интегрированный
+`generate --with-timings` требует заранее закешированных весов до платного
+TTS; отдельный `timings` может загрузить модель и требует разрешения на сеть.
+Тайминги являются наблюдёнными границами; ASR-текст не подменяет утверждённый
+сценарий автоматически.
 
 ## Аудиообработка
 
