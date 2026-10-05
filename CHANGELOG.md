@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.8.0
+
+- Google Gemini 3.8 Flash TTS (`google/gemini-3.8-flash-tts`) and Flash-Lite
+  (`google/gemini-3.8-flash-lite-tts`) are ordinary speech models on both
+  `polza-tts` and `openrouter-tts`: `voiceover list providers` lists them and
+  `generate`/`validate` admit them without any experimental opt-in. Every request
+  still carries exactly one scalar `voice` with the part's effective direction in
+  a separate `instructions` field, and different parts or dialogue turns become
+  separate requests, so no request ever implies more than one speaker. The former
+  `--allow-experimental-gemini-speech-parts` flag is now accepted and recorded
+  only as a deprecated compatibility spelling: it is never required and refuses
+  nothing.
+- `generate` and `validate` share one effective model admission rule: an unknown,
+  stale, or provider-mismatched model is refused identically by both before any
+  key read or request, so a model `generate` would reject is never reported as a
+  usable route.
+- Added optional path-only credential source defaults `VOICEOVER_POLZA_ENV_FILE`
+  and `VOICEOVER_OPENROUTER_ENV_FILE`. Each holds a path the operator already
+  maintains; when set it replaces the working-directory `.env` for that
+  provider's secret without copying or merging keys. No new secret store and no
+  parent-directory search were added.
+- OpenRouter `/audio/speech` persists the bounded private raw response (the raw
+  body, then its bounded receipt) before the status check and decode, keeps the
+  bounded container the response reported so a local replay decodes the stored bytes
+  as they arrived, maps the documented `audio/pcm` stream to canonical pcm16 24 kHz
+  mono, and never follows a redirect, so a paid response is kept with one bounded
+  refusal instead of a second POST.
+- Includes the prior Windows portability and type repairs that keep the runtime
+  and history checks portable on Windows, committed before this release.
+
 ## 0.7.0
 
 - Added canonical SQLite-first generation and local history: reserve each paid

@@ -34,6 +34,7 @@ DEFAULT_ELEVENLABS_VOICE = "Rachel"
 
 DEFAULT_POLZA_TTS_MODEL = "openai/gpt-4o-mini-tts"
 DEFAULT_POLZA_TTS_RESPONSE_FORMAT = "mp3"
+DEFAULT_OPENROUTER_TTS_RESPONSE_FORMAT = "pcm"
 
 OPENAI_TTS_VOICES = [
     "alloy",
@@ -72,19 +73,21 @@ ELEVENLABS_TTS_VOICES = [
     "Bill",
 ]
 
+# The ordinary Gemini 3.8 speech models. Both are listed for both cloud speech
+# providers, and each request carries exactly one scalar ``voice`` with the part's
+# effective direction in a separate ``instructions`` field, so no experimental
+# opt-in is required and no request ever implies more than one speaker.
+GEMINI_38_TTS_MODELS = [
+    "google/gemini-3.8-flash-tts",
+    "google/gemini-3.8-flash-lite-tts",
+]
+
 POLZA_TTS_MODELS = [
     "openai/gpt-4o-mini-tts",
     "elevenlabs/text-to-speech-turbo-2-5",
     "elevenlabs/text-to-speech-multilingual-v2",
+    *GEMINI_38_TTS_MODELS,
 ]
-
-# The one experimental Polza Gemini TTS model whose scalar per-part request was
-# observed but never documented. It is deliberately absent from
-# ``POLZA_TTS_MODELS`` and from ``list`` so nothing advertises it as a stable
-# route; only the ordinary CLI's explicit opt-in flag admits it, and only for the
-# ``speech-parts`` format. ``instructions`` is an undocumented field for this
-# model, so the provider sends it only behind that same opt-in.
-POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL = "google/gemini-3.8-flash-tts"
 
 TTS_PROMPT_MODE_NONE = "none"
 TTS_PROMPT_MODE_PREFIX = "prefix"
@@ -98,6 +101,7 @@ POLZA_PROMPTABLE_TTS_MODELS: dict[str, str] = {}
 
 OPENROUTER_TTS_MODELS = [
     "google/gemini-3.1-flash-tts-preview",
+    *GEMINI_38_TTS_MODELS,
 ]
 
 OPENROUTER_WHISPER_MODELS = [
@@ -219,9 +223,24 @@ def model_slug(model: str) -> str:
 
 
 # Runtime ``.env`` resolution. The process environment always wins; then an explicit
-# ``--env-file`` scoped to the current CLI call; then ``<call-time CWD>/.env`` for
-# compatibility. No hidden parent-directory search runs and no import-time path is
-# captured for a runtime lookup.
+# ``--env-file`` scoped to the current CLI call; then the optional path-only provider
+# source configured for that secret; then ``<call-time CWD>/.env`` for compatibility.
+# No hidden parent-directory search runs, nothing is copied or merged, and no
+# import-time path is captured for a runtime lookup.
+#
+# ``VOICEOVER_POLZA_ENV_FILE``/``VOICEOVER_OPENROUTER_ENV_FILE`` are optional
+# *path-only* defaults: each holds a path to an external file the operator already
+# maintains, so a provider source outside the working directory can be selected
+# without copying a key into this project.
+PROVIDER_ENV_FILE_VARIABLES: dict[str, str] = {
+    "POLZA_API_KEY": "VOICEOVER_POLZA_ENV_FILE",
+    "OPENROUTER_API_KEY": "VOICEOVER_OPENROUTER_ENV_FILE",
+}
+
+# The two required sources are named in their fixed messages by label only, so a
+# diagnostic says which source failed without echoing a path or a value.
+_EXPLICIT_ENV_FILE_LABEL = "Explicit --env-file"
+_CONFIGURED_ENV_FILE_LABEL = "The configured provider env file"
 _ACTIVE_ENV_FILE: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "voiceover_active_env_file", default=None
 )
@@ -234,17 +253,43 @@ class EnvFileError(RuntimeError):
     """
 
 
-def resolved_env_file_path() -> Path:
+def resolved_env_file_path(secret_name: str | None = None) -> Path:
     """The file a runtime secret lookup would read.
 
-    Returns the explicit ``--env-file`` when one is scoped to this call, otherwise
-    ``<call-time CWD>/.env``. It never reads the file, so a read-only command can
-    report the path without touching a secret.
+    Returns the explicit ``--env-file`` when one is scoped to this call. Otherwise a
+    ``secret_name`` whose provider configured a path-only source
+    (:data:`PROVIDER_ENV_FILE_VARIABLES`) resolves to that configured path, which
+    replaces the working-directory file instead of merging with it; without one,
+    ``<call-time CWD>/.env`` remains for compatibility. It never reads the file, so a
+    read-only command such as ``doctor`` or ``help`` can report or ignore the path
+    without touching a secret.
     """
     active = _ACTIVE_ENV_FILE.get()
     if active is not None:
         return active
+    if secret_name is not None:
+        configured = _configured_provider_env_file(secret_name)
+        if configured is not None:
+            return configured
     return Path.cwd() / ".env"
+
+
+def _configured_provider_env_file(secret_name: str) -> Path | None:
+    """The path-only source configured for this secret, or ``None``.
+
+    The variable holds a path and nothing else. A blank value means "not
+    configured", so an accidental empty override keeps the call-time
+    working-directory compatibility instead of failing every paid run. The path is
+    used exactly as given -- no parent search, no expansion, and no merge with any
+    other file.
+    """
+    variable = PROVIDER_ENV_FILE_VARIABLES.get(secret_name)
+    if variable is None:
+        return None
+    value = os.environ.get(variable)
+    if value is None or not value.strip():
+        return None
+    return Path(value.strip())
 
 
 @contextmanager
@@ -263,14 +308,23 @@ def use_env_file(env_path: Path | None) -> Iterator[None]:
         _ACTIVE_ENV_FILE.reset(token)
 
 
-def _require_regular_explicit_env_file(env_path: Path) -> None:
-    """Reject an unusable explicit path without opening or parsing its contents."""
+def _require_regular_env_file(env_path: Path, *, label: str) -> None:
+    """Reject an unusable required source without opening or parsing its contents.
+
+    ``label`` names the caller-supplied or configured source in the fixed, path-free
+    message, so a diagnostic says which source failed without echoing a path.
+    """
     try:
         regular_file = env_path.is_file()
     except OSError as exc:
-        raise EnvFileError("Explicit --env-file could not be read.") from exc
+        raise EnvFileError(f"{label} could not be read.") from exc
     if not regular_file:
-        raise EnvFileError("Explicit --env-file is missing or not a regular file.")
+        raise EnvFileError(f"{label} is missing or not a regular file.")
+
+
+def _require_regular_explicit_env_file(env_path: Path) -> None:
+    """Reject an unusable explicit ``--env-file`` without opening its contents."""
+    _require_regular_env_file(env_path, label=_EXPLICIT_ENV_FILE_LABEL)
 
 
 def _read_env_values(env_path: Path, *, required: bool) -> dict[str, str]:
@@ -282,7 +336,9 @@ def _read_env_values(env_path: Path, *, required: bool) -> dict[str, str]:
         text = env_path.read_text(encoding="utf-8")
     except (OSError, UnicodeError) as exc:
         message = (
-            "Explicit --env-file could not be read." if required else "Env file could not be read."
+            f"{_EXPLICIT_ENV_FILE_LABEL} could not be read."
+            if required
+            else "Env file could not be read."
         )
         raise EnvFileError(message) from exc
 
@@ -301,6 +357,21 @@ def _read_env_values(env_path: Path, *, required: bool) -> dict[str, str]:
     return values
 
 
+def _read_configured_env_values(env_path: Path) -> dict[str, str]:
+    """Read a required provider-configured path-only source.
+
+    The file is validated by metadata first and every failure is reported under its
+    own path-free label, so a missing or unreadable provider file fails closed
+    instead of silently falling back to another file. A present file is then read with
+    the same parser as every other source.
+    """
+    _require_regular_env_file(env_path, label=_CONFIGURED_ENV_FILE_LABEL)
+    try:
+        return _read_env_values(env_path, required=False)
+    except EnvFileError:
+        raise EnvFileError(f"{_CONFIGURED_ENV_FILE_LABEL} could not be read.") from None
+
+
 def read_env_file(env_path: Path | None = None) -> dict[str, str]:
     """Read a ``.env`` file under the runtime resolution rules.
 
@@ -308,7 +379,9 @@ def read_env_file(env_path: Path | None = None) -> dict[str, str]:
     returns an empty mapping when it does not exist. With no argument, an explicit
     ``--env-file`` scoped through :func:`use_env_file` is read next and fails closed
     when it is missing or unreadable; otherwise ``<call-time CWD>/.env`` is read for
-    compatibility. Parents are never searched.
+    compatibility. Parents are never searched. This reader has no secret identity, so
+    it never substitutes a provider-configured source; :func:`get_secret` does that
+    for a named secret.
     """
     if env_path is not None:
         return _read_env_values(env_path, required=False)
@@ -321,11 +394,22 @@ def read_env_file(env_path: Path | None = None) -> dict[str, str]:
 
 
 def get_secret(name: str, env_path: Path | None = None) -> str | None:
-    """Resolve a secret: validate an explicit CLI path, then prefer the process value.
+    """Resolve a secret under the one documented credential precedence.
 
-    A supplied --env-file must exist and be regular even when the process has a
-    usable key. Validation checks metadata only; contents are not read when the
-    process value wins. Direct-call env_path retains its historical behavior.
+    1. A non-empty process value wins, and the file is not read at all.
+    2. A supplied ``--env-file`` must exist and be regular even when the process has
+       a usable key, and an unusable explicit path fails closed. A direct-call
+       ``env_path`` keeps its historical lenient behavior and wins over a configured
+       provider source.
+    3. Without either, a provider-configured path-only source
+       (:data:`PROVIDER_ENV_FILE_VARIABLES`) is used instead of the call-time
+       working-directory file; a missing or unreadable configured source fails
+       closed with one path-free message.
+    4. Without a configured source, ``<call-time CWD>/.env`` is read for
+       compatibility.
+
+    Validation checks metadata only, and no parent directory is ever searched or
+    merged.
     """
     if env_path is None:
         active = _ACTIVE_ENV_FILE.get()
@@ -335,7 +419,18 @@ def get_secret(name: str, env_path: Path | None = None) -> str | None:
     if value:
         return value
 
-    return read_env_file(env_path).get(name)
+    if env_path is not None:
+        return _read_env_values(env_path, required=False).get(name)
+
+    active = _ACTIVE_ENV_FILE.get()
+    if active is not None:
+        return _read_env_values(active, required=True).get(name)
+
+    configured = _configured_provider_env_file(name)
+    if configured is not None:
+        return _read_configured_env_values(configured).get(name)
+
+    return _read_env_values(Path.cwd() / ".env", required=False).get(name)
 
 
 def read_polza_key() -> str:

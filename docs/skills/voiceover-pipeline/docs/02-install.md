@@ -28,6 +28,11 @@ GUI, корпоративная политика запрещает.
 
 ## Installation Decision Tree
 
+Пакет публикуется как GitHub Release, а не через package index: если `uvx`/`pip`
+не находят `voiceover-pipeline` в индексе, установи закреплённый
+release-wheel из `## Команды установки пакета` (`uv tool install "... @ <release
+wheel URL>"`). Шаги ниже описывают выбор extras и проверку после установки.
+
 Проверяй последовательно, на каждом шаге запускай probe-команду:
 
 **Шаг 1 — CLI уже работает?**
@@ -115,7 +120,16 @@ GUI, корпоративная политика запрещает.
 
 ## Команды установки пакета
 
-Console scripts: `voiceover` и `voiceover-pipeline` (работают оба).
+Релиз публикуется как **GitHub Release wheel** (не PyPI). Закреплённая установка
+из тега `v0.8.0`:
+
+```powershell
+uv tool install "voiceover-pipeline @ https://github.com/VladimirMonin/voiceover-pipeline/releases/download/v0.8.0/voiceover_pipeline-0.8.0-py3-none-any.whl"
+```
+
+После установки проверь метаданные закреплённого артефакта и справку из пакета:
+`voiceover help --json`. Console scripts: `voiceover` и `voiceover-pipeline`
+(работают оба).
 
 | Менеджер | Base | +Whisper | +Qwen GPU | +Whisper+Qwen+cuda |
 |---|---|---|---|---|
@@ -168,6 +182,8 @@ voiceover doctor --provider qwen-local --json
   владельца.
 - Модели кешируются, повторные запуски быстрые.
 - Значение ключа разрешается так: непустое окружение процесса → явный
-  `--env-file PATH` → `<CWD>/.env`; поиска по родительским каталогам нет. Реальный
-  env-файл создаёт пользователь; агент создаёт только `.env.example`
+  `--env-file PATH` → необязательный path-only
+  `VOICEOVER_POLZA_ENV_FILE`/`VOICEOVER_OPENROUTER_ENV_FILE` (заменяет CWD-файл
+  для своего провайдера) → `<CWD>/.env`; поиска по родительским каталогам нет.
+  Реальный env-файл создаёт пользователь; агент создаёт только `.env.example`
   (см. `docs/03-security-and-secrets.md`).

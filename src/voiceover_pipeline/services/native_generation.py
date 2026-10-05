@@ -118,7 +118,11 @@ from pathlib import Path
 from typing import Any, cast
 
 from ..artifacts import build_run_paths, build_srt, build_timing_manifest
-from ..config import DEFAULT_POLZA_TTS_RESPONSE_FORMAT, DEFAULT_TIMING_MODEL
+from ..config import (
+    DEFAULT_OPENROUTER_TTS_RESPONSE_FORMAT,
+    DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
+    DEFAULT_TIMING_MODEL,
+)
 from ..execution_identity import build_execution_identity
 from ..gemini_dialogue import is_dialogue_format
 from ..history.database import (
@@ -245,6 +249,11 @@ OUTPUT_PROCESSING_VERSION = 1
 # Bounded account label for a single paid attempt; the provider identity itself is
 # the model, and no user secret ever enters this field.
 PAID_ACCOUNT_ALIAS = "default"
+
+# Cloud speech providers whose submit is one synchronous ``/audio/speech`` response.
+# Both return their audio inline and can persist that exact HTTP body before any
+# status check or decode, so one pre-parse sink and one local replay serve both.
+_SYNC_RESPONSE_PROVIDERS = frozenset({"polza-tts", "openrouter-tts"})
 
 # Stable machine-readable error codes carried in the CLI error envelope.
 _ERROR_OWNERSHIP_UNVERIFIABLE = "NATIVE_OWNERSHIP_UNVERIFIABLE"
@@ -1574,15 +1583,27 @@ class _Executor:
         )
 
     def _uses_sync_response_route(self) -> bool:
-        """Whether this run submits to Polza's synchronous ``/audio/speech`` route.
+        """Whether this run submits to a synchronous ``/audio/speech`` route.
 
-        Only that provider can persist its exact HTTP response body *before* the
-        status check and parse, so the pre-parse response sink and the local body
-        replay are bound to it alone. ``openrouter-tts`` also returns audio inline
-        but has no response-body sink, so it keeps the decoded-receipt
-        reconciliation and the documented unconfirmed block.
+        Both synchronous cloud speech providers return their audio inline and persist
+        their exact HTTP response body *before* the status check and the decode, so the
+        pre-parse response sink and the local body replay are bound to them. The async
+        Polza ``/media`` route is excluded: its paid evidence is an accepted task id
+        plus a GET-only recovery, not a stored response body.
         """
-        return self.prepared.provider == "polza-tts" and not self._uses_media_route()
+        return self.prepared.provider in _SYNC_RESPONSE_PROVIDERS and not self._uses_media_route()
+
+    def _sync_response_format(self) -> str:
+        """The requested container this run's response sink records and a replay re-derives.
+
+        The receipt's ``response_format`` is the request identity a later replay must
+        match, so the sink and the replay read it from one place instead of guessing it
+        from whatever provider object happens to exist at that moment (a local replay
+        never builds one).
+        """
+        if self.prepared.provider == "openrouter-tts":
+            return DEFAULT_OPENROUTER_TTS_RESPONSE_FORMAT
+        return DEFAULT_POLZA_TTS_RESPONSE_FORMAT
 
     # -- per-part processing --------------------------------------------------
 
@@ -1645,7 +1666,11 @@ class _Executor:
         JSON, or decodes audio. The receipt binds the already-reserved attempt, part,
         chunk, synthesis fingerprint, and request identity (provider/model/voice and
         the requested response format), so a resume can replay exactly this body
-        locally. A persistence or size failure propagates out of the provider call
+        locally. The bounded container the provider observed is recorded as optional
+        evidence too, so a replay of a body whose container came from the response
+        header is decoded with the container it actually arrived in; a provider that
+        reports none (its body describes its own container) omits the fourth value. A
+        persistence or size failure propagates out of the provider call
         and keeps the attempt unconfirmed instead of repeating it.
         """
         run_root = self.run_root
@@ -1661,11 +1686,14 @@ class _Executor:
         # cast voice, so the private evidence and its later replay must name the
         # exact voice that request used.
         voice = part.effective_voice
-        response_format = str(
-            getattr(provider, "response_format", DEFAULT_POLZA_TTS_RESPONSE_FORMAT)
-        )
+        response_format = self._sync_response_format()
 
-        def on_response(body: bytes, status_code: int, generation_id: str | None) -> None:
+        def on_response(
+            body: bytes,
+            status_code: int,
+            generation_id: str | None,
+            observed_audio_format: str | None = None,
+        ) -> None:
             write_sync_response_receipt(
                 run_root=run_root,
                 attempt_uuid=attempt_uuid,
@@ -1680,6 +1708,7 @@ class _Executor:
                 http_status=status_code,
                 body=body,
                 generation_id=generation_id,
+                observed_audio_format=observed_audio_format,
             )
 
         provider.on_raw_response = on_response
@@ -3000,12 +3029,29 @@ class _Executor:
         self._revision = run.revision
         return artifact
 
+    def _sync_response_parser(self) -> Callable[..., SynthesisResult]:
+        """The pure parser that decodes one stored ``/audio/speech`` body for this provider.
+
+        Each synchronous adapter owns exactly one decoder shared by its live submit and
+        a local replay, so a stored body is never decoded by another provider's rules.
+        """
+        if self.prepared.provider == "openrouter-tts":
+            from ..providers.openrouter_tts import (
+                build_audio_speech_result as build_openrouter_audio_speech_result,
+            )
+
+            return build_openrouter_audio_speech_result
+        from ..providers.polza_tts import build_audio_speech_result
+
+        return build_audio_speech_result
+
     def _replay_sync_response(self, evidence: _PartEvidence, attempt: AttemptRecord) -> bool:
         """Replay a verified synchronous response body locally, with no POST or GET.
 
         The stored private body is verified against exactly this attempt and its
         request identity, read bounded, and parsed with the same pure parser the live
-        submit uses; a successful parse links the decoded raw receipt and the exact
+        submit uses -- including the bounded container the paid evidence preserved for
+        it -- a successful parse links the decoded raw receipt and the exact
         observed cost, then converts the part. An absent, mismatched, tampered, or
         oversized body, a non-success status, or a body that will not parse returns
         ``False`` so the caller keeps the documented unconfirmed-submit block and
@@ -3024,7 +3070,7 @@ class _Executor:
                 provider=self.prepared.provider,
                 model=self._model(),
                 voice=part.effective_voice,
-                response_format=DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
+                response_format=self._sync_response_format(),
             )
         except (PaidSyncResponseError, ValueError):
             return False
@@ -3032,7 +3078,14 @@ class _Executor:
             body = read_sync_response_body(receipt)
         except (PaidSyncResponseError, ValueError):
             return False
-        from ..providers.polza_tts import build_audio_speech_result
+        build_audio_speech_result = self._sync_response_parser()
+        decode_input: dict[str, str] = {}
+        if self.prepared.provider == "openrouter-tts" and receipt.observed_audio_format:
+            # OpenRouter's stored body is raw audio whose container arrived in the
+            # response header, so the paid evidence preserves it for this local replay;
+            # without that evidence (an older receipt) the decoder falls back to the
+            # requested container, exactly as before.
+            decode_input["observed_audio_format"] = receipt.observed_audio_format
 
         try:
             result = build_audio_speech_result(
@@ -3042,6 +3095,7 @@ class _Executor:
                 transcript=part.text,
                 model=self._model(),
                 voice=part.effective_voice,
+                **decode_input,
             )
         except (ValueError, RuntimeError):
             # A malformed or unsupported stored response stays private and unknown;

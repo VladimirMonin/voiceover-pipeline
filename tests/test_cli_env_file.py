@@ -25,6 +25,22 @@ from voiceover_pipeline import cli, config
 
 _SYNTHETIC_KEY = "VOICEOVER_TEST_ENV_KEY"
 _REDACTED_MESSAGE = "Explicit --env-file is missing or not a regular file."
+_CONFIGURED_REDACTED_MESSAGE = "The configured provider env file is missing or not a regular file."
+_POLZA_SOURCE_VARIABLE = "VOICEOVER_POLZA_ENV_FILE"
+_OPENROUTER_SOURCE_VARIABLE = "VOICEOVER_OPENROUTER_ENV_FILE"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_sources(monkeypatch):
+    """Keep a developer machine's real provider sources out of every test here.
+
+    ``VOICEOVER_POLZA_ENV_FILE``/``VOICEOVER_OPENROUTER_ENV_FILE`` may name a real
+    external credential file on the machine running the suite. No test in this module
+    may read it or be influenced by it, so both are cleared first and each test opts
+    back in with its own synthetic file.
+    """
+    monkeypatch.delenv(_POLZA_SOURCE_VARIABLE, raising=False)
+    monkeypatch.delenv(_OPENROUTER_SOURCE_VARIABLE, raising=False)
 
 
 def _write_env(path: Path, *lines: str) -> Path:
@@ -530,3 +546,173 @@ def test_main_resets_env_file_scope_after_each_call(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         cli.main()
     assert config.resolved_env_file_path() == Path.cwd() / ".env"
+
+
+# ── provider-configured path-only sources ────────────────────────────────────
+
+
+def test_configured_provider_source_replaces_the_cwd_file(tmp_path, monkeypatch):
+    """A configured provider path is used instead of the working-directory file."""
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    _write_env(cwd / ".env", "POLZA_API_KEY=synthetic-cwd-secret")
+    provider_source = _write_env(
+        tmp_path / "provider.env", "POLZA_API_KEY=synthetic-provider-secret"
+    )
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(provider_source))
+    monkeypatch.chdir(cwd)
+
+    assert config.get_secret("POLZA_API_KEY") == "synthetic-provider-secret"
+    assert config.read_polza_key() == "synthetic-provider-secret"
+    assert config.resolved_env_file_path("POLZA_API_KEY") == provider_source
+    # The unnamed reader keeps its exact compatibility behavior.
+    assert config.resolved_env_file_path() == cwd / ".env"
+    assert config.read_env_file() == {"POLZA_API_KEY": "synthetic-cwd-secret"}
+
+
+def test_process_key_wins_without_reading_the_configured_source(tmp_path, monkeypatch):
+    """A non-empty process value is returned without opening the configured file."""
+    unreadable = tmp_path / "not-a-file.env"
+    unreadable.mkdir()
+    monkeypatch.setenv("POLZA_API_KEY", "synthetic-process-secret")
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(unreadable))
+
+    assert config.get_secret("POLZA_API_KEY") == "synthetic-process-secret"
+    assert config.read_polza_key() == "synthetic-process-secret"
+
+
+def test_explicit_env_file_wins_over_the_configured_source_without_merging(tmp_path, monkeypatch):
+    """An explicit file replaces the configured source instead of merging with it."""
+    configured = _write_env(tmp_path / "provider.env", "POLZA_API_KEY=synthetic-provider-secret")
+    explicit = _write_env(tmp_path / "explicit.env", "OTHER_KEY=1")
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(configured))
+
+    with config.use_env_file(explicit):
+        assert config.get_secret("POLZA_API_KEY") is None
+        assert config.resolved_env_file_path("POLZA_API_KEY") == explicit
+
+
+def test_direct_env_path_wins_over_the_configured_source(tmp_path, monkeypatch):
+    """A direct-call path keeps winning, exactly as it does over a scoped override."""
+    configured = _write_env(tmp_path / "provider.env", "POLZA_API_KEY=synthetic-provider-secret")
+    direct = _write_env(tmp_path / "direct.env", "POLZA_API_KEY=synthetic-direct-secret")
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(configured))
+
+    assert config.get_secret("POLZA_API_KEY", env_path=direct) == "synthetic-direct-secret"
+
+
+def test_missing_configured_source_fails_closed_without_the_path(tmp_path, monkeypatch):
+    """A missing configured source is one redacted failure, never a CWD fallback."""
+    missing = tmp_path / "synthetic-private-source.env"
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(missing))
+
+    with pytest.raises(config.EnvFileError) as excinfo:
+        config.get_secret("POLZA_API_KEY")
+    with pytest.raises(cli.CliError) as paid:
+        cli.read_api_key(argparse.Namespace(provider="polza-tts"))
+
+    assert str(excinfo.value) == _CONFIGURED_REDACTED_MESSAGE
+    assert paid.value.code == 20
+    assert str(paid.value) == _CONFIGURED_REDACTED_MESSAGE
+    assert str(tmp_path) not in str(paid.value)
+
+
+def test_undecodable_configured_source_fails_closed_without_content(tmp_path, monkeypatch):
+    """An unreadable configured source fails closed only when no process key wins."""
+    corrupted = tmp_path / "synthetic-private-source.env"
+    corrupted.write_bytes(b"\xff\xfe\x00synthetic-not-utf8")
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(corrupted))
+
+    with pytest.raises(config.EnvFileError) as excinfo:
+        config.read_polza_key()
+    assert "synthetic-not-utf8" not in str(excinfo.value)
+    assert str(tmp_path) not in str(excinfo.value)
+
+    monkeypatch.setenv("POLZA_API_KEY", "synthetic-process-secret")
+    assert config.read_polza_key() == "synthetic-process-secret"
+
+
+def test_provider_sources_stay_isolated_per_secret(tmp_path, monkeypatch):
+    """One provider's configured source never serves another provider's secret."""
+    polza = _write_env(tmp_path / "polza.env", "POLZA_API_KEY=synthetic-polza-secret")
+    openrouter = _write_env(
+        tmp_path / "openrouter.env", "OPENROUTER_API_KEY=synthetic-openrouter-secret"
+    )
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(polza))
+    monkeypatch.setenv(_OPENROUTER_SOURCE_VARIABLE, str(openrouter))
+
+    assert config.read_polza_key() == "synthetic-polza-secret"
+    assert config.read_openrouter_key() == "synthetic-openrouter-secret"
+
+    # A provider with no configured source keeps the call-time CWD file.
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    _write_env(cwd / ".env", "GROQ_API_KEY=synthetic-groq-secret")
+    monkeypatch.chdir(cwd)
+    assert config.read_groq_key() == "synthetic-groq-secret"
+
+
+def test_blank_configured_value_keeps_the_cwd_compatibility(tmp_path, monkeypatch):
+    """An accidental empty override is not a configured source."""
+    cwd = tmp_path / "work"
+    cwd.mkdir()
+    _write_env(cwd / ".env", "POLZA_API_KEY=synthetic-cwd-secret")
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, "   ")
+    monkeypatch.chdir(cwd)
+
+    assert config.read_polza_key() == "synthetic-cwd-secret"
+
+
+def test_help_reads_no_configured_provider_source(tmp_path, monkeypatch):
+    """``help`` neither reads nor validates a configured source."""
+    missing = tmp_path / "synthetic-private-source.env"
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(missing))
+    monkeypatch.setenv(_OPENROUTER_SOURCE_VARIABLE, str(missing))
+
+    code, payload = cli_json("help", "providers.polza", "--json", cwd=tmp_path)
+
+    assert code == 0
+    assert payload["status"] == "success"
+    assert str(missing) not in json.dumps(payload)
+
+
+def test_doctor_reports_the_configured_source_path_and_presence_without_a_value(
+    tmp_path, monkeypatch
+):
+    """``doctor`` names the selected provider source and never a value."""
+    provider_source = _write_env(tmp_path / "provider.env", "POLZA_API_KEY=synthetic-doctor-secret")
+    monkeypatch.delenv("POLZA_API_KEY", raising=False)
+    monkeypatch.setenv(_POLZA_SOURCE_VARIABLE, str(provider_source))
+
+    code, payload = cli_json("doctor", "--provider", "polza-tts", "--json", cwd=tmp_path)
+
+    assert code == 0
+    checks = payload["checks"]
+    assert checks["env_file"]["path"] == str(provider_source)
+    assert checks["env_file"]["ok"] is True
+    assert checks["polza_key"]["ok"] is True
+    assert "synthetic-doctor-secret" not in json.dumps(payload)
+
+
+def test_doctor_reports_the_openrouter_source_for_that_provider(tmp_path, monkeypatch):
+    """The reported source follows the selected provider, not a fixed one."""
+    openrouter_source = _write_env(
+        tmp_path / "openrouter.env", "OPENROUTER_API_KEY=synthetic-doctor-secret"
+    )
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv(_OPENROUTER_SOURCE_VARIABLE, str(openrouter_source))
+
+    code, payload = cli_json("doctor", "--provider", "openrouter-tts", "--json", cwd=tmp_path)
+
+    assert code == 0
+    assert payload["checks"]["env_file"]["path"] == str(openrouter_source)
+    assert payload["checks"]["openrouter_key"]["ok"] is True
+    assert "synthetic-doctor-secret" not in json.dumps(payload)

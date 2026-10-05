@@ -87,6 +87,13 @@ _RESPONSE_RECEIPT_FIELDS = (
     "size",
     "sha256",
 )
+# One additive bounded evidence field: the raw audio container the synchronous provider
+# observed in its response, already mapped to a bounded value (never a raw header). It is
+# preserved so a local replay decodes the stored bytes with the container they actually
+# arrived in instead of the requested one. It stays optional, so every receipt written
+# before it existed still loads, verifies, and replays, and the requested
+# ``response_format`` stays the separate request-identity field.
+_OPTIONAL_RESPONSE_RECEIPT_FIELDS = ("observed_audio_format",)
 
 # Run-local directory that holds raw paid audio and its receipts.
 RAW_DIRECTORY_NAME = "raw"
@@ -849,8 +856,12 @@ class SyncResponseReceipt:
 
     ``generation_id`` is the sanitized opaque ``X-Generation-Id`` header value (or
     ``None`` when the provider reported none or a value that is not a bounded
-    token). ``http_status`` is the observed status code. ``relative_path`` and
-    ``body_path`` point at the private run-local body. No request text, API key,
+    token). ``http_status`` is the observed status code. ``observed_audio_format``
+    is the bounded raw container the provider observed for this body, or ``None``
+    when the provider reported none or the stored body describes its own container
+    (a JSON body carrying ``contentType``); it never carries a raw header value and
+    is not the request identity, which stays ``response_format``. ``relative_path``
+    and ``body_path`` point at the private run-local body. No request text, API key,
     signed URL, or provider error body is carried in the receipt itself.
     """
 
@@ -869,6 +880,7 @@ class SyncResponseReceipt:
     size: int
     sha256: str
     body_path: Path
+    observed_audio_format: str | None = None
 
 
 def _new_response_receipt_payload(
@@ -887,9 +899,15 @@ def _new_response_receipt_payload(
     relative_path: str,
     size: int,
     sha256: str,
+    observed_audio_format: str | None = None,
 ) -> dict[str, Any]:
-    """Assemble the exact bounded response-receipt payload for validated inputs."""
-    return {
+    """Assemble the exact bounded response-receipt payload for validated inputs.
+
+    The optional observed container is written only when one was observed, so a
+    provider that reports none keeps the exact pre-existing payload bytes and a
+    repeated write of the same evidence stays an idempotent no-op.
+    """
+    payload: dict[str, Any] = {
         "artifact_type": RESPONSE_RECEIPT_ARTIFACT_TYPE,
         "receipt_version": RESPONSE_RECEIPT_VERSION,
         "attempt_uuid": attempt_uuid,
@@ -907,6 +925,9 @@ def _new_response_receipt_payload(
         "size": size,
         "sha256": sha256,
     }
+    if observed_audio_format is not None:
+        payload["observed_audio_format"] = observed_audio_format
+    return payload
 
 
 def _normalize_response_receipt(
@@ -930,6 +951,8 @@ def _normalize_response_receipt(
     http_status = _bounded_http_status(payload["http_status"])
     stored_generation = payload["generation_id"]
     generation = None if stored_generation is None else _bounded_opaque(stored_generation)
+    stored_observed = payload.get("observed_audio_format")
+    observed = None if stored_observed is None else _bounded_identity(stored_observed)
     size = _bounded_size(payload["size"])
     sha256 = _bounded_sha256(payload["sha256"])
     if (
@@ -948,12 +971,13 @@ def _normalize_response_receipt(
         or size > MAX_RESPONSE_BODY_BYTES
         or sha256 is None
         or (stored_generation is not None and generation is None)
+        or (stored_observed is not None and observed is None)
     ):
         raise error("paid sync response receipt does not carry valid bounded evidence")
     expected_path = _response_relative_path(attempt)
     if payload["path"] != expected_path:
         raise error("paid sync response receipt path is not the deterministic response path")
-    return {
+    normalized: dict[str, Any] = {
         "artifact_type": RESPONSE_RECEIPT_ARTIFACT_TYPE,
         "receipt_version": RESPONSE_RECEIPT_VERSION,
         "attempt_uuid": attempt,
@@ -971,6 +995,9 @@ def _normalize_response_receipt(
         "size": size,
         "sha256": sha256,
     }
+    if observed is not None:
+        normalized["observed_audio_format"] = observed
+    return normalized
 
 
 def _read_response_receipt_payload(
@@ -991,7 +1018,9 @@ def _read_response_receipt_payload(
         raise error("paid sync response receipt is not valid JSON") from exc
     if not isinstance(payload, dict):
         raise error("paid sync response receipt is not a JSON object")
-    if set(payload) != set(_RESPONSE_RECEIPT_FIELDS):
+    present = set(payload)
+    allowed = set(_RESPONSE_RECEIPT_FIELDS) | set(_OPTIONAL_RESPONSE_RECEIPT_FIELDS)
+    if not set(_RESPONSE_RECEIPT_FIELDS) <= present or not present <= allowed:
         raise error("paid sync response receipt does not carry exactly the bounded fields")
     return _normalize_response_receipt(payload, error=error)
 
@@ -1014,6 +1043,7 @@ def _response_receipt_from_payload(run_root: Path, payload: dict[str, Any]) -> S
         size=payload["size"],
         sha256=payload["sha256"],
         body_path=run_root / payload["path"],
+        observed_audio_format=payload.get("observed_audio_format"),
     )
 
 
@@ -1032,6 +1062,7 @@ def write_sync_response_receipt(
     http_status: int,
     body: bytes,
     generation_id: str | None = None,
+    observed_audio_format: str | None = None,
 ) -> SyncResponseReceipt:
     """Persist a synchronous provider response body and its bounded receipt.
 
@@ -1041,7 +1072,12 @@ def write_sync_response_receipt(
     never lost to a malformed or unsupported payload. ``generation_id`` is the
     untrusted ``X-Generation-Id`` header value and is sanitized to a bounded opaque
     token (or ``None``) before it is stored, so an invalid header never fails a
-    valid body. An oversized, empty, or unstorable body fails closed. A repeated
+    valid body. ``observed_audio_format`` is the already-mapped bounded container the
+    provider observed for this body (or ``None`` when it reported none), recorded
+    alongside the requested ``response_format`` so a local replay decodes the stored
+    bytes with the container they arrived in; the requested format stays the request
+    identity and is never replaced by the observed one. An oversized, empty, or
+    unstorable body fails closed. A repeated
     call with identical bytes and identity is an idempotent no-op; any existing
     evidence that does not match this exact attempt is a conflict, so another paid
     attempt is never overwritten or adopted. No database row is written here, and
@@ -1069,6 +1105,11 @@ def write_sync_response_receipt(
                 "the paid sync response body exceeds the bounded maximum"
             )
         bounded_generation = _bounded_opaque(generation_id)
+        bounded_observed = (
+            None if observed_audio_format is None else _bounded_identity(observed_audio_format)
+        )
+        if observed_audio_format is not None and bounded_observed is None:
+            raise ValueError("observed_audio_format must be a bounded non-empty container")
 
         relative_path = _response_relative_path(attempt)
         payload = _new_response_receipt_payload(
@@ -1086,6 +1127,7 @@ def write_sync_response_receipt(
             relative_path=relative_path,
             size=len(data),
             sha256=hashlib.sha256(data).hexdigest(),
+            observed_audio_format=bounded_observed,
         )
 
         raw_dir = _prepare_raw_directory(root)
@@ -1187,8 +1229,9 @@ def verify_sync_response_receipt(
     """Verify stored synchronous response evidence for local replay, or raise.
 
     The receipt and body must both exist as regular non-symlink files inside a
-    private ``raw`` directory, the receipt must carry exactly the bounded fields,
-    and its attempt, part, fingerprint, chunk, number, and request identity must
+    private ``raw`` directory, the receipt must carry exactly the bounded evidence
+    fields (plus the optional observed audio container), and its attempt, part,
+    fingerprint, chunk, number, and request identity must
     match the requested run. The observed status must be a successful response and
     the body's size and digest must match the receipt, so a replayed body is never
     guessed from a file name. Any tampered, mismatched, missing, oversized, or

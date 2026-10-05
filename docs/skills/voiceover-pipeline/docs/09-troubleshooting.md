@@ -25,7 +25,7 @@ submit агент не повторяет автоматически.
 | `python` | Python отсутствует | Требуется Python ≥3.11 (см. `docs/02-install.md`) |
 | `ffmpeg` | FFmpeg не найден | Установи FFmpeg + открой новый terminal |
 | `ffprobe` | FFprobe не найден | Установи FFmpeg (идёт в комплекте) |
-| `env_file` | файла env нет или явный `--env-file` непригоден | Создай только `.env.example`; реальный env заводит владелец вне инструментов агента, агент его не читает. При непригодном явном `--env-file` doctor даёт exit `0`, `status: success`, но `workflow_ok: false` |
+| `env_file` | файла env нет или выбранный источник непригоден (явный `--env-file` или настроенный `VOICEOVER_POLZA_ENV_FILE`/`VOICEOVER_OPENROUTER_ENV_FILE`) | Создай только `.env.example`; реальный env заводит владелец вне инструментов агента, агент его не читает. При непригодном явном `--env-file` doctor даёт exit `0`, `status: success`, но `workflow_ok: false` |
 | `polza_key` | POLZA_API_KEY missing | Попроси владельца поместить `pza_...` в приватный env-файл/окружение; НЕ создавай и НЕ читай `.env` |
 | `openrouter_key` | OPENROUTER_API_KEY missing | Попроси владельца поместить `sk-or-v1-...` в приватный env-файл/окружение; НЕ создавай и НЕ читай `.env` |
 | `faster_whisper` | Whisper не установлен | Переустанови с extra `timing-whisper` |
@@ -127,8 +127,8 @@ POLZA_API_KEY not found / OPENROUTER_API_KEY is required
 
 - НЕ читай и не создавай `.env`
 - Запусти `voiceover doctor --provider <X> --json`
-- Если `polza_key.ok: false` — попроси владельца добавить `POLZA_API_KEY=pza_...` в приватный env/окружение процесса
-- Если `openrouter_key.ok: false` — попроси владельца добавить `OPENROUTER_API_KEY=sk-or-v1-...` в приватный env/окружение процесса
+- Если `polza_key.ok: false` — попроси владельца добавить `POLZA_API_KEY=pza_...` в приватный env/окружение процесса (либо настроить path-only `VOICEOVER_POLZA_ENV_FILE`)
+- Если `openrouter_key.ok: false` — попроси владельца добавить `OPENROUTER_API_KEY=sk-or-v1-...` в приватный env/окружение процесса (либо настроить path-only `VOICEOVER_OPENROUTER_ENV_FILE`)
 - Больше не спрашивать
 
 ### Invalid key / 401 / 403

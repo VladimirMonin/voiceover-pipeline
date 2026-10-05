@@ -4,14 +4,15 @@ CLI для генерации озвучки (TTS) из Markdown/YAML-сцена
 таймингов/субтитров. Машинный контракт для агентов: `--json`, семантические
 exit codes, `manifest.json` в каталоге прогона.
 
-> **Статус.** Версия исходного пакета — `0.7.0`. Факт публикации сверяйте
+> **Статус.** Версия исходного пакета — `0.8.0`. Факт публикации сверяйте
 > отдельно по проверенному Git-тегу и GitHub Release: версия исходников сама
 > по себе не доказывает, что выпуск уже состоялся.
 
 ## Возможности
 
 - Облачные TTS: Polza GPT Audio (`/chat/completions`), Polza TTS
-  (`/audio/speech`, `/media`), OpenRouter Gemini TTS.
+  (`/audio/speech`, `/media`), OpenRouter Gemini TTS — включая Gemini 3.8 Flash
+  и Flash-Lite.
 - Локальные TTS: Qwen3-TTS (GPU) и OmniVoice.
 - Двухспикерный подкаст (`format: dialogue`) и явные части
   (`format: speech-parts`).
@@ -31,6 +32,13 @@ cd voiceover-pipeline
 uv sync --group dev                    # CLI + dev-инструменты (lint, mypy, pytest)
 uv sync --extra timing-whisper         # + локальный faster-whisper
 uv run voiceover doctor --json
+```
+
+Пакет публикуется как GitHub Release, а не как PyPI-дистрибутив. Устанавливайте
+wheel из закреплённого тега (пример для `v0.8.0`):
+
+```bash
+uv tool install "voiceover-pipeline @ https://github.com/VladimirMonin/voiceover-pipeline/releases/download/v0.8.0/voiceover_pipeline-0.8.0-py3-none-any.whl"
 ```
 
 Console scripts `voiceover` и `voiceover-pipeline` эквивалентны.
@@ -62,12 +70,17 @@ Console scripts `voiceover` и `voiceover-pipeline` эквивалентны.
 
 1. непустая переменная окружения процесса — приоритет; содержимое файла тогда не читается;
 2. явный глобальный `voiceover --env-file PATH <command> ...` (проверяется по метаданным как regular file);
-3. `<call-time CWD>/.env` — для совместимости.
+3. необязательный path-only источник, настроенный для провайдера через
+   `VOICEOVER_POLZA_ENV_FILE`/`VOICEOVER_OPENROUTER_ENV_FILE` — внешний файл,
+   который владелец уже ведёт; он **заменяет** CWD-файл, а не сливается с ним;
+4. `<call-time CWD>/.env` — для совместимости.
 
 Поиска `.env` по родительским каталогам нет. Явный `--env-file` **заменяет**
 CWD-файл, а не дополняет его: фоллбэка на `<CWD>/.env` не происходит.
 Отсутствующий, не-regular или недоступный для проверки метаданных явный путь
-fail-closed с exit `20`, даже если в окружении есть пригодный ключ.
+fail-closed с exit `20`, даже если в окружении есть пригодный ключ. То же
+fail-closed (сообщение без пути) даёт и настроенный path-only источник, если он
+недоступен; пустое значение переменной считается «не настроено».
 
 Read-only справка не читает ключ и env-файл:
 
@@ -105,11 +118,12 @@ voiceover generate \
 ```
 
 Для подкаста с несколькими голосами — один готовый YAML, один run и один
-итоговый MP3, но **один платный POST на каждую авторскую часть**. Пример ниже
-доступен только как явно выбранный **экспериментальный** маршрут Gemini Flash:
-поле `instructions` у Polza для Gemini не документировано, слышимый результат
-будущих запросов не гарантирован. Перед отправкой требуются согласие владельца
-и доказанный потолок затрат; два голоса в одном POST этот маршрут не обещает.
+итоговый MP3, но **один платный POST на каждую авторскую часть**. Gemini 3.8
+Flash и Flash-Lite — обычные модели и на `polza-tts`, и на `openrouter-tts`:
+каждый запрос несёт ровно один scalar `voice`, а направление части уходит
+отдельным полем `instructions`, не в произносимый текст. Два голоса в одном
+POST этот маршрут не заявляет. Перед отправкой всё равно требуются согласие
+владельца и доказанный потолок затрат.
 
 ```bash
 voiceover generate \
@@ -117,7 +131,6 @@ voiceover generate \
   --model google/gemini-3.8-flash-tts \
   --format speech-parts \
   --script podcast.speech-parts \
-  --allow-experimental-gemini-speech-parts \
   --run-id podcast-01 \
   --json
 ```

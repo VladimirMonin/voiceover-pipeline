@@ -30,7 +30,6 @@ from voiceover_pipeline.speech_parts import (
 )
 
 GEMINI_MODEL = "google/gemini-3.1-flash-tts-preview"
-CANDIDATE_MODEL = "google/gemini-3.8-flash-tts"
 
 SPEECH_PARTS_SCRIPT = """\
 version: 1
@@ -159,20 +158,11 @@ def _run_validate(capsys, monkeypatch, script: Path, *extra: str):
     return excinfo.value.code, json.loads(capsys.readouterr().out)
 
 
-def test_validate_reports_the_unverified_candidate_route_as_blocked(tmp_path, capsys, monkeypatch):
+def test_validate_reports_a_route_that_cannot_carry_the_instruction(tmp_path, capsys, monkeypatch):
+    """A route with no separate instruction field stays a blocked route offline."""
     script = tmp_path / "podcast.yaml"
     script.write_text(SPEECH_PARTS_SCRIPT, encoding="utf-8")
-    code, report = _run_validate(
-        capsys,
-        monkeypatch,
-        script,
-        "--format",
-        "speech-parts",
-        "--provider",
-        "polza-tts",
-        "--model",
-        CANDIDATE_MODEL,
-    )
+    code, report = _run_validate(capsys, monkeypatch, script, "--format", "speech-parts")
     assert code == 0
     assert report["valid"] is True
     assert report["route"] == {"admitted": False, "reason": "BLOCKED_PROVIDER_CONTRACT"}
@@ -289,37 +279,32 @@ def test_markdown_script_vibe_refuses_before_key_or_provider(media_env, capsys, 
     assert not (media_env / "out").exists()
 
 
-def test_candidate_model_is_blocked_before_any_key_or_provider(media_env, capsys, monkeypatch):
-    script = media_env / "p.yaml"
-    script.write_text(SPEECH_PARTS_SCRIPT, encoding="utf-8")
+def test_two_voices_on_a_single_voice_route_are_refused_before_any_key_or_provider(
+    media_env, capsys, monkeypatch
+):
+    """Parts with differing voices need a route that sends one voice per request."""
+    script = media_env / "two-voices.yaml"
+    script.write_text(
+        "version: 1\nformat: speech-parts\nparts:\n"
+        "  - voice: Kore\n    text: |-\n      Первая реплика.\n"
+        "  - voice: Puck\n    text: |-\n      Вторая реплика.\n",
+        encoding="utf-8",
+    )
 
     def explode(*_args, **_kwargs):  # pragma: no cover - asserted never to run
-        raise AssertionError("no provider may be built for a candidate route")
+        raise AssertionError("no provider may be built for a one-voice route")
 
     monkeypatch.setattr(cli, "build_provider", explode)
     monkeypatch.setattr(cli, "read_api_key", explode)
     code, payload = _run_generate(
         capsys,
         monkeypatch,
-        [
-            "--script",
-            str(script),
-            "--format",
-            "speech-parts",
-            "--provider",
-            "polza-tts",
-            "--model",
-            CANDIDATE_MODEL,
-        ],
+        ["--script", str(script), "--format", "speech-parts"],
     )
     assert code == 30
     assert payload["details"]["error_code"] == "BLOCKED_PROVIDER_CONTRACT"
-    assert "catalog-confirmed ID" in payload["error"]
-    assert "/audio/speech" in payload["error"]
-    assert "one scalar voice" in payload["error"]
-    assert "two distinct voices in one POST" in payload["error"]
-    assert "invoice" in payload["error"].lower()
-    assert "endpoint, instruction field, voices, audio container" not in payload["error"].lower()
+    assert "different per-part voices" in payload["error"]
+    assert not (media_env / "out").exists()
 
 
 def test_a_late_over_limit_part_posts_nothing(media_env, capsys, monkeypatch):

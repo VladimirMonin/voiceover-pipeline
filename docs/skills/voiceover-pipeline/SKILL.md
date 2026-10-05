@@ -18,7 +18,7 @@ description: >
 > АГЕНТ: ЧИТАЙ ЭТОТ ФАЙЛ ЦЕЛИКОМ. Сначала [безопасность](docs/03-security-and-secrets.md):
 > реальный `.env` не трогать, сеть/платные вызовы — только с разрешения владельца.
 > Детали в docs/ — по необходимости; запись файлов только через инструменты редактирования.
-> **Совместимость:** пакет 0.7.0, skill revision 2026-10-01 (release).
+> **Совместимость:** пакет 0.8.0, skill revision 2026-10-05 (release).
 > **Версионный лог:** [docs/00-version-log.md](docs/00-version-log.md)
 
 ## Справка из пакета (S10)
@@ -116,8 +116,9 @@ dotted identifier; неизвестная тема — exit `2`. Актуаль�
    Агент НЕ создаёт, не копирует, не читает и не печатает реальный `.env`;
    пользователь помещает ключи в приватный env-файл вне инструментов агента или
    использует уже существующие переменные окружения процесса. Порядок разрешения:
-   непустое окружение процесса → явный `--env-file PATH` (перед подкомандой) →
-   `<CWD>/.env`; поиска по родительским каталогам нет, явный файл заменяет CWD-файл.
+   непустое окружение процесса → явный `--env-file PATH` → необязательный
+   path-only `VOICEOVER_POLZA_ENV_FILE`/`VOICEOVER_OPENROUTER_ENV_FILE` (заменяет
+   CWD-файл для своего провайдера) → `<CWD>/.env`; поиска по родительским каталогам нет.
 2. **Bootstrap проекта.** Создай болванки: `script.md` (если нет), `out/`,
    `.env.example` уже создан. Если CLI не установлен — поставь Python/UV/FFmpeg
    (если среда позволяет), затем выбери сборку по `docs/02-install.md`. Сетевые
@@ -228,8 +229,6 @@ dotted identifier; неизвестная тема — exit `2`. Актуаль�
 
 ## Режим G: Короткая реплика и `speech-parts` (S06)
 
-Одна реплика или части: `podcast.yaml` здесь без vibe.
-
 ```bash
 voiceover generate --provider polza-chat-audio --text "Добрый вечер." --voice ash --run-id greeting-01 --json
 voiceover validate --script ./podcast.yaml --format speech-parts --json
@@ -238,22 +237,22 @@ voiceover generate --script ./podcast.yaml --format speech-parts --run-id podcas
 
 - Примеры `generate` платные: только после разрешения владельца и доказанного
   потолка расходов; зарегистрированный голос не подтверждает live-доступность.
-- Непустой `--vibe` в legacy отклоняется как формат. С `--text` и в YAML он
-  синтаксически допустим, но **по умолчанию любой маршрут** возвращает
-  `BLOCKED_PROVIDER_CONTRACT` до ключа и POST; примеры выше — без vibe.
+- Непустой `--vibe` допустим только на маршруте, который несёт направление
+  отдельным полем (Gemini 3.8 Flash/Flash-Lite на `polza-tts`/`openrouter-tts`);
+  любой другой маршрут возвращает `BLOCKED_PROVIDER_CONTRACT` до ключа и POST.
+- **Gemini 3.8 Flash / Flash-Lite:** `google/gemini-3.8-flash-tts` и
+  `google/gemini-3.8-flash-lite-tts` — обычные admitted-модели `polza-tts` и
+  `openrouter-tts` без opt-in: один scalar `voice` POST на часть и отдельное
+  недокументированное `instructions`; устаревший
+  `--allow-experimental-gemini-speech-parts` принимается, но ничего не требует
+  ([подробности](docs/05-providers-and-models.md)). Ни multi-speaker POST,
+  ни внешний счёт не подтверждены.
 - `speech-parts` — строгий YAML (`version: 1`, `format: speech-parts`, непустой
-  `parts` с `voice`/`text`). `provider`/`model` задаёт CLI; CLI `--voice`/`--vibe`
-  с этим сценарием отклоняются без скрытых override. Общий и частный vibe
-  составляют отдельную инструкцию, не произносимый текст.
-- **Polza Gemini Flash:** `--allow-experimental-gemini-speech-parts` допускает
-  только `polza-tts/google/gemini-3.8-flash-tts` с `--text`/YAML: один scalar
-  `voice` POST на часть, отдельное недокументированное `instructions`; эффект
-  не гарантирован ([подробности](docs/05-providers-and-models.md)).
+  `parts` с `voice`/`text`); `provider`/`model` задаёт CLI, CLI `--voice`/`--vibe`
+  с этим сценарием отклоняются без скрытых override; vibe — не произносимый текст.
 - Прогон и resume идут через DB-first историю без повторного чтения YAML;
   все части проверяются до POST, поздняя слишком длинная часть не отправляется.
 - `--audio-format {mp3,wav}` меняет только итоговый файл (default mp3); `wav` — только нативный маршрут.
-- По умолчанию Gemini `BLOCKED_PROVIDER_CONTRACT`, Flash-Lite недоступен.
-  Ни multi-speaker POST, ни внешний счёт не подтверждены ([S06-пробы](../../reports/2026-10-01-s06-gemini38-live-probes.md)); live — только с разрешением и потолком.
 
 ## Поиск по сохранённому тексту (S08)
 

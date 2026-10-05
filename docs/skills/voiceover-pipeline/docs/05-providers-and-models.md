@@ -72,6 +72,8 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 | Зарегистрированная модель | Endpoint |
 |---|---|
 | `openai/gpt-4o-mini-tts` | `POST /api/v1/audio/speech` |
+| `google/gemini-3.8-flash-tts` | `POST /api/v1/audio/speech` |
+| `google/gemini-3.8-flash-lite-tts` | `POST /api/v1/audio/speech` |
 
 Ответ: `{"audio":"<base64>","contentType":"audio/mpeg","usage":{"cost_rub":...}}`
 
@@ -122,19 +124,17 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 - **ElevenLabs resume:** принятый `/media` task ID сохраняется до poll, поэтому после сбоя `--resume` при совпадении provider/model/voice/script и наличии более ранних MP3 доводит ту же часть GET-запросами без второго платного POST; маркер без ID по-прежнему блокирует `--resume`/`--overwrite`
 - Единый `POLZA_API_KEY` для обоих polza-провайдеров
 - Style prompt НЕ используется для Polza TTS (не поддерживается endpoint).
-- Polza Gemini 3.8 Flash наблюдался в каталоге и ограниченных `/audio/speech`
-  live-пробах: scalar `voice` работал по отдельным частям, возвращался WAV при
-  запросе MP3. Попытка двух голосов в одном POST дала на слух один голос;
-  документированной multi-speaker схемы нет, `instructions` для Gemini в
-  опубликованном контракте не описан. Flash-Lite не испытывался. По умолчанию
-  `speech-parts` Flash — `BLOCKED_PROVIDER_CONTRACT`; published цена не равна
-  внешнему счёту. Новые GET/POST — только с разрешением и доказанным ценовым
-  пределом (`voiceover help speech.parts`, датированный Gemini live-отчёт в
-  репозитории). Явный эмпирический opt-in
-  `--allow-experimental-gemini-speech-parts` допускает только эту пару с `--text`
-  или `speech-parts`: один scalar `voice` на POST и отдельное поле `instructions`
-  (для Gemini не документировано); он не делает маршрут stable и не обещает,
-  что инструкция применена или не прочитана вслух.
+- Polza Gemini 3.8 Flash (`google/gemini-3.8-flash-tts`) и Flash-Lite
+  (`google/gemini-3.8-flash-lite-tts`) — обычные зарегистрированные модели
+  `/audio/speech`. Их голоса — Gemini prebuilt voices (как у `openrouter-tts`),
+  голос по умолчанию — `Puck`. Каждый запрос несёт ровно один scalar `voice`, а
+  направление части уходит отдельным полем `instructions` (для Gemini не документировано,
+  поэтому слышимый эффект режиссуры не гарантирован). Датированные наблюдения
+  (возврат WAV при запросе MP3, отсутствие документированной multi-speaker-схемы,
+  недоказанный внешний счёт) — в отчёте
+  `docs/reports/2026-10-01-s06-gemini38-live-probes.md`; они не отменяют обычную
+  поддержку. Устаревший `--allow-experimental-gemini-speech-parts` принимается и
+  записывается, но больше ничего не требует.
 
 ---
 
@@ -147,6 +147,8 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 | Зарегистрированная модель | Style prompt | Голоса |
 |---|---|---|
 | `google/gemini-3.1-flash-tts-preview` | Нет | `voiceover list voices --provider openrouter-tts --json` |
+| `google/gemini-3.8-flash-tts` | Нет | `voiceover list voices --provider openrouter-tts --json` |
+| `google/gemini-3.8-flash-lite-tts` | Нет | `voiceover list voices --provider openrouter-tts --json` |
 
 ### Голоса Gemini TTS
 
@@ -159,7 +161,9 @@ Model-aware dispatch: `openai/*` → `/audio/speech`, `elevenlabs/*` → `/media
 OpenRouter `/audio/speech` получает только точный произносимый текст текущей
 реплики. `style_prompt`, `vibe`, speaker `profile`, labels и соседние реплики
 не добавляются к `input`; отдельное поле `prompt` также не отправляется.
-Подача выбирается только top-level полем `voice`. CLI отклоняет явные
+Подача выбирается top-level полем `voice`; отдельного поля направления у Gemini 3.1
+нет, а у Gemini 3.8 направление реплики передаётся дополнительно отдельным полем
+`instructions` (в `input` оно не попадает). CLI отклоняет явные
 `--style-prompt` и `--style-prompt-file` до платного запроса.
 
 OpenRouter делает ровно один платный synthesis-запрос на turn; автоматического
@@ -168,7 +172,9 @@ generation retry или fallback-запроса с другим prompt нет.
 ### Особенности OpenRouter
 
 - Gemini-запрос содержит `model`, `input`, `voice`, `response_format="pcm"`;
-  ответ — raw audio body. JSON, data URI, base64 field и SSE отклоняются.
+  ответ — raw audio body. JSON, data URI, base64 field и SSE отклоняются;
+  для Gemini 3.8 направление части добавляется отдельным `instructions`, а для 3.1
+  по-прежнему нет.
 - OpenRouter dialogue требует явный `--tts-quality-provider`: каждый turn
   транскрибируется и строго сверяется до final concat; receipt не хранит текст.
 - Отсутствующий в текущем speech-каталоге model ID отклоняется до billing.

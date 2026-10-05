@@ -1,10 +1,12 @@
 # Polza TTS
 
-Три модели text-to-speech через российского провайдера Polza AI:
+Модели text-to-speech через российского провайдера Polza AI:
 
 - `openai/gpt-4o-mini-tts` — через `/api/v1/audio/speech` (OpenAI-compatible endpoint)
 - `elevenlabs/text-to-speech-turbo-2-5` — через `/api/v1/media` (Polza Media API)
 - `elevenlabs/text-to-speech-multilingual-v2` — через `/api/v1/media` (Polza Media API)
+- `google/gemini-3.8-flash-tts` — через `/audio/speech` (обычная speech-модель)
+- `google/gemini-3.8-flash-lite-tts` — через `/audio/speech` (обычная speech-модель)
 
 ## Модели
 
@@ -89,13 +91,25 @@ voiceover generate `
   --run-id "my-run"
 ```
 
+## Gemini 3.8 speech-маршрут
+
+`google/gemini-3.8-flash-tts` и `google/gemini-3.8-flash-lite-tts` — обычные
+зарегистрированные модели `polza-tts` через `/audio/speech`. Их голоса — Gemini
+prebuilt voices (TitleCase), как у `openrouter-tts`, а голос по умолчанию —
+`Puck`. Каждый запрос несёт
+ровно один scalar `voice`, а эффективная инструкция части уходит отдельным полем
+`instructions`; разные части или реплики — это отдельные платные POST, а не один
+multi-speaker запрос. Поле `instructions` для Gemini не документировано, поэтому
+это не обещание слышимого эффекта режиссуры. Датированный отчёт о наблюдениях
+(WAV вместо запрошенного MP3, отсутствие multi-speaker-схемы) остаётся в
+[`docs/reports/2026-10-01-s06-gemini38-live-probes.md`](reports/2026-10-01-s06-gemini38-live-probes.md).
+
 ## Ключ
 
-Используется `POLZA_API_KEY` из `.env`. Тот же ключ, что и для `polza-chat-audio`.
-
-```env
-POLZA_API_KEY=pza_...
-```
+Используется `POLZA_API_KEY`. Тот же ключ, что и для `polza-chat-audio`.
+Значение берётся из окружения процесса, явного `--env-file`, необязательного
+path-only `VOICEOVER_POLZA_ENV_FILE` или `<CWD>/.env`; реальный env-файл ведёт
+владелец, агент его не читает.
 
 ## Как работает
 

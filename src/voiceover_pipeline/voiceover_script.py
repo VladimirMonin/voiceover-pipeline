@@ -13,6 +13,7 @@ from .config import (
     DEFAULT_QWEN_VOICE,
     DEFAULT_VOICE,
     ELEVENLABS_TTS_VOICES,
+    GEMINI_38_TTS_MODELS,
     GEMINI_TTS_VOICES,
     OMNIVOICE_LOCAL_MODEL_ID,
     OPENAI_TTS_VOICES,
@@ -239,6 +240,8 @@ def voices_for_provider_model(provider: str, model: str) -> list[str]:
     if provider == "polza-chat-audio":
         return POLZA_CHAT_AUDIO_VOICES
     if provider == "polza-tts":
+        if model in GEMINI_38_TTS_MODELS:
+            return GEMINI_TTS_VOICES
         return ELEVENLABS_TTS_VOICES if model.startswith("elevenlabs/") else OPENAI_TTS_VOICES
     if provider == "openrouter-tts":
         return OPENAI_TTS_VOICES if model.startswith("openai/") else GEMINI_TTS_VOICES
@@ -251,6 +254,8 @@ def voices_for_provider_model(provider: str, model: str) -> list[str]:
 
 def default_voice(provider: str, model: str) -> str:
     if provider == "polza-tts":
+        if model in GEMINI_38_TTS_MODELS:
+            return DEFAULT_OPENROUTER_TTS_VOICE
         return (
             DEFAULT_ELEVENLABS_VOICE if model.startswith("elevenlabs/") else DEFAULT_POLZA_TTS_VOICE
         )

@@ -12,6 +12,13 @@
 | Языки | 70+, включая русский |
 | Исторический smoke | ~$0.030/мин (2026-04-29, не текущая котировка) |
 
+Обычный speech-маршрут включает также два Gemini 3.8 ID:
+`google/gemini-3.8-flash-tts` и `google/gemini-3.8-flash-lite-tts` (оба —
+`/api/v1/audio/speech`, без experimental opt-in). Каждый запрос несёт ровно один
+scalar `voice`, а эффективная инструкция части передаётся отдельным полем
+`instructions` (для Gemini не документировано), не в произносимом `input`;
+разные реплики — отдельные запросы. Два голоса в одном POST не заявляются.
+
 `openai/gpt-4o-mini-tts-2025-12-15` больше не публикуется текущим
 `/api/v1/models?output_modalities=speech` и отклоняется до запроса. Модели
 `openai/gpt-audio-mini` и `openai/gpt-audio` принадлежат chat-audio контракту

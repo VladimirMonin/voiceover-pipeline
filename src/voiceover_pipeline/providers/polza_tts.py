@@ -10,8 +10,8 @@ import requests
 
 from voiceover_pipeline.config import (
     DEFAULT_POLZA_TTS_RESPONSE_FORMAT,
+    GEMINI_38_TTS_MODELS,
     POLZA_BASE_URL,
-    POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL,
 )
 from voiceover_pipeline.models import SynthesisResult
 from voiceover_pipeline.providers.base import TTSProvider
@@ -194,12 +194,11 @@ class PolzaTTSProvider(TTSProvider):
         request and result, so a caller may pass a different per-part cast voice
         (as a ``speech-parts`` part or a dialogue turn does) while an omitted
         ``voice`` keeps the configured run voice exactly as before. A non-empty
-        ``vibe`` is an effective instruction the caller already admitted for exactly
-        one experimental route; it is sent as that route's separate ``instructions``
-        field and never mixed into the spoken text. The ElevenLabs ``/media`` route
-        speaks with its one configured voice and cannot carry a per-part override or
-        an instruction, so either fails closed here instead of being silently
-        dropped.
+        ``vibe`` is an effective instruction the caller already admitted for a Gemini
+        3.8 speech route; it is sent as that route's separate ``instructions`` field
+        and never mixed into the spoken text. The ElevenLabs ``/media`` route speaks
+        with its one configured voice and cannot carry a per-part override or an
+        instruction, so either fails closed here instead of being silently dropped.
         """
         effective_voice = voice or self.voice
         if self._is_elevenlabs:
@@ -221,16 +220,14 @@ class PolzaTTSProvider(TTSProvider):
             "response_format": self.response_format,
         }
         if vibe:
-            # Only the explicitly opt-in experimental Polza Gemini speech-parts
-            # model carries an instruction, and only through the ``instructions``
-            # field no published schema documents for it. Any other model fails
-            # closed before the POST instead of sending an instruction that could
-            # be read aloud or silently dropped; the spoken ``input`` is never
-            # composed with the instruction.
-            if self.model != POLZA_EXPERIMENTAL_GEMINI_SPEECH_PARTS_MODEL:
+            # Only the ordinary Gemini 3.8 speech models carry an instruction, and
+            # only through the separate ``instructions`` field. Any other model fails
+            # closed before the POST instead of sending an instruction that could be
+            # read aloud or silently dropped; the spoken ``input`` is never composed
+            # with the instruction.
+            if self.model not in GEMINI_38_TTS_MODELS:
                 raise ValueError(
-                    "Polza TTS instructions are only carried by the explicit experimental "
-                    "Gemini speech-parts route."
+                    "Polza TTS instructions are only carried by the Gemini 3.8 speech models."
                 )
             payload["instructions"] = vibe
         response = requests.post(

@@ -43,7 +43,15 @@ def build_request_body(
     response_format: str,
     style_prompt: str | None,
     prompt_mode: str,
+    instructions: str | None = None,
 ) -> dict:
+    """Build one ``/audio/speech`` body for the requested speech contract.
+
+    ``input`` is always the exact spoken text. A non-empty ``instructions`` is the
+    part's effective direction on a route that transmits it in that separate field,
+    so the direction is never composed into the spoken ``input`` and never becomes a
+    spoken prefix.
+    """
     body: dict = {
         "model": model,
         "voice": voice,
@@ -57,6 +65,9 @@ def build_request_body(
         body["input"] = build_prompted_input(text, style_prompt, TTS_PROMPT_MODE_PREFIX)
     else:
         body["input"] = text
+
+    if instructions:
+        body["instructions"] = instructions
 
     return body
 

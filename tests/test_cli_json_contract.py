@@ -262,13 +262,19 @@ def test_list_polza_tts_providers():
     assert "elevenlabs/text-to-speech-turbo-2-5" in models
     assert "elevenlabs/text-to-speech-multilingual-v2" in models
     assert "openai/gpt-4o-mini-tts" in models
+    assert "google/gemini-3.8-flash-tts" in models
+    assert "google/gemini-3.8-flash-lite-tts" in models
 
 
 def test_openrouter_tts_models_match_current_speech_catalog():
     code, data = cli_json("list", "providers", "--json")
     assert code == 0
     or_tts = next(p for p in data["providers"] if p["id"] == "openrouter-tts")
-    assert or_tts["models"] == ["google/gemini-3.1-flash-tts-preview"]
+    assert or_tts["models"] == [
+        "google/gemini-3.1-flash-tts-preview",
+        "google/gemini-3.8-flash-tts",
+        "google/gemini-3.8-flash-lite-tts",
+    ]
 
 
 def test_openrouter_tts_voices_match_current_speech_catalog():

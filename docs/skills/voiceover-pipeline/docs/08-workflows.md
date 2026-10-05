@@ -101,6 +101,9 @@ voiceover generate `
 - OpenRouter принимает только top-level `voice`; `input` byte-equals произносимому
   тексту реплики. Явные `--style-prompt`/`--style-prompt-file` отклоняются до
   платного запроса, а `--no-style-prompt` — совместимый no-op.
+- `google/gemini-3.8-flash-tts`/`google/gemini-3.8-flash-lite-tts` — обычные
+  speech-модели этого маршрута (и `polza-tts`) без opt-in: один scalar `voice`
+  на запрос, направление части — отдельным `instructions`.
 - Для этого OpenRouter-маршрута только произносимый turn text (включая допустимые
   inline audio tags) попадает в `input`; метаданные `vibe`/profile не становятся
   отдельной инструкцией провайдеру. Не обещайте эффект режиссуры без live/listening

@@ -212,10 +212,7 @@ from .speech_parts import (
 )
 from .speech_parts_route import (
     SpeechPartsRouteError,
-    is_candidate_speech_parts_model,
-    is_experimental_gemini_speech_parts_route,
     require_confirmed_speech_parts_route,
-    speech_parts_required_text_wrapper,
 )
 from .tts_prompting import read_style_prompt_from_file
 from .tts_quality import evaluate_tts_transcript
@@ -418,9 +415,9 @@ def build_parser() -> argparse.ArgumentParser:
         dest="allow_experimental_gemini_speech_parts",
         action="store_true",
         help=(
-            "Explicit opt-in for the empirical experimental Polza Gemini 3.8 Flash "
-            "speech-parts route: one scalar voice POST per part, instruction in an "
-            "undocumented instructions field. Stable contract stays blocked."
+            "Deprecated compatibility spelling with no effect: the Gemini 3.8 speech "
+            "models are supported ordinarily (one scalar voice per request, direction "
+            "in a separate instructions field). Accepted and recorded, never required."
         ),
     )
     gen.add_argument("--no-trim", action="store_true")
@@ -721,8 +718,8 @@ def build_parser() -> argparse.ArgumentParser:
         dest="allow_experimental_gemini_speech_parts",
         action="store_true",
         help=(
-            "Report the empirical experimental Polza Gemini 3.8 Flash speech-parts "
-            "route as admitted instead of blocked; validate never submits."
+            "Deprecated compatibility spelling with no effect: the Gemini 3.8 speech "
+            "models are supported ordinarily. validate never submits."
         ),
     )
     val.add_argument(
@@ -1285,47 +1282,36 @@ def _speech_parts_chunks(
 
 
 def _experimental_gemini_speech_parts_requested(args: argparse.Namespace) -> bool:
-    """Whether this command explicitly opted into the experimental Polza route."""
+    """Whether this command passed the deprecated experimental opt-in spelling.
+
+    Gemini 3.8 speech support is ordinary, so the flag no longer gates admission: it
+    is accepted for compatibility and recorded with the run's output options exactly
+    as before, so an existing run and its resume keep the same identity. It never
+    refuses an otherwise supported target.
+    """
     return bool(getattr(args, "allow_experimental_gemini_speech_parts", False))
 
 
-def _require_experimental_gemini_speech_parts_target(args: argparse.Namespace) -> bool:
-    """Resolve the explicit opt-in, refusing a target it does not name.
-
-    The flag admits exactly one observed provider/model route, so it is never
-    silently ignored: any other target is a usage error before the route check, the
-    model check, a key read, or a POST.
-    """
-    if not _experimental_gemini_speech_parts_requested(args):
-        return False
-    provider = getattr(args, "provider", None)
-    model = getattr(args, "model", None)
-    if not is_experimental_gemini_speech_parts_route(str(provider), str(model)):
-        fail(
-            "--allow-experimental-gemini-speech-parts only admits the observed "
-            "polza-tts/google/gemini-3.8-flash-tts speech-parts route; remove the flag or "
-            "select that exact provider and model. Nothing was submitted.",
-            _EXIT_ARGS,
-            details={"error_code": "EXPERIMENTAL_SPEECH_PARTS_TARGET_UNSUPPORTED"},
-        )
-    return True
-
-
 def _preflight_speech_parts_route(args: argparse.Namespace, document: SpeechPartsDocument) -> None:
-    """Reject, before any provider or key, an over-budget or unconfirmed request.
+    """Reject, before any provider or key, an over-budget or unadmitted request.
 
     Every part is checked against the conservative character budget first, so a
     late over-limit part stops the run before the first POST rather than after some
-    paid parts, and the whole request route is then admitted only when it is
-    confirmed or explicitly opted into as experimental. An unverified candidate
-    route, the opt-in flag on any other target, or any non-empty effective vibe on a
-    route that cannot carry it fails closed with an explicit contract error instead
-    of a silent fallback or a dropped instruction.
+    paid parts, and the whole request route is then admitted only when it can carry
+    this exact request. A per-part instruction on a route whose request has no
+    separate instruction field, or parts whose voices differ on a route that speaks
+    with one run voice, fails closed with an explicit contract error instead of a
+    silent fallback or a dropped instruction.
     """
-    experimental = _require_experimental_gemini_speech_parts_target(args)
-    wrapper = speech_parts_required_text_wrapper(args.provider, args.model)
+    # The same effective model admission ``validate`` reports runs here first, so an
+    # unknown, stale, or provider-mismatched model is a usage error rather than a
+    # route-contract failure, and both commands refuse the same request identically.
+    _validate_model_for_provider(args.provider, args.model)
     for part in document.parts:
-        request_chars = speech_part_request_chars(part.text, part.effective_vibe, wrapper)
+        # No admitted route adds service text around the spoken transcript: the
+        # direction travels in a separate field, so the budget is exactly the spoken
+        # text plus the effective instruction.
+        request_chars = speech_part_request_chars(part.text, part.effective_vibe, "")
         if request_chars > SPEECH_PARTS_REQUEST_CHAR_LIMIT:
             fail(
                 f"speech-part {part.position} needs {request_chars} characters including its "
@@ -1346,7 +1332,6 @@ def _preflight_speech_parts_route(args: argparse.Namespace, document: SpeechPart
             model=args.model,
             voices=[part.voice for part in document.parts],
             has_vibe=any(part.effective_vibe for part in document.parts),
-            experimental_gemini_opt_in=experimental,
         )
     except SpeechPartsRouteError as exc:
         fail(str(exc), _EXIT_PROVIDER, details={"error_code": exc.error_code})
@@ -1393,14 +1378,6 @@ def generate(args: argparse.Namespace) -> None:
             args.script = _find_default_script()
         script_format = _resolve_script_format(args.script, args.format)
     args.format = script_format
-    if _experimental_gemini_speech_parts_requested(args) and script_format != SPEECH_PARTS_FORMAT:
-        fail(
-            "--allow-experimental-gemini-speech-parts is only supported with --text or a "
-            "--format speech-parts script; legacy script formats carry no per-part voice or "
-            "instruction. Remove the flag before a paid request.",
-            _EXIT_ARGS,
-            details={"error_code": "EXPERIMENTAL_SPEECH_PARTS_FORMAT_UNSUPPORTED"},
-        )
     if (
         not explicit_text
         and script_format != SPEECH_PARTS_FORMAT
@@ -1547,11 +1524,7 @@ def generate(args: argparse.Namespace) -> None:
         chunks = split_markdown_by_delimiter(args.script, args.delimiter)
 
     _resolve_qwen_mode_identity(args)
-    _validate_model_for_provider(
-        args.provider,
-        args.model,
-        experimental_speech_parts=_experimental_gemini_speech_parts_requested(args),
-    )
+    _validate_model_for_provider(args.provider, args.model)
     _validate_omnivoice_options(args)
     if args.provider == "openrouter-tts" and (
         getattr(args, "style_prompt", None) is not None
@@ -3765,7 +3738,16 @@ def doctor_cmd(args: argparse.Namespace) -> None:
     results["ffmpeg"] = {"ok": bool(ffmpeg), "path": ffmpeg, "required": True}
     results["ffprobe"] = {"ok": bool(ffprobe), "path": ffprobe, "required": True}
 
-    env_file = resolved_env_file_path()
+    # The reported env-file source is the one the selected provider would actually
+    # consult: an explicit ``--env-file``, otherwise the provider-configured path-only
+    # source, otherwise the call-time working-directory file. Only the path is
+    # reported, never a value; the key checks below resolve through the same source.
+    provider_env_secret = (
+        "OPENROUTER_API_KEY"
+        if (args.provider or DEFAULT_PROVIDER) == "openrouter-tts"
+        else "POLZA_API_KEY"
+    )
+    env_file = resolved_env_file_path(provider_env_secret)
     try:
         env_file_available = env_file.is_file()
     except OSError:
@@ -3944,20 +3926,23 @@ def doctor_cmd(args: argparse.Namespace) -> None:
 def _validate_speech_parts_cmd(args: argparse.Namespace, script: Path) -> None:
     """Validate one ``speech-parts`` script and report its syntax, budget, and route.
 
-    The document syntax, part order, one voice per part, and the conservative
-    request budget are checked fully offline. The provider route is reported too: an
-    unverified candidate model, or a non-empty vibe that no confirmed route can
-    carry without reading it, is surfaced with ``BLOCKED_PROVIDER_CONTRACT`` so the
-    author sees it before ``generate`` would refuse the run. The explicit opt-in
-    flag instead reports that same candidate as admitted for the empirical
-    experimental per-part route. Validation never reads an API key and never
+    The document syntax, part order, one voice per part, the conservative request
+    budget, and the *same* effective provider/model admission ``generate`` applies are
+    checked fully offline, so an unknown, stale, or provider-mismatched model is
+    reported before a key read or a paid request exactly as it would be refused there.
+    The provider route is reported too: a non-empty vibe that no route can carry in a
+    separate field, or parts whose voices differ on a route that speaks with one run
+    voice, is surfaced with ``BLOCKED_PROVIDER_CONTRACT`` so the author sees it before
+    ``generate`` would refuse the run. Validation never reads an API key and never
     submits.
     """
     provider = args.provider or DEFAULT_PROVIDER
     model = args.model or PROVIDER_DEFAULT_MODELS.get(provider, DEFAULT_MODEL)
-    experimental = _require_experimental_gemini_speech_parts_target(args)
     errors: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    rejection = _model_rejection_reason(provider, model)
+    if rejection is not None:
+        errors.append({"code": "INVALID_MODEL", "message": rejection})
     try:
         raw = script.read_text(encoding="utf-8-sig")
     except OSError as exc:
@@ -3968,12 +3953,11 @@ def _validate_speech_parts_cmd(args: argparse.Namespace, script: Path) -> None:
     except SpeechPartsError as exc:
         errors.append({"code": "SPEECH_PARTS_INVALID", "message": str(exc)})
 
-    wrapper = speech_parts_required_text_wrapper(provider, model)
     parts_report: list[dict[str, Any]] = []
     total_chars = 0
     if document is not None:
         for part in document.parts:
-            request_chars = speech_part_request_chars(part.text, part.effective_vibe, wrapper)
+            request_chars = speech_part_request_chars(part.text, part.effective_vibe, "")
             total_chars += len(part.text)
             parts_report.append(
                 {
@@ -4007,7 +3991,6 @@ def _validate_speech_parts_cmd(args: argparse.Namespace, script: Path) -> None:
                 model=model,
                 voices=[part.voice for part in document.parts],
                 has_vibe=any(part.effective_vibe for part in document.parts),
-                experimental_gemini_opt_in=experimental,
             )
             route_admitted = True
         except SpeechPartsRouteError as exc:
@@ -4057,13 +4040,6 @@ def validate_cmd(args: argparse.Namespace) -> None:
         fail("Script file not found", _EXIT_ARGS)
 
     script_format = _resolve_script_format(script, args.format)
-    if _experimental_gemini_speech_parts_requested(args) and script_format != SPEECH_PARTS_FORMAT:
-        fail(
-            "--allow-experimental-gemini-speech-parts is only supported with a "
-            "--format speech-parts script. Remove the flag; nothing was submitted.",
-            _EXIT_ARGS,
-            details={"error_code": "EXPERIMENTAL_SPEECH_PARTS_FORMAT_UNSUPPORTED"},
-        )
 
     if script_format == SPEECH_PARTS_FORMAT:
         _validate_speech_parts_cmd(args, script)
@@ -4200,7 +4176,7 @@ def list_cmd(args: argparse.Namespace) -> None:
                 "shimmer",
                 "onyx",
             ],
-            "polza-tts": OPENAI_TTS_VOICES + ELEVENLABS_TTS_VOICES,
+            "polza-tts": OPENAI_TTS_VOICES + ELEVENLABS_TTS_VOICES + GEMINI_TTS_VOICES,
             "openrouter-tts": GEMINI_TTS_VOICES,
             "qwen-local": QWEN_PRESET_SPEAKERS,
             "omnivoice-local": [],
@@ -4209,6 +4185,7 @@ def list_cmd(args: argparse.Namespace) -> None:
             "polza-tts": {
                 "openai": OPENAI_TTS_VOICES,
                 "elevenlabs": ELEVENLABS_TTS_VOICES,
+                "gemini": GEMINI_TTS_VOICES,
             },
             "openrouter-tts": {
                 "gemini": GEMINI_TTS_VOICES,
@@ -5640,23 +5617,25 @@ def _resolve_qwen_mode_identity(args: argparse.Namespace) -> None:
         )
 
 
-def _validate_model_for_provider(
-    provider: str, model: str, *, experimental_speech_parts: bool = False
-) -> None:
+def _model_rejection_reason(provider: str, model: str) -> str | None:
+    """Return why this provider/model is not admitted, or ``None`` when it is.
+
+    One rule serves both commands: ``generate`` refuses the run and ``validate``
+    reports the same reason, so a model that ``generate`` would reject is never
+    reported as a usable route. A provider without a catalog entry keeps its
+    existing behavior and admits any model.
+    """
     valid = _VALID_MODELS_BY_PROVIDER.get(provider, [])
-    if not valid:
-        return
-    if model in valid:
-        return
-    if experimental_speech_parts and is_candidate_speech_parts_model(provider, model):
-        # The one experimental candidate is never a stable catalog model, so only
-        # the explicit speech-parts opt-in admits it; without that opt-in it stays a
-        # usage error and the candidate never becomes an ordinary route.
-        return
-    fail(
-        f"Model '{model}' is not valid for provider '{provider}'. Valid models: {valid}",
-        _EXIT_ARGS,
-    )
+    if not valid or model in valid:
+        return None
+    return f"Model '{model}' is not valid for provider '{provider}'. Valid models: {valid}"
+
+
+def _validate_model_for_provider(provider: str, model: str) -> None:
+    """Refuse an unknown, stale, or provider-mismatched model before any paid work."""
+    reason = _model_rejection_reason(provider, model)
+    if reason is not None:
+        fail(reason, _EXIT_ARGS)
 
 
 def _omnivoice_voice_identity(args: argparse.Namespace) -> str | None:

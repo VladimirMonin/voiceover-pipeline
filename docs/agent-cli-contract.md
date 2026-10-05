@@ -68,12 +68,19 @@ flags) превращаются в единственный JSON error
 1. непустая переменная окружения текущего процесса — приоритет; содержимое
    env-файла при этом не читается;
 2. явный `--env-file PATH` (проверяется только по метаданным как regular file);
-3. `<call-time CWD>/.env` — для совместимости.
+3. необязательный path-only источник, настроенный для провайдера
+   (`VOICEOVER_POLZA_ENV_FILE`/`VOICEOVER_OPENROUTER_ENV_FILE`): путь к внешнему
+   файлу, который владелец уже ведёт, — он **заменяет** `<CWD>/.env` для этого
+   секрета, а не сливается с ним; пустое значение = «не настроено»;
+4. `<call-time CWD>/.env` — для совместимости.
 
-Поиска `.env` по родительским каталогам нет, и путь не захватывается на момент
-импорта: шаг 3 разрешается в момент вызова. Явный `--env-file` **заменяет**
+Поиска `.env` по родительским каталогам нет, ключи не копируются и не
+объединяются, новый secret store не создаётся, и путь не захватывается на момент
+импорта: шаги 3–4 разрешаются в момент вызова. Явный `--env-file` **заменяет**
 рабочий `.env`, а не дополняет его: если в явном файле ключа нет, фоллбэка на
-`<CWD>/.env` не происходит.
+`<CWD>/.env` не происходит. Настроенный path-only источник консультируется
+только когда он нужен (процессный ключ побеждает, не читая его); недоступный
+настроенный источник fail-closed с фиксированным сообщением без пути.
 
 При обращении к ключу отсутствующий, не-regular (каталог) или недоступный для
 проверки метаданных явный путь fail-closed с exit `20` **даже если** в процессе
@@ -86,8 +93,9 @@ file.` / `Explicit --env-file could not be read.`). Когда процессн�
 проверяет файл; `doctor` отдельно сообщает о проблеме в checks без exit `20`.
 
 `help` не читает ключ и env-файл даже при заданном `--env-file`. `doctor`
-проверяет наличие ключей и отдаёт `checks.env_file.path` (разрешённый явный путь
-или `<CWD>/.env`) и `checks.env_file.ok` по `is_file()`, но никогда не значение;
+проверяет наличие ключей и отдаёт `checks.env_file.path` (разрешённый явный путь,
+настроенный path-only источник выбранного провайдера или `<CWD>/.env`) и
+`checks.env_file.ok` по `is_file()`, но никогда не значение;
 при непригодном явном файле `doctor` завершается с exit `0` и JSON
 `status: "success"`, но сообщает `checks.env_file.ok: false` при
 `required: true`, поэтому `required_ok: false` и `workflow_ok: false`;
@@ -149,7 +157,9 @@ voiceover help [TOPIC] [--raw | --json]
 ## `doctor --json`
 
 Проверяет: Python, FFmpeg, FFprobe, `.env`, ключи, faster-whisper, CUDA и
-явно выбранную локальную конфигурацию OmniVoice.
+явно выбранную локальную конфигурацию OmniVoice. `checks.env_file.path` —
+источник, который выберет провайдер: явный `--env-file`, настроенный
+`VOICEOVER_POLZA_ENV_FILE`/`VOICEOVER_OPENROUTER_ENV_FILE` или `<CWD>/.env`.
 
 Без флагов проверяет общее окружение (Polza cloud TTS baseline; faster-whisper и CUDA становятся required только с `--with-timings` или `--provider qwen-local|omnivoice-local`). Локальный ASR runtime проверяется только при явных `--with-asr --asr-provider <id>`; CUDA сама по себе не является ASR healthcheck.
 
@@ -234,33 +244,32 @@ voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спо
   консервативная политика, не доказанный предел Gemini). Поздняя over-limit
   часть не отправляет ни одного запроса (JSON `SPEECH_PART_TOO_LONG`, exit `2`).
 - Маршрут `speech-parts` идёт только через DB-first нативную генерацию; legacy
-  fallback отсутствует. Каталог Polza и ограниченные реальные пробы подтвердили
-  модель `google/gemini-3.8-flash-tts`, endpoint `/audio/speech`, отдельный
-  scalar `voice` на запрос, WAV вместо запрошенного MP3 и опубликованные
-  компоненты цены. Но схема Polza не описывает два голоса в одном POST;
-  инструкция со вторым голосом дала на слух один голос, а поле `instructions`
-  не документировано для Gemini. Общий MP3 с тремя голосами в исследовательском
-  прогоне потребовал отдельных POST по частям, не подтверждая stable API или
-  внешний счёт (см. `docs/reports/2026-10-01-s06-gemini38-live-probes.md`).
-  Flash-Lite не проверялся. Поэтому candidate-маршрут Flash (и любая непустая
-  vibe на любом другом маршруте) по умолчанию fail-closed: JSON `error_code`
-  `BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до** чтения ключа и любого POST.
-  Наблюдённый ID каталога не является подтверждённым speech-parts-контрактом.
-- `--allow-experimental-gemini-speech-parts` — **явный opt-in** к эмпирическому
-  экспериментальному маршруту `polza-tts/google/gemini-3.8-flash-tts`. Флаг
-  принимается только с `--text` или `--format speech-parts`, только с этой
-  provider/model парой и только на нативном DB-first маршруте; иначе — usage
-  error до ключа и POST. Он не подтверждает Gemini-контракт и не делает модель
-  stable: `list` её не показывает, а каждый POST по-прежнему несёт ровно один
-  scalar `voice`. Эффективная инструкция части уходит отдельным полем
-  `instructions` (для Gemini не документировано), а произносимый `input` —
-  ровно `text`, без инструкции и без смешивания. Маршрут не обещает, что
-  инструкция применена или не прочитана вслух. Флаг записывается в
-  `config_snapshot.output.experimental_speech_parts`; `generate --resume` без
-  того же флага отказывает, а `history resume`/`sync` продолжают ровно
-  записанную политику. Принятое тело ответа и receipt сохраняются до разбора,
-  наблюдённый WAV конвертируется в обычный MP3-чанк, а редиректы не следуются:
-  3xx — это один наблюдённый ответ, а не повторный платный POST.
+  fallback отсутствует. Gemini 3.8 Flash (`google/gemini-3.8-flash-tts`) и
+  Flash-Lite (`google/gemini-3.8-flash-lite-tts`) — обычные admitted-модели обоих
+  облачных speech-провайдеров (`polza-tts`, `openrouter-tts`), перечисленные
+  `list providers`, и допускаются без какого-либо opt-in. Каждый запрос несёт
+  ровно один scalar `voice` и уходит отдельным POST на часть/реплику;
+  эффективная инструкция передаётся отдельным полем `instructions`, которое для
+  Gemini не документировано, а произносимый `input` — ровно `text`. Два голоса в
+  одном POST не заявляются. Датированные наблюдения (WAV вместо запрошенного MP3,
+  отсутствие документированной multi-speaker-схемы, недоказанный внешний счёт)
+  остаются историческими фактами — см.
+  `docs/reports/2026-10-01-s06-gemini38-live-probes.md`. Любая непустая vibe на
+  маршруте без отдельного поля инструкции по-прежнему fail-closed: JSON
+  `error_code` `BLOCKED_PROVIDER_CONTRACT`, exit `30`, **до** чтения ключа и
+  любого POST.
+- `generate` и `validate` применяют одно и то же effective model admission:
+  неизвестная, устаревшая или чужая провайдеру модель отклоняется обоими до
+  чтения ключа и любого запроса и никогда не превращается в маршрут молча.
+- `--allow-experimental-gemini-speech-parts` — **устаревшее compatibility-написание
+  без эффекта**. Оно принимается для `generate` и `validate` и записывается в
+  снимок (`config_snapshot.output.experimental_speech_parts`), но больше ничего
+  не требует и ничего не отклоняет: оба Gemini 3.8 ID доступны и без него.
+  `generate --resume` сравнивает записанную output-опцию, а `history resume`/`sync`
+  продолжают ровно записанную политику. Принятое тело ответа и receipt
+  сохраняются до разбора, наблюдённый WAV конвертируется в обычный MP3-чанк, а
+  редиректы не следуются: 3xx — это один наблюдённый ответ, а не повторный
+  платный POST.
 - `--audio-format {mp3,wav}` задаёт контейнер итогового merged-файла (default
   `mp3`); промежуточные части в `chunks/` остаются MP3. `wav` пишет реальный
   RIFF/WAVE через ffmpeg и допускается только на нативном маршруте; смена
@@ -270,8 +279,8 @@ voiceover generate --text "Добрый вечер." --voice Kore --vibe "Спо
 `validate --format speech-parts --json` возвращает `parts`, `request_chars`,
 `route.admitted` и `route.reason`; синтаксическая/бюджетная ошибка — exit `2`,
 неподтверждённый маршрут — предупреждение `BLOCKED_PROVIDER_CONTRACT` при
-валидном документе. С `--allow-experimental-gemini-speech-parts` тот же отчёт
-возвращает `route.admitted: true`; `validate` никогда не отправляет запрос.
+валидном документе. Обычные admitted-маршруты (включая Gemini 3.8) возвращают
+`route.admitted: true` без какого-либо флага; `validate` никогда не отправляет запрос.
 
 ## `generate` — Style Prompt Flags
 
@@ -607,7 +616,8 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
   Потерянный/неопределённый ответ оставляет `submitting`, блокирует resume и
   overwrite и никогда не разрешает второй POST/GET.
 
-  Только нативный `polza-tts` `/audio/speech` сохраняет **до status check и
+  Нативные синхронные `/audio/speech` (`polza-tts` и Gemini-маршрут
+  `openrouter-tts` через тот же sink) сохраняют **до status check и
   parse** точное тело полученного HTTP-ответа в приватный
   `raw/<attempt_uuid>.response` (максимум 16 MiB, файл 0600, каталог 0700) и
   bounded `*.response.receipt.json`: UUID попытки/части, chunk number/id,
@@ -626,10 +636,14 @@ executor'ом; `openrouter-whisper` (не даёт реальных таймст
   `PAID_SUBMIT_UNCONFIRMED` без ключа, POST/GET или усвоения чужих байтов.
   Если response-evidence **вообще не существует**, прежний decoded raw receipt
   может восстановить старую попытку локально с неизвестной стоимостью:
-  её нельзя придумать из аудиофайла. Для legacy/OpenRouter эта новая pre-parse
-  гарантия не заявляется; Gemini 3.8 через Polza остаётся нестабильным и
-  отправляется только по явному
-  `--allow-experimental-gemini-speech-parts` (см. раздел S06), live не подтверждён.
+  её нельзя придумать из аудиофайла. Тело OpenRouter не несёт контейнерного типа,
+  поэтому receipt хранит запрошенный `response_format` как request-identity и
+  дополнительно ограниченный наблюдаемый контейнер ответа, которым локальный replay
+  декодирует сохранённые байты; receipt без этого поля (прежняя запись) грузится
+  и повторяется по запрошенному `response_format`. Документированный `audio/pcm`
+  декодируется в канонический pcm16 24 kHz mono; `polza`-`/media`
+  legacy-маршрут эту pre-parse-гарантию не заявляет. Gemini 3.8 остаётся
+  admitted-моделью без opt-in (см. раздел S06); конкретное live-поведение не подтверждено.
 - **Экспорт — проекция.** `run_state.json`, `chunks.json`, run/manifest JSON из
   одного verified DB-вида; каждый файл несёт `history_run_uuid` и
   `history_revision`, пишется атомарно и не даёт legacy JSON-разрешения на
