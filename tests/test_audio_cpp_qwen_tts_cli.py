@@ -16,12 +16,19 @@ from voiceover_pipeline.config import (
 )
 from voiceover_pipeline.local_runtime.contracts import LocalTTSRequest, RuntimeProtocolError
 from voiceover_pipeline.local_runtime.drivers.audio_cpp import AudioCppRuntimeDriver
+from voiceover_pipeline.local_runtime.transports import audio_cpp_qwen_tts as qwen_tts_transport
 from voiceover_pipeline.local_runtime.transports.audio_cpp_container import (
     PINNED_AUDIO_CPP_CONTAINER_IMAGE,
 )
 from voiceover_pipeline.local_runtime.transports.audio_cpp_qwen_tts import (
     AudioCppQwenTTSCLITransport,
 )
+
+
+@pytest.fixture(autouse=True)
+def _simulated_linux_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pinned container transport is POSIX-only, so simulate its host here."""
+    monkeypatch.setattr(qwen_tts_transport.sys, "platform", "linux")
 
 
 def _model_package(tmp_path: Path, model_id: str = QWEN_MODEL_CUSTOMVOICE) -> Path:

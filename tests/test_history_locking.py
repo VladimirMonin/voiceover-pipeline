@@ -15,21 +15,22 @@ the temporary directory. The Windows backend is exercised only through a mocked
 
 Cross-process coordination is deterministic: a child process acquires the lock,
 prints a readiness marker, and holds it until the parent closes its stdin. The
-parent waits for that marker with a bounded ``select`` timeout instead of a sleep,
-and kills and reaps a holder that misses that timeout before reading its output.
+parent waits for that marker with a bounded host-independent read instead of a
+sleep, and kills and reaps a holder that misses that timeout before reading its
+output.
 """
 
 import errno
 import os
-import select
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
 
-from voiceover_pipeline.history import locking
+from voiceover_pipeline.history import locking, paths
 from voiceover_pipeline.history.locking import (
     LOCK_FILE_MODE,
     LOCKS_DIR_NAME,
@@ -46,6 +47,7 @@ from voiceover_pipeline.history.paths import (
 )
 
 _SRC_DIR = Path(__file__).resolve().parents[1] / "src"
+_POSIX = os.name == "posix"
 _HOLDER_TIMEOUT = 15.0
 # Readiness timeout shortened for the test that forces a timeout on purpose.
 _READINESS_TIMEOUT = 0.5
@@ -64,6 +66,57 @@ _CHILD_HOLDER = (
 _STUCK_HOLDER = (
     "import sys\nprint('holder-stuck', file=sys.stderr, flush=True)\nsys.stdin.readline()\n"
 )
+
+
+class _SimulatedPosixOs:
+    """An ``os`` shim that reports POSIX while proxying the host module.
+
+    Windows stores no meaningful POSIX access bits and applies no group/world
+    check, so the run-lock privacy policy is exercised by presenting the platform
+    those bits belong to; every other attribute stays the host answer. On a POSIX
+    host this only restates reality.
+    """
+
+    name = "posix"
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
+
+
+def _simulate_volume_probe(
+    monkeypatch: pytest.MonkeyPatch, *, case_insensitive: bool | None
+) -> None:
+    """Make the module's mocked volume answer authoritative on any host.
+
+    ``_lock_key_text`` folds names through ``os.path.normcase`` on Windows
+    instead of asking the volume probe, so a simulated non-Windows platform is
+    injected; the test never claims the Windows filesystem supplies POSIX case
+    sensitivity.
+    """
+    monkeypatch.setattr(locking, "_volume_case_sensitivity", lambda path: case_insensitive)
+    monkeypatch.setattr(locking.sys, "platform", "linux")
+
+
+def _read_readiness_line(child: subprocess.Popen[str], timeout: float) -> str:
+    """Read the child's readiness line within ``timeout``, on any host.
+
+    ``select`` cannot watch a pipe on Windows, so a bounded reader thread waits
+    for the line instead. A child that misses the timeout is killed and reaped by
+    the caller, which closes the pipe and lets the reader finish.
+    """
+    assert child.stdout is not None
+    lines: list[str] = []
+
+    def read_line() -> None:
+        try:
+            lines.append(child.stdout.readline())
+        except (OSError, ValueError):  # pragma: no cover - closed-pipe race
+            pass
+
+    reader = threading.Thread(target=read_line, daemon=True)
+    reader.start()
+    reader.join(timeout)
+    return lines[0] if lines else ""
 
 
 def _release_lock_holder(child: subprocess.Popen[str]) -> None:
@@ -118,9 +171,7 @@ def _start_lock_holder(
         text=True,
         env=env,
     )
-    assert child.stdout is not None
-    ready, _, _ = select.select([child.stdout], [], [], timeout)
-    marker = child.stdout.readline() if ready else ""
+    marker = _read_readiness_line(child, timeout)
     if marker.strip() != "LOCKED":
         # The child may still be alive with stderr open, so it is killed and
         # reaped first; only then is reading its stderr bounded.
@@ -148,9 +199,13 @@ def test_acquire_creates_private_layout_and_locks_file(tmp_path):
     with acquire_run_lock(run_root, home=home) as lock_path:
         assert lock_path.is_file()
         assert lock_path.parent == home / LOCKS_DIR_NAME
-        assert stat.S_IMODE(lock_path.stat().st_mode) == LOCK_FILE_MODE
+        # Windows stores no meaningful POSIX bits for the new lock file, so the
+        # private mode is only asserted where those bits describe real access.
+        if _POSIX:
+            assert stat.S_IMODE(lock_path.stat().st_mode) == LOCK_FILE_MODE
 
-    assert stat.S_IMODE(home.stat().st_mode) & 0o077 == 0
+    if _POSIX:
+        assert stat.S_IMODE(home.stat().st_mode) & 0o077 == 0
 
 
 def test_lock_filename_is_opaque_and_stable(tmp_path):
@@ -205,7 +260,7 @@ def test_case_insensitive_volume_folds_case_and_unicode_aliases(monkeypatch, tmp
     home = tmp_path / "home"
     lower = tmp_path / "run-root"
     lower.mkdir()
-    monkeypatch.setattr(locking, "_volume_case_sensitivity", lambda path: True)
+    _simulate_volume_probe(monkeypatch, case_insensitive=True)
 
     assert run_lock_path(tmp_path / "RUN-ROOT", home=home) == run_lock_path(lower, home=home)
     composed = tmp_path / "caf\u00e9"
@@ -227,20 +282,26 @@ def test_case_insensitive_alias_contends_for_one_lock(monkeypatch, tmp_path):
 
 def test_case_sensitive_volume_keeps_distinct_roots_distinct(monkeypatch, tmp_path):
     home = tmp_path / "home"
-    monkeypatch.setattr(locking, "_volume_case_sensitivity", lambda path: False)
+    _simulate_volume_probe(monkeypatch, case_insensitive=False)
 
     upper = tmp_path / "MiXeD"
     lower = tmp_path / "mixed"
 
     assert run_lock_path(upper, home=home) != run_lock_path(lower, home=home)
-    with acquire_run_lock(lower, home=home):
-        with acquire_run_lock(upper, home=home) as lock_path:
-            assert lock_path.is_file()
+
+    # The simulated key contract runs everywhere; simultaneous native locks
+    # additionally require two physically distinct, case-sensitive roots.
+    upper.mkdir()
+    lower.mkdir(exist_ok=True)
+    if not upper.samefile(lower):
+        with acquire_run_lock(lower, home=home):
+            with acquire_run_lock(upper, home=home) as lock_path:
+                assert lock_path.is_file()
 
 
 def test_undeterminable_case_sensitivity_is_refused(monkeypatch, tmp_path):
     home = tmp_path / "home"
-    monkeypatch.setattr(locking, "_volume_case_sensitivity", lambda path: None)
+    _simulate_volume_probe(monkeypatch, case_insensitive=None)
 
     with pytest.raises(HistoryRunLockError):
         run_lock_path(tmp_path / "run-root", home=home)
@@ -308,16 +369,18 @@ def test_lock_touches_only_private_layout_not_database_or_output(tmp_path):
     assert [path.name for path in (home / LOCKS_DIR_NAME).iterdir()] == [lock_path.name]
 
 
-def test_insecure_home_is_rejected_without_chmodding(tmp_path):
+def test_insecure_home_is_rejected_without_chmodding(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     home.chmod(0o755)
+    before_mode = os.stat(home).st_mode
+    monkeypatch.setattr(paths, "os", _SimulatedPosixOs())
 
     with pytest.raises(HistoryPathsError):
         with acquire_run_lock(tmp_path / "run-root", home=home):
             pass
 
-    assert stat.S_IMODE(home.stat().st_mode) == 0o755
+    assert os.stat(home).st_mode == before_mode
 
 
 def test_symlinked_home_is_rejected(tmp_path):
@@ -331,7 +394,7 @@ def test_symlinked_home_is_rejected(tmp_path):
             pass
 
 
-def test_insecure_existing_lock_file_is_rejected_not_chmodded(tmp_path):
+def test_insecure_existing_lock_file_is_rejected_not_chmodded(tmp_path, monkeypatch):
     home = tmp_path / "home"
     ensure_history_home(home)
     ensure_private_directory(home / LOCKS_DIR_NAME)
@@ -339,12 +402,14 @@ def test_insecure_existing_lock_file_is_rejected_not_chmodded(tmp_path):
     lock_path = run_lock_path(run_root, home=home)
     lock_path.write_text("", encoding="utf-8")
     lock_path.chmod(0o644)
+    before_mode = os.stat(lock_path).st_mode
+    monkeypatch.setattr(locking, "os", _SimulatedPosixOs())
 
     with pytest.raises(HistoryRunLockError):
         with acquire_run_lock(run_root, home=home):
             pass
 
-    assert stat.S_IMODE(lock_path.stat().st_mode) == 0o644
+    assert os.stat(lock_path).st_mode == before_mode
 
 
 def test_symlinked_lock_file_is_rejected_not_followed(tmp_path):

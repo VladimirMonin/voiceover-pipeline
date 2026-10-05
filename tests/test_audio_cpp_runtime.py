@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import threading
 import time
@@ -139,6 +140,32 @@ def test_subprocess_transport_times_out_without_exposing_private_workspace(tmp_p
         transport.invoke("timeout-request", {"schema_version": 1})
 
     assert str(tmp_path) not in str(error.value)
+
+
+def test_subprocess_transport_reports_the_timeout_when_workspace_cleanup_is_locked_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A just-released Windows directory lock must not replace the timeout error."""
+    script = tmp_path / "slow_driver.py"
+    script.write_text("import time\ntime.sleep(10)\n")
+    transport = SubprocessJSONTransport((sys.executable, str(script)), timeout_seconds=0.01)
+    removals: list[str] = []
+    real_rmtree = shutil.rmtree
+
+    def locked_once(path, *args, **kwargs):
+        removals.append(str(path))
+        if len(removals) == 1:
+            raise PermissionError(32, "the workspace is still in use")
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", locked_once)
+
+    with pytest.raises(RuntimeTransportError, match="timed out") as error:
+        transport.invoke("timeout-request", {"schema_version": 1})
+
+    assert str(tmp_path) not in str(error.value)
+    assert len(removals) >= 2
+    assert not Path(removals[0]).exists()
 
 
 @pytest.mark.parametrize(

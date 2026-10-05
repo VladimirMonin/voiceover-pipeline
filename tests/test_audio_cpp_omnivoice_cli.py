@@ -18,6 +18,12 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_omnivoice import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _simulated_linux_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pinned container transport is POSIX-only, so simulate its host here."""
+    monkeypatch.setattr(audio_cpp_omnivoice.sys, "platform", "linux")
+
+
 def _request_payload(text: str = "Привет") -> dict[str, object]:
     return {
         "schema_version": 1,
@@ -211,6 +217,11 @@ def test_long_form_timeout_is_bounded(monkeypatch, tmp_path: Path):
     assert transport._timeout_for_request(request) == 1800.0
 
 
+# POSIX SIGKILL number: the Windows stubs do not declare the name, so the fixture
+# injects it and both the runtime lookup and this assertion use that one value.
+_SIGKILL_FIXTURE = 9
+
+
 def test_timeout_cleanup_reaps_after_kill(monkeypatch):
     process = _StubbornProcess()
     killed: list[tuple[int, int]] = []
@@ -218,13 +229,15 @@ def test_timeout_cleanup_reaps_after_kill(monkeypatch):
         audio_cpp_omnivoice.os,
         "killpg",
         lambda pid, sig: killed.append((pid, sig)),
+        raising=False,
     )
+    monkeypatch.setattr(audio_cpp_omnivoice.signal, "SIGKILL", _SIGKILL_FIXTURE, raising=False)
 
     AudioCppOmniVoiceCLITransport._terminate_process(process)  # type: ignore[arg-type]
 
     assert killed == [
         (1234, audio_cpp_omnivoice.signal.SIGTERM),
-        (1234, audio_cpp_omnivoice.signal.SIGKILL),
+        (1234, _SIGKILL_FIXTURE),
     ]
     assert process.wait_calls == 2
 

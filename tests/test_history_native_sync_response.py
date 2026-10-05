@@ -14,6 +14,7 @@ locally -- recovering even the observed cost -- with zero POST or GET.
 
 import base64
 import json
+import os
 import sqlite3
 import sys
 import uuid
@@ -29,6 +30,7 @@ from voiceover_pipeline.services import native_generation
 
 POLZA_SYNC_MODEL = "openai/gpt-4o-mini-tts"
 POST_TARGET = "voiceover_pipeline.providers.polza_tts.requests.post"
+_POSIX = os.name == "posix"
 
 
 def _write_mp3(_ffmpeg: str, data: bytes, _fmt: str, path: Path) -> None:
@@ -310,7 +312,16 @@ def test_write_sync_response_receipt_is_idempotent_and_conflicts_on_change(tmp_p
     second = raw_receipt.write_sync_response_receipt(**args)
     assert first.sha256 == second.sha256
     assert first.body_path.read_bytes() == args["body"]
-    assert not (run_root / "raw").stat().st_mode & 0o077
+    # The evidence set (this attempt's body and receipt, with no atomic-write
+    # leftover) is asserted on every host; Windows stores no meaningful POSIX
+    # bits on the new directory, so the private-mode claim is only made where
+    # those bits describe real access.
+    raw_dir = run_root / "raw"
+    assert sorted(item.name for item in raw_dir.iterdir()) == sorted(
+        [first.body_path.name, f"{first.body_path.name}.receipt.json"]
+    )
+    if _POSIX:
+        assert not raw_dir.stat().st_mode & 0o077
 
     with pytest.raises(raw_receipt.PaidSyncResponseConflictError):
         raw_receipt.write_sync_response_receipt(**{**args, "body": b'{"audio": "y"}'})

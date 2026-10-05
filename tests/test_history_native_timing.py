@@ -637,13 +637,16 @@ def test_preflight_local_timing_rejects_cloud_provider_and_reports_unavailable(m
     assert excinfo.value.code == 10
 
 
-def test_faster_whisper_availability_reports_missing_package() -> None:
+def test_faster_whisper_availability_reports_missing_package(monkeypatch) -> None:
     """The availability probe reports an unimportable package without raising."""
     from voiceover_pipeline.providers.faster_whisper import faster_whisper_availability
 
+    # faster-whisper may be installed in this environment, so the missing-package
+    # answer is produced by an import seam instead of depending on the host.
+    monkeypatch.setitem(sys.modules, "faster_whisper", None)
+
     availability = faster_whisper_availability("small")
-    # This environment has no local faster-whisper install; the probe must report
-    # an unavailable dependency rather than raising or downloading.
+
     assert availability.available is False
     assert availability.reason_code is not None
     assert availability.remediation

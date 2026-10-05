@@ -5,7 +5,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from math import ceil
@@ -42,6 +42,23 @@ _CHILD_ENVIRONMENT_KEYS: Final = (
 _MODEL_HASH_CHUNK_BYTES: Final = 1024 * 1024
 _DEFAULT_TIMEOUT_CHARS: Final = 420
 _MAX_TIMEOUT_SECONDS: Final = 1800.0
+
+
+def _kill_process_group(pid: int, sig: int) -> None:
+    """Send ``sig`` to the process group ``pid``.
+
+    ``os.killpg`` and ``signal.SIGKILL`` are declared for POSIX hosts only, so
+    both are resolved through their module when the POSIX branch really runs;
+    that keeps the Windows stubs clean and stays substitutable by the platform
+    simulation in tests.
+    """
+    killpg: Callable[[int, int], None] = getattr(os, "killpg")
+    killpg(pid, sig)
+
+
+def _sigkill() -> int:
+    """Return ``signal.SIGKILL``, which the Windows stubs do not declare."""
+    return getattr(signal, "SIGKILL")
 
 
 @dataclass(frozen=True)
@@ -111,7 +128,11 @@ class AudioCppOmniVoiceCLITransport:
         timeout_seconds: float = 300.0,
         expected_sample_rate_hz: int = 24_000,
     ) -> None:
-        if sys.platform.startswith("win"):
+        # The platform is read at construction so host-simulating tests keep
+        # working; a local keeps mypy from folding the check for its own host and
+        # hiding the rest of this POSIX-only constructor from type checking.
+        host_is_windows = sys.platform.startswith("win")
+        if host_is_windows:
             raise ValueError("OmniVoice container transport is unavailable on Windows")
         if image != PINNED_AUDIO_CPP_CONTAINER_IMAGE:
             raise ValueError("OmniVoice container image must use the verified pinned digest")
@@ -294,7 +315,7 @@ class AudioCppOmniVoiceCLITransport:
         if process.poll() is not None:
             return
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            _kill_process_group(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
         except OSError:
@@ -303,7 +324,7 @@ class AudioCppOmniVoiceCLITransport:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                _kill_process_group(process.pid, _sigkill())
             except ProcessLookupError:
                 return
             try:

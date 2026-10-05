@@ -33,7 +33,7 @@ import os
 import stat
 import sys
 from collections.abc import Mapping
-from pathlib import Path, PureWindowsPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 # Directory under a platform data root that holds this application's history.
 APP_DIR_NAME = "voiceover-pipeline"
@@ -59,13 +59,16 @@ def _is_absolute_config_path(value: str, *, platform: str | None = None) -> bool
     """Check absoluteness for the active platform, not either path syntax.
 
     An injected Windows platform must accept ``C:\\Users\\u`` on a POSIX test
-    host. On POSIX that same string is relative and must not make history follow
-    the current working directory.
+    host, and an injected POSIX platform must treat ``C:/...`` as relative even
+    on a Windows host. Each platform is checked with the pure path class that
+    spells it, so the answer never depends on the host running the check. On
+    POSIX that same string is relative and must not make history follow the
+    current working directory.
     """
     active_platform = sys.platform if platform is None else platform
     if active_platform.startswith("win"):
         return PureWindowsPath(value).is_absolute()
-    return Path(value).is_absolute()
+    return PurePosixPath(value).is_absolute()
 
 
 def default_history_home(

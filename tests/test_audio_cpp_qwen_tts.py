@@ -254,6 +254,9 @@ def test_qwen_cli_selects_audio_cpp_from_environment_and_carries_the_artifact(
     monkeypatch.setattr(
         "voiceover_pipeline.providers.audio_cpp_qwen_tts.which", lambda _command: "/usr/bin/docker"
     )
+    # The environment container route is the POSIX host route; simulate that host so
+    # this selection contract stays available on every platform.
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_qwen_tts.sys.platform", "linux")
 
     provider = build_provider(
         build_parser().parse_args("generate --provider qwen-local".split()),

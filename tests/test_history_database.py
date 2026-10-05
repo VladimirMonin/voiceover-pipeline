@@ -8,12 +8,14 @@ The typed entity API is covered separately in ``test_history_repository.py``.
 """
 
 import logging
+import os
 import shutil
 import sqlite3
 import stat
 
 import pytest
 
+from voiceover_pipeline.history import database as history_database
 from voiceover_pipeline.history.database import (
     MIGRATIONS,
     HistoryDatabase,
@@ -30,6 +32,7 @@ from voiceover_pipeline.history.database import (
 # Frozen sha256 of the v1 core migration; the v2 revision migration must never
 # rewrite v1 bytes, so an already-migrated v1 database still validates against it.
 _V1_CHECKSUM = "e802c869914ac25365b5ae9859bcfce81a4ef4937984988b2cfcdcd867e27232"
+_POSIX = os.name == "posix"
 
 _LEDGER_DDL = (
     "CREATE TABLE schema_migrations ("
@@ -38,6 +41,25 @@ _LEDGER_DDL = (
     "checksum TEXT NOT NULL, "
     "applied_at TEXT NOT NULL)"
 )
+
+
+class _RecordingModeOs:
+    """An ``os`` shim that records the access modes the module requests.
+
+    Windows stores no meaningful POSIX mode bits on a reserved file, so the
+    private-mode contract can only be observed there through the mode the code
+    asks the OS for; every other attribute stays the host answer.
+    """
+
+    def __init__(self) -> None:
+        self.requested_modes: list[int] = []
+
+    def open(self, path, flags: int, mode: int = 0o777, **kwargs: object) -> int:
+        self.requested_modes.append(mode)
+        return os.open(path, flags, mode, **kwargs)
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
 
 
 def _widgets_v1() -> Migration:
@@ -558,14 +580,21 @@ def test_default_backup_names_never_overwrite(tmp_path):
     assert first.read_bytes() == first_bytes
 
 
-def test_backup_files_use_private_mode(tmp_path):
+def test_backup_files_use_private_mode(tmp_path, monkeypatch):
     database_path = tmp_path / "history.sqlite3"
     database = HistoryDatabase(database_path)
     database.migrate()
+    recorder = _RecordingModeOs()
+    monkeypatch.setattr(history_database, "os", recorder)
     backup_path = database.backup(tmp_path / "backups")
     database.close()
 
-    assert stat.S_IMODE(backup_path.stat().st_mode) & 0o077 == 0
+    # Windows has no meaningful POSIX bits on the reserved file, so the private
+    # mode is checked there through the mode the reservation asks the OS for; on
+    # a POSIX host the kernel bits are asserted as well.
+    assert recorder.requested_modes == [history_database._BACKUP_FILE_MODE]
+    if _POSIX:
+        assert stat.S_IMODE(backup_path.stat().st_mode) & 0o077 == 0
 
 
 def test_incompatible_upgrade_takes_backup_before_migrating(tmp_path):

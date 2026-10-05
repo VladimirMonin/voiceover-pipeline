@@ -11,6 +11,7 @@ logging, future-schema rejection, and post-import metadata queries.
 import hashlib
 import json
 import logging
+import os
 import shutil
 import sqlite3
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import pytest
 
+from voiceover_pipeline.history import paths as history_paths
 from voiceover_pipeline.history.database import (
     MIGRATIONS,
     HistoryDatabase,
@@ -43,6 +45,21 @@ from voiceover_pipeline.history.repository import (
 _SLUG = "openai-gpt-4o-mini-tts"
 _MODEL = "openai/gpt-4o-mini-tts"
 _SCRIPT_HASH = "a" * 64
+
+
+class _SimulatedPosixOs:
+    """An ``os`` shim that reports POSIX while proxying the host module.
+
+    Windows stores no meaningful POSIX access bits and applies no group/world
+    check, so the private-history policy is exercised by presenting the platform
+    those bits belong to; every other attribute stays the host answer. On a POSIX
+    host this only restates reality.
+    """
+
+    name = "posix"
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
 
 
 @contextmanager
@@ -1239,6 +1256,7 @@ def test_import_rejects_insecure_existing_home_before_db_write(tmp_path, monkeyp
     home.mkdir()
     home.chmod(0o755)
     monkeypatch.setenv("VOICEOVER_HOME", str(home))
+    monkeypatch.setattr(history_paths, "os", _SimulatedPosixOs())
     source = tmp_path / "out"
     _write_legacy_run(source, run_id="prod")
 
@@ -1263,6 +1281,7 @@ def test_import_rejects_insecure_home_even_when_database_is_unknown(tmp_path, mo
     finally:
         raw.close()
     monkeypatch.setenv("VOICEOVER_HOME", str(home))
+    monkeypatch.setattr(history_paths, "os", _SimulatedPosixOs())
     source = tmp_path / "out"
     _write_legacy_run(source, run_id="prod")
 
@@ -1274,10 +1293,11 @@ def test_import_rejects_insecure_home_even_when_database_is_unknown(tmp_path, mo
     assert not (home / "logs").exists()
 
 
-def test_import_rejects_insecure_existing_explicit_parent(tmp_path):
+def test_import_rejects_insecure_existing_explicit_parent(tmp_path, monkeypatch):
     parent = tmp_path / "open-parent"
     parent.mkdir()
     parent.chmod(0o755)
+    monkeypatch.setattr(history_paths, "os", _SimulatedPosixOs())
     database_path = parent / "history.sqlite3"
     source = tmp_path / "out"
     _write_legacy_run(source, run_id="prod")

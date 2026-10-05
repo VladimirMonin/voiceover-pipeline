@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import sys
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pytest
 
@@ -40,6 +44,25 @@ def _provider(payload: dict[str, object]):
     from voiceover_pipeline.providers.audio_cpp_qwen_asr import AudioCppQwenASRProvider
 
     return AudioCppQwenASRProvider(FixtureRuntime(payload))
+
+
+@contextmanager
+def _noop_lock(_lock_path: Path) -> Iterator[None]:
+    """Process-local lease lock for a simulated POSIX route on a non-POSIX host."""
+    yield
+
+
+def _simulate_posix_environment_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the POSIX-only environment binary route with a process-local lease lock.
+
+    The environment binary route exists on POSIX hosts only, and a simulated host
+    must not reach for the Windows-imported ``fcntl`` module, so the fixture supplies
+    the same process-local lock backend the Nemotron environment route test uses.
+    """
+    import voiceover_pipeline.local_runtime.gpu_lease as gpu_lease
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(gpu_lease, "_default_lock_backend", lambda: _noop_lock)
 
 
 def test_audio_cpp_qwen_text_route_preserves_context_and_forced_language_without_alignment():
@@ -182,6 +205,7 @@ def test_audio_cpp_qwen_environment_route_composes_lifecycle_for_cancellation_an
             pass
 
     monkeypatch.setenv("VOICEOVER_AUDIO_CPP_BINARY", "fixture-audio-cpp")
+    _simulate_posix_environment_route(monkeypatch)
     monkeypatch.setattr(audio_cpp_qwen_asr, "AudioCppRuntimeDriver", BlockingDriver)
     provider = audio_cpp_qwen_asr.AudioCppQwenASRProvider.from_environment()
     assert isinstance(provider._runtime, LocalAudioRuntime)
@@ -258,6 +282,7 @@ def test_audio_cpp_qwen_environment_route_uses_the_real_local_gpu_probe(monkeypa
         return None
 
     monkeypatch.setenv("VOICEOVER_AUDIO_CPP_BINARY", "fixture-audio-cpp")
+    _simulate_posix_environment_route(monkeypatch)
     monkeypatch.setattr(audio_cpp_qwen_asr, "AudioCppRuntimeDriver", FixtureDriver)
     monkeypatch.setattr(audio_cpp_qwen_asr, "probe_local_gpu_state", sentinel_probe)
 

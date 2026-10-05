@@ -16,6 +16,12 @@ from voiceover_pipeline.local_runtime.transports.audio_cpp_container import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _simulated_linux_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pinned container transport is POSIX-only, so simulate its host here."""
+    monkeypatch.setattr(container.sys, "platform", "linux")
+
+
 def _write_mono_wav(path: Path, *, frames: int = 16_000) -> None:
     with wave.open(str(path), "wb") as audio:
         audio.setnchannels(1)

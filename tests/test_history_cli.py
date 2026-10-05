@@ -13,6 +13,7 @@ fail-closed behavior, and the no-network guarantee.
 import hashlib
 import json
 import logging
+import os
 import socket
 import sqlite3
 import sys
@@ -22,12 +23,28 @@ from pathlib import Path
 import pytest
 
 import voiceover_pipeline.cli as cli
+from voiceover_pipeline.history import paths as history_paths
 from voiceover_pipeline.history.database import MIGRATIONS, HistoryDatabase, Migration
 from voiceover_pipeline.history.repository import HistoryRepository
 
 _SLUG = "openai-gpt-4o-mini-tts"
 _MODEL = "openai/gpt-4o-mini-tts"
 _SCRIPT_HASH = "a" * 64
+
+
+class _SimulatedPosixOs:
+    """An ``os`` shim that reports POSIX while proxying the host module.
+
+    Windows stores no meaningful POSIX access bits and applies no group/world
+    check, so the private-history policy is exercised by presenting the platform
+    those bits belong to; every other attribute stays the host answer. On a POSIX
+    host this only restates reality.
+    """
+
+    name = "posix"
+
+    def __getattr__(self, attribute: str) -> object:
+        return getattr(os, attribute)
 
 
 @pytest.fixture(autouse=True)
@@ -442,6 +459,7 @@ def test_history_import_insecure_home_is_output_error(
 ):
     _isolated_home.mkdir()
     _isolated_home.chmod(0o755)
+    monkeypatch.setattr(history_paths, "os", _SimulatedPosixOs())
     source = tmp_path / "out"
     _write_legacy_run(source, run_id="prod")
 

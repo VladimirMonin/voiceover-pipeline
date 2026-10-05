@@ -119,6 +119,9 @@ def test_qwen_asr_registry_listing_exposes_both_local_sizes_with_one_default():
 def test_qwen_asr_family_selects_audio_cpp_without_changing_the_public_provider_id(monkeypatch):
     from voiceover_pipeline.providers.qwen_asr_local import QWEN_ASR_PROVIDER_SPEC
 
+    # The environment binary route is the POSIX host route; simulate that host so
+    # this selection contract stays available on every platform.
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_qwen_asr.sys.platform", "linux")
     monkeypatch.setenv("VOICEOVER_AUDIO_CPP_BINARY", "fixture-audio-cpp")
 
     provider = QWEN_ASR_PROVIDER_SPEC.factory()
@@ -712,7 +715,9 @@ def test_qwen_asr_settings_file_resolves_assets_and_environment_wins(monkeypatch
     workdir = tmp_path / "cwd"
     workdir.mkdir()
     (workdir / "settings.toml").write_text(
-        f'[asr.qwen_local]\nmodels_root = "{configured_root}"\nrevision = "{QWEN_ASR_REVISION}"\n',
+        "[asr.qwen_local]\n"
+        f"models_root = '{configured_root}'\n"
+        f'revision = "{QWEN_ASR_REVISION}"\n',
         encoding="utf-8",
     )
     monkeypatch.chdir(workdir)
@@ -1213,6 +1218,7 @@ def test_qwen_asr_auto_runtime_keeps_the_environment_based_audio_cpp_selection(m
     from voiceover_pipeline.providers.qwen_asr_local import QWEN_ASR_PROVIDER_SPEC
     from voiceover_pipeline.services import transcription
 
+    monkeypatch.setattr("voiceover_pipeline.providers.audio_cpp_qwen_asr.sys.platform", "linux")
     monkeypatch.setenv("VOICEOVER_AUDIO_CPP_BINARY", "fixture-audio-cpp")
 
     provider = transcription.resolve_asr_provider(

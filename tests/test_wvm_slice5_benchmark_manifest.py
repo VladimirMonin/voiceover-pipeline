@@ -83,7 +83,7 @@ def test_wvm_slice5_manifest_is_canonical_and_category_balanced():
         assert not Path(case["reference_path"]).is_absolute()
         assert Path(case["audio_path"]).suffix == ".ogg"
         assert Path(case["reference_path"]).suffix == ".txt"
-        assert case["reference_path"] == str(Path(case["audio_path"]).with_suffix(".txt"))
+        assert case["reference_path"] == Path(case["audio_path"]).with_suffix(".txt").as_posix()
         assert case["expected_text"]
         assert case["duration_s"] > 0
         assert case["language"] in {None, "de", "en", "es", "ru"}

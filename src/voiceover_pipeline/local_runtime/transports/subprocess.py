@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 from typing import Final
@@ -15,6 +18,8 @@ from voiceover_pipeline.local_runtime.contracts import RuntimeProtocolError, Run
 
 _PRIVATE_TMP_PREFIX: Final = "voiceover-audio-cpp-"
 _MAX_TTS_WAV_BYTES: Final = 64 * 1024 * 1024
+_PRIVATE_WORKSPACE_REMOVE_SECONDS: Final = 1.0
+_PRIVATE_WORKSPACE_REMOVE_INTERVAL_SECONDS: Final = 0.005
 _CHILD_ENVIRONMENT_KEYS: Final = (
     "PATH",
     "LD_LIBRARY_PATH",
@@ -22,6 +27,54 @@ _CHILD_ENVIRONMENT_KEYS: Final = (
     "LANG",
     "LC_ALL",
 )
+
+
+def _kill_process_group(pid: int, sig: int) -> None:
+    """Send ``sig`` to the process group ``pid``.
+
+    ``os.killpg`` is declared for POSIX hosts only, so the callable is resolved
+    through its module when the POSIX branch really runs; that keeps the Windows
+    stubs clean and stays substitutable by the platform simulation in tests.
+    """
+    killpg: Callable[[int, int], None] = getattr(os, "killpg")
+    killpg(pid, sig)
+
+
+def _sigkill() -> int:
+    """Return ``signal.SIGKILL``, which the Windows stubs do not declare."""
+    return getattr(signal, "SIGKILL")
+
+
+@contextmanager
+def _private_workspace() -> Iterator[str]:
+    """Yield a private transport workspace that is always removed afterwards."""
+    workspace = tempfile.mkdtemp(prefix=_PRIVATE_TMP_PREFIX)
+    try:
+        yield workspace
+    finally:
+        _remove_private_workspace(workspace)
+
+
+def _remove_private_workspace(workspace: str) -> None:
+    """Remove the private workspace, retrying a just-released Windows directory lock.
+
+    A child that was terminated moments ago can still hold its private workspace as
+    the current directory for a few milliseconds on Windows, so one removal attempt
+    fails and its error would replace the transport's own timeout or cancellation
+    error with an unrelated cleanup error.
+    """
+    deadline = time.monotonic() + _PRIVATE_WORKSPACE_REMOVE_SECONDS
+    while True:
+        try:
+            shutil.rmtree(workspace)
+        except FileNotFoundError:
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_PRIVATE_WORKSPACE_REMOVE_INTERVAL_SECONDS)
+        else:
+            return
 
 
 class SubprocessJSONTransport:
@@ -47,7 +100,7 @@ class SubprocessJSONTransport:
 
     def invoke(self, request_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        with tempfile.TemporaryDirectory(prefix=_PRIVATE_TMP_PREFIX) as temporary_directory:
+        with _private_workspace() as temporary_directory:
             if not self._is_windows:
                 os.chmod(temporary_directory, 0o700)
             environment = {
@@ -250,7 +303,7 @@ class SubprocessJSONTransport:
                     return
             return
         try:
-            os.killpg(process.pid, signal.SIGTERM)
+            _kill_process_group(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             return
         except OSError:
@@ -259,6 +312,6 @@ class SubprocessJSONTransport:
             process.wait(timeout=1)
         except subprocess.TimeoutExpired:
             try:
-                os.killpg(process.pid, signal.SIGKILL)
+                _kill_process_group(process.pid, _sigkill())
             except ProcessLookupError:
                 return
